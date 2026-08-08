@@ -54,7 +54,7 @@
       {% endfor %}
     </nav>
   </div>
-  <form class="file-search-form" method="get" action="/w/{{ workspace.id }}/files" role="search">
+  <form class="file-search-form" method="get" action="/w/{{ workspace.id }}/files" role="search" data-live-file-search>
     <input type="hidden" name="path" value="{{ path }}">
     {% if show_noise %}<input type="hidden" name="noise" value="1">{% endif %}
     <label class="sr-only" for="file-search-input">{{ t('files.search') }}</label>
@@ -65,7 +65,7 @@
            placeholder="{{ t('files.search_placeholder') }}"
            autocomplete="off">
     <button class="secondary-button" type="submit">{{ t('files.search') }}</button>
-    {% if query %}<a class="quiet-action" href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}{% if show_noise %}&noise=1{% endif %}">{{ t('common.clear') }}</a>{% endif %}
+    <button id="file-search-clear" class="quiet-action" type="button" {% if not query %}hidden{% endif %}>{{ t('common.clear') }}</button>
   </form>
 </section>
 
@@ -102,70 +102,9 @@
   <a id="upload-refresh-link" class="text-action" href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}" hidden>{{ t('files.upload_refresh') }}</a>
 </section>
 
-<section class="workspace-file-list">
-  <div class="file-table-head">
-    <label class="file-select-control file-select-all-control" aria-label="{{ t('files.select_all') }}">
-      <input id="file-select-all" type="checkbox">
-      <span class="file-select-all-label">{{ t('files.select_all') }}</span>
-    </label>
-    <span>{{ t('common.name') }}</span><span>{{ t('common.size') }}</span><span>{{ t('common.modified') }}</span><span></span>
-  </div>
-  {% if path != '.' %}
-  <a class="file-browser-row parent-row" href="/w/{{ workspace.id }}/files?path={{ (path.rsplit('/', 1)[0] if '/' in path else '.') | urlencode }}{% if show_noise %}&noise=1{% endif %}">
-    <span class="file-glyph parent" aria-hidden="true">↑</span><span class="file-name">{{ t('files.parent') }}</span><span class="file-size">—</span><span class="file-mtime">—</span>
-  </a>
-  {% endif %}
-  {% for entry in entries %}
-  <div class="file-browser-row file-row-with-actions">
-    <label class="file-select-control" aria-label="{{ t('files.select_item', name=entry.name) }}">
-      <input type="checkbox"
-             name="paths"
-             value="{{ entry.relative_path }}"
-             form="file-bulk-form"
-             data-file-select>
-    </label>
-    {% if entry.is_dir %}
-    <a class="file-primary" href="/w/{{ workspace.id }}/files?path={{ entry.relative_path | urlencode }}{% if show_noise %}&noise=1{% endif %}">
-      <span class="file-glyph folder" aria-hidden="true"></span><span class="file-name">{{ entry.name }}</span><span class="file-size">{{ t('common.folder') }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
-    </a>
-    {% else %}
-    <a class="file-primary" href="/w/{{ workspace.id }}/view/{{ entry.relative_path | urlencode }}">
-      <span class="file-glyph document" aria-hidden="true"></span>
-      <span class="file-name">{{ entry.name }}</span><span class="file-size">{{ format_size(entry.size) }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
-    </a>
-    {% endif %}
-    <button type="button"
-            class="file-actions-button"
-            data-file-actions
-            data-file-path="{{ entry.relative_path }}"
-            data-file-name="{{ entry.name }}"
-            data-file-size="{{ entry.size }}"
-            data-file-mtime="{{ format_time_ns(entry.mtime_ns) }}"
-            data-file-directory="{{ '1' if entry.is_dir else '0' }}"
-            aria-label="{{ t('files.item_actions', name=entry.name) }}">•••</button>
-  </div>
-  {% else %}
-  <div class="empty-state quiet-empty"><p>{% if query %}{{ t('files.no_search_results', query=query) }}{% else %}{{ t('files.empty') }}{% endif %}</p></div>
-  {% endfor %}
-</section>
-
-{% if page_count > 1 %}
-<nav class="file-pagination" aria-label="{{ t('files.pagination') }}">
-  {% if current_page > 1 %}
-  <a class="secondary-button"
-     href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&page={{ current_page - 1 }}{% if show_noise %}&noise=1{% endif %}{% if query %}&q={{ query | urlencode }}{% endif %}">{{ t('files.previous_page') }}</a>
-  {% else %}
-  <span class="secondary-button disabled" aria-disabled="true">{{ t('files.previous_page') }}</span>
-  {% endif %}
-  <span class="file-pagination-status">{{ t('files.page_status', page=current_page, pages=page_count, count=total_entries) }}</span>
-  {% if current_page < page_count %}
-  <a class="secondary-button"
-     href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&page={{ current_page + 1 }}{% if show_noise %}&noise=1{% endif %}{% if query %}&q={{ query | urlencode }}{% endif %}">{{ t('files.next_page') }}</a>
-  {% else %}
-  <span class="secondary-button disabled" aria-disabled="true">{{ t('files.next_page') }}</span>
-  {% endif %}
-</nav>
-{% endif %}
+<div id="file-results" aria-live="polite" aria-busy="false">
+  {% include "_file_results.html" %}
+</div>
 
 <dialog id="file-actions-dialog" class="file-actions-dialog" data-workspace-id="{{ workspace.id }}">
   <header class="file-actions-dialog-header">

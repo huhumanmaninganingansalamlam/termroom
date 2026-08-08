@@ -208,7 +208,11 @@ Default bind is loopback. Other-device access should use LAN, an existing VPN su
 as Tailscale, or an operator-managed HTTPS reverse proxy.
 
 Docker uses a non-root `termroom` runtime user, `/config` for persistent state, and
-`/workspaces` for allowed local content.
+`/workspaces` for allowed local content. Release container images are built only
+after the matching PyPI version is published; the Dockerfile installs that exact
+PyPI package rather than copying the repository source. The release workflow then
+publishes multi-architecture images to GHCR so Python and container artifacts share
+one versioned source of truth.
 
 ## Localization
 

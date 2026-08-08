@@ -259,13 +259,23 @@ owner-only encrypted credential 파일에 저장합니다. 이 저장소가 hard
 
 ## Docker Compose
 
-Docker로 실행하고 싶다면:
+PyPI 릴리스가 성공하면 같은 버전의 Docker 이미지를 GHCR에도 자동으로 배포합니다.
+Docker 이미지 안에서도 해당 버전의 `termroom`을 PyPI에서 설치하므로 Python 패키지와
+컨테이너 버전이 서로 어긋나지 않습니다.
+
+배포된 이미지를 사용하려면:
 
 ```bash
 cp .env.example .env
 # TERMROOM_PASSWORD 변경
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+이미지는 `ghcr.io/huhumanmaninganingansalamlam/termroom:latest`로 제공하고 `0.1.1`,
+`0.1` 같은 버전 태그도 함께 배포합니다. PyPI 패키지로 Docker 이미지를 로컬 빌드하려면
+`docker compose up -d --build`를 사용할 수 있고, Dockerfile의 `TERMROOM_VERSION` build
+argument로 설치할 버전을 지정할 수 있습니다.
 
 기본 Compose는 다음을 사용합니다.
 

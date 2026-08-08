@@ -266,13 +266,23 @@ a replacement for a hardware-backed vault.
 
 ## Docker Compose
 
-To run with Docker:
+Release images are published to GHCR after the matching PyPI release succeeds. The
+image itself installs that exact `termroom` version from PyPI, so the Python package
+and container release stay aligned.
+
+To run the published image:
 
 ```bash
 cp .env.example .env
 # Change TERMROOM_PASSWORD
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+The image is `ghcr.io/huhumanmaninganingansalamlam/termroom:latest`. Versioned tags
+such as `0.1.1` and `0.1` are published as well. To build the container locally from
+the PyPI package instead, use `docker compose up -d --build`; the Dockerfile accepts
+`TERMROOM_VERSION` as a build argument.
 
 The included Compose configuration uses:
 

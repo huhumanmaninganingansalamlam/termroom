@@ -101,39 +101,96 @@
   const fileSelectionBar = document.querySelector("#file-bulk-form");
   const fileSelectionCount = document.querySelector("#file-selection-count");
   const fileSelectionClear = document.querySelector("#file-selection-clear");
-  const fileSelectAll = document.querySelector("#file-select-all");
-  const fileSelectionInputs = [...document.querySelectorAll("[data-file-select]")];
+  const fileSelectionInputs = () => [...document.querySelectorAll("[data-file-select]")];
 
   const syncFileSelection = () => {
     if (!fileSelectionBar) return;
-    const selected = fileSelectionInputs.filter((input) => input.checked);
+    const inputs = fileSelectionInputs();
+    const selected = inputs.filter((input) => input.checked);
     fileSelectionBar.hidden = selected.length === 0;
     if (fileSelectionCount) fileSelectionCount.textContent = String(selected.length);
-    fileSelectionInputs.forEach((input) => {
+    inputs.forEach((input) => {
       input.closest(".file-row-with-actions")?.classList.toggle("is-selected", input.checked);
     });
+    const fileSelectAll = document.querySelector("#file-select-all");
     if (fileSelectAll) {
-      fileSelectAll.checked =
-        fileSelectionInputs.length > 0 && selected.length === fileSelectionInputs.length;
-      fileSelectAll.indeterminate =
-        selected.length > 0 && selected.length < fileSelectionInputs.length;
+      fileSelectAll.checked = inputs.length > 0 && selected.length === inputs.length;
+      fileSelectAll.indeterminate = selected.length > 0 && selected.length < inputs.length;
     }
   };
 
-  fileSelectionInputs.forEach((input) => input.addEventListener("change", syncFileSelection));
-  fileSelectAll?.addEventListener("change", () => {
-    fileSelectionInputs.forEach((input) => {
-      input.checked = fileSelectAll.checked;
-    });
-    syncFileSelection();
+  document.addEventListener("change", (event) => {
+    if (event.target.matches("[data-file-select]")) {
+      syncFileSelection();
+      return;
+    }
+    if (event.target.matches("#file-select-all")) {
+      fileSelectionInputs().forEach((input) => {
+        input.checked = event.target.checked;
+      });
+      syncFileSelection();
+    }
   });
   fileSelectionClear?.addEventListener("click", () => {
-    fileSelectionInputs.forEach((input) => {
+    fileSelectionInputs().forEach((input) => {
       input.checked = false;
     });
     syncFileSelection();
   });
   syncFileSelection();
+
+  const liveSearchForm = document.querySelector("[data-live-file-search]");
+  const liveSearchInput = liveSearchForm?.querySelector("#file-search-input");
+  const liveSearchClear = liveSearchForm?.querySelector("#file-search-clear");
+  const liveSearchResults = document.querySelector("#file-results");
+  let liveSearchTimer = 0;
+  let liveSearchRequest = null;
+
+  const runLiveFileSearch = async () => {
+    if (!liveSearchForm || !liveSearchInput || !liveSearchResults) return;
+    liveSearchRequest?.abort();
+    liveSearchRequest = new AbortController();
+    const params = new URLSearchParams(new FormData(liveSearchForm));
+    if (!params.get("q")) params.delete("q");
+    params.delete("page");
+    const url = `${liveSearchForm.action}${params.size ? `?${params}` : ""}`;
+    liveSearchResults.setAttribute("aria-busy", "true");
+    try {
+      const response = await fetch(url, {
+        credentials: "same-origin",
+        headers: { "X-Termroom-Partial": "file-results" },
+        signal: liveSearchRequest.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      liveSearchResults.innerHTML = await response.text();
+      history.replaceState({}, "", url);
+      if (liveSearchClear) liveSearchClear.hidden = !liveSearchInput.value.trim();
+      syncFileSelection();
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        window.location.assign(url);
+      }
+    } finally {
+      liveSearchResults.setAttribute("aria-busy", "false");
+    }
+  };
+
+  const scheduleLiveFileSearch = () => {
+    window.clearTimeout(liveSearchTimer);
+    liveSearchTimer = window.setTimeout(runLiveFileSearch, 180);
+  };
+
+  liveSearchInput?.addEventListener("input", scheduleLiveFileSearch);
+  liveSearchForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    window.clearTimeout(liveSearchTimer);
+    runLiveFileSearch();
+  });
+  liveSearchClear?.addEventListener("click", () => {
+    liveSearchInput.value = "";
+    liveSearchInput.focus({ preventScroll: true });
+    runLiveFileSearch();
+  });
 
   const uploadInput = document.querySelector("#file-upload-input");
   const uploadForm = document.querySelector("#file-upload-form");
@@ -475,6 +532,200 @@
       event.preventDefault();
       first.focus();
     }
+  });
+
+  const cleanFolderPickerQuery = () => {
+    const url = new URL(window.location.href);
+    [
+      "browse",
+      "browse_path",
+      "browse_hidden",
+      "browse_location",
+      "location_path",
+      "location_hidden",
+    ].forEach((name) => url.searchParams.delete(name));
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  };
+
+  const ensureFolderPickerPanel = (form) => {
+    let panel = form.querySelector("[data-folder-picker-panel]");
+    if (panel) return panel;
+
+    panel = document.createElement("section");
+    panel.className = form.classList.contains("remote-workspace-form")
+      ? "path-picker remote-path-picker remote-folder-browser"
+      : "path-picker";
+    panel.dataset.folderPickerPanel = "";
+    panel.hidden = true;
+    panel.setAttribute("aria-label", tr("open.browse_folders"));
+    panel.innerHTML = `
+      <header class="path-picker-header">
+        <div><span>${tr("open.current_folder")}</span><code data-folder-picker-current></code></div>
+        <div class="path-picker-header-actions">
+          <a class="path-picker-control" href="#" data-folder-picker-parent hidden>↑ ${tr("open.parent_folder")}</a>
+          <button class="path-picker-control path-picker-close-control" type="button" data-folder-picker-close>${tr("common.close")}</button>
+        </div>
+      </header>
+      <button class="path-picker-control path-picker-hidden" type="button" data-folder-picker-hidden hidden></button>
+      <div class="path-picker-list" data-folder-picker-list></div>
+    `;
+
+    const pathSection = form.querySelector(".remote-workspace-path-section");
+    if (pathSection) {
+      pathSection.insertAdjacentElement("afterend", panel);
+    } else {
+      const actions = form.querySelector(".path-picker-actions");
+      actions?.insertAdjacentElement("afterend", panel);
+    }
+    return panel;
+  };
+
+  const ensureFolderPickerError = (form, panel) => {
+    let error = form.querySelector(".path-picker-error");
+    if (error) return error;
+    error = document.createElement("p");
+    error.className = "notice error path-picker-error";
+    error.hidden = true;
+    panel.insertAdjacentElement("beforebegin", error);
+    return error;
+  };
+
+  const appendFolderPickerRow = (list, entry) => {
+    const link = document.createElement("a");
+    link.className = "path-picker-row";
+    link.href = "#";
+    link.dataset.folderPath = entry.path;
+    const glyph = document.createElement("span");
+    glyph.className = "file-glyph folder";
+    glyph.setAttribute("aria-hidden", "true");
+    const name = document.createElement("span");
+    name.textContent = entry.name;
+    const arrow = document.createElement("span");
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "›";
+    link.append(glyph, name, arrow);
+    list.append(link);
+  };
+
+  document.querySelectorAll("[data-folder-picker]").forEach((form) => {
+    const endpoint = form.dataset.folderPickerUrl;
+    const input = form.querySelector("[data-folder-picker-input]");
+    const openButton = form.querySelector("[data-folder-picker-open]");
+    const panel = ensureFolderPickerPanel(form);
+    const errorBox = ensureFolderPickerError(form, panel);
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton && !submitButton.dataset.folderPickerDefaultLabel) {
+      submitButton.dataset.folderPickerDefaultLabel = submitButton.textContent.trim();
+    }
+    let request = null;
+    let showHidden = panel.querySelector("[data-folder-picker-hidden]")?.dataset.showHidden === "1";
+
+    const closePanel = () => {
+      request?.abort();
+      panel.hidden = true;
+      panel.removeAttribute("aria-busy");
+      errorBox.hidden = true;
+      if (submitButton?.dataset.folderPickerDefaultLabel) {
+        submitButton.textContent = submitButton.dataset.folderPickerDefaultLabel;
+      }
+      cleanFolderPickerQuery();
+      openButton?.focus({ preventScroll: true });
+    };
+
+    const render = (data) => {
+      const current = panel.querySelector("[data-folder-picker-current]");
+      const parent = panel.querySelector("[data-folder-picker-parent]");
+      const hiddenToggle = panel.querySelector("[data-folder-picker-hidden]");
+      const list = panel.querySelector("[data-folder-picker-list]");
+      if (current) current.textContent = data.current || "";
+      if (input && data.current) input.value = data.current;
+      if (parent) {
+        parent.hidden = !data.parent;
+        parent.dataset.folderPath = data.parent || "";
+        parent.href = data.parent ? `#${encodeURIComponent(data.parent)}` : "#";
+      }
+      showHidden = Boolean(data.show_hidden);
+      if (hiddenToggle) {
+        const hiddenCount = Number(data.hidden_count || 0);
+        hiddenToggle.hidden = hiddenCount === 0;
+        hiddenToggle.dataset.hiddenCount = String(hiddenCount);
+        hiddenToggle.dataset.showHidden = showHidden ? "1" : "0";
+        hiddenToggle.textContent = showHidden
+          ? tr("browse.hide_hidden")
+          : tr("browse.show_hidden", { count: hiddenCount });
+      }
+      if (list) {
+        list.replaceChildren();
+        (data.entries || []).forEach((entry) => appendFolderPickerRow(list, entry));
+        if (!data.entries?.length) {
+          const empty = document.createElement("p");
+          empty.className = "path-picker-empty";
+          empty.textContent = tr("open.folder_picker_empty");
+          list.append(empty);
+        }
+      }
+      panel.hidden = false;
+      panel.removeAttribute("aria-busy");
+      errorBox.hidden = true;
+      if (submitButton) submitButton.textContent = tr("open.use_current_folder");
+      cleanFolderPickerQuery();
+    };
+
+    const loadFolder = async (path = "", hidden = showHidden) => {
+      if (!endpoint) return;
+      request?.abort();
+      request = new AbortController();
+      const params = new URLSearchParams();
+      if (path) params.set("path", path);
+      if (hidden) params.set("hidden", "1");
+      panel.hidden = false;
+      panel.setAttribute("aria-busy", "true");
+      errorBox.hidden = true;
+      try {
+        const response = await fetch(`${endpoint}${params.size ? `?${params}` : ""}`, {
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+          signal: request.signal,
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        render(data);
+      } catch (error) {
+        if (error?.name === "AbortError") return;
+        panel.removeAttribute("aria-busy");
+        panel.hidden = true;
+        errorBox.textContent = error?.message || String(error);
+        errorBox.hidden = false;
+      }
+    };
+
+    form.addEventListener("click", (event) => {
+      const open = event.target.closest("[data-folder-picker-open]");
+      if (open) {
+        event.preventDefault();
+        const candidate = input?.value.trim() || "";
+        loadFolder(candidate.startsWith("/") ? candidate : "", false);
+        return;
+      }
+      const close = event.target.closest("[data-folder-picker-close]");
+      if (close) {
+        event.preventDefault();
+        closePanel();
+        return;
+      }
+      const hiddenToggle = event.target.closest("[data-folder-picker-hidden]");
+      if (hiddenToggle) {
+        event.preventDefault();
+        const current = panel.querySelector("[data-folder-picker-current]")?.textContent || "";
+        loadFolder(current, hiddenToggle.dataset.showHidden !== "1");
+        return;
+      }
+      const folder = event.target.closest("[data-folder-path]");
+      if (folder && panel.contains(folder)) {
+        event.preventDefault();
+        loadFolder(folder.dataset.folderPath || "", showHidden);
+      }
+    });
   });
 
   const shareButton = document.querySelector("#file-share");

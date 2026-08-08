@@ -295,6 +295,19 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
         assert "reports" in search.text
         assert "notes.txt" not in search.text
         assert 'value="report"' in search.text
+        assert "data-live-file-search" in search.text
+        assert 'id="file-results"' in search.text
+
+        partial = await client.get(
+            f"/w/{workspace['id']}/files",
+            params={"q": "report"},
+            headers={"X-Termroom-Partial": "file-results"},
+        )
+        assert partial.status_code == 200
+        assert "report-final.csv" in partial.text
+        assert "notes.txt" not in partial.text
+        assert '<section class="workspace-file-list">' in partial.text
+        assert "<!doctype html>" not in partial.text
 
         archive = await client.get(f"/w/{workspace['id']}/archive/reports")
 
@@ -435,6 +448,10 @@ async def test_local_location_picker_can_browse_absolute_directories(tmp_path: P
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
+        api_picker = await client.get(
+            "/api/local/browse-directories",
+            params={"path": str(tmp_path)},
+        )
         picker = await client.get(
             "/open/local",
             params={"browse_location": "1", "location_path": str(tmp_path)},
@@ -448,12 +465,20 @@ async def test_local_location_picker_can_browse_absolute_directories(tmp_path: P
             },
         )
 
+    assert api_picker.status_code == 200
+    api_data = api_picker.json()
+    assert api_data["ok"] is True
+    assert api_data["current"] == str(tmp_path)
+    assert "visible-location" in {entry["name"] for entry in api_data["entries"]}
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
     assert "이 폴더 선택" in picker.text
     assert 'class="secondary-button folder-picker-button"' in picker.text
     assert "취소" in picker.text
     assert 'data-close-popover' in picker.text
+    assert 'data-folder-picker-url="/api/local/browse-directories"' in picker.text
+    assert "data-folder-picker-open" in picker.text
+    assert "data-folder-path=" in picker.text
     assert str(tmp_path) in picker.text
     assert "visible-location" in picker.text
     assert ".hidden-location" not in picker.text
@@ -509,13 +534,23 @@ async def test_remote_workspace_picker_renders_browsable_directories(
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
+        api_picker = await client.get(f"/api/computers/{computer['id']}/browse-directories")
         picker = await client.get(f"/open/{computer['id']}?browse=1")
 
+    assert api_picker.status_code == 200
+    api_data = api_picker.json()
+    assert api_data["ok"] is True
+    assert api_data["current"] == "/home/dev"
+    assert {entry["name"] for entry in api_data["entries"]} == {"projects", "work"}
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
     assert 'class="secondary-button folder-picker-button"' in picker.text
     assert 'class="remote-workspace-path-section"' in picker.text
     assert 'class="remote-workspace-submit-row"' in picker.text
+    browse_url = f'/api/computers/{computer["id"]}/browse-directories'
+    assert f'data-folder-picker-url="{browse_url}"' in picker.text
+    assert "data-folder-picker-open" in picker.text
+    assert "data-folder-path=" in picker.text
     assert "/home/dev" in picker.text
     assert "projects" in picker.text
     assert "work" in picker.text
@@ -558,8 +593,13 @@ async def test_remote_workspace_picker_can_close_after_browse_failure(
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
+        api_response = await client.get(
+            f"/api/computers/{computer['id']}/browse-directories"
+        )
         response = await client.get(f"/open/{computer['id']}?browse=1")
 
+    assert api_response.status_code == 400
+    assert api_response.json() == {"ok": False, "error": "SSH connection failed"}
     assert response.status_code == 200
     assert "SSH connection failed" in response.text
     assert "닫기" in response.text

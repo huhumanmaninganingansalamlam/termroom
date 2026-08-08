@@ -1,6 +1,10 @@
 services:
   termroom:
-    build: .
+    image: ghcr.io/huhumanmaninganingansalamlam/termroom:${TERMROOM_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        TERMROOM_VERSION: "${TERMROOM_VERSION:-}"
     restart: unless-stopped
     env_file:
       - .env

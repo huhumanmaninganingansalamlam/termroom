@@ -63,7 +63,8 @@
            data-popover-clear-query="{{ 1 if browse_location else 0 }}">
     <summary class="secondary-button">{{ t('open.add_location') }}</summary>
     <span class="add-location-backdrop" data-close-popover aria-hidden="true"></span>
-    <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}">
+    <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}"
+          data-folder-picker data-folder-picker-url="/api/local/browse-directories">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <header class="floating-form-heading">
         <strong>{{ t('open.add_location') }}</strong>
@@ -71,10 +72,10 @@
       </header>
       <label>
         <span>{{ t('open.location_path') }}</span>
-        <input name="path" value="{{ location_picker.current if location_picker else '' }}" placeholder="/home/me/projects" required autocapitalize="off" spellcheck="false">
+        <input name="path" value="{{ location_picker.current if location_picker else '' }}" placeholder="/home/me/projects" required autocapitalize="off" spellcheck="false" data-folder-picker-input>
       </label>
       <div class="path-picker-actions">
-        <a class="secondary-button folder-picker-button" href="/open/local?root={{ selected_root_id }}&path={{ path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}&browse_location=1">
+        <a class="secondary-button folder-picker-button" href="/open/local?root={{ selected_root_id }}&path={{ path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}&browse_location=1" data-folder-picker-open>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9H3.5z"/></svg>
           <span>{{ t('open.browse_folders') }}</span>
         </a>
@@ -82,22 +83,22 @@
       </div>
       {% if location_error %}<p class="notice error path-picker-error">{{ location_error }}</p>{% endif %}
       {% if browse_location and location_picker %}
-      <section class="path-picker" aria-label="{{ t('open.browse_folders') }}">
+      <section class="path-picker" aria-label="{{ t('open.browse_folders') }}" data-folder-picker-panel>
         <header class="path-picker-header">
           <div>
             <span>{{ t('open.current_folder') }}</span>
-            <code>{{ location_picker.current }}</code>
+            <code data-folder-picker-current>{{ location_picker.current }}</code>
           </div>
-          {% if location_picker.parent_url %}<a class="quiet-action" href="{{ location_picker.parent_url }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
+          {% if location_picker.parent_url %}<a class="path-picker-control" href="{{ location_picker.parent_url }}" data-folder-picker-parent data-folder-path="{{ location_picker.parent }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
         </header>
         {% if location_picker.hidden_count %}
-        <a class="hidden-toggle path-picker-hidden" href="{{ location_picker.hidden_url }}">
+        <a class="path-picker-control path-picker-hidden" href="{{ location_picker.hidden_url }}" data-folder-picker-hidden data-hidden-count="{{ location_picker.hidden_count }}" data-show-hidden="{{ 1 if location_picker.show_hidden else 0 }}">
           {% if location_picker.show_hidden %}{{ t('browse.hide_hidden') }}{% else %}{{ t('browse.show_hidden', count=location_picker.hidden_count) }}{% endif %}
         </a>
         {% endif %}
-        <div class="path-picker-list">
+        <div class="path-picker-list" data-folder-picker-list>
           {% for entry in location_picker.entries %}
-          <a class="path-picker-row" href="{{ entry.url }}"><span class="file-glyph folder" aria-hidden="true"></span><span>{{ entry.name }}</span><span aria-hidden="true">›</span></a>
+          <a class="path-picker-row" href="{{ entry.url }}" data-folder-path="{{ entry.path }}"><span class="file-glyph folder" aria-hidden="true"></span><span>{{ entry.name }}</span><span aria-hidden="true">›</span></a>
           {% else %}
           <p class="path-picker-empty">{{ t('open.folder_picker_empty') }}</p>
           {% endfor %}
@@ -107,7 +108,7 @@
       <small>{{ t('open.location_copy') }}</small>
       <div class="floating-form-actions">
         <button class="secondary-button" type="button" data-close-popover>{{ t('common.cancel') }}</button>
-        <button class="primary-button" type="submit">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
+        <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('open.add_location') }}">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
       </div>
     </form>
   </details>
@@ -121,7 +122,8 @@
              data-popover-clear-query="{{ 1 if browse_location else 0 }}">
       <summary class="secondary-button">{{ t('open.add_location') }}</summary>
       <span class="add-location-backdrop" data-close-popover aria-hidden="true"></span>
-      <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}">
+      <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}"
+            data-folder-picker data-folder-picker-url="/api/local/browse-directories">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <header class="floating-form-heading">
           <strong>{{ t('open.add_location') }}</strong>
@@ -129,10 +131,10 @@
         </header>
         <label>
           <span>{{ t('open.location_path') }}</span>
-          <input name="path" value="{{ location_picker.current if location_picker else '' }}" placeholder="/home/me/projects" required autocapitalize="off" spellcheck="false">
+          <input name="path" value="{{ location_picker.current if location_picker else '' }}" placeholder="/home/me/projects" required autocapitalize="off" spellcheck="false" data-folder-picker-input>
         </label>
         <div class="path-picker-actions">
-          <a class="secondary-button folder-picker-button" href="/open/local?root={{ selected_root_id }}&path={{ path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}&browse_location=1">
+          <a class="secondary-button folder-picker-button" href="/open/local?root={{ selected_root_id }}&path={{ path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}&browse_location=1" data-folder-picker-open>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9H3.5z"/></svg>
             <span>{{ t('open.browse_folders') }}</span>
           </a>
@@ -140,19 +142,19 @@
         </div>
         {% if location_error %}<p class="notice error path-picker-error">{{ location_error }}</p>{% endif %}
         {% if browse_location and location_picker %}
-        <section class="path-picker" aria-label="{{ t('open.browse_folders') }}">
+        <section class="path-picker" aria-label="{{ t('open.browse_folders') }}" data-folder-picker-panel>
           <header class="path-picker-header">
-            <div><span>{{ t('open.current_folder') }}</span><code>{{ location_picker.current }}</code></div>
-            {% if location_picker.parent_url %}<a class="quiet-action" href="{{ location_picker.parent_url }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
+            <div><span>{{ t('open.current_folder') }}</span><code data-folder-picker-current>{{ location_picker.current }}</code></div>
+            {% if location_picker.parent_url %}<a class="path-picker-control" href="{{ location_picker.parent_url }}" data-folder-picker-parent data-folder-path="{{ location_picker.parent }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
           </header>
           {% if location_picker.hidden_count %}
-          <a class="hidden-toggle path-picker-hidden" href="{{ location_picker.hidden_url }}">
+          <a class="path-picker-control path-picker-hidden" href="{{ location_picker.hidden_url }}" data-folder-picker-hidden data-hidden-count="{{ location_picker.hidden_count }}" data-show-hidden="{{ 1 if location_picker.show_hidden else 0 }}">
             {% if location_picker.show_hidden %}{{ t('browse.hide_hidden') }}{% else %}{{ t('browse.show_hidden', count=location_picker.hidden_count) }}{% endif %}
           </a>
           {% endif %}
-          <div class="path-picker-list">
+          <div class="path-picker-list" data-folder-picker-list>
             {% for entry in location_picker.entries %}
-            <a class="path-picker-row" href="{{ entry.url }}"><span class="file-glyph folder" aria-hidden="true"></span><span>{{ entry.name }}</span><span aria-hidden="true">›</span></a>
+            <a class="path-picker-row" href="{{ entry.url }}" data-folder-path="{{ entry.path }}"><span class="file-glyph folder" aria-hidden="true"></span><span>{{ entry.name }}</span><span aria-hidden="true">›</span></a>
             {% else %}
             <p class="path-picker-empty">{{ t('open.folder_picker_empty') }}</p>
             {% endfor %}
@@ -162,7 +164,7 @@
         <small>{{ t('open.location_copy') }}</small>
         <div class="floating-form-actions">
           <button class="secondary-button" type="button" data-close-popover>{{ t('common.cancel') }}</button>
-          <button class="primary-button" type="submit">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
+          <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('open.add_location') }}">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
         </div>
       </form>
     </details>
@@ -274,40 +276,41 @@
   <header class="open-section-heading">
     <div><h2>{{ t('open.add_workspace') }}</h2><p>{{ t('ssh.detail.open_project_copy') }}</p></div>
   </header>
-  <form method="post" action="/computers/{{ computer.id }}/workspaces" class="remote-workspace-form">
+  <form method="post" action="/computers/{{ computer.id }}/workspaces" class="remote-workspace-form"
+        data-folder-picker data-folder-picker-url="/api/computers/{{ computer.id }}/browse-directories">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <section class="remote-workspace-path-section">
       <label>
         <span>{{ t('ssh.detail.project_path') }}</span>
-        <input name="path" value="{{ remote_picker.current if remote_picker else '' }}" placeholder="/srv/projects/crawler" required autocapitalize="off" spellcheck="false">
+        <input name="path" value="{{ remote_picker.current if remote_picker else '' }}" placeholder="/srv/projects/crawler" required autocapitalize="off" spellcheck="false" data-folder-picker-input>
       </label>
       <div class="path-picker-actions remote-path-picker-actions">
-        <a class="secondary-button folder-picker-button" href="/open/{{ computer.id }}?browse=1">
+        <a class="secondary-button folder-picker-button" href="/open/{{ computer.id }}?browse=1" data-folder-picker-open>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9H3.5z"/></svg>
           <span>{{ t('open.browse_folders') }}</span>
         </a>
-        {% if browse and not remote_picker %}<a class="secondary-button path-picker-close-button" href="{{ remote_browse_close_url }}">{{ t('common.close') }}</a>{% endif %}
+        {% if browse and not remote_picker %}<a class="secondary-button path-picker-close-button" href="{{ remote_browse_close_url }}" data-folder-picker-close>{{ t('common.close') }}</a>{% endif %}
         <span>{{ t('open.direct_path_hint') }}</span>
       </div>
       {% if browse_error %}<p class="notice error path-picker-error">{{ browse_error }}</p>{% endif %}
     </section>
     {% if browse and remote_picker %}
-    <section class="path-picker remote-path-picker remote-folder-browser" aria-label="{{ t('open.browse_folders') }}">
+    <section class="path-picker remote-path-picker remote-folder-browser" aria-label="{{ t('open.browse_folders') }}" data-folder-picker-panel>
       <header class="path-picker-header">
-        <div><span>{{ t('open.current_folder') }}</span><code>{{ remote_picker.current }}</code></div>
+        <div><span>{{ t('open.current_folder') }}</span><code data-folder-picker-current>{{ remote_picker.current }}</code></div>
         <div class="path-picker-header-actions">
-          {% if remote_picker.parent_url %}<a class="quiet-action" href="{{ remote_picker.parent_url }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
-          <a class="quiet-action" href="{{ remote_browse_close_url }}">{{ t('common.close') }}</a>
+          {% if remote_picker.parent_url %}<a class="path-picker-control" href="{{ remote_picker.parent_url }}" data-folder-picker-parent data-folder-path="{{ remote_picker.parent }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
+          <a class="path-picker-control" href="{{ remote_browse_close_url }}" data-folder-picker-close>{{ t('common.close') }}</a>
         </div>
       </header>
       {% if remote_picker.hidden_count %}
-      <a class="hidden-toggle path-picker-hidden" href="{{ remote_picker.hidden_url }}">
+      <a class="path-picker-control path-picker-hidden" href="{{ remote_picker.hidden_url }}" data-folder-picker-hidden data-hidden-count="{{ remote_picker.hidden_count }}" data-show-hidden="{{ 1 if remote_picker.show_hidden else 0 }}">
         {% if remote_picker.show_hidden %}{{ t('browse.hide_hidden') }}{% else %}{{ t('browse.show_hidden', count=remote_picker.hidden_count) }}{% endif %}
       </a>
       {% endif %}
-      <div class="path-picker-list">
+      <div class="path-picker-list" data-folder-picker-list>
         {% for entry in remote_picker.entries %}
-        <a class="path-picker-row" href="{{ entry.url }}"><span class="file-glyph folder" aria-hidden="true"></span><span>{{ entry.name }}</span><span aria-hidden="true">›</span></a>
+        <a class="path-picker-row" href="{{ entry.url }}" data-folder-path="{{ entry.path }}"><span class="file-glyph folder" aria-hidden="true"></span><span>{{ entry.name }}</span><span aria-hidden="true">›</span></a>
         {% else %}
         <p class="path-picker-empty">{{ t('open.folder_picker_empty') }}</p>
         {% endfor %}
@@ -319,7 +322,7 @@
         <span>{{ t('ssh.detail.display_name') }} <small>{{ t('common.optional') }}</small></span>
         <input name="display_name" placeholder="crawler">
       </label>
-      <button class="primary-button" type="submit">{% if browse and remote_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('ssh.detail.open_workspace') }}{% endif %}</button>
+      <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('ssh.detail.open_workspace') }}">{% if browse and remote_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('ssh.detail.open_workspace') }}{% endif %}</button>
     </div>
   </form>
 </section>

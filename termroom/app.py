@@ -753,6 +753,22 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=303,
         )
 
+    @app.get("/api/local/browse-directories", response_class=JSONResponse)
+    async def browse_local_directories(
+        request: Request,
+        path: str | None = None,
+        hidden: bool = False,
+    ) -> JSONResponse:
+        locale = locale_from_request(request)
+        try:
+            picker = _local_location_picker(path, show_hidden=hidden)
+        except (OSError, ValueError) as exc:
+            return JSONResponse(
+                {"ok": False, "error": _localized_exception(locale, exc)},
+                status_code=400,
+            )
+        return JSONResponse({"ok": True, **picker})
+
     @app.get("/open/{computer_id}", response_class=HTMLResponse)
     async def workspace_open_remote(
         request: Request,
@@ -826,6 +842,32 @@ def create_app(settings: Settings) -> FastAPI:
                 has_multiple_computers=True,
             ),
         )
+
+    @app.get(
+        "/api/computers/{computer_id}/browse-directories",
+        response_class=JSONResponse,
+    )
+    async def browse_remote_directories(
+        request: Request,
+        computer_id: str,
+        path: str | None = None,
+        hidden: bool = False,
+    ) -> JSONResponse:
+        locale = locale_from_request(request)
+        computer = _require_computer(store, computer_id)
+        try:
+            picker = await asyncio.to_thread(
+                ssh.list_browse_directories,
+                computer,
+                path,
+                show_hidden=hidden,
+            )
+        except (OSError, ValueError, SSHBackendError) as exc:
+            return JSONResponse(
+                {"ok": False, "error": _localized_exception(locale, exc)},
+                status_code=400,
+            )
+        return JSONResponse({"ok": True, **picker})
 
     @app.get("/computers/new", response_class=HTMLResponse)
     async def new_computer_page(request: Request) -> HTMLResponse:
@@ -1330,29 +1372,35 @@ def create_app(settings: Settings) -> FastAPI:
         page_start = (current_page - 1) * FILE_BROWSER_PAGE_SIZE
         entries = filtered_entries[page_start : page_start + FILE_BROWSER_PAGE_SIZE]
         store.touch_workspace(workspace_id, tab="files")
+        context = _workspace_context(
+            settings,
+            workspace,
+            active_tab="files",
+            path=relative,
+            entries=entries,
+            breadcrumbs=_breadcrumbs(relative),
+            error=error,
+            uploaded=uploaded,
+            show_noise=noise,
+            noise_count=noise_count,
+            current_page=current_page,
+            page_count=page_count,
+            total_entries=total_entries,
+            query=query,
+            max_upload_bytes=settings.max_upload_bytes,
+            format_size=_format_size,
+            format_time_ns=lambda value: _relative_time_ns(value, locale),
+            **_workspace_status(store, terminals, workspace),
+        )
+        template_name = (
+            "_file_results.html"
+            if request.headers.get("x-termroom-partial") == "file-results"
+            else "files.html"
+        )
         return templates.TemplateResponse(
             request=request,
-            name="files.html",
-            context=_workspace_context(
-                settings,
-                workspace,
-                active_tab="files",
-                path=relative,
-                entries=entries,
-                breadcrumbs=_breadcrumbs(relative),
-                error=error,
-                uploaded=uploaded,
-                show_noise=noise,
-                noise_count=noise_count,
-                current_page=current_page,
-                page_count=page_count,
-                total_entries=total_entries,
-                query=query,
-                max_upload_bytes=settings.max_upload_bytes,
-                format_size=_format_size,
-                format_time_ns=lambda value: _relative_time_ns(value, locale),
-                **_workspace_status(store, terminals, workspace),
-            ),
+            name=template_name,
+            context=context,
         )
 
     @app.get("/w/{workspace_id}/view/{file_path:path}", response_class=HTMLResponse)

@@ -10,7 +10,7 @@
   <title>{{ title }} · Termroom</title>
   <link rel="icon" href="data:,">
   <link rel="manifest" href="/static/manifest.webmanifest?v=2">
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=12">
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=13">
   <script>
     window.TermroomLocale = {{ locale | tojson }};
     window.TermroomI18n = {{ i18n_messages | tojson }};
@@ -54,7 +54,7 @@
     {% block content %}{% endblock %}
   </main>
   {% endblock %}
-  <script src="{{ url_for('static', path='app.js') }}?v=42" defer></script>
+  <script src="{{ url_for('static', path='app.js') }}?v=43" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
