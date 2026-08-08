@@ -1,0 +1,214 @@
+{% extends "workspace_base.html" %}
+{% block workspace_content %}
+<section class="content-heading files-heading">
+  <div>
+    <h1>{{ t('files.heading') }}</h1>
+  </div>
+  <div class="file-heading-actions">
+    {% if noise_count %}
+    <a class="quiet-action file-noise-toggle"
+       href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&noise={{ 0 if show_noise else 1 }}{% if query %}&q={{ query | urlencode }}{% endif %}">
+      {% if show_noise %}{{ t('files.hide_noise') }}{% else %}{{ t('files.show_noise', count=noise_count) }}{% endif %}
+    </a>
+    {% endif %}
+    <form id="file-upload-form"
+          method="post"
+          action="/w/{{ workspace.id }}/files/upload"
+          enctype="multipart/form-data"
+          class="upload-form"
+          data-check-url="/w/{{ workspace.id }}/files/upload-check"
+          data-stream-url="/w/{{ workspace.id }}/files/upload-stream"
+          data-files-url="/w/{{ workspace.id }}/files"
+          data-max-upload-bytes="{{ max_upload_bytes }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="parent" value="{{ path }}">
+      <input id="upload-overwrite" type="hidden" name="overwrite" value="0">
+      <label class="secondary-button upload-trigger">
+        <span>{{ t('files.upload') }}</span>
+        <input id="file-upload-input" type="file" name="files" multiple>
+      </label>
+    </form>
+    <details class="create-entry">
+      <summary class="secondary-button">{{ t('files.new') }}</summary>
+      <form method="post" action="/w/{{ workspace.id }}/files/create" class="create-popover">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="parent" value="{{ path }}">
+        <select name="kind" aria-label="{{ t('files.kind') }}">
+          <option value="file">{{ t('common.file') }}</option>
+          <option value="directory">{{ t('common.folder') }}</option>
+        </select>
+        <input name="name" placeholder="{{ t('common.name') }}" required>
+        <button class="primary-button" type="submit">{{ t('common.create') }}</button>
+      </form>
+    </details>
+  </div>
+</section>
+
+<section class="file-location-bar">
+  <div class="path-panel compact-path-panel">
+    <span class="path-label">{{ t('files.current') }}</span>
+    <nav class="breadcrumbs" aria-label="{{ t('files.current') }}">
+      {% for crumb in breadcrumbs %}
+        <a href="/w/{{ workspace.id }}/files?path={{ crumb.path | urlencode }}{% if show_noise %}&noise=1{% endif %}">{% if loop.first %}{{ workspace.display_name }}{% else %}{{ crumb.name }}{% endif %}</a>
+        {% if not loop.last %}<span>/</span>{% endif %}
+      {% endfor %}
+    </nav>
+  </div>
+  <form class="file-search-form" method="get" action="/w/{{ workspace.id }}/files" role="search">
+    <input type="hidden" name="path" value="{{ path }}">
+    {% if show_noise %}<input type="hidden" name="noise" value="1">{% endif %}
+    <label class="sr-only" for="file-search-input">{{ t('files.search') }}</label>
+    <input id="file-search-input"
+           type="search"
+           name="q"
+           value="{{ query }}"
+           placeholder="{{ t('files.search_placeholder') }}"
+           autocomplete="off">
+    <button class="secondary-button" type="submit">{{ t('files.search') }}</button>
+    {% if query %}<a class="quiet-action" href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}{% if show_noise %}&noise=1{% endif %}">{{ t('common.clear') }}</a>{% endif %}
+  </form>
+</section>
+
+{% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+{% if uploaded %}<p class="notice success">{{ t('files.uploaded', count=uploaded) }}</p>{% endif %}
+
+<form id="file-bulk-form"
+      method="post"
+      action="/w/{{ workspace.id }}/files/archive"
+      class="file-selection-bar"
+      hidden>
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="parent" value="{{ path }}">
+  <span class="file-selection-summary">
+    <strong id="file-selection-count">0</strong>
+    <span>{{ t('files.selected') }}</span>
+  </span>
+  <span class="file-selection-actions">
+    <button id="file-selection-clear" class="quiet-action" type="button">{{ t('files.clear_selection') }}</button>
+    <button class="primary-button" type="submit">{{ t('files.download_zip') }}</button>
+  </span>
+</form>
+
+<section id="upload-progress-panel" class="upload-progress-panel" hidden aria-live="polite">
+  <div class="upload-progress-heading">
+    <span>
+      <strong id="upload-progress-title">{{ t('files.upload_progress_title') }}</strong>
+      <small id="upload-progress-status"></small>
+    </span>
+    <button id="cancel-file-upload" class="secondary-button" type="button">{{ t('files.upload_cancel') }}</button>
+  </div>
+  <progress id="upload-progress-bar" max="100" value="0"></progress>
+  <small class="upload-progress-note">{{ t('files.upload_cancel_note') }}</small>
+  <a id="upload-refresh-link" class="text-action" href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}" hidden>{{ t('files.upload_refresh') }}</a>
+</section>
+
+<section class="workspace-file-list">
+  <div class="file-table-head">
+    <label class="file-select-control file-select-all-control" aria-label="{{ t('files.select_all') }}">
+      <input id="file-select-all" type="checkbox">
+      <span class="file-select-all-label">{{ t('files.select_all') }}</span>
+    </label>
+    <span>{{ t('common.name') }}</span><span>{{ t('common.size') }}</span><span>{{ t('common.modified') }}</span><span></span>
+  </div>
+  {% if path != '.' %}
+  <a class="file-browser-row parent-row" href="/w/{{ workspace.id }}/files?path={{ (path.rsplit('/', 1)[0] if '/' in path else '.') | urlencode }}{% if show_noise %}&noise=1{% endif %}">
+    <span class="file-glyph parent" aria-hidden="true">↑</span><span class="file-name">{{ t('files.parent') }}</span><span class="file-size">—</span><span class="file-mtime">—</span>
+  </a>
+  {% endif %}
+  {% for entry in entries %}
+  <div class="file-browser-row file-row-with-actions">
+    <label class="file-select-control" aria-label="{{ t('files.select_item', name=entry.name) }}">
+      <input type="checkbox"
+             name="paths"
+             value="{{ entry.relative_path }}"
+             form="file-bulk-form"
+             data-file-select>
+    </label>
+    {% if entry.is_dir %}
+    <a class="file-primary" href="/w/{{ workspace.id }}/files?path={{ entry.relative_path | urlencode }}{% if show_noise %}&noise=1{% endif %}">
+      <span class="file-glyph folder" aria-hidden="true"></span><span class="file-name">{{ entry.name }}</span><span class="file-size">{{ t('common.folder') }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
+    </a>
+    {% else %}
+    <a class="file-primary" href="/w/{{ workspace.id }}/view/{{ entry.relative_path | urlencode }}">
+      <span class="file-glyph document" aria-hidden="true"></span>
+      <span class="file-name">{{ entry.name }}</span><span class="file-size">{{ format_size(entry.size) }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
+    </a>
+    {% endif %}
+    <button type="button"
+            class="file-actions-button"
+            data-file-actions
+            data-file-path="{{ entry.relative_path }}"
+            data-file-name="{{ entry.name }}"
+            data-file-size="{{ entry.size }}"
+            data-file-mtime="{{ format_time_ns(entry.mtime_ns) }}"
+            data-file-directory="{{ '1' if entry.is_dir else '0' }}"
+            aria-label="{{ t('files.item_actions', name=entry.name) }}">•••</button>
+  </div>
+  {% else %}
+  <div class="empty-state quiet-empty"><p>{% if query %}{{ t('files.no_search_results', query=query) }}{% else %}{{ t('files.empty') }}{% endif %}</p></div>
+  {% endfor %}
+</section>
+
+{% if page_count > 1 %}
+<nav class="file-pagination" aria-label="{{ t('files.pagination') }}">
+  {% if current_page > 1 %}
+  <a class="secondary-button"
+     href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&page={{ current_page - 1 }}{% if show_noise %}&noise=1{% endif %}{% if query %}&q={{ query | urlencode }}{% endif %}">{{ t('files.previous_page') }}</a>
+  {% else %}
+  <span class="secondary-button disabled" aria-disabled="true">{{ t('files.previous_page') }}</span>
+  {% endif %}
+  <span class="file-pagination-status">{{ t('files.page_status', page=current_page, pages=page_count, count=total_entries) }}</span>
+  {% if current_page < page_count %}
+  <a class="secondary-button"
+     href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&page={{ current_page + 1 }}{% if show_noise %}&noise=1{% endif %}{% if query %}&q={{ query | urlencode }}{% endif %}">{{ t('files.next_page') }}</a>
+  {% else %}
+  <span class="secondary-button disabled" aria-disabled="true">{{ t('files.next_page') }}</span>
+  {% endif %}
+</nav>
+{% endif %}
+
+<dialog id="file-actions-dialog" class="file-actions-dialog" data-workspace-id="{{ workspace.id }}">
+  <header class="file-actions-dialog-header">
+    <span>
+      <small>{{ t('files.actions') }}</small>
+      <strong id="file-actions-title"></strong>
+    </span>
+    <button type="button" data-close-dialog aria-label="{{ t('common.close') }}">×</button>
+  </header>
+  <form method="post"
+        action="/w/{{ workspace.id }}/files/rename"
+        class="stack-form file-action-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input id="file-rename-path" type="hidden" name="path">
+    <label>
+      <span>{{ t('files.new_name') }}</span>
+      <input id="file-rename-name" name="new_name" required>
+    </label>
+    <button type="submit">{{ t('common.rename') }}</button>
+  </form>
+  <form method="post"
+        action="/w/{{ workspace.id }}/files/delete"
+        id="file-delete-form"
+        class="file-delete-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input id="file-delete-path" type="hidden" name="path">
+    <button class="danger-button" type="submit">{{ t('common.delete') }}</button>
+  </form>
+  <a id="file-download-action" class="secondary-button file-dialog-download" href="#">{{ t('common.download') }}</a>
+</dialog>
+
+<dialog id="upload-confirm-dialog" class="upload-confirm-dialog">
+  <header class="file-actions-dialog-header">
+    <span><small>{{ t('files.upload_confirm') }}</small><strong>{{ t('files.upload_conflict') }}</strong></span>
+    <button type="button" data-close-dialog aria-label="{{ t('common.close') }}">×</button>
+  </header>
+  <div class="upload-conflict-copy">
+    <p>{{ t('files.upload_conflict_copy') }}</p>
+    <div id="upload-conflict-list" class="upload-conflict-list"></div>
+  </div>
+  <div class="dialog-actions">
+    <button type="button" class="secondary-button" data-close-dialog>{{ t('common.cancel') }}</button>
+    <button type="button" class="primary-button" id="confirm-upload-overwrite">{{ t('files.overwrite') }}</button>
+  </div>
+</dialog>
+{% endblock %}

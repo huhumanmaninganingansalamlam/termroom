@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block body_class %}computer-page{% endblock %}
+{% block content %}
+<section class="computer-detail-shell">
+  <header class="computer-detail-heading">
+    <div>
+      <a class="text-back-link" href="/open/{{ computer.id }}">← {{ t('common.workspace') }}</a>
+      <p class="eyebrow">{{ t('ssh.detail.eyebrow') }}</p>
+      <h1>{{ computer.name }}</h1>
+      <p><code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code></p>
+    </div>
+    <form method="post" action="/computers/{{ computer.id }}/test">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="secondary-button" type="submit">{{ t('ssh.detail.retest') }}</button>
+    </form>
+  </header>
+
+  {% if error %}
+  <div class="connection-notice error">
+    <strong>{{ t('ssh.detail.needs_check') }}</strong>
+    <p>{{ error }}</p>
+  </div>
+  {% elif checked %}
+  <div class="connection-notice success">
+    <strong>{{ t('ssh.detail.checked') }}</strong>
+    <p>{{ t('ssh.detail.checked_copy') }}</p>
+  </div>
+  {% elif connected %}
+  <div class="connection-notice success">
+    <strong>{{ t('ssh.detail.connected') }}</strong>
+    <p>{{ t('ssh.detail.connected_copy') }}</p>
+  </div>
+  {% endif %}
+  {% if password_updated %}
+  <div class="connection-notice success">
+    <strong>{{ t('ssh.detail.password_updated') }}</strong>
+    <p>{{ t('ssh.detail.password_updated_copy') }}</p>
+  </div>
+  {% endif %}
+
+  <section class="computer-facts">
+    <span><small>{{ t('ssh.detail.host_key') }}</small><code>{{ computer.host_fingerprint }}</code></span>
+    <span><small>{{ t('ssh.detail.auth') }}</small><strong>{% if computer.auth_kind == 'password' %}{{ t('ssh.detail.auth_password') }}{% elif computer.identity_file == managed_key_path %}{{ t('ssh.detail.auth_public_key') }}{% elif computer.identity_file %}{{ t('ssh.detail.auth_existing') }}{% else %}{{ t('ssh.detail.auth_config') }}{% endif %}</strong></span>
+    <span><small>{{ t('ssh.detail.requirements') }}</small><strong>SSH + tmux</strong></span>
+  </section>
+
+  <div class="computer-workspace-return panel">
+    <div><strong>{{ t('open.workspaces_live_elsewhere') }}</strong><p>{{ t('open.workspaces_live_elsewhere_copy') }}</p></div>
+    <a class="primary-button" href="/open/{{ computer.id }}">{{ t('home.open_workspace') }}</a>
+  </div>
+
+  {% if computer.auth_kind == 'password' %}
+  <details class="computer-password-update panel">
+    <summary>{{ t('ssh.detail.update_password') }}</summary>
+    <form method="post" action="/computers/{{ computer.id }}/password">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <label>
+        <span>{{ t('ssh.detail.new_password') }}</span>
+        <input type="password" name="password" autocomplete="new-password" required>
+      </label>
+      <small>{{ t('ssh.detail.update_password_copy') }}</small>
+      <button class="primary-button" type="submit">{{ t('ssh.detail.update_password_button') }}</button>
+    </form>
+  </details>
+  {% endif %}
+
+  <section class="computer-danger-zone panel">
+    <div>
+      <h2>{{ t('ssh.detail.remove') }}</h2>
+      <p>{{ t('ssh.detail.remove_copy') }}</p>
+    </div>
+    <form method="post"
+          action="/computers/{{ computer.id }}/delete"
+          data-confirm="{{ t('ssh.detail.remove_confirm', name=computer.name) }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="danger-button" type="submit">{{ t('ssh.detail.remove_button') }}</button>
+    </form>
+  </section>
+</section>
+{% endblock %}

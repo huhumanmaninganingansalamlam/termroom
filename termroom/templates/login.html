@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block body_class %}centered-page{% endblock %}
+{% block content %}
+<section class="login-card panel">
+  <p class="eyebrow">Termroom</p>
+  <h1>{{ t('login.heading') }}</h1>
+  <p class="muted">{{ t('login.copy') }}</p>
+  {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+  <form method="post" action="/login" class="stack-form">
+    <label>
+      <span>{{ t('login.password') }}</span>
+      <input name="password" type="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button class="primary-button" type="submit">{{ t('login.submit') }}</button>
+  </form>
+</section>
+{% endblock %}

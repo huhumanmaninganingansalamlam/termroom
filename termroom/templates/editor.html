@@ -1,0 +1,61 @@
+{% extends "workspace_base.html" %}
+{% block workspace_content_class %}editor-screen{% endblock %}
+{% block workspace_content %}
+<form id="editor-form" method="post" action="/w/{{ workspace.id }}/edit/{{ snapshot.relative_path | urlencode }}">
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="digest" value="{{ snapshot.digest }}">
+  <input type="hidden" name="mtime_ns" value="{{ snapshot.mtime_ns }}">
+  <header class="editor-header">
+    <a class="editor-back" href="/w/{{ workspace.id }}/files?path={{ (snapshot.relative_path.rsplit('/', 1)[0] if '/' in snapshot.relative_path else '.') | urlencode }}">←</a>
+    <span class="editor-file-title">
+      <strong class="truncate">{{ snapshot.relative_path.rsplit('/', 1)[-1] }}</strong>
+      <small class="truncate">{{ snapshot.relative_path }}</small>
+    </span>
+    <span class="editor-header-actions">
+      <a class="secondary-button editor-terminal-link" href="/w/{{ workspace.id }}/terminal">{{ t('common.terminal') }}</a>
+      <button class="primary-button" type="submit">{{ t('common.save') }}</button>
+    </span>
+  </header>
+  {% if saved %}
+  <div class="notice success editor-saved-notice">
+    <span>{{ t('editor.saved') }}</span>
+    <a href="/w/{{ workspace.id }}/terminal">{{ t('editor.back_terminal') }}</a>
+  </div>
+  {% endif %}
+  {% if conflict %}
+  <div class="notice error conflict-notice">
+    <strong>{{ t('editor.conflict') }}</strong>
+    <span>{{ t('editor.conflict_copy') }}</span>
+  </div>
+  {% endif %}
+  {% if save_error %}
+  <div class="notice error conflict-notice">
+    <strong>{{ t('editor.save_failed') }}</strong>
+    <span>{{ save_error }}</span>
+  </div>
+  {% endif %}
+  <div class="editor-toolbar" role="toolbar" aria-label="{{ t('editor.tools') }}">
+    <button type="button" data-editor-action="undo">{{ t('editor.undo') }}</button>
+    <button type="button" data-editor-action="redo">{{ t('editor.redo') }}</button>
+    <button type="button" data-editor-action="find">{{ t('editor.find') }}</button>
+    <button type="button" id="show-diff" data-diff-url="/w/{{ workspace.id }}/diff/{{ snapshot.relative_path | urlencode }}">{{ t('editor.diff') }}</button>
+    <button type="button" data-editor-action="indent">{{ t('editor.indent') }}</button>
+    <button type="button" data-editor-action="outdent">{{ t('editor.outdent') }}</button>
+  </div>
+  <div id="find-bar" class="find-bar" hidden>
+    <input id="find-input" type="search" placeholder="{{ t('editor.search_placeholder') }}">
+    <button type="button" id="find-next">{{ t('editor.next') }}</button>
+  </div>
+  <textarea id="editor-content"
+            name="content"
+            aria-label="{{ t('editor.content') }}"
+            data-unsaved="{{ '1' if editor_unsaved else '0' }}"
+            spellcheck="false"
+            autocapitalize="off"
+            autocorrect="off">{{ submitted_content if submitted_content is defined else snapshot.content }}</textarea>
+</form>
+<dialog id="diff-dialog" class="diff-dialog">
+  <header><strong>{{ t('editor.diff') }}</strong><button type="button" data-close-dialog>{{ t('common.close') }}</button></header>
+  <pre id="diff-output"></pre>
+</dialog>
+{% endblock %}

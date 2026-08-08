@@ -1,0 +1,58 @@
+[project]
+name = "termroom"
+version = "0.1.0"
+description = "Self-hosted Linux workspace for persistent tmux terminals and files"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Termroom contributors" }]
+license = "MIT"
+license-files = ["LICENSE", "termroom/static/vendor/xterm.LICENSE"]
+dependencies = [
+  "cryptography>=43,<51",
+  "fastapi>=0.115,<1",
+  "jinja2>=3.1,<4",
+  "paramiko>=3.5,<5",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/huhumanmaninganingansalamlam/termroom"
+
+[project.scripts]
+termroom = "termroom.cli:main"
+termroom-assets = "termroom.assets:main"
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["termroom"]
+
+[tool.hatch.build]
+include = [
+  "termroom/**/*.py",
+  "termroom/locales/**/*.json",
+  "termroom/templates/**/*.html",
+  "termroom/static/**/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]

@@ -1,0 +1,16 @@
+{% extends "workspace_base.html" %}
+{% block workspace_content %}
+<section class="content-heading scrollback-heading">
+  <div>
+    <a class="text-back-link compact-back-link" href="/w/{{ workspace.id }}/terminal?terminal={{ terminal.id }}">← {{ t('common.terminal') }}</a>
+    <p class="section-kicker">{{ t('terminal.output') }}</p>
+    <h1>{{ t('scrollback.heading') }}</h1>
+  </div>
+</section>
+<div class="scrollback-tools">
+  <input id="scrollback-search" type="search" placeholder="{{ t('scrollback.search') }}" aria-label="{{ t('scrollback.search') }}">
+  <button class="secondary-button" type="button" data-copy-target="#scrollback-output">{{ t('scrollback.copy_all') }}</button>
+  <span id="scrollback-search-status" class="scrollback-search-status" role="status"></span>
+</div>
+<pre id="scrollback-output" class="scrollback-output">{{ output }}</pre>
+{% endblock %}

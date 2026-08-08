@@ -1,0 +1,99 @@
+{% extends "workspace_base.html" %}
+{% block workspace_content %}
+<section class="file-view-shell">
+  <header class="file-view-header">
+    <div class="file-view-title">
+      <a class="text-back-link" href="/w/{{ workspace.id }}/files?path={{ (file_path.rsplit('/', 1)[0] if '/' in file_path else '.') | urlencode }}">{{ t('file_view.back') }}</a>
+      <h1>{{ entry.name }}</h1>
+      <p>{{ file_path }}</p>
+    </div>
+    <div class="file-view-actions">
+      {% if can_edit %}<a class="secondary-button" href="/w/{{ workspace.id }}/edit/{{ file_path | urlencode }}">{{ t('file_view.edit') }}</a>{% endif %}
+      {% if copy_text is not none %}<button class="secondary-button" type="button" data-copy-target="#file-copy-source">{{ t('file_view.copy_content') }}</button>{% endif %}
+      {% if not sensitive_file %}<button id="file-share"
+              class="secondary-button"
+              type="button"
+              data-share-url="/w/{{ workspace.id }}/download/{{ file_path | urlencode }}"
+              data-share-name="{{ entry.name }}"
+              data-share-type="{{ content_type }}"
+              data-share-size="{{ entry.size }}"
+              hidden>{{ t('common.share') }}</button>{% endif %}
+      <a class="primary-button" href="/w/{{ workspace.id }}/download/{{ file_path | urlencode }}">{{ t('common.download') }}</a>
+    </div>
+  </header>
+
+  {% if copy_text is not none %}<pre id="file-copy-source" hidden>{{ copy_text }}</pre>{% endif %}
+
+  <div class="file-facts" aria-label="{{ t('common.file') }}">
+    <span><small>{{ t('common.size') }}</small><strong>{{ format_size(entry.size) }}</strong></span>
+    <span><small>{{ t('common.modified') }}</small><strong>{{ format_time_ns(entry.mtime_ns) }}</strong></span>
+    <span><small>{{ t('common.type') }}</small><strong>{{ content_type }}</strong></span>
+  </div>
+
+  {% if sensitive_file %}
+  <p class="notice sensitive-file-notice">{{ t('file_view.sensitive') }}</p>
+  {% endif %}
+
+  {% if preview_error %}<p class="notice error">{{ preview_error }}</p>{% endif %}
+
+  {% if view_kind == 'image' %}
+  <section class="media-preview image-preview">
+    <img src="/w/{{ workspace.id }}/raw/{{ file_path | urlencode }}" alt="{{ t('file_view.image_alt', name=entry.name) }}">
+  </section>
+  {% elif view_kind == 'pdf' %}
+  <section class="media-preview pdf-preview">
+    <iframe src="/w/{{ workspace.id }}/raw/{{ file_path | urlencode }}" title="{{ t('file_view.pdf_title', name=entry.name) }}"></iframe>
+  </section>
+  {% elif view_kind == 'json' and json_content is not none %}
+  <section class="text-preview-shell">
+    <header><strong>{{ t('file_view.json') }}</strong><span>{{ t('file_view.json_copy') }}</span></header>
+    <pre class="file-text-preview"><code>{{ json_content }}</code></pre>
+  </section>
+  {% elif view_kind == 'csv' and csv_header %}
+  <section class="csv-preview-shell">
+    <header><strong>{{ t('file_view.csv') }}</strong><span>{{ t('file_view.csv_copy') }}</span></header>
+    <div class="csv-table-scroll">
+      <table class="csv-preview-table">
+        <thead><tr>{% for cell in csv_header %}<th>{{ cell }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for row in csv_rows %}<tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% elif preview %}
+  <section class="text-preview-shell">
+    <header class="text-preview-header">
+      <div>
+        <strong>{% if preview.mode == 'tail' %}{{ t('file_view.tail') }}{% elif preview.mode == 'range' %}{{ t('file_view.range') }}{% else %}{{ t('file_view.head') }}{% endif %}</strong>
+        {% if preview.mode == 'range' %}
+        <span>{{ t('file_view.range_offset', offset=format_size(preview.offset)) }}</span>
+        {% elif preview.truncated %}
+        <span>{{ t('file_view.partial', size=format_size(preview.size)) }}</span>
+        {% endif %}
+      </div>
+      {% if preview.truncated %}
+      <nav class="preview-mode-switch" aria-label="{{ t('file_view.position') }}">
+        <a class="{% if preview.mode == 'head' %}active{% endif %}" href="?mode=head">{{ t('file_view.first') }}</a>
+        {% if preview.offset > 0 %}<a href="?mode=range&offset={{ preview_previous_offset }}">{{ t('file_view.previous') }}</a>{% endif %}
+        {% if preview_next_offset < preview.size %}<a href="?mode=range&offset={{ preview_next_offset }}">{{ t('file_view.next') }}</a>{% endif %}
+        <a class="{% if preview.mode == 'tail' %}active{% endif %}" href="?mode=tail">{{ t('file_view.end') }}</a>
+      </nav>
+      {% endif %}
+    </header>
+    <pre class="file-text-preview"><code>{{ preview.content }}</code></pre>
+  </section>
+  {% else %}
+  <section class="empty-state binary-preview">
+    {% if preview_too_large %}
+    <strong>{{ t('file_view.preview_too_large') }}</strong>
+    <p>{{ t('file_view.preview_too_large_copy') }}</p>
+    {% else %}
+    <strong>{{ t('file_view.unsupported') }}</strong>
+    <p>{{ t('file_view.unsupported_copy') }}</p>
+    {% endif %}
+    <a class="primary-button" href="/w/{{ workspace.id }}/download/{{ file_path | urlencode }}">{{ t('file_view.original_download') }}</a>
+  </section>
+  {% endif %}
+</section>
+{% endblock %}

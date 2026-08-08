@@ -1,0 +1,73 @@
+{% extends "workspace_base.html" %}
+{% block workspace_content %}
+<section class="content-heading recent-heading">
+  <div>
+    <p class="section-kicker">{{ t('recent.fast_return') }}</p>
+    <h1>{{ t('recent.heading') }}</h1>
+    <p class="page-copy">{{ t('recent.copy') }}</p>
+  </div>
+  <a class="secondary-button" href="/w/{{ workspace.id }}/recent">{{ t('recent.refresh') }}</a>
+</section>
+
+{% if refresh_error %}
+<p class="notice error recent-refresh-error">{{ t('recent.refresh_failed', error=refresh_error) }}</p>
+{% endif %}
+
+<section class="recent-section" aria-labelledby="recent-files-title">
+  <header class="recent-section-heading">
+    <div>
+      <h2 id="recent-files-title">{{ t('recent.files') }}</h2>
+      <p>{{ t('recent.files_copy') }}</p>
+    </div>
+    <a href="/w/{{ workspace.id }}/files" class="text-action">{{ t('recent.all_files') }}</a>
+  </header>
+  {% if recent_files %}
+  <div class="recent-file-list">
+    {% for entry in recent_files %}
+    <a class="recent-file-row" href="/w/{{ workspace.id }}/view/{{ entry.relative_path | urlencode }}">
+      <span class="file-glyph document" aria-hidden="true"></span>
+      <span class="recent-file-main">
+        <strong>{{ entry.name }}</strong>
+        {% if '/' in entry.relative_path %}<small>{{ entry.relative_path }}</small>{% endif %}
+      </span>
+      <span class="recent-file-meta">
+        <strong>{{ format_size(entry.size) }}</strong>
+        <small>{{ format_time_ns(entry.mtime_ns) }}</small>
+        {% if entry.growing %}<small class="recent-growing">{{ t('recent.growing') }}</small>{% endif %}
+      </span>
+      <span class="row-arrow" aria-hidden="true">→</span>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state quiet-empty">
+    <strong>{{ t('recent.no_files') }}</strong>
+    <p>{{ t('recent.no_files_copy') }}</p>
+  </div>
+  {% endif %}
+  {% if recent_scan.truncated %}
+  <p class="scan-note">{{ t('recent.scan_limited', count=recent_scan.scanned_files) }}</p>
+  {% endif %}
+</section>
+
+<section class="recent-section" aria-labelledby="recent-terminals-title">
+  <header class="recent-section-heading">
+    <div>
+      <h2 id="recent-terminals-title">{{ t('recent.terminals') }}</h2>
+      <p>{{ t('recent.terminals_copy') }}</p>
+    </div>
+  </header>
+  <div class="recent-terminal-list">
+    {% for item in terminals %}
+    <a class="recent-terminal-row" href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}">
+      <span class="terminal-mini-icon" aria-hidden="true">›_</span>
+      <span>
+        <strong>{{ item.name }}</strong>
+        <small>{{ t('recent.terminal_meta', output=item.last_output_label, opened=item.last_opened_label) }}</small>
+      </span>
+      <span class="row-arrow" aria-hidden="true">→</span>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

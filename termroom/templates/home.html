@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block body_class %}home-page{% endblock %}
+{% block content %}
+<header class="dashboard-heading">
+  <div>
+    <p class="eyebrow">Termroom</p>
+    <h1>{{ t('home.heading') }}</h1>
+    <p class="page-copy">{{ t('home.copy') }}</p>
+  </div>
+  <div class="dashboard-primary-actions">
+    <a class="primary-button dashboard-open" href="/open">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      <span>{{ t('home.open_workspace') }}</span>
+    </a>
+  </div>
+</header>
+
+<section class="workspace-panel">
+  <header class="panel-heading">
+    <div>
+      <h2>{{ t('home.recent_workspaces') }}</h2>
+      <p>{{ t('home.recent_workspaces_copy') }}</p>
+    </div>
+  </header>
+
+  {% if recent %}
+  <div class="workspace-table" aria-label="{{ t('home.recent_workspaces') }}">
+    <div class="workspace-table-head" aria-hidden="true">
+      <span>{{ t('home.project') }}</span><span>{{ t('home.last_used') }}</span><span>{{ t('home.status') }}</span><span></span>
+    </div>
+    {% for workspace in recent %}
+    <a class="workspace-item" href="/w/{{ workspace.id }}">
+      <span class="workspace-main">
+        <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
+        <span>
+          <strong>{{ workspace.display_name }}</strong>
+          <small>{{ workspace.canonical_path }}</small>
+        </span>
+      </span>
+      <span class="workspace-last-opened">{{ workspace.last_opened_label }}</span>
+      <span class="workspace-state-summary">
+        <span class="state-chip {{ workspace.session_status_class }}">
+          <span class="status-dot"></span>
+          {{ t(workspace.session_status_label) }}
+        </span>
+        <small>{{ t('common.terminal') }} {{ workspace.terminal_count }} · {{ workspace.connection_label or t('home.this_computer') }}</small>
+      </span>
+      <span class="row-arrow" aria-hidden="true">→</span>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state dashboard-empty">
+    <span class="empty-icon" aria-hidden="true"></span>
+    <strong>{{ t('home.no_workspace') }}</strong>
+    <p>{{ t('home.no_workspace_copy') }}</p>
+    <a class="secondary-button" href="/open">{{ t('home.first_workspace') }}</a>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

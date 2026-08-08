@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_mobile_terminal_keeps_direct_xterm_as_primary_input() -> None:
+    template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+
+    assert 'id="open-command-editor"' in template
+    assert 'id="close-command-editor"' in template
+    assert 'class="terminal-compose-pane" hidden' in template
+    assert 'data-terminal-input-mode="direct"' not in template
+    assert 'data-terminal-input-mode="compose"' not in template
+    assert "term.textarea" in script
+    assert "setComposerOpen" in script
+    assert 'addEventListener("compositionstart"' in script
+    assert 'addEventListener("compositionend"' in script
+    assert "composerComposing" in script
+
+
+def test_mobile_terminal_uses_xterm_for_paste_and_helper_input() -> None:
+    script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+
+    assert "term.paste(text)" in script
+    assert "term.input(value, true)" in script
+    assert "term.modes.applicationCursorKeysMode" in script
+    assert 'application ? "\\u001bOA" : "\\u001b[A"' in script
+
+
+def test_mobile_terminal_has_visual_viewport_keyboard_focus_mode() -> None:
+    script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+
+    assert "window.visualViewport" in script
+    assert 'classList.toggle("terminal-keyboard-open"' in script
+    assert ".workspace-page.terminal-keyboard-open .workspace-header" in styles
+    assert ".terminal-composer.command-editor-open" in styles
+
+
+def test_mobile_terminal_has_short_landscape_and_safe_area_rules() -> None:
+    template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+
+    assert "workspace-page terminal-page" in template
+    assert "(orientation: landscape)" in styles
+    assert ".terminal-page .bottom-nav" in styles
+    assert "safe-area-inset-left" in styles
+    assert "safe-area-inset-right" in styles
+
+
+def test_workspace_shell_scrolls_long_content_and_terminal_owns_remaining_height() -> None:
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+
+    desktop_workspace = re.search(
+        r"@media \(min-width: 1024px\).*?\.workspace-content\s*\{(?P<body>.*?)\}",
+        styles,
+        re.S,
+    )
+    assert desktop_workspace
+    assert "overflow: auto" in desktop_workspace.group("body")
+
+    terminal_host = re.search(r"\.terminal-host\s*\{(?P<body>.*?)\}", styles, re.S)
+    assert terminal_host
+    assert "flex: 1 1 0" in terminal_host.group("body")
+    assert "overflow: hidden" in terminal_host.group("body")
+    assert ".terminal-key-rail" in styles
+    assert ".terminal-top-actions" in styles
+
+
+def test_terminal_status_updates_label_without_replacing_status_structure() -> None:
+    template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+
+    assert 'class="terminal-status-dot"' in template
+    assert 'class="terminal-status-label"' in template
+    assert 'querySelector(".terminal-status-label")' in script
+    assert "setStatusMessage" in script
+    assert "status.textContent = message" not in script
+
+
+def test_terminal_font_size_is_user_adjustable_and_browser_persistent() -> None:
+    template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+
+    assert 'id="terminal-font-decrease"' in template
+    assert 'id="terminal-font-increase"' in template
+    assert 'id="terminal-font-reset"' in template
+    assert 'id="terminal-font-size-value"' in template
+    assert '"termroom.terminal.font-size"' in script
+    assert "term.options.fontSize = size" in script
+    assert "window.localStorage.setItem" in script
+    assert "scheduleResize(true)" in script
+
+
+def test_file_upload_ui_uses_stream_progress_and_cancel() -> None:
+    template = (ROOT / "termroom/templates/files.html").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/app.js").read_text(encoding="utf-8")
+
+    assert 'data-stream-url="/w/{{ workspace.id }}/files/upload-stream"' in template
+    assert 'id="upload-progress-panel"' in template
+    assert "new XMLHttpRequest()" in script
+    assert 'xhr.upload.addEventListener("progress"' in script
+    assert "activeUploadRequest.abort()" in script

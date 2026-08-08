@@ -1,0 +1,530 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import webbrowser
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import uvicorn
+
+from termroom.app import create_app
+from termroom.assets import ensure_xterm_assets
+from termroom.config import Settings, default_state_dir
+from termroom.db import StateStore
+from termroom.runtime import runtime_fingerprint
+from termroom.terminals import TerminalManager
+from termroom.workspaces import RootManager, WorkspaceManager
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="termroom",
+        description="Open a Linux project as a persistent touch-first web workspace.",
+    )
+    parser.add_argument("root", nargs="?", default=".", help="Project or allowed root directory")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP port")
+    _add_config_dir_argument(parser)
+    parser.add_argument(
+        "--secure-cookie",
+        action="store_true",
+        help="Mark auth cookies Secure (use behind HTTPS)",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the local browser automatically",
+    )
+    parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Run the web Core in the foreground (for Docker/systemd)",
+    )
+    parser.add_argument(
+        "--allow-root",
+        action="store_true",
+        help="Allow running as the root OS user (strongly discouraged)",
+    )
+    return parser
+
+
+def _build_attach_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="termroom attach", description="Attach to this Workspace")
+    parser.add_argument("path", nargs="?", default=".")
+    _add_config_dir_argument(parser)
+    return parser
+
+
+def _build_stop_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="termroom stop", description="Stop a Workspace or Core")
+    parser.add_argument("path", nargs="?", default=".")
+    _add_config_dir_argument(parser)
+    parser.add_argument("--core", action="store_true", help="Stop the Termroom web Core")
+    return parser
+
+
+def _add_config_dir_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config-dir",
+        "--state-dir",
+        dest="state_dir",
+        help="Persistent Termroom config directory (DB, SSH keys, credentials)",
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "attach":
+        attach_parser = _build_attach_parser()
+        _require_tmux(attach_parser)
+        _attach(attach_parser.parse_args(argv[1:]))
+        return
+    if argv and argv[0] == "stop":
+        _stop(_build_stop_parser().parse_args(argv[1:]))
+        return
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _validate_user(parser, args.allow_root)
+    _require_tmux(parser)
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+
+    try:
+        settings = Settings.create(
+            args.root,
+            host=args.host,
+            port=args.port,
+            state_dir=args.state_dir,
+            secure_cookie=args.secure_cookie,
+        )
+        ensure_xterm_assets()
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    existing_core = _read_core_metadata(settings.state_dir)
+    if existing_core and _core_process_matches(existing_core):
+        current_fingerprint = runtime_fingerprint()
+        runtime_matches = _core_runtime_matches(existing_core, current_fingerprint)
+        settings_match = _core_settings_match(existing_core, settings)
+        if runtime_matches and settings_match:
+            _open_in_running_core(parser, args, settings, existing_core)
+            return
+        _adopt_existing_core_options(args, existing_core)
+        try:
+            old_pid = _stop_core_process(existing_core)
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        reason = "older code" if not runtime_matches else "updated settings"
+        print(f"Termroom Core was using {reason}; restarting it (pid {old_pid}).", flush=True)
+        settings = Settings.create(
+            args.root,
+            host=args.host,
+            port=args.port,
+            state_dir=args.state_dir,
+            secure_cookie=args.secure_cookie,
+        )
+        existing_core = None
+    if existing_core:
+        with contextlib.suppress(FileNotFoundError):
+            _core_metadata_path(settings.state_dir).unlink()
+
+    if not settings.login_password:
+        parser.error(
+            "Termroom login password is not configured. Add `TERMROOM_PASSWORD=...` "
+            f"to {settings.state_dir / '.env'} or the environment."
+        )
+
+    if not args.foreground:
+        _start_background_core(parser, args, settings)
+        metadata = _wait_for_core(settings.state_dir, timeout=8.0)
+        if not metadata:
+            raise SystemExit(
+                "Termroom Core did not start. Run `termroom . --foreground` to see startup errors."
+            )
+        _open_in_running_core(parser, args, settings, metadata, started_now=True)
+        return
+
+    app = create_app(settings)
+    workspace = app.state.workspaces.open(".")
+    app.state.terminals.ensure_workspace(workspace)
+    local_base = f"http://127.0.0.1:{settings.port}"
+    browser_url = f"{local_base}/w/{workspace['id']}"
+    shown_base = _display_base_url(settings.host, settings.port)
+    shown_url = f"{shown_base}/w/{workspace['id']}"
+
+    _write_core_metadata(settings, workspace["id"])
+    print("Termroom is running", flush=True)
+    print(f"Workspace: {workspace['path']}", flush=True)
+    print(f"Local:     {local_base}/w/{workspace['id']}", flush=True)
+    print(f"Open:      {shown_url}", flush=True)
+    print("Login:     TERMROOM_PASSWORD", flush=True)
+    if settings.host not in {"127.0.0.1", "localhost", "::1"}:
+        print(
+            "Access is exposed beyond localhost. Prefer a private VPN or HTTPS proxy.",
+            flush=True,
+        )
+
+    if not args.no_open:
+        _open_browser(browser_url)
+
+    try:
+        uvicorn.run(
+            app,
+            host=settings.host,
+            port=settings.port,
+            log_level="info",
+        )
+    finally:
+        _remove_core_metadata_if_current(settings.state_dir)
+
+
+def _open_in_running_core(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    settings: Settings,
+    metadata: dict[str, Any],
+    *,
+    started_now: bool = False,
+) -> None:
+    existing_port = int(metadata.get("port", 8765))
+    existing_host = str(metadata.get("host", "127.0.0.1"))
+    if args.port != 8765 and args.port != existing_port:
+        parser.error(
+            f"Termroom Core is already running on port {existing_port}. "
+            "Stop it with `termroom stop --core` before changing ports."
+        )
+    if args.host != "127.0.0.1" and args.host != existing_host:
+        parser.error(
+            f"Termroom Core is already bound to {existing_host}. "
+            "Stop it with `termroom stop --core` before changing bind address."
+        )
+
+    store = StateStore(settings.database_path)
+    store.initialize()
+    manager = WorkspaceManager(RootManager(settings.root), store)
+    workspace = manager.open(".")
+    TerminalManager(store).ensure_workspace(workspace)
+    base = _display_base_url(existing_host, existing_port)
+    url = f"{base}/w/{workspace['id']}"
+    status = (
+        "Termroom Core started in the background"
+        if started_now
+        else "Termroom Core is already running"
+    )
+    print(status, flush=True)
+    print(f"Workspace: {workspace['path']}", flush=True)
+    print(f"Open:      {url}", flush=True)
+    print("Login:     TERMROOM_PASSWORD", flush=True)
+    if existing_host not in {"127.0.0.1", "localhost", "::1"}:
+        print(
+            "Access is exposed beyond localhost. Prefer a private VPN or HTTPS proxy.",
+            flush=True,
+        )
+    if not args.no_open:
+        _open_browser(url)
+
+
+def _start_background_core(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, settings: Settings
+) -> None:
+    command = [
+        sys.executable,
+        "-m",
+        "termroom.cli",
+        str(settings.root),
+        "--foreground",
+        "--no-open",
+        "--host",
+        settings.host,
+        "--port",
+        str(settings.port),
+        "--state-dir",
+        str(settings.state_dir),
+    ]
+    if settings.secure_cookie:
+        command.append("--secure-cookie")
+    if getattr(args, "allow_root", False):
+        command.append("--allow-root")
+
+    log_path = settings.state_dir / "core.log"
+    try:
+        log_handle = log_path.open("ab", buffering=0)
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            cwd=str(settings.root),
+        )
+    except OSError as exc:
+        parser.error(f"Could not start Termroom Core: {exc}")
+    finally:
+        with contextlib.suppress(UnboundLocalError):
+            log_handle.close()
+
+
+def _wait_for_core(state_dir: Path, *, timeout: float) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        metadata = _read_core_metadata(state_dir)
+        if (
+            metadata
+            and _core_process_matches(metadata)
+            and _core_accepting_connections(metadata)
+        ):
+            return metadata
+        time.sleep(0.05)
+    return None
+
+
+def _core_accepting_connections(metadata: dict[str, Any]) -> bool:
+    host = str(metadata.get("host", "127.0.0.1"))
+    if host in {"0.0.0.0", "::", "localhost", "::1"}:
+        host = "127.0.0.1"
+    try:
+        port = int(metadata.get("port", 8765))
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _attach(args: argparse.Namespace) -> None:
+    store = _open_existing_store(args.state_dir)
+    workspace = store.find_workspace_for_path(Path(args.path))
+    if not workspace:
+        raise SystemExit(
+            "No Termroom Workspace contains this path. Open it with `termroom .` first."
+        )
+    session = str(workspace["tmux_session"])
+    if subprocess.run(
+        ["tmux", "has-session", "-t", session], capture_output=True, check=False
+    ).returncode:
+        raise SystemExit(
+            "The Workspace tmux session is not running. Open the Workspace in Termroom first."
+        )
+    os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+
+
+def _stop(args: argparse.Namespace) -> None:
+    state_dir = _state_path(args.state_dir)
+    if args.core:
+        metadata = _read_core_metadata(state_dir)
+        if not metadata:
+            raise SystemExit("Termroom Core is not recorded as running.")
+        try:
+            pid = _stop_core_process(metadata)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"Stopped Termroom Core (pid {pid}).")
+        return
+
+    if shutil.which("tmux") is None:
+        raise SystemExit("tmux is required to stop a Workspace session. Install tmux and retry.")
+
+    store = _open_existing_store(args.state_dir)
+    workspace = store.find_workspace_for_path(Path(args.path))
+    if not workspace:
+        raise SystemExit("No Termroom Workspace contains this path.")
+    result = subprocess.run(
+        ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit("The Workspace session is already stopped.")
+    print(f"Stopped Workspace session: {workspace['display_name']}")
+
+
+def _validate_user(parser: argparse.ArgumentParser, allow_root: bool) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0 and not allow_root:
+        parser.error("Termroom refuses to run as root. Use a dedicated non-root user.")
+
+
+def _require_tmux(parser: argparse.ArgumentParser) -> None:
+    if shutil.which("tmux") is None:
+        parser.error(
+            "tmux is required for persistent Termroom terminals. Install tmux and retry."
+        )
+
+
+def _state_path(value: str | None) -> Path:
+    return (Path(value).expanduser() if value else default_state_dir()).resolve()
+
+
+def _open_existing_store(state_dir_value: str | None) -> StateStore:
+    state_dir = _state_path(state_dir_value)
+    database = state_dir / "termroom.sqlite3"
+    if not database.exists():
+        raise SystemExit(f"Termroom state database not found: {database}")
+    store = StateStore(database)
+    store.initialize()
+    return store
+
+
+def _display_base_url(host: str, port: int) -> str:
+    if host in {"0.0.0.0", "::"}:
+        host = _local_address()
+    elif host in {"localhost", "::1"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
+def _local_address() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return socket.gethostname()
+
+
+def _open_browser(url: str) -> None:
+    # On headless Linux, webbrowser can choose console-oriented helpers. Avoid
+    # surprising users and simply leave the printed access URL instead.
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        return
+    try:
+        webbrowser.open(url, new=2)
+    except webbrowser.Error:
+        return
+
+
+def _core_metadata_path(state_dir: Path) -> Path:
+    return state_dir / "core.json"
+
+
+def _write_core_metadata(settings: Settings, workspace_id: str) -> None:
+    data = {
+        "pid": os.getpid(),
+        "pid_start_ticks": _pid_start_ticks(os.getpid()),
+        "runtime_fingerprint": runtime_fingerprint(),
+        "root": str(settings.root),
+        "state_dir": str(settings.state_dir),
+        "host": settings.host,
+        "port": settings.port,
+        "secure_cookie": settings.secure_cookie,
+        "default_locale": settings.default_locale,
+        "workspace_id": workspace_id,
+        "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    path = _core_metadata_path(settings.state_dir)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _read_core_metadata(state_dir: Path) -> dict[str, Any] | None:
+    path = _core_metadata_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _core_process_matches(metadata: dict[str, Any]) -> bool:
+    try:
+        pid = int(metadata.get("pid", 0))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    expected_ticks = str(metadata.get("pid_start_ticks", ""))
+    actual_ticks = _pid_start_ticks(pid)
+    if not actual_ticks:
+        return False
+    return not expected_ticks or actual_ticks == expected_ticks
+
+
+def _core_runtime_matches(
+    metadata: dict[str, Any], current_fingerprint: str | None = None
+) -> bool:
+    expected = str(metadata.get("runtime_fingerprint", ""))
+    if not expected:
+        return False
+    return expected == (current_fingerprint or runtime_fingerprint())
+
+
+def _core_settings_match(metadata: dict[str, Any], settings: Settings) -> bool:
+    return str(metadata.get("default_locale", "")) == settings.default_locale
+
+
+def _adopt_existing_core_options(args: argparse.Namespace, metadata: dict[str, Any]) -> None:
+    if args.port == 8765:
+        with contextlib.suppress(TypeError, ValueError):
+            args.port = int(metadata.get("port", args.port))
+    if args.host == "127.0.0.1":
+        args.host = str(metadata.get("host", args.host))
+    if not args.secure_cookie and bool(metadata.get("secure_cookie", False)):
+        args.secure_cookie = True
+
+
+def _stop_core_process(metadata: dict[str, Any], *, timeout: float = 5.0) -> int:
+    try:
+        pid = int(metadata.get("pid", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Termroom Core metadata does not contain a valid process ID.") from exc
+    expected_ticks = str(metadata.get("pid_start_ticks", ""))
+    if pid <= 0 or (expected_ticks and _pid_start_ticks(pid) != expected_ticks):
+        raise RuntimeError("Termroom Core metadata is stale; no matching process was stopped.")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError as exc:
+        raise RuntimeError("Termroom Core is no longer running.") from exc
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _core_process_matches(metadata):
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError(
+            f"Termroom Core did not stop within {timeout:g} seconds. "
+            "Check the process before retrying."
+        )
+    state_dir_value = metadata.get("state_dir")
+    if state_dir_value:
+        with contextlib.suppress(FileNotFoundError):
+            _core_metadata_path(Path(str(state_dir_value))).unlink()
+    return pid
+
+
+def _remove_core_metadata_if_current(state_dir: Path) -> None:
+    metadata = _read_core_metadata(state_dir)
+    if not metadata or int(metadata.get("pid", -1)) != os.getpid():
+        return
+    with contextlib.suppress(FileNotFoundError):
+        _core_metadata_path(state_dir).unlink()
+
+
+def _pid_start_ticks(pid: int) -> str:
+    try:
+        parts = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+    except OSError:
+        return ""
+    return parts[21] if len(parts) > 21 else ""
+
+
+if __name__ == "__main__":
+    main()

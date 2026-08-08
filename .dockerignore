@@ -1,0 +1,13 @@
+.git
+.env
+.venv
+.uv-cache
+.pytest_cache
+.ruff_cache
+.qa-*
+.termroom-state
+__pycache__
+*.pyc
+dist
+build
+*.egg-info

@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block body_class %}computer-setup-page{% endblock %}
+{% block content %}
+<section class="computer-setup-shell ssh-setup-v2">
+  <a class="text-back-link" href="/open">← {{ t('open.computers') }}</a>
+  <header class="computer-setup-heading">
+    <p class="eyebrow">{{ t('ssh.add.eyebrow') }}</p>
+    <h1>{{ t('ssh.add.heading') }}</h1>
+    <p>{{ t('ssh.add.copy') }}</p>
+  </header>
+
+  {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+
+  <form id="ssh-setup-form"
+        method="post"
+        action="/computers"
+        data-probe-url="/computers/probe"
+        class="ssh-setup-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input id="ssh-host-key-type" type="hidden" name="host_key_type">
+    <input id="ssh-host-key-data" type="hidden" name="host_key_data">
+    <input id="ssh-host-fingerprint" type="hidden" name="host_fingerprint">
+    <input id="ssh-confirm-fingerprint" type="hidden" name="confirm_fingerprint" value="0">
+
+    <section class="ssh-setup-section panel">
+      <header class="ssh-setup-section-heading">
+        <span class="step-number">1</span>
+        <div><strong>{{ t('ssh.add.step_computer') }}</strong><small>{{ t('ssh.add.step_computer_copy') }}</small></div>
+      </header>
+      <div class="ssh-basic-grid">
+        <label class="setup-field ssh-host-field">
+          <span>{{ t('ssh.add.target') }}</span>
+          <input name="target" value="{{ values.target or '' }}" placeholder="{{ t('ssh.add.target_placeholder') }}" required autofocus autocapitalize="off" spellcheck="false">
+        </label>
+        <div class="ssh-user-port-grid">
+          <label class="setup-field">
+            <span>{{ t('ssh.add.username') }}</span>
+            <input name="username" value="{{ values.username or '' }}" placeholder="ubuntu" autocapitalize="off" spellcheck="false">
+          </label>
+          <label class="setup-field ssh-port-field">
+            <span>{{ t('ssh.add.port') }}</span>
+            <input name="port" value="{{ values.port or '' }}" placeholder="22" inputmode="numeric">
+          </label>
+        </div>
+      </div>
+      <p class="setup-help">{{ t('ssh.add.config_hint') }}</p>
+      <details class="ssh-optional-name">
+        <summary>{{ t('ssh.add.display_name') }} <span>{{ t('common.optional') }}</span></summary>
+        <label class="setup-field">
+          <span>{{ t('ssh.add.display_name_label') }}</span>
+          <input name="name" value="{{ values.name or '' }}" placeholder="Home Server">
+        </label>
+      </details>
+    </section>
+
+    <section class="ssh-setup-section panel">
+      <header class="ssh-setup-section-heading">
+        <span class="step-number">2</span>
+        <div><strong>{{ t('ssh.add.auth') }}</strong><small>{{ t('ssh.add.auth_copy') }}</small></div>
+      </header>
+
+      <div class="ssh-auth-options" role="radiogroup" aria-label="{{ t('ssh.add.auth') }}">
+        <label class="ssh-auth-option">
+          <input type="radio" name="auth_mode" value="password" {% if not values.auth_mode or values.auth_mode == 'password' %}checked{% endif %}>
+          <span><strong>{{ t('ssh.add.password') }}</strong><small>{{ t('ssh.add.password_copy') }}</small></span>
+        </label>
+        <label class="ssh-auth-option {% if not managed_public_key %}is-disabled{% endif %}">
+          <input type="radio" name="auth_mode" value="key" {% if values.auth_mode in ['key', 'managed'] %}checked{% endif %} {% if not managed_public_key %}disabled{% endif %}>
+          <span><strong>{{ t('ssh.add.public_key') }}</strong><small>{{ t('ssh.add.public_key_copy') }}</small></span>
+        </label>
+      </div>
+
+      <div class="ssh-auth-pane" data-auth-pane="password">
+        <label class="setup-field">
+          <span>{{ t('ssh.add.password_label') }}</span>
+          <input name="password" type="password" autocomplete="new-password" placeholder="{{ t('ssh.add.password_placeholder') }}">
+          <small>{{ t('ssh.add.password_storage') }}</small>
+        </label>
+      </div>
+
+      <div class="ssh-auth-pane managed-key-pane" data-auth-pane="key" hidden>
+        {% if managed_key_error %}<p class="notice error">{{ managed_key_error }}</p>{% endif %}
+        {% if managed_public_key %}
+        <div class="managed-key-copy">
+          <span>{{ t('ssh.add.public_key_label') }}</span>
+          <code id="termroom-public-key">{{ managed_public_key }}</code>
+          <button type="button" class="secondary-button" data-copy-target="#termroom-public-key">{{ t('ssh.add.copy_public_key') }}</button>
+        </div>
+        <p>{{ t('ssh.add.public_key_help') }}</p>
+        {% endif %}
+      </div>
+
+      <details class="ssh-existing-key-details">
+        <summary>{{ t('ssh.add.advanced') }}</summary>
+        <label class="ssh-auth-option compact">
+          <input type="radio" name="auth_mode" value="existing" {% if values.auth_mode == 'existing' %}checked{% endif %}>
+          <span><strong>{{ t('ssh.add.existing') }}</strong><small>{{ t('ssh.add.existing_copy') }}</small></span>
+        </label>
+        <div class="ssh-auth-pane" data-auth-pane="existing" hidden>
+          <label class="setup-field">
+            <span>{{ t('ssh.add.private_key') }}</span>
+            <input name="identity_file" value="{{ values.identity_file or '' }}" placeholder="{{ t('ssh.add.private_key_placeholder') }}" autocapitalize="off" spellcheck="false">
+            <small>{{ t('ssh.add.private_key_help') }}</small>
+          </label>
+        </div>
+      </details>
+    </section>
+
+    <section id="ssh-fingerprint-panel" class="ssh-fingerprint-panel panel" hidden>
+      <header class="ssh-setup-section-heading">
+        <span class="step-number">3</span>
+        <div><strong>{{ t('ssh.add.verify') }}</strong><small>{{ t('ssh.add.verify_copy') }}</small></div>
+      </header>
+      <div class="ssh-probed-target">
+        <span id="ssh-probed-address"></span>
+        <code id="ssh-probed-fingerprint"></code>
+        <small id="ssh-probed-key-type"></small>
+      </div>
+      <label class="confirm-check ssh-fingerprint-check">
+        <input id="ssh-fingerprint-checkbox" type="checkbox">
+        <span>{{ t('ssh.add.fingerprint_confirm') }}</span>
+      </label>
+    </section>
+
+    <div id="ssh-setup-status" class="ssh-setup-status" role="status" aria-live="polite"></div>
+    <div class="ssh-setup-actions">
+      <button id="ssh-probe-button" class="secondary-button" type="button">{{ t('ssh.add.verify') }}</button>
+      <button id="ssh-connect-button" class="primary-button" type="submit" hidden disabled>{{ t('ssh.add.connect') }}</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

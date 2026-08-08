@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block body_class %}workspace-page{% endblock %}
+{% block body %}
+<header class="workspace-header">
+  <div class="workspace-brand-row">
+    <a class="workspace-brand" href="/" aria-label="{{ t('app.home') }}">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M6 7l5 5-5 5M13 17h5"/></svg>
+      </span>
+      <span>Termroom</span>
+    </a>
+    <span class="workspace-brand-actions">
+      <span class="workspace-mode">{{ workspace.connection_label or t('home.this_computer') }} · {{ t(access_scope_label) }}</span>
+      <label class="workspace-language-select workspace-language-desktop" aria-label="{{ t('app.language') }}">
+        <select data-language-select>
+          {% for code, label in languages.items() %}
+          <option value="{{ code }}" {% if code == locale %}selected{% endif %}>{{ code | upper }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </span>
+  </div>
+  <div class="workspace-project-row">
+    <a class="workspace-home-button" href="/" aria-label="{{ t('common.home') }}">
+      <span aria-hidden="true">←</span>
+    </a>
+    <div class="workspace-title">
+      <strong>{{ workspace.display_name }}</strong>
+      <small>{{ workspace.canonical_path }}</small>
+    </div>
+    <span class="workspace-mobile-actions">
+      <span class="workspace-mobile-mode" aria-label="{{ t('common.computer') }} · Termroom">
+        <strong>{{ workspace.connection_label or t('home.this_computer') }}</strong>
+        <small class="{{ access_scope_class }}">{{ t(access_scope_label) }}</small>
+      </span>
+      <label class="workspace-language-select workspace-language-mobile" aria-label="{{ t('app.language') }}">
+        <select data-language-select>
+          {% for code, label in languages.items() %}
+          <option value="{{ code }}" {% if code == locale %}selected{% endif %}>{{ code | upper }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </span>
+  </div>
+</header>
+<main class="workspace-content {% block workspace_content_class %}{% endblock %}">
+  {% block workspace_content %}{% endblock %}
+</main>
+<nav class="bottom-nav" aria-label="{{ t('common.workspace') }}">
+  <span class="workspace-nav-label">{{ t('common.workspace') }}</span>
+  <a class="{% if active_tab == 'terminal' %}active{% endif %}" href="/w/{{ workspace.id }}/terminal">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7l4 5-4 5M11 17h8"/></svg>
+    <span>{{ t('common.terminal') }}</span>
+  </a>
+  <a class="{% if active_tab == 'files' %}active{% endif %}" href="/w/{{ workspace.id }}/files">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4z"/></svg>
+    <span>{{ t('common.files') }}</span>
+  </a>
+  <a class="{% if active_tab == 'recent' %}active{% endif %}" href="/w/{{ workspace.id }}/recent">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v6l4 2M4 12a8 8 0 1 0 2-5.3M4 4v4h4"/></svg>
+    <span>{{ t('common.recent') }}</span>
+  </a>
+</nav>
+<footer class="workspace-sidebar-footer" aria-label="{{ t('common.workspace') }}">
+  <span class="status-dot {% if session_active or workspace.backend_kind == 'ssh' %}is-active{% endif %}"></span>
+  <span>
+    <strong>{{ t(session_status_label) }}</strong>
+    <small>{{ t('common.terminal') }} {{ terminal_count }} · {{ workspace.relative_path }}</small>
+  </span>
+</footer>
+{% block workspace_scripts %}{% endblock %}
+{% endblock %}

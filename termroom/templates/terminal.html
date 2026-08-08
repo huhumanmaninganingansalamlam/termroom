@@ -1,0 +1,157 @@
+{% extends "workspace_base.html" %}
+{% block body_class %}workspace-page terminal-page{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="{{ url_for('static', path='vendor/xterm.css') }}?v=6.0.0">
+{% endblock %}
+{% block workspace_content_class %}terminal-screen{% endblock %}
+{% block workspace_content %}
+<div class="terminal-chrome">
+  <span class="terminal-purpose">{{ t('terminal.purpose') }}</span>
+  <nav class="terminal-tabs" aria-label="{{ t('terminal.switch') }}">
+    {% for item in terminals %}
+    <a class="{% if item.id == terminal.id %}active{% endif %}"
+       href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}">{{ item.name }}</a>
+    {% endfor %}
+  </nav>
+  <div class="terminal-top-actions">
+    <span id="terminal-status" class="terminal-status" role="status">
+      <span class="terminal-status-dot" aria-hidden="true"></span>
+      <span class="terminal-status-label">{{ t('terminal.connecting') }}</span>
+    </span>
+    <a class="terminal-tool-button terminal-output-action"
+       href="/w/{{ workspace.id }}/terminal/{{ terminal.id }}/scrollback"
+       aria-label="{{ t('terminal.output') }}">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
+      <span class="terminal-tool-label">{{ t('terminal.output') }}</span>
+    </a>
+    <details class="new-terminal-menu terminal-manage-menu" name="terminal-popover">
+      <summary class="terminal-tool-button" aria-label="{{ t('terminal.manage') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>
+      </summary>
+      <form method="post" action="/w/{{ workspace.id }}/terminals/{{ terminal.id }}" class="terminal-manage-form">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <section class="terminal-display-settings" aria-labelledby="terminal-display-settings-title">
+          <span class="terminal-display-heading">
+            <strong id="terminal-display-settings-title">{{ t('terminal.display') }}</strong>
+            <span>{{ t('terminal.font_size') }}</span>
+          </span>
+          <div class="terminal-font-size-controls">
+            <button id="terminal-font-decrease" type="button" aria-label="{{ t('terminal.font_smaller') }}">−</button>
+            <output id="terminal-font-size-value" aria-live="polite">{{ t('terminal.font_size_value', size=14) }}</output>
+            <button id="terminal-font-increase" type="button" aria-label="{{ t('terminal.font_larger') }}">+</button>
+            <button id="terminal-font-reset" class="terminal-font-reset" type="button">{{ t('terminal.font_reset') }}</button>
+          </div>
+        </section>
+        <label>
+          <span>{{ t('terminal.name') }}</span>
+          <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}">
+        </label>
+        <button type="submit" name="action" value="rename">{{ t('terminal.rename') }}</button>
+        <button type="submit"
+                name="action"
+                value="delete"
+                class="danger-button"
+                formnovalidate
+                data-confirm="{{ t('terminal.close_confirm') }}">{{ t('terminal.close') }}</button>
+      </form>
+    </details>
+    <details class="new-terminal-menu" name="terminal-popover">
+      <summary class="terminal-tool-button terminal-new-button" aria-label="{{ t('terminal.new') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </summary>
+      <form method="post" action="/w/{{ workspace.id }}/terminals">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input name="name" value="shell" maxlength="32" aria-label="{{ t('terminal.name') }}">
+        <button type="submit">{{ t('common.create') }}</button>
+      </form>
+    </details>
+  </div>
+</div>
+{% if error %}<p class="terminal-error-banner" role="alert">{{ error }}</p>{% endif %}
+<div id="terminal"
+     class="terminal-host"
+     data-terminal-id="{{ terminal.id }}"
+     data-workspace-id="{{ workspace.id }}"
+     data-device-id="{{ current_device_id }}"></div>
+
+<div class="terminal-composer">
+  <div class="quick-keys" aria-label="{{ t('terminal.more_keys') }}">
+    <div class="terminal-key-rail">
+      <button class="terminal-keycap" type="button" data-terminal-key="\u001b">Esc</button>
+      <button class="terminal-keycap" type="button" data-terminal-key="\t">Tab</button>
+      <button class="terminal-keycap" type="button" id="ctrl-key" aria-pressed="false">Ctrl</button>
+      <button class="terminal-keycap terminal-keycap-symbol" type="button" data-terminal-action="arrow-up">↑</button>
+      <button class="terminal-keycap terminal-keycap-symbol" type="button" data-terminal-action="arrow-down">↓</button>
+      <button class="terminal-keycap" type="button" data-terminal-key="\u0003">C-c</button>
+    </div>
+    <details class="more-keys" name="terminal-popover">
+      <summary class="terminal-keycap terminal-keycap-symbol" aria-label="{{ t('terminal.more_keys') }}">•••</summary>
+      <div class="more-keys-panel">
+        <div class="more-key-grid">
+          <button type="button" data-terminal-action="arrow-left">←</button>
+          <button type="button" data-terminal-action="arrow-right">→</button>
+          <button type="button" data-terminal-key="\u0004">C-d</button>
+          <button type="button" data-terminal-key="/">/</button>
+          <button type="button" data-terminal-key="-">-</button>
+          <button type="button" data-terminal-key="_">_</button>
+          <button type="button" data-terminal-key="|">|</button>
+          <button type="button" data-terminal-key="~">~</button>
+        </div>
+        <div class="terminal-secondary-actions">
+          <button type="button" id="focus-terminal">{{ t('terminal.keyboard') }}</button>
+          <button type="button" id="paste-terminal">{{ t('terminal.paste') }}</button>
+        </div>
+      </div>
+    </details>
+    <button id="open-command-editor" class="terminal-command-trigger" type="button" aria-label="{{ t('terminal.command_edit') }}">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
+      <span>{{ t('terminal.command_edit') }}</span>
+    </button>
+  </div>
+  <div class="terminal-compose-pane" hidden>
+    <header class="terminal-compose-heading">
+      <span>
+        <strong>{{ t('terminal.command_edit') }}</strong>
+        <small>{{ t('terminal.command_edit_hint') }}</small>
+      </span>
+      <button id="close-command-editor"
+              class="terminal-compose-close"
+              type="button"
+              aria-label="{{ t('terminal.command_edit_close') }}">×</button>
+    </header>
+    <form id="command-form" class="command-bar">
+      <div class="command-input-shell">
+        <textarea id="command-input"
+                  name="command"
+                  rows="1"
+                  placeholder="{{ t('terminal.command_placeholder') }}"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  autocorrect="off"
+                  spellcheck="false"></textarea>
+        <span id="command-meta" class="command-meta">{{ t('terminal.command_hint') }}</span>
+      </div>
+      <button class="send-command" type="submit">{{ t('terminal.run') }}</button>
+    </form>
+    {% if commands %}
+    <div class="recent-command-strip" aria-label="{{ t('terminal.recent_commands_aria') }}">
+      <span class="recent-command-label">{{ t('terminal.recent_commands') }}</span>
+      {% for command in commands[:5] %}
+      <button type="button" data-command-reuse="{{ command }}">{{ command }}</button>
+      {% endfor %}
+      <form method="post" action="/w/{{ workspace.id }}/commands/clear" class="recent-command-clear-form">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="terminal" value="{{ terminal.id }}">
+        <button type="submit" class="recent-command-clear">{{ t('terminal.clear_recent') }}</button>
+      </form>
+    </div>
+    {% else %}
+    <p class="terminal-first-hint">{{ t('terminal.first_hint') }}</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+{% block workspace_scripts %}
+<script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=32"></script>
+{% endblock %}
