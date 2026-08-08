@@ -47,7 +47,9 @@ jobs:
           node --check termroom/static/terminal.js
 
       - name: Validate Docker Compose configuration
-        run: docker compose config
+        run: |
+          cp .env.example .env
+          docker compose config
 
   build:
     name: Build release artifacts
