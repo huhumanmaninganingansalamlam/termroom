@@ -50,6 +50,25 @@
 </header>
 
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+{% if project_error and project_created %}
+<section class="notice error project-result-notice">
+  <strong>{{ project_error }}</strong>
+  {% if project_created %}<code>{{ project_created }}</code>{% endif %}
+  <span class="project-result-actions">
+    {% if project_existing %}
+    <form method="post" action="/api/workspaces">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="root_id" value="{{ selected_root_id }}">
+      <input type="hidden" name="path" value="{{ project_existing }}">
+      <button class="secondary-button" type="submit">{{ t('project.open_existing') }}</button>
+    </form>
+    {% endif %}
+    {% if project_workspace %}<a class="secondary-button" href="/w/{{ project_workspace }}/terminal">{{ t('project.retry_open') }}</a>{% endif %}
+    {% if project_created %}<a class="secondary-button" href="/open/local?root={{ selected_root_id }}&path={{ path | urlencode }}">{{ t('project.back_folder') }}</a>{% endif %}
+    <button class="secondary-button" type="button" data-new-project data-project-parent="{{ path }}" data-project-parent-display="{{ current_path_display }}">{{ t('project.edit_name') }}</button>
+  </span>
+</section>
+{% endif %}
 
 {% if roots | length == 1 %}
 <section class="open-location-compact">
@@ -201,28 +220,29 @@
 
 <section class="folder-browser open-folder-browser" aria-label="{{ t('browse.heading') }}">
   <header class="folder-browser-header">
-    <div class="folder-browser-location">
-      <span class="path-label">{{ t('browse.current') }}</span>
-      <nav class="breadcrumbs" aria-label="{{ t('browse.current') }}">
-        {% for crumb in breadcrumbs %}
-          <a href="/open/local?root={{ selected_root_id }}&path={{ crumb.path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}">{% if loop.first %}{{ selected_root_label }}{% else %}{{ crumb.name }}{% endif %}</a>
-          {% if not loop.last %}<span>/</span>{% endif %}
-        {% endfor %}
-      </nav>
+    <div class="folder-browser-navigation">
+      {% for crumb in breadcrumbs %}
+        {% if loop.revindex == 2 %}
+        <a class="folder-browser-up" href="/open/local?root={{ selected_root_id }}&path={{ crumb.path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}" aria-label="{{ t('open.parent_folder') }}">← <span>{{ t('open.parent_folder') }}</span></a>
+        {% endif %}
+      {% endfor %}
+      <div class="folder-browser-location">
+        <span class="path-label">{{ t('browse.current') }}</span>
+        <nav class="breadcrumbs" aria-label="{{ t('browse.current') }}">
+          {% for crumb in breadcrumbs %}
+            <a href="/open/local?root={{ selected_root_id }}&path={{ crumb.path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}">{% if loop.first %}{{ selected_root_label }}{% else %}{{ crumb.name }}{% endif %}</a>
+            {% if not loop.last %}<span>/</span>{% endif %}
+          {% endfor %}
+        </nav>
+      </div>
     </div>
-    <div class="folder-browser-actions">
+    <div class="folder-browser-tools">
       {% if hidden_count %}
       <a class="hidden-toggle"
          href="/open/local?root={{ selected_root_id }}&path={{ path | urlencode }}&hidden={{ 0 if show_hidden else 1 }}">
         {% if show_hidden %}{{ t('browse.hide_hidden') }}{% else %}{{ t('browse.show_hidden', count=hidden_count) }}{% endif %}
       </a>
       {% endif %}
-      <form method="post" action="/api/workspaces" class="browse-open-form">
-        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <input type="hidden" name="root_id" value="{{ selected_root_id }}">
-        <input type="hidden" name="path" value="{{ path }}">
-        <button class="primary-button" type="submit">{{ t('browse.open_current') }}</button>
-      </form>
     </div>
   </header>
   <div class="folder-browser-list">
@@ -237,7 +257,60 @@
     <div class="empty-state quiet-empty"><strong>{{ t('browse.empty') }}</strong><p>{{ t('browse.empty_copy') }}</p></div>
     {% endfor %}
   </div>
+  <footer class="folder-browser-selection">
+    <span class="folder-browser-selection-copy"><small>{{ t('browse.selected_location') }}</small><code>{{ current_path_display }}</code></span>
+    <div class="folder-browser-actions">
+      <button class="secondary-button" type="button" data-new-project data-project-parent="{{ path }}" data-project-parent-display="{{ current_path_display }}">＋ {{ t('project.new_here') }}</button>
+      <form method="post" action="/api/workspaces" class="browse-open-form">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="root_id" value="{{ selected_root_id }}">
+        <input type="hidden" name="path" value="{{ path }}">
+        <button class="primary-button" type="submit">{{ t('browse.open_current') }}</button>
+      </form>
+    </div>
+  </footer>
 </section>
+
+{% if project_existing and not project_created %}
+<form id="open-existing-local-project" method="post" action="/api/workspaces" hidden>
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="root_id" value="{{ selected_root_id }}">
+  <input type="hidden" name="path" value="{{ project_existing }}">
+</form>
+{% endif %}
+<dialog id="new-project-dialog" class="project-create-dialog"{% if project_error and not project_created %} data-project-autopen{% endif %}>
+  <form method="post" action="/open/local/projects" class="project-create-form" data-project-form>
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="root_id" value="{{ selected_root_id }}">
+    <input type="hidden" name="parent" value="{{ path }}" data-project-parent-input>
+    <header class="floating-form-heading">
+      <strong>{{ t('project.new') }}</strong>
+      <button type="button" class="floating-form-close" data-project-close aria-label="{{ t('common.close') }}">×</button>
+    </header>
+    <dl class="project-create-facts">
+      <div><dt>{{ t('project.computer') }}</dt><dd>{{ t('home.this_computer') }}</dd></div>
+      <div><dt>{{ t('project.location') }}</dt><dd><code data-project-parent-label>{{ current_path_display }}</code></dd></div>
+    </dl>
+    {% if project_error and not project_created %}
+    <div class="notice error project-dialog-error" role="alert">
+      <strong>{{ project_error }}</strong>
+      {% if project_existing %}<button class="secondary-button" type="submit" form="open-existing-local-project">{{ t('project.open_existing') }}</button>{% endif %}
+    </div>
+    {% endif %}
+    <label>
+      <span>{{ t('project.folder_name') }}</span>
+      <input name="name" value="{{ project_name }}" required maxlength="255" autocomplete="off" autocapitalize="off" spellcheck="false" data-project-name>
+    </label>
+    <div class="project-final-path">
+      <span>{{ t('project.final_path') }}</span>
+      <code data-project-final-path>{{ current_path_display }}</code>
+    </div>
+    <div class="floating-form-actions">
+      <button class="secondary-button" type="button" data-project-close>{{ t('common.cancel') }}</button>
+      <button class="primary-button" type="submit">{{ t('project.create_open') }}</button>
+    </div>
+  </form>
+</dialog>
 
 {% elif mode == 'remote' %}
 <header class="open-page-heading remote-open-heading">
@@ -251,11 +324,32 @@
 </header>
 
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+{% if project_error and project_created %}
+<section class="notice error project-result-notice">
+  <strong>{{ project_error }}</strong>
+  {% if project_created %}<code>{{ project_created }}</code>{% endif %}
+  <span class="project-result-actions">
+    {% if project_existing %}
+    <form method="post" action="/computers/{{ computer.id }}/workspaces">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="path" value="{{ project_existing }}">
+      <button class="secondary-button" type="submit">{{ t('project.open_existing') }}</button>
+    </form>
+    {% endif %}
+    {% if project_workspace %}<a class="secondary-button" href="/w/{{ project_workspace }}/terminal">{{ t('project.retry_open') }}</a>{% endif %}
+    {% if project_created %}<a class="secondary-button" href="/open/{{ computer.id }}?browse=1&browse_path={{ (remote_picker.current if remote_picker else (browse_path or '')) | urlencode }}">{{ t('project.back_folder') }}</a>{% endif %}
+  </span>
+</section>
+{% endif %}
 {% if connected %}<p class="notice success">{{ t('ssh.detail.connected_copy') }}</p>{% endif %}
 
 <section class="open-workspace-panel panel">
   <header class="open-section-heading">
     <div><h2>{{ t('open.registered') }}</h2><p>{{ t('open.remote_registered_copy') }}</p></div>
+    <span class="project-result-actions" aria-label="{{ t('remote_run.server_entry_heading') }}">
+      <a class="secondary-button" href="/remote-runs/new?target_computer_id={{ computer.id | urlencode }}&source_kind=git">{{ t('remote_run.run_public_git') }}</a>
+      <a class="secondary-button" href="/remote-runs/new?target_computer_id={{ computer.id | urlencode }}&source_kind=zip">{{ t('remote_run.run_zip') }}</a>
+    </span>
   </header>
   {% if remote_workspaces %}
   <div class="open-workspace-list">
@@ -271,6 +365,31 @@
   <div class="empty-state quiet-empty"><p>{{ t('ssh.detail.no_workspace') }}</p></div>
   {% endif %}
 </section>
+
+{% if remote_runs %}
+<section class="open-workspace-panel panel remote-run-recent-panel">
+  <header class="open-section-heading">
+    <div><h2>{{ t('remote_run.server_runs_heading') }}</h2><p>{{ t('remote_run.server_runs_copy') }}</p></div>
+  </header>
+  <div class="open-workspace-list">
+    {% for run in remote_runs %}
+    <a class="open-workspace-row"
+       href="/remote-runs/{{ run.id }}"
+       data-remote-run-server-row
+       data-remote-run-recent
+       data-run-state="{{ run.state }}"
+       data-status-url="/api/remote-runs/{{ run.id }}/status">
+      <span class="project-avatar" aria-hidden="true">{{ run.source_label[:1] | upper }}</span>
+      <span>
+        <strong>{{ run.source_label }}</strong>
+        <small>{{ run.state_label }} · {{ run.created_label }}</small>
+      </span>
+      <span class="row-arrow" aria-hidden="true">→</span>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 
 <section class="remote-workspace-card panel open-remote-add">
   <header class="open-section-heading">
@@ -299,8 +418,9 @@
       <header class="path-picker-header">
         <div><span>{{ t('open.current_folder') }}</span><code data-folder-picker-current>{{ remote_picker.current }}</code></div>
         <div class="path-picker-header-actions">
-          {% if remote_picker.parent_url %}<a class="path-picker-control" href="{{ remote_picker.parent_url }}" data-folder-picker-parent data-folder-path="{{ remote_picker.parent }}">↑ {{ t('open.parent_folder') }}</a>{% endif %}
-          <a class="path-picker-control" href="{{ remote_browse_close_url }}" data-folder-picker-close>{{ t('common.close') }}</a>
+          <button class="path-picker-control" type="button" data-new-project data-project-parent="{{ remote_picker.current }}" data-project-parent-display="{{ remote_picker.current }}">＋ {{ t('project.new_here') }}</button>
+          {% if remote_picker.parent_url %}<a class="path-picker-control" href="{{ remote_picker.parent_url }}" data-folder-picker-parent data-folder-path="{{ remote_picker.parent }}">← <span>{{ t('open.parent_folder') }}</span></a>{% endif %}
+          <a class="path-picker-control path-picker-close-control" href="{{ remote_browse_close_url }}" data-folder-picker-close aria-label="{{ t('common.close') }}" title="{{ t('common.close') }}">{{ t('common.close') }}</a>
         </div>
       </header>
       {% if remote_picker.hidden_count %}
@@ -322,9 +442,51 @@
         <span>{{ t('ssh.detail.display_name') }} <small>{{ t('common.optional') }}</small></span>
         <input name="display_name" placeholder="crawler">
       </label>
-      <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('ssh.detail.open_workspace') }}">{% if browse and remote_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('ssh.detail.open_workspace') }}{% endif %}</button>
+      <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('ssh.detail.open_workspace') }}">{% if browse and remote_picker %}{{ t('browse.open_current') }}{% else %}{{ t('ssh.detail.open_workspace') }}{% endif %}</button>
     </div>
   </form>
 </section>
+
+{% if project_existing and not project_created %}
+<form id="open-existing-remote-project" method="post" action="/computers/{{ computer.id }}/workspaces" hidden>
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="path" value="{{ project_existing }}">
+</form>
 {% endif %}
+<dialog id="new-project-dialog" class="project-create-dialog"{% if project_error and not project_created %} data-project-autopen{% endif %}>
+  <form method="post" action="/computers/{{ computer.id }}/projects" class="project-create-form" data-project-form>
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="parent" value="{{ remote_picker.current if remote_picker else '' }}" data-project-parent-input>
+    <header class="floating-form-heading">
+      <strong>{{ t('project.new') }}</strong>
+      <button type="button" class="floating-form-close" data-project-close aria-label="{{ t('common.close') }}">×</button>
+    </header>
+    <dl class="project-create-facts">
+      <div><dt>{{ t('project.computer') }}</dt><dd>{{ computer.name }}</dd></div>
+      <div><dt>{{ t('project.location') }}</dt><dd><code data-project-parent-label>{{ remote_picker.current if remote_picker else '' }}</code></dd></div>
+    </dl>
+    {% if project_error and not project_created %}
+    <div class="notice error project-dialog-error" role="alert">
+      <strong>{{ project_error }}</strong>
+      {% if project_existing %}<button class="secondary-button" type="submit" form="open-existing-remote-project">{{ t('project.open_existing') }}</button>{% endif %}
+    </div>
+    {% endif %}
+    <label>
+      <span>{{ t('project.folder_name') }}</span>
+      <input name="name" value="{{ project_name }}" required maxlength="255" autocomplete="off" autocapitalize="off" spellcheck="false" data-project-name>
+    </label>
+    <div class="project-final-path">
+      <span>{{ t('project.final_path') }}</span>
+      <code data-project-final-path>{{ remote_picker.current if remote_picker else '' }}</code>
+    </div>
+    <div class="floating-form-actions">
+      <button class="secondary-button" type="button" data-project-close>{{ t('common.cancel') }}</button>
+      <button class="primary-button" type="submit">{{ t('project.create_open') }}</button>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+{% if mode == 'remote' and remote_runs %}<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>{% endif %}
 {% endblock %}

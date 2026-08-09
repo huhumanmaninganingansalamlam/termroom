@@ -116,12 +116,26 @@ termroom .
 ### Files
 
 - Browse and search project folders.
+- Create a new project folder from the Open Workspace browser and open it immediately.
 - Select several files or folders and download them as a ZIP.
 - Upload multiple files with overwrite confirmation.
 - Create files/folders, rename, and delete them.
 - Edit small text files directly in the browser.
 - Preview images/PDFs, JSON/CSV, and bounded portions of large text files.
 - Use the same Files UI for local and SSH projects.
+
+### Remote Run
+
+- Copy a Local/SSH Workspace folder, a public HTTPS Git repository, or one ZIP to a
+  registered SSH server's temporary space.
+- Run one command with that SSH user's installed tools and CPU/GPU/RAM.
+- Keep the command alive in a dedicated remote `tmux` session when the browser disconnects.
+- Open the prepared folder through the normal Workspace Terminal and Files UI; there is no
+  separate log dashboard or file viewer.
+- Keep completed files for 24 hours, with immediate deletion available from the temporary
+  Workspace header.
+- Remote Run does not configure environments, provide a sandbox, schedule jobs, or write
+  changes back to the Source.
 
 ### Recent
 
@@ -145,6 +159,10 @@ Computer
 
 A `Computer` is either this Linux machine or an SSH Linux server you registered.
 
+**Remote Run is a temporary Workspace shell, not a persistent project.** Its Source is copied
+to an SSH server, its Terminal and Files reuse the normal Workspace UI, and its managed folder
+is disposable. It does not appear in Recent Workspaces.
+
 ### Local projects
 
 The simplest path is to run Termroom from the project folder:
@@ -155,6 +173,10 @@ termroom .
 ```
 
 The web UI can also open other allowed folders on this computer as Workspaces.
+
+From the folder browser, choose **New project**, enter one folder name, and Termroom creates
+that directory and opens it through the normal Workspace flow. No project template or
+environment is generated.
 
 Choose **Add location → Browse folders** to start from your home directory and click through
 folders instead of typing an absolute path. Direct path entry remains available when you
@@ -172,7 +194,10 @@ Enter SSH address
 → open the Workspace
 ```
 
-The remote Linux host needs an SSH server and `tmux`.
+The remote folder browser has the same **New project** action. The directory is created via
+SFTP and then opened as an ordinary remote Workspace.
+
+The remote Linux host needs an SSH server, `/bin/bash`, and `tmux`.
 
 ## Common commands
 
@@ -333,6 +358,7 @@ Validation commands:
 uv run --frozen ruff check termroom tests
 uv run --frozen pytest
 node --check termroom/static/app.js
+node --check termroom/static/remote_run.js
 node --check termroom/static/terminal.js
 docker compose config
 ```

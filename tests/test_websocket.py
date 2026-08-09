@@ -69,6 +69,37 @@ def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Pa
         _cleanup(app, workspace)
 
 
+def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(tmp_path: Path) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    marker = "TERMROOM_INPUT_한글"
+    try:
+        with TestClient(app, base_url="http://testserver") as client:
+            login = client.post("/login", data={"password": "correct-password"})
+            assert login.status_code == 200
+            with client.websocket_connect(
+                f"/ws/terminal/{terminal['id']}",
+                headers={"origin": "http://testserver"},
+            ) as websocket:
+                websocket.send_json(
+                    {
+                        "kind": "input",
+                        "data": f"printf '%s\\n' '{marker}'\r",
+                    }
+                )
+
+                deadline = time.monotonic() + 3
+                scrollback = ""
+                while time.monotonic() < deadline:
+                    scrollback = app.state.terminals.capture_scrollback(workspace, terminal)
+                    if marker in scrollback:
+                        break
+                    time.sleep(0.05)
+
+                assert marker in scrollback
+    finally:
+        _cleanup(app, workspace)
+
+
 def test_terminal_websocket_closes_when_signed_session_expires(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

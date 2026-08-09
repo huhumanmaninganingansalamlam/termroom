@@ -42,17 +42,19 @@
             <button id="terminal-font-reset" class="terminal-font-reset" type="button">{{ t('terminal.font_reset') }}</button>
           </div>
         </section>
-        <label>
-          <span>{{ t('terminal.name') }}</span>
-          <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}">
-        </label>
-        <button type="submit" name="action" value="rename">{{ t('terminal.rename') }}</button>
-        <button type="submit"
-                name="action"
-                value="delete"
-                class="danger-button"
-                formnovalidate
-                data-confirm="{{ t('terminal.close_confirm') }}">{{ t('terminal.close') }}</button>
+        {% if not (remote_run and terminal.name == 'run') %}
+          <label>
+            <span>{{ t('terminal.name') }}</span>
+            <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}">
+          </label>
+          <button type="submit" name="action" value="rename">{{ t('terminal.rename') }}</button>
+          <button type="submit"
+                  name="action"
+                  value="delete"
+                  class="danger-button"
+                  formnovalidate
+                  data-confirm="{{ t('terminal.close_confirm') }}">{{ t('terminal.close') }}</button>
+        {% endif %}
       </form>
     </details>
     <details class="new-terminal-menu" name="terminal-popover">
@@ -87,6 +89,14 @@
     <details class="more-keys" name="terminal-popover">
       <summary class="terminal-keycap terminal-keycap-symbol" aria-label="{{ t('terminal.more_keys') }}">•••</summary>
       <div class="more-keys-panel">
+        <header class="more-keys-heading">
+          <strong>{{ t('terminal.more_keys') }}</strong>
+          <button id="close-more-keys"
+                  class="more-keys-close"
+                  type="button"
+                  data-close-popover
+                  aria-label="{{ t('common.close') }}">×</button>
+        </header>
         <div class="more-key-grid">
           <button type="button" data-terminal-action="arrow-left">←</button>
           <button type="button" data-terminal-action="arrow-right">→</button>
@@ -153,5 +163,5 @@
 {% endblock %}
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=32"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=35"></script>
 {% endblock %}

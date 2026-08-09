@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block body_class %}remote-run-new-page{% endblock %}
+{% block content %}
+<header class="open-page-heading remote-run-heading">
+  <div>
+    <a class="text-back-link" href="{{ return_url }}">← {{ t('common.back') }}</a>
+    <p class="eyebrow">{{ t('remote_run.eyebrow') }}</p>
+    <h1>{{ t('remote_run.new_heading') }}</h1>
+    <p class="page-copy">{{ t('remote_run.new_copy') }}</p>
+  </div>
+</header>
+
+{% if not computers %}
+<section class="panel remote-run-empty">
+  <strong>{{ t('remote_run.no_targets') }}</strong>
+  <p>{{ t('remote_run.no_targets_copy') }}</p>
+  <a class="primary-button" href="/computers/new">{{ t('home.add_ssh') }}</a>
+</section>
+{% else %}
+<form id="remote-run-form"
+      class="panel stack-form remote-run-form"
+      data-create-url="/api/remote-runs"
+      data-upload-prefix="/api/remote-runs"
+      data-csrf="{{ csrf_token }}"
+      data-max-archive-bytes="{{ max_archive_bytes }}">
+  <section class="remote-run-form-section">
+    <h2>{{ t('remote_run.source_heading') }}</h2>
+    {% if source_workspace %}
+    <input type="hidden" name="source_kind" value="workspace">
+    <input type="hidden" name="source_workspace_id" value="{{ source_workspace.id }}">
+    <input type="hidden" name="source_path" value="{{ selected_source_path }}">
+    <div class="open-workspace-list" data-source-panel="workspace">
+      <div class="open-workspace-row">
+        <span class="project-avatar" aria-hidden="true">{{ source_workspace.display_name[:1] | upper }}</span>
+        <span>
+          <strong>{{ source_workspace.display_name }}</strong>
+          <small>{{ source_path_display }}</small>
+        </span>
+        <span class="row-arrow" aria-hidden="true">✓</span>
+      </div>
+    </div>
+    <p class="form-help">
+      {{ t('remote_run.workspace_snapshot_copy') }}
+      <a class="text-action" href="{{ change_source_url }}">{{ t('remote_run.change') }}</a>
+    </p>
+    <details class="remote-run-exclusions">
+      <summary>{{ t('remote_run.exclusions_heading') }}</summary>
+      <p>{{ t('remote_run.exclusions_copy') }}</p>
+    </details>
+    {% else %}
+    <div class="remote-run-source-tabs" role="group" aria-label="{{ t('remote_run.source_heading') }}">
+      <label><input type="radio" name="source_kind" value="workspace" {% if selected_source_kind == 'workspace' %}checked{% endif %}> <span>{{ t('remote_run.source.workspace') }}</span></label>
+      <label><input type="radio" name="source_kind" value="git" {% if selected_source_kind == 'git' %}checked{% endif %}> <span>{{ t('remote_run.source.git') }}</span></label>
+      <label><input type="radio" name="source_kind" value="zip" {% if selected_source_kind == 'zip' %}checked{% endif %}> <span>{{ t('remote_run.source.zip') }}</span></label>
+    </div>
+
+    <div data-source-panel="workspace" {% if selected_source_kind != 'workspace' %}hidden{% endif %}>
+      <label>
+        <span>{{ t('remote_run.workspace_source') }}</span>
+        <select name="source_workspace_id">
+          <option value="">{{ t('remote_run.workspace_placeholder') }}</option>
+          {% for workspace in source_workspaces %}
+          <option value="{{ workspace.id }}">{{ workspace.display_name }} · {{ workspace.connection_label or t('home.this_computer') }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>{{ t('remote_run.source_path') }} <small>{{ t('common.optional') }}</small></span>
+        <input name="source_path" value="." autocapitalize="off" spellcheck="false">
+      </label>
+      <p class="form-help">{{ t('remote_run.workspace_snapshot_copy') }}</p>
+      <details class="remote-run-exclusions">
+        <summary>{{ t('remote_run.exclusions_heading') }}</summary>
+        <p>{{ t('remote_run.exclusions_copy') }}</p>
+      </details>
+    </div>
+
+    <div data-source-panel="git" {% if selected_source_kind != 'git' %}hidden{% endif %}>
+      <label>
+        <span>{{ t('remote_run.git_url') }}</span>
+        <input name="source_url" type="url" inputmode="url" placeholder="https://github.com/owner/repository.git" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <p class="form-help">{{ t('remote_run.git_help') }}</p>
+      <p class="form-help">{{ t('remote_run.git_private_alternative') }}</p>
+    </div>
+
+    <div data-source-panel="zip" {% if selected_source_kind != 'zip' %}hidden{% endif %}>
+      <label class="remote-run-zip-input">
+        <span>{{ t('remote_run.zip_choose') }}</span>
+        <input name="archive" type="file" accept=".zip,application/zip">
+      </label>
+      <p class="form-help">{{ t('remote_run.zip_help') }}</p>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="remote-run-form-section">
+    <label>
+      <span>{{ t('remote_run.target_heading') }}</span>
+      <select name="target_computer_id" required>
+        <option value="">{{ t('remote_run.target_placeholder') }}</option>
+        {% for computer in computers %}
+        <option value="{{ computer.id }}" {% if computer.id == selected_target_id %}selected{% endif %}>{{ computer.name }} · {{ computer.username }}@{{ computer.host }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </section>
+
+  <section class="remote-run-form-section">
+    <label>
+      <span>{{ t('remote_run.command') }} · {{ t('remote_run.command_multiline') }}</span>
+      <textarea name="command" rows="6" required placeholder="{{ t('remote_run.command_placeholder') }}" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+    </label>
+    <p class="form-help">{{ t('remote_run.command_help') }}</p>
+  </section>
+
+  <aside class="remote-run-safety-note">
+    {{ t('remote_run.execution_note') }}
+  </aside>
+  <p id="remote-run-form-error" class="notice error" role="alert" hidden></p>
+  <div id="remote-run-upload-progress" class="remote-run-upload-progress" hidden aria-live="polite">
+    <span>{{ t('remote_run.uploading') }}</span>
+    <progress max="100" value="0"></progress>
+  </div>
+  <div class="remote-run-form-actions">
+    <a class="secondary-button" href="{{ return_url }}">{{ t('common.cancel') }}</a>
+    <button class="primary-button" type="submit">{{ t('remote_run.prepare_and_run') }}</button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>
+{% endblock %}

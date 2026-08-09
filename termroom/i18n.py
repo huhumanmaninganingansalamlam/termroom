@@ -38,6 +38,29 @@ ERROR_MESSAGE_KEYS = {
     "Termroom internal config is not exposed through Files": "error.path.internal_config",
     "Terminal disappeared while renaming": "error.terminal.disappeared",
     "Upload exceeds the configured size limit": "files.error.too_large_generic",
+    "git is not installed on the remote computer": "remote_run.error.git_missing",
+}
+
+ERROR_CODE_KEYS = {
+    "command_required": "remote_run.error.command_required",
+    "git_clone_failed": "remote_run.failed.git_copy",
+    "git_missing": "remote_run.error.git_missing",
+    "git_url_control": "remote_run.error.public_https_git",
+    "git_url_fragment": "remote_run.error.public_https_git",
+    "git_url_host": "remote_run.error.public_https_git",
+    "git_url_invalid": "remote_run.error.public_https_git",
+    "git_url_path": "remote_run.error.public_https_git",
+    "git_url_query": "remote_run.error.public_https_git",
+    "git_url_required": "remote_run.error.public_https_git",
+    "git_url_scheme": "remote_run.error.public_https_git",
+    "git_url_userinfo": "remote_run.error.public_https_git",
+    "git_url_whitespace": "remote_run.error.public_https_git",
+    "source_contains_run_base": "remote_run.error.workspace_required",
+    "source_path": "remote_run.error.workspace_required",
+    "target_required": "remote_run.error.target_required",
+    "workspace_required": "remote_run.error.workspace_required",
+    "zip_extension": "remote_run.error.zip_only",
+    "zip_filename": "remote_run.error.zip_required",
 }
 
 OS_ERROR_MESSAGE_KEYS = {
@@ -89,11 +112,19 @@ def translate(locale: str, key: str, **values: Any) -> str:
         return value
 
 
+def localize_error_code(locale: str, code: Any, **values: Any) -> str | None:
+    key = ERROR_CODE_KEYS.get(str(code or ""))
+    return translate(locale, key, **values) if key else None
+
+
 def localize_exception(locale: str, exc: BaseException) -> str:
     locale_key = getattr(exc, "locale_key", None)
     if locale_key:
         values = getattr(exc, "locale_values", {}) or {}
         return translate(locale, str(locale_key), **values)
+    coded = localize_error_code(locale, getattr(exc, "code", None))
+    if coded:
+        return coded
     key = ERROR_MESSAGE_KEYS.get(str(exc))
     if key:
         return translate(locale, key)

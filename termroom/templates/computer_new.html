@@ -48,7 +48,7 @@
         <summary>{{ t('ssh.add.display_name') }} <span>{{ t('common.optional') }}</span></summary>
         <label class="setup-field">
           <span>{{ t('ssh.add.display_name_label') }}</span>
-          <input name="name" value="{{ values.name or '' }}" placeholder="Home Server">
+          <input name="name" value="{{ values.name or '' }}" placeholder="Home Server" maxlength="80">
         </label>
       </details>
     </section>

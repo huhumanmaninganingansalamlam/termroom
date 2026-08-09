@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import os
@@ -9,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -19,8 +21,9 @@ from starlette.datastructures import UploadFile
 from termroom.app import create_app
 from termroom.config import Settings
 from termroom.db import StateStore
+from termroom.remote_runs import RemoteRunManager
 from termroom.ssh_backend import SSHBackend, SSHBackendError, SSHHostKeyChanged
-from termroom.workspaces import RootManager, WorkspaceManager
+from termroom.workspaces import ProjectPathExists, RootManager, WorkspaceManager
 
 
 def _free_port() -> int:
@@ -33,6 +36,8 @@ def _free_port() -> int:
 def _test_sshd(tmp_path: Path) -> Iterator[dict[str, object]]:
     qa = tmp_path / "sshd"
     qa.mkdir()
+    remote_tmux_root = qa / "tmux"
+    remote_tmux_root.mkdir(mode=0o700)
     host_key = qa / "host_key"
     client_key = qa / "client_key"
     authorized_keys = qa / "authorized_keys"
@@ -64,6 +69,7 @@ def _test_sshd(tmp_path: Path) -> Iterator[dict[str, object]]:
                 "UsePAM no",
                 "PermitRootLogin no",
                 f"AllowUsers {username}",
+                f"SetEnv TMUX_TMPDIR={remote_tmux_root}",
                 "LogLevel ERROR",
                 "Subsystem sftp internal-sftp",
                 "",
@@ -445,6 +451,9 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
         manager = WorkspaceManager(RootManager(local_root), store)
         workspace = manager.open_remote(computer["id"], canonical, "remote-qa")
         terminal = backend.ensure_workspace(workspace)[0]
+        remote_home = backend.home_directory(computer)
+        server_workspace = manager.open_server_terminal(computer["id"], remote_home)
+        server_terminal = backend.ensure_workspace(server_workspace)[0]
 
         try:
             terminal = backend.rename_terminal(workspace, terminal, "worker one")
@@ -604,9 +613,34 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 terminal_page = await client.get(f"/w/{workspace['id']}/terminal")
                 assert terminal_page.status_code == 200
                 assert "Loopback QA" in terminal_page.text
+
+                server_open = await client.post(
+                    f"/computers/{computer['id']}/server-terminal",
+                    data={"_csrf": settings.csrf_token},
+                    follow_redirects=False,
+                )
+                assert server_open.status_code == 303
+                assert server_open.headers["location"] == (
+                    f"/w/{server_workspace['id']}/terminal"
+                )
+                server_page = await client.get(server_open.headers["location"])
+                assert server_page.status_code == 200
+                assert "SSH server terminal" in server_page.text
+                assert remote_home in server_page.text
+                assert server_terminal["id"] in server_page.text
+                assert f'/w/{server_workspace["id"]}/files' not in server_page.text
+
+                picker_page = await client.get(f"/open/{computer['id']}")
+                assert picker_page.status_code == 200
+                assert f'/w/{server_workspace["id"]}' not in picker_page.text
         finally:
             with contextlib.suppress(Exception):
                 backend._exec(computer, f"tmux kill-session -t {workspace['tmux_session']}")
+            with contextlib.suppress(Exception):
+                backend._exec(
+                    computer,
+                    f"tmux kill-session -t {server_workspace['tmux_session']}",
+                )
 
 
 def test_ssh_backend_rejects_changed_host_key(tmp_path: Path) -> None:
@@ -634,6 +668,157 @@ def test_ssh_backend_rejects_changed_host_key(tmp_path: Path) -> None:
 
         with pytest.raises(SSHHostKeyChanged):
             backend.test_connection(computer)
+
+
+@pytest.mark.asyncio
+async def test_ssh_new_project_end_to_end(tmp_path: Path) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    remote_parent = tmp_path / "remote-parent"
+    remote_parent.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    with _test_sshd(tmp_path) as server:
+        store = StateStore(state_dir / "termroom.sqlite3")
+        store.initialize()
+        backend = SSHBackend(store, state_dir)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="GPU QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        backend.remember_host_key(computer)
+
+        canonical = backend.create_project_directory(
+            computer, str(remote_parent), "한글 remote project"
+        )
+        created = Path(canonical)
+        assert created.is_dir()
+        assert created.name == "한글 remote project"
+
+        with pytest.raises(ProjectPathExists) as folder_conflict:
+            backend.create_project_directory(computer, str(remote_parent), created.name)
+        assert folder_conflict.value.is_directory is True
+
+        (remote_parent / "taken.txt").write_text("file", encoding="utf-8")
+        with pytest.raises(ProjectPathExists) as file_conflict:
+            backend.create_project_directory(computer, str(remote_parent), "taken.txt")
+        assert file_conflict.value.is_directory is False
+
+        workspaces = WorkspaceManager(RootManager(local_root), store)
+        workspace = workspaces.open_remote(str(computer["id"]), canonical)
+        terminals = backend.ensure_workspace(workspace)
+        assert terminals
+        try:
+            assert backend.session_exists(workspace)
+        finally:
+            with contextlib.suppress(Exception):
+                backend._exec(
+                    computer,
+                    f"tmux kill-session -t {workspace['tmux_session']}",
+                )
+
+
+@pytest.mark.asyncio
+async def test_remote_run_end_to_end_uses_real_ssh_sftp_tmux_and_workspace(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    source_project = local_root / "source-project"
+    source_project.mkdir(parents=True)
+    (source_project / "input.txt").write_text("source-data\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    remote_run_base = tmp_path / "remote-runs"
+
+    with _test_sshd(tmp_path) as server:
+        store = StateStore(state_dir / "termroom.sqlite3")
+        store.initialize()
+        backend = SSHBackend(store, state_dir)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Remote Run QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        store.update_computer_run_base(str(computer["id"]), str(remote_run_base))
+        computer = store.get_computer(str(computer["id"]))
+        assert computer is not None
+        backend.remember_host_key(computer)
+
+        workspaces = WorkspaceManager(RootManager(local_root), store)
+        source = workspaces.open("source-project")
+        manager = RemoteRunManager(
+            store,
+            workspaces,
+            backend,
+            state_dir=state_dir,
+            max_archive_bytes=64 * 1024 * 1024,
+        )
+        run_id = str(uuid.uuid4())
+        run, created = await manager.create(
+            {
+                "id": run_id,
+                "source_kind": "workspace",
+                "source_workspace_id": str(source["id"]),
+                "source_path": ".",
+                "target_computer_id": str(computer["id"]),
+                "command": (
+                    "test \"$(cat input.txt)\" = source-data\n"
+                    "false\n"
+                    "printf 'continued-after-false\\n' > result.txt"
+                ),
+            }
+        )
+        assert created is True
+        assert run["state"] == "preparing"
+
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                run = await asyncio.to_thread(manager.poll, run_id, offset=0)
+                if run["state"] in {"finished", "stopped", "failed", "lost"}:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                pytest.fail("Remote Run did not finish through the real SSH/tmux path")
+
+            assert run["state"] == "finished"
+            assert run["exit_code"] == 0
+            assert run["workspace_id"]
+            workspace = workspaces.require(str(run["workspace_id"]))
+            assert workspace["is_remote_run"] is True
+            assert backend.read_text(workspace, "result.txt", 1024).content == (
+                "continued-after-false\n"
+            )
+            assert [row["id"] for row in store.list_recent_workspaces()] == [source["id"]]
+
+            deleted = manager.request_delete(run_id)
+            assert deleted["deleted"] is True
+            assert store.get_remote_run(run_id) is None
+            assert not remote_run_base.joinpath(run_id).exists()
+        finally:
+            with contextlib.suppress(Exception):
+                manager.kill(run_id)
+            with contextlib.suppress(Exception):
+                terminal_run = store.get_remote_run(run_id)
+                if terminal_run and terminal_run.get("workspace_id"):
+                    store.delete_remote_run_workspace(run_id)
+            await manager.shutdown()
 
 
 def test_ssh_backend_rejects_overly_permissive_private_key(tmp_path: Path) -> None:

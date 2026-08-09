@@ -44,18 +44,27 @@ from termroom.i18n import (
     LOCALE_COOKIE,
     SUPPORTED_LOCALES,
     locale_from_request,
+    localize_error_code,
     localize_exception,
     normalize_locale,
     template_context,
     translate,
 )
 from termroom.pwa_icon import termroom_png_icon
+from termroom.remote_runs import RemoteRunConflict, RemoteRunError, RemoteRunManager
+from termroom.run_sources import normalize_source_relative_path
 from termroom.runtime import runtime_stamp
 from termroom.security import PathBoundaryError, is_within, resolve_inside, secure_compare
 from termroom.ssh_backend import SSHBackend, SSHBackendError
 from termroom.terminal_control import TerminalControl
 from termroom.terminals import TerminalError, TerminalManager
-from termroom.workspaces import RootManager, WorkspaceManager
+from termroom.workspaces import (
+    ProjectCreatedButWorkspaceFailed,
+    ProjectNameError,
+    ProjectPathExists,
+    RootManager,
+    WorkspaceManager,
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 FILE_BROWSER_PAGE_SIZE = 200
@@ -81,6 +90,13 @@ def create_app(settings: Settings) -> FastAPI:
     terminal_control = TerminalControl()
     terminals = TerminalManager(store, terminal_control)
     ssh = SSHBackend(store, settings.state_dir, terminal_control)
+    remote_runs = RemoteRunManager(
+        store,
+        workspaces,
+        ssh,
+        state_dir=settings.state_dir,
+        max_archive_bytes=settings.max_upload_bytes,
+    )
     auth = AuthManager(settings)
     active_websockets: dict[str, list[WebSocket]] = {}
     active_terminal_websockets: dict[str, list[WebSocket]] = {}
@@ -96,9 +112,12 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.terminals = terminals
     app.state.terminal_control = terminal_control
     app.state.ssh = ssh
+    app.state.remote_runs = remote_runs
     app.state.auth = auth
     app.state.runtime_stamp = runtime_stamp()
     app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
+    app.router.add_event_handler("startup", remote_runs.startup)
+    app.router.add_event_handler("shutdown", remote_runs.shutdown)
 
     @app.middleware("http")
     async def reject_mixed_runtime(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -107,18 +126,45 @@ def create_app(settings: Settings) -> FastAPI:
             and not request.url.path.startswith(("/static/", "/icons/"))
             and runtime_stamp() != app.state.runtime_stamp
         ):
+            headers = {"X-Termroom-Restart-Required": "1"}
+            if request.url.path.startswith("/api/") or "application/json" in request.headers.get(
+                "accept", ""
+            ):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "restart_required",
+                        "error": translate(
+                            locale_from_request(request), "app.restart_required"
+                        ),
+                    },
+                    status_code=503,
+                    headers=headers,
+                )
             return HTMLResponse(
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>Termroom update</title></head><body>"
-                "<main style='max-width:680px;margin:12vh auto;padding:24px;"
-                "font-family:system-ui,sans-serif;line-height:1.6'>"
+                "<meta name='color-scheme' content='dark light'>"
+                "<script>(()=>{let t;try{t=localStorage.getItem('termroom.theme')}catch{};"
+                "if(t!=='dark'&&t!=='light')t=matchMedia('(prefers-color-scheme:light)').matches?"
+                "'light':'dark';document.documentElement.dataset.theme=t})()</script>"
+                "<style>:root{color-scheme:dark;--bg:#212830;--surface:#2a313c;"
+                "--border:#3d444d;--text:#e1e6ed;--muted:#b7bec8;--accent:#adbbff}"
+                ":root[data-theme=light]{color-scheme:light;--bg:#d9d6ce;"
+                "--surface:#ece9e1;--border:#afa99f;--text:#302f2c;"
+                "--muted:#514f4a;--accent:#4a5880}*{box-sizing:border-box}"
+                "body{margin:0;background:var(--bg);color:var(--text);"
+                "font-family:Inter,ui-sans-serif,system-ui,sans-serif;line-height:1.6}"
+                "main{max-width:680px;margin:12vh auto;padding:28px;border:1px solid var(--border);"
+                "border-radius:10px;background:var(--surface)}h1{margin:0 0 12px;font-size:1.65rem}"
+                "p{margin:0;color:var(--muted)}code{color:var(--accent)}</style>"
+                "<title>Termroom update</title></head><body><main>"
                 "<h1>Termroom was updated</h1>"
                 "<p>The running Core is using older code. Run <code>termroom .</code> "
                 "once in a terminal to restart the Core, then refresh this page.</p>"
                 "</main></body></html>",
                 status_code=503,
-                headers={"X-Termroom-Restart-Required": "1"},
+                headers=headers,
             )
         return await call_next(request)
 
@@ -550,7 +596,9 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def home(request: Request) -> HTMLResponse:
         locale = locale_from_request(request)
+        remote_runs.schedule_cleanup()
         recent = workspaces.list_recent()
+        recent_runs = remote_runs.list_recent(limit=6)
         active_sessions = terminals.existing_sessions()
         for workspace in recent:
             workspace.update(
@@ -564,6 +612,14 @@ def create_app(settings: Settings) -> FastAPI:
             workspace["last_opened_label"] = _relative_time(
                 workspace["last_opened_at"], locale
             )
+        for run in recent_runs:
+            target = run.get("target") or {}
+            run["target_label"] = str(target.get("name") or "")
+            run["created_label"] = _relative_time(str(run["created_at"]), locale)
+            run["state_label"] = translate(
+                locale,
+                f"remote_run.state.{run['state']}",
+            )
         return templates.TemplateResponse(
             request=request,
             name="home.html",
@@ -571,8 +627,312 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 title="Termroom",
                 recent=recent,
+                recent_runs=recent_runs,
             ),
         )
+
+    @app.get("/remote-runs/new", response_class=HTMLResponse)
+    async def remote_run_new_page(
+        request: Request,
+        source_kind: str = "workspace",
+        source_workspace_id: str | None = None,
+        source_path: str = ".",
+        target_computer_id: str | None = None,
+    ) -> HTMLResponse:
+        remote_runs.schedule_cleanup()
+        computers = store.list_computers()
+        source_workspaces = workspaces.list_all()
+        source_workspace_by_id = {
+            str(workspace["id"]): workspace for workspace in source_workspaces
+        }
+        source_workspace = source_workspace_by_id.get(source_workspace_id or "")
+        normalized_source_path = "."
+        if source_workspace is not None:
+            with contextlib.suppress(ValueError):
+                normalized_source_path = normalize_source_relative_path(
+                    source_path or ".",
+                    allow_root=True,
+                )
+        selected_source_kind = (
+            "workspace"
+            if source_workspace is not None
+            else source_kind
+            if source_kind in {"workspace", "git", "zip"}
+            else "workspace"
+        )
+        computer_ids = {str(computer["id"]) for computer in computers}
+        selected_target_id = target_computer_id if target_computer_id in computer_ids else ""
+        source_path_display = ""
+        if source_workspace is not None:
+            source_path_display = str(source_workspace["canonical_path"])
+            if normalized_source_path != ".":
+                source_path_display = f"{source_path_display.rstrip('/')}/{normalized_source_path}"
+        change_source_url = _url_with_query(
+            "/remote-runs/new",
+            target_computer_id=selected_target_id or None,
+        )
+        return_url = "/open"
+        if selected_target_id:
+            return_url = f"/open/{selected_target_id}"
+        if source_workspace is not None:
+            return_url = _url_with_query(
+                f"/w/{source_workspace['id']}/files",
+                path=normalized_source_path,
+            )
+        return templates.TemplateResponse(
+            request=request,
+            name="remote_run_new.html",
+            context=_context(
+                settings,
+                title=translate(locale_from_request(request), "remote_run.new_heading"),
+                computers=computers,
+                source_workspaces=source_workspaces,
+                source_workspace=source_workspace,
+                selected_source_kind=selected_source_kind,
+                selected_source_path=normalized_source_path,
+                source_path_display=source_path_display,
+                selected_target_id=selected_target_id,
+                change_source_url=change_source_url,
+                return_url=return_url,
+                max_archive_bytes=settings.max_upload_bytes,
+            ),
+        )
+
+    @app.post("/api/remote-runs", response_class=JSONResponse)
+    async def create_remote_run(request: Request) -> JSONResponse:
+        locale = locale_from_request(request)
+        _verified_csrf_header(request, settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Remote Run request must be an object")
+            run, created = await remote_runs.create(payload)
+        except (
+            KeyError,
+            OSError,
+            ValueError,
+            RemoteRunError,
+            SSHBackendError,
+            json.JSONDecodeError,
+        ) as exc:
+            return JSONResponse(
+                {"ok": False, "error": _localized_remote_run_exception(locale, exc)},
+                status_code=409 if isinstance(exc, RemoteRunConflict) else 400,
+            )
+        run_id = str(run["id"])
+        return JSONResponse(
+            {
+                "ok": True,
+                "created": created,
+                "run_id": run_id,
+                "detail_url": f"/remote-runs/{run_id}",
+                "archive_url": f"/api/remote-runs/{run_id}/archive"
+                if run["source_kind"] == "zip"
+                else None,
+            },
+            status_code=202 if created else 200,
+        )
+
+    @app.post(
+        "/api/remote-runs/{run_id}/archive",
+        response_class=JSONResponse,
+    )
+    async def upload_remote_run_archive(
+        request: Request,
+        run_id: str,
+        filename: str = "",
+    ) -> JSONResponse:
+        locale = locale_from_request(request)
+        _verified_csrf_header(request, settings)
+        try:
+            header = request.headers.get("content-length")
+            content_length = int(header) if header else None
+            if content_length is not None and content_length < 0:
+                raise ValueError("Invalid upload length")
+            run = await remote_runs.upload_archive(
+                run_id,
+                filename,
+                request.stream(),
+                content_length=content_length,
+            )
+        except (
+            KeyError,
+            OSError,
+            ValueError,
+            RemoteRunError,
+            SSHBackendError,
+        ) as exc:
+            return JSONResponse(
+                {"ok": False, "error": _localized_remote_run_exception(locale, exc)},
+                status_code=409
+                if isinstance(exc, RemoteRunConflict)
+                else _upload_error_status(exc),
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "run_id": str(run["id"]),
+                "detail_url": f"/remote-runs/{run['id']}",
+            },
+            status_code=202,
+        )
+
+    @app.get("/remote-runs/{run_id}", response_class=HTMLResponse)
+    async def remote_run_page(
+        request: Request,
+        run_id: str,
+        error: str | None = None,
+    ) -> Response:
+        locale = locale_from_request(request)
+        try:
+            run = await asyncio.to_thread(remote_runs.get, run_id)
+            if run["state"] in {"preparing", "running"}:
+                with contextlib.suppress(OSError, RemoteRunError, SSHBackendError):
+                    run = await asyncio.to_thread(
+                        remote_runs.poll,
+                        run_id,
+                        offset=0,
+                        limit=1,
+                    )
+            if (
+                run["state"] in {"finished", "stopped", "lost"}
+                and not run.get("workspace_id")
+            ):
+                with contextlib.suppress(
+                    FileNotFoundError,
+                    OSError,
+                    RemoteRunError,
+                    SSHBackendError,
+                ):
+                    run = await asyncio.to_thread(
+                        remote_runs.ensure_workspace_bridge,
+                        run_id,
+                    )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        workspace_id = str(run.get("workspace_id") or "")
+        if workspace_id:
+            destination = f"/w/{workspace_id}/terminal"
+            if error:
+                destination = _url_with_query(destination, error=error)
+            return RedirectResponse(
+                destination,
+                status_code=303,
+            )
+        target = run.get("target") or {}
+        run["error_detail"] = _localized_remote_run_error_detail(locale, run)
+        return templates.TemplateResponse(
+            request=request,
+            name="remote_run_wait.html",
+            context=_context(
+                settings,
+                title=str(run["source_label"]),
+                run=run,
+                target_label=str(target.get("name") or ""),
+                action_error=error,
+            ),
+        )
+
+    @app.get(
+        "/api/remote-runs/{run_id}/status",
+        response_class=JSONResponse,
+    )
+    async def remote_run_status(request: Request, run_id: str) -> JSONResponse:
+        locale = locale_from_request(request)
+        try:
+            run = await asyncio.to_thread(remote_runs.get, run_id)
+            if run["state"] in {"preparing", "running"}:
+                run = await asyncio.to_thread(
+                    remote_runs.poll,
+                    run_id,
+                    offset=0,
+                    limit=1,
+                )
+            if (
+                run["state"] in {"finished", "stopped", "lost"}
+                and not run.get("workspace_id")
+            ):
+                run = await asyncio.to_thread(
+                    remote_runs.ensure_workspace_bridge,
+                    run_id,
+                )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        except (OSError, RemoteRunError, SSHBackendError) as exc:
+            return JSONResponse(
+                {"ok": False, "error": _localized_remote_run_exception(locale, exc)},
+                status_code=502,
+            )
+        return JSONResponse(
+            {"ok": True, **_remote_run_status_payload(run, locale=locale)}
+        )
+
+    @app.post("/remote-runs/{run_id}/stop")
+    async def stop_remote_run(
+        request: Request, run_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        await _verified_form(request, settings)
+        try:
+            await asyncio.to_thread(remote_runs.stop, run_id)
+        except (KeyError, OSError, ValueError, RemoteRunError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/remote-runs/{run_id}",
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/remote-runs/{run_id}", status_code=303)
+
+    @app.post("/remote-runs/{run_id}/kill")
+    async def kill_remote_run(
+        request: Request, run_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        await _verified_form(request, settings)
+        try:
+            await asyncio.to_thread(remote_runs.kill, run_id)
+        except (KeyError, OSError, ValueError, RemoteRunError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/remote-runs/{run_id}",
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/remote-runs/{run_id}", status_code=303)
+
+    @app.post("/remote-runs/{run_id}/delete")
+    async def delete_remote_run(
+        request: Request, run_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        await _verified_form(request, settings)
+        try:
+            result = await asyncio.to_thread(remote_runs.request_delete, run_id)
+        except (KeyError, OSError, ValueError, RemoteRunError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/remote-runs/{run_id}",
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        if not result.get("deleted"):
+            target = result.get("target") or {}
+            return RedirectResponse(
+                _url_with_query(
+                    f"/remote-runs/{run_id}",
+                    error=translate(
+                        locale,
+                        "remote_run.cleanup_pending_copy",
+                        computer=str(target.get("name") or "SSH"),
+                    ),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse("/", status_code=303)
 
     @app.get("/open", response_class=HTMLResponse)
     async def workspace_open_hub(
@@ -613,6 +973,11 @@ def create_app(settings: Settings) -> FastAPI:
         location_path: str | None = None,
         location_hidden: bool = False,
         error: str | None = None,
+        project_error: str | None = None,
+        project_existing: str | None = None,
+        project_created: str | None = None,
+        project_workspace: str | None = None,
+        project_name: str | None = None,
     ) -> HTMLResponse:
         locale = locale_from_request(request)
         local_roots = store.list_local_roots()
@@ -713,12 +1078,18 @@ def create_app(settings: Settings) -> FastAPI:
                     or str(selected_root["path"])
                 ),
                 path=relative,
+                current_path_display=str(directory),
                 entries=entries,
                 breadcrumbs=_breadcrumbs(relative),
                 show_hidden=hidden,
                 hidden_count=hidden_count,
                 local_workspaces=local_workspaces,
                 error=error,
+                project_error=project_error,
+                project_existing=project_existing,
+                project_created=project_created,
+                project_workspace=project_workspace,
+                project_name=project_name or "",
                 browse_location=browse_location,
                 location_picker=location_picker,
                 location_error=location_error,
@@ -753,6 +1124,122 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=303,
         )
 
+    @app.post("/open/local/projects")
+    async def create_local_project(request: Request):  # type: ignore[no-untyped-def]
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        root_id = str(form.get("root_id", "")).strip()
+        parent = str(form.get("parent", "."))
+        name = str(form.get("name", ""))
+        root_record = store.get_root(root_id)
+        if not root_record or str(root_record["path"]).startswith("ssh://"):
+            raise HTTPException(status_code=404, detail="Local folder location not found")
+        root_manager = RootManager(Path(str(root_record["path"])))
+        try:
+            workspace, created_path = workspaces.create_local_project(
+                str(root_record["path"]), parent, name
+            )
+        except ProjectCreatedButWorkspaceFailed as exc:
+            existing_relative = None
+            with contextlib.suppress(OSError, ValueError):
+                existing_relative = root_manager.relative(Path(exc.path))
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    path=parent,
+                    project_error=translate(
+                        locale,
+                        "project.error.created_not_opened",
+                        error=_localized_exception(locale, exc.cause),
+                    ),
+                    project_created=exc.path,
+                    project_existing=existing_relative,
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except ProjectPathExists as exc:
+            existing_relative = None
+            if exc.is_directory:
+                with contextlib.suppress(OSError, ValueError):
+                    existing_relative = root_manager.relative(Path(exc.path))
+            message = translate(
+                locale,
+                "project.error.folder_exists" if exc.is_directory else "project.error.file_exists",
+                path=exc.path,
+            )
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    path=parent,
+                    project_error=message,
+                    project_existing=existing_relative,
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except ProjectNameError as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    path=parent,
+                    project_error=_localized_exception(locale, exc),
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except PermissionError:
+            target = str(root_manager.resolve(parent) / name)
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    path=parent,
+                    project_error=translate(
+                        locale,
+                        "project.error.permission",
+                        computer=translate(locale, "home.this_computer"),
+                        path=target,
+                    ),
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except (OSError, ValueError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    path=parent,
+                    project_error=_localized_exception(locale, exc),
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        try:
+            await asyncio.to_thread(terminals.ensure_workspace, workspace)
+        except (OSError, TerminalError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    path=parent,
+                    project_error=translate(
+                        locale,
+                        "project.error.created_not_opened",
+                        error=_localized_exception(locale, exc),
+                    ),
+                    project_created=str(created_path),
+                    project_workspace=workspace["id"],
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/w/{workspace['id']}/terminal", status_code=303)
+
     @app.get("/api/local/browse-directories", response_class=JSONResponse)
     async def browse_local_directories(
         request: Request,
@@ -778,7 +1265,13 @@ def create_app(settings: Settings) -> FastAPI:
         browse_hidden: bool = False,
         error: str | None = None,
         connected: bool = False,
+        project_error: str | None = None,
+        project_existing: str | None = None,
+        project_created: str | None = None,
+        project_workspace: str | None = None,
+        project_name: str | None = None,
     ) -> HTMLResponse:
+        locale = locale_from_request(request)
         computer = _require_computer(store, computer_id)
         remote_workspaces = []
         for item in store.list_workspaces_for_computer(computer_id):
@@ -786,6 +1279,13 @@ def create_app(settings: Settings) -> FastAPI:
                 remote_workspaces.append(workspaces.require(str(item["id"])))
             except (KeyError, OSError):
                 continue
+        computer_runs = store.list_remote_runs_for_computer(computer_id)
+        for run in computer_runs:
+            run["created_label"] = _relative_time(str(run["created_at"]), locale)
+            run["state_label"] = translate(
+                locale,
+                f"remote_run.state.{run['state']}",
+            )
         remote_picker = None
         browse_error = None
         remote_browse_close_url = f"/open/{computer_id}"
@@ -823,7 +1323,7 @@ def create_app(settings: Settings) -> FastAPI:
                     browse_hidden=None if browse_hidden else 1,
                 )
             except (OSError, ValueError, SSHBackendError) as exc:
-                browse_error = _localized_exception(locale_from_request(request), exc)
+                browse_error = _localized_exception(locale, exc)
         return templates.TemplateResponse(
             request=request,
             name="workspace_open.html",
@@ -833,9 +1333,16 @@ def create_app(settings: Settings) -> FastAPI:
                 mode="remote",
                 computer=computer,
                 remote_workspaces=remote_workspaces,
+                remote_runs=computer_runs,
                 error=error,
+                project_error=project_error,
+                project_existing=project_existing,
+                project_created=project_created,
+                project_workspace=project_workspace,
+                project_name=project_name or "",
                 connected=connected,
                 browse=browse,
+                browse_path=browse_path,
                 remote_picker=remote_picker,
                 browse_error=browse_error,
                 remote_browse_close_url=remote_browse_close_url,
@@ -868,6 +1375,121 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=400,
             )
         return JSONResponse({"ok": True, **picker})
+
+    @app.post("/computers/{computer_id}/projects")
+    async def create_remote_project(
+        request: Request, computer_id: str
+    ):  # type: ignore[no-untyped-def]
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        computer = _require_computer(store, computer_id)
+        parent = str(form.get("parent", "")).strip()
+        name = str(form.get("name", ""))
+        target_hint = f"{parent.rstrip('/')}/{name}" if parent else name
+        try:
+            canonical = await asyncio.to_thread(
+                ssh.create_project_directory, computer, parent, name
+            )
+        except ProjectPathExists as exc:
+            message = translate(
+                locale,
+                "project.error.folder_exists" if exc.is_directory else "project.error.file_exists",
+                path=exc.path,
+            )
+            return RedirectResponse(
+                _url_with_query(
+                    f"/open/{computer_id}",
+                    browse=1,
+                    browse_path=parent,
+                    project_error=message,
+                    project_existing=exc.path if exc.is_directory else None,
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except ProjectNameError as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/open/{computer_id}",
+                    browse=1,
+                    browse_path=parent,
+                    project_error=_localized_exception(locale, exc),
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except PermissionError:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/open/{computer_id}",
+                    browse=1,
+                    browse_path=parent,
+                    project_error=translate(
+                        locale,
+                        "project.error.permission",
+                        computer=computer["name"],
+                        path=target_hint,
+                    ),
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        except (OSError, ValueError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/open/{computer_id}",
+                    browse=1,
+                    browse_path=parent or None,
+                    project_error=translate(
+                        locale,
+                        "project.error.remote_create",
+                        computer=computer["name"],
+                        error=_localized_exception(locale, exc),
+                    ),
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+
+        try:
+            workspace = workspaces.open_remote(computer_id, canonical)
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/open/{computer_id}",
+                    browse=1,
+                    browse_path=parent,
+                    project_error=translate(
+                        locale,
+                        "project.error.created_not_opened",
+                        error=_localized_exception(locale, exc),
+                    ),
+                    project_created=canonical,
+                    project_existing=canonical,
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        try:
+            await asyncio.to_thread(ssh.ensure_workspace, workspace)
+        except (OSError, ValueError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/open/{computer_id}",
+                    browse=1,
+                    browse_path=parent,
+                    project_error=translate(
+                        locale,
+                        "project.error.created_not_opened",
+                        error=_localized_exception(locale, exc),
+                    ),
+                    project_created=canonical,
+                    project_workspace=workspace["id"],
+                    project_name=name,
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/w/{workspace['id']}/terminal", status_code=303)
 
     @app.get("/computers/new", response_class=HTMLResponse)
     async def new_computer_page(request: Request) -> HTMLResponse:
@@ -1022,6 +1644,8 @@ def create_app(settings: Settings) -> FastAPI:
         connected: bool = False,
         checked: bool = False,
         password_updated: bool = False,
+        run_base_updated: bool = False,
+        name_updated: bool = False,
     ) -> HTMLResponse:
         locale = locale_from_request(request)
         computer = _require_computer(store, computer_id)
@@ -1041,9 +1665,62 @@ def create_app(settings: Settings) -> FastAPI:
                 connected=connected,
                 checked=checked,
                 password_updated=password_updated,
+                run_base_updated=run_base_updated,
+                name_updated=name_updated,
                 managed_key_path=str(ssh.managed_key_path),
             ),
         )
+
+    @app.post("/computers/{computer_id}/name")
+    async def update_computer_name(
+        request: Request, computer_id: str
+    ):  # type: ignore[no-untyped-def]
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        _require_computer(store, computer_id)
+        try:
+            store.update_computer_name(computer_id, str(form.get("name", "")))
+        except ValueError:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/computers/{computer_id}",
+                    error=translate(locale, "ssh.detail.name_invalid"),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _url_with_query(f"/computers/{computer_id}", name_updated=1),
+            status_code=303,
+        )
+
+    @app.post("/computers/{computer_id}/server-terminal")
+    async def open_server_terminal(
+        request: Request, computer_id: str
+    ):  # type: ignore[no-untyped-def]
+        locale = locale_from_request(request)
+        await _verified_form(request, settings)
+        computer = _require_computer(store, computer_id)
+        try:
+            home = await asyncio.to_thread(ssh.home_directory, computer)
+            workspace = workspaces.open_server_terminal(computer_id, home)
+            await asyncio.to_thread(ssh.ensure_workspace, workspace)
+        except (OSError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/computers/{computer_id}",
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        except (RuntimeError, ValueError):
+            return RedirectResponse(
+                _url_with_query(
+                    f"/computers/{computer_id}",
+                    error=translate(locale, "server_terminal.open_failed"),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/w/{workspace['id']}/terminal", status_code=303)
 
     @app.post("/computers/{computer_id}/test")
     async def test_computer(request: Request, computer_id: str):  # type: ignore[no-untyped-def]
@@ -1103,13 +1780,62 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=303,
         )
 
+    @app.post("/computers/{computer_id}/run-base")
+    async def update_computer_run_base(
+        request: Request, computer_id: str
+    ):  # type: ignore[no-untyped-def]
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        computer = _require_computer(store, computer_id)
+        requested = str(form.get("run_base_dir", "")).strip()
+        if requested and not requested.startswith("/"):
+            return RedirectResponse(
+                _url_with_query(
+                    f"/computers/{computer_id}",
+                    error=translate(locale, "ssh.detail.run_base_error"),
+                ),
+                status_code=303,
+            )
+        try:
+            preflight = await asyncio.to_thread(
+                ssh.preflight_remote_run_target,
+                computer,
+                run_base_dir=requested or None,
+            )
+            await asyncio.to_thread(
+                store.update_computer_run_base,
+                computer_id,
+                str(preflight["run_base"]) if requested else None,
+            )
+        except (OSError, ValueError, SSHBackendError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/computers/{computer_id}",
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _url_with_query(f"/computers/{computer_id}", run_base_updated=1),
+            status_code=303,
+        )
+
     @app.post("/computers/{computer_id}/delete")
     async def delete_computer(request: Request, computer_id: str):  # type: ignore[no-untyped-def]
         locale = locale_from_request(request)
         await _verified_form(request, settings)
         _require_computer(store, computer_id)
+        if store.list_remote_runs_for_computer(computer_id):
+            return RedirectResponse(
+                _url_with_query(
+                    f"/computers/{computer_id}",
+                    error=translate(locale, "ssh.detail.remove_runs_first"),
+                ),
+                status_code=303,
+            )
         workspace_ids = [
-            str(item["id"]) for item in store.list_workspaces_for_computer(computer_id)
+            str(item["id"])
+            for item in store.list_registered_workspaces_for_computer(computer_id)
         ]
         terminal_ids = [
             str(terminal["id"])
@@ -1120,7 +1846,7 @@ def create_app(settings: Settings) -> FastAPI:
             await asyncio.to_thread(ssh.delete_password, computer_id)
             await asyncio.to_thread(ssh.forget_host_key, computer_id)
             store.remove_computer_registration(computer_id)
-        except (OSError, ValueError, SSHBackendError) as exc:
+        except (OSError, RuntimeError, ValueError, SSHBackendError) as exc:
             return RedirectResponse(
                 _url_with_query(
                     f"/computers/{computer_id}",
@@ -1266,6 +1992,10 @@ def create_app(settings: Settings) -> FastAPI:
         form = await _verified_form(request, settings)
         action = str(form.get("action", "rename"))
         try:
+            if workspace.get("is_remote_run") and str(terminal["name"]) == "run":
+                raise ValueError(
+                    translate(locale, "remote_run.managed_terminal_locked")
+                )
             if action == "rename":
                 name = str(form.get("name", "shell"))
                 if is_remote(workspace):
@@ -2310,6 +3040,29 @@ def _workspace_status(
     }
 
 
+def _remote_run_status_payload(
+    run: Mapping[str, Any], *, locale: str
+) -> dict[str, Any]:
+    workspace_id = str(run.get("workspace_id") or "")
+    return {
+        "id": str(run.get("id", "")),
+        "state": str(run.get("state", "preparing")),
+        "phase": run.get("phase"),
+        "exit_code": run.get("exit_code"),
+        "created_at": run.get("created_at"),
+        "started_at": run.get("started_at"),
+        "stop_requested_at": run.get("stop_requested_at"),
+        "ended_at": run.get("ended_at"),
+        "expires_at": run.get("expires_at"),
+        "error_code": run.get("error_code"),
+        "error_detail": _localized_remote_run_error_detail(locale, run),
+        "connection": run.get("connection", "online"),
+        "cleanup_pending": bool(run.get("cleanup_pending", False)),
+        "workspace_id": workspace_id or None,
+        "workspace_url": f"/w/{workspace_id}/terminal" if workspace_id else None,
+    }
+
+
 def _relative_time_ns(value: int, locale: str) -> str:
     if not value:
         return "—"
@@ -2763,6 +3516,22 @@ def _url_with_query(base_url: str, **values: Any) -> str:
 
 def _localized_exception(locale: str, exc: BaseException) -> str:
     return localize_exception(locale, exc)
+
+
+def _localized_remote_run_exception(locale: str, exc: BaseException) -> str:
+    localized = localize_exception(locale, exc)
+    if localized != str(exc):
+        return localized
+    return translate(locale, "remote_run.error.prepare_failed")
+
+
+def _localized_remote_run_error_detail(
+    locale: str, run: Mapping[str, Any]
+) -> str | None:
+    if not run.get("error_detail"):
+        return None
+    localized = localize_error_code(locale, run.get("error_code"))
+    return localized or translate(locale, "remote_run.error.prepare_failed")
 
 
 def _localized_stored_ssh_error(locale: str, value: Any) -> str | None:

@@ -5,6 +5,12 @@
     <h1>{{ t('files.heading') }}</h1>
   </div>
   <div class="file-heading-actions">
+    {% if not workspace.is_remote_run %}
+    <a class="quiet-action"
+       href="/remote-runs/new?source_workspace_id={{ workspace.id | urlencode }}&source_path={{ path | urlencode }}">
+      {{ t('remote_run.run_elsewhere') }}
+    </a>
+    {% endif %}
     {% if noise_count %}
     <a class="quiet-action file-noise-toggle"
        href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&noise={{ 0 if show_noise else 1 }}{% if query %}&q={{ query | urlencode }}{% endif %}">

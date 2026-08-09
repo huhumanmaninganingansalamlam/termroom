@@ -41,6 +41,41 @@ def test_mobile_terminal_has_visual_viewport_keyboard_focus_mode() -> None:
     assert ".terminal-composer.command-editor-open" in styles
 
 
+def test_terminal_focus_is_not_stolen_by_closed_popovers_or_narrow_desktop_layouts() -> None:
+    app_script = (ROOT / "termroom/static/app.js").read_text(encoding="utf-8")
+    terminal_script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+
+    assert "if (!details.open) return false" in app_script
+    assert "restoreFocus = false" in app_script
+    assert "if (restoreFocus)" in app_script
+    assert "popoverDetails.filter((details) => details.open)" in app_script
+    assert 'window.matchMedia("(pointer: coarse)")' in terminal_script
+    assert "if (!coarsePrimaryPointer.matches) term.focus()" in terminal_script
+    assert "if (!mobileInput.matches) term.focus()" not in terminal_script
+
+    helper = re.search(
+        r"\.terminal-host \.xterm-helper-textarea\s*\{(?P<body>.*?)\}",
+        styles,
+        re.S,
+    )
+    assert helper
+    assert "min-height: 0" in helper.group("body")
+
+
+def test_more_keys_popover_has_an_explicit_close_and_returns_focus_to_terminal() -> None:
+    template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")
+
+    assert 'id="close-more-keys"' in template
+    assert 'class="more-keys-close"' in template
+    assert "data-close-popover" in template
+    assert 'const moreKeys = document.querySelector("details.more-keys")' in script
+    assert 'button.closest(".more-keys-panel")' in script
+    assert "moreKeys.open = false" in script
+    assert 'document.querySelector("#close-more-keys")' in script
+
+
 def test_mobile_terminal_has_short_landscape_and_safe_area_rules() -> None:
     template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
     styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")

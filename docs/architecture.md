@@ -25,7 +25,7 @@ Browser / PWA
  tmux        remote tmux
 ```
 
-SSH hosts require normal SSH and tmux.
+SSH hosts require normal SSH, `/bin/bash`, and tmux.
 
 ## Data model
 
@@ -55,6 +55,33 @@ state.
 For SSH computers, the pre-Workspace picker uses SFTP to browse real remote
 directories starting from the SSH user's home directory. It skips symlinks and
 does not create a Workspace until the user explicitly opens the selected folder.
+
+The same folder browsers may create one new child directory. Project creation is deliberately
+not a new project system: validate one folder name, create the directory, then pass it through
+the existing Workspace registration and tmux preparation path. If later Workspace preparation
+fails, Termroom keeps the created directory rather than rolling back possible user data.
+
+### Remote Run
+
+A Remote Run targets one registered SSH computer. It copies one Workspace folder, public HTTPS
+Git repository, or ZIP into a Termroom-managed remote directory and executes one command there.
+
+```text
+Remote Run
+├─ selected SSH Computer
+├─ Workspace | public HTTPS Git | ZIP Source
+├─ command
+├─ temporary remote work directory
+├─ one remote tmux session
+├─ preparing | running | finished | stopped | failed | lost
+├─ exit code
+└─ one transient Workspace using the existing Terminal and Files UI
+```
+
+There is no local Run target, worker, queue, scheduler, environment builder, or generic job
+engine. The transient Workspace is excluded from Recent Workspaces and is deleted with the Run.
+The browser polls Run status; remote tmux owns execution persistence when the browser or Core is
+gone.
 
 ### Terminal
 
@@ -135,6 +162,33 @@ uses SFTP and refuses unsupported objects.
 Large previews are bounded to prevent the browser from freezing. Remote media can
 serve byte ranges where useful.
 
+Remote Run files reuse the existing SSH Workspace SFTP primitives after the Source has been
+materialized. The remote temporary filesystem is the source of truth.
+
+## Remote Run lifecycle
+
+Remote Runs target registered SSH computers only. A Source is one Local/SSH Workspace folder,
+a public anonymous HTTPS Git URL, or one verified ZIP. Each target stores the Run under
+`$HOME/.cache/termroom/runs/<run-id>/` by default, with `work/` for the copied Source and results
+and a hidden `.termroom/` directory for the marker, command, state, and logs.
+
+The command is written to metadata and executed by a fixed Bash runner. User text is never
+interpolated into a tmux command string. The Run is not a sandbox and uses the registered SSH
+user's permissions. Public Git clone arguments and environment are fixed and isolated; private
+Git authentication is intentionally unsupported.
+
+Once `work/` is committed, the Run is linked one-to-one to a transient SSH Workspace row. Its
+fixed `termroom-run-<uuid>` session exposes the running command and an interactive shell window.
+All Terminal WebSocket, Files, preview, edit, upload, and download routes are the existing `/w/`
+Workspace routes. Transient rows are excluded from Recent Workspaces.
+
+Completed and stopped Runs expire after 24 hours. An uploaded ZIP that never starts is also
+bounded by spool retention. Deletion is
+allowed only when the path is under the managed Runs root and `.termroom/marker` matches the
+Run ID. SSH cleanup follows the same root-and-marker rule. No periodic cleanup worker exists;
+cleanup runs at Core startup and relevant list/browse operations, and users may delete a Run
+immediately.
+
 ## Recent scan
 
 Local scanning is bounded by file count and wall time. Remote scanning uses a
@@ -189,10 +243,8 @@ The navigation model is:
 
 ```text
 Home
-→ Open Workspace
-→ Computer
-→ Workspace
-→ Terminal | Files | Recent
+├─ Open Workspace → Computer → Workspace → Terminal | Files | Recent
+└─ Remote Run → Source → SSH server → temporary Workspace → Terminal | Files | Recent
 ```
 
 Mobile uses a bottom tab bar for the three Workspace sections. Desktop uses a
