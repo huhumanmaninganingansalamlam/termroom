@@ -9,6 +9,8 @@ import pytest
 
 from termroom.app import create_app
 from termroom.config import Settings
+from termroom.i18n import localize_exception
+from termroom.ssh_backend import SSHBackendError
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALES = ROOT / "termroom" / "locales"
@@ -22,6 +24,13 @@ def _locale(name: str) -> dict[str, str]:
 
 def test_korean_and_english_locale_keys_match() -> None:
     assert set(_locale("ko")) == set(_locale("en"))
+
+
+def test_workspace_kind_labels_are_backend_specific() -> None:
+    assert _locale("en")["workspace.kind.local"] == "Local Workspace"
+    assert _locale("en")["workspace.kind.ssh"] == "SSH Workspace"
+    assert _locale("ko")["workspace.kind.local"] == "로컬 작업공간"
+    assert _locale("ko")["workspace.kind.ssh"] == "SSH 작업공간"
 
 
 def test_ui_strings_live_in_locale_files() -> None:
@@ -49,6 +58,13 @@ def test_literal_translation_keys_exist() -> None:
     ):
         used.update(re.findall(r"\btr\(['\"]([^'\"]+)['\"]", path.read_text()))
     assert used - known == set()
+
+
+def test_missing_remote_git_error_is_localized() -> None:
+    error = SSHBackendError("git is not installed on the remote computer")
+
+    assert "Git is not installed" in localize_exception("en", error)
+    assert "Git이 설치되어 있지 않습니다" in localize_exception("ko", error)
 
 
 @pytest.mark.asyncio

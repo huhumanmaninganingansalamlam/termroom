@@ -113,12 +113,23 @@ termroom .
 ### 파일
 
 - 프로젝트 폴더 탐색과 검색
+- Workspace 열기의 폴더 탐색 화면에서 새 프로젝트 폴더를 만들고 바로 열기
 - 여러 파일·폴더를 선택해서 ZIP으로 다운로드
 - 여러 파일 업로드와 덮어쓰기 확인
 - 새 파일/폴더 만들기, 이름 변경, 삭제
 - 작은 텍스트 파일을 브라우저에서 바로 편집
 - 이미지/PDF, JSON/CSV, 큰 텍스트 일부 미리보기
 - 로컬 프로젝트와 SSH 프로젝트에서 같은 파일 UI 사용
+
+### 원격 실행
+
+- Local/SSH Workspace 폴더, 공개 HTTPS Git 저장소 또는 ZIP 하나를 등록한 SSH 서버의
+  임시 공간으로 복사
+- 해당 SSH 사용자의 설치된 도구와 CPU/GPU/RAM으로 명령 하나 실행
+- 브라우저 연결이 끊겨도 원격 전용 `tmux` session에서 실행 유지
+- 준비가 끝나면 별도 로그 화면이 아니라 기존 Workspace Terminal·Files 화면을 그대로 사용
+- 완료 파일은 24시간 보관하고 임시 Workspace 상단에서 즉시 삭제 가능
+- 환경 자동 구성, sandbox, 작업 queue, scheduler, Source로 결과 덮어쓰기는 제공하지 않음
 
 ### 최근 작업
 
@@ -142,6 +153,10 @@ Computer
 
 `Computer`는 이 PC 또는 등록한 SSH Linux 서버입니다.
 
+**원격 실행은 지속 프로젝트가 아닌 임시 Workspace shell입니다.** Source를 SSH 서버로
+복사한 뒤 기존 Terminal·Files UI를 재사용하지만 관리 폴더는 휘발성이며 최근 Workspace
+목록에는 표시되지 않습니다.
+
 ### 로컬 프로젝트
 
 가장 간단한 방법은 프로젝트 폴더에서 실행하는 것입니다.
@@ -153,12 +168,15 @@ termroom .
 
 웹 화면에서도 이 컴퓨터의 다른 허용 폴더를 Workspace로 열 수 있습니다.
 
+폴더 탐색 화면에서 **새 프로젝트**를 누르고 폴더 이름 하나만 입력하면 해당 폴더를 만든
+뒤 기존 Workspace 흐름으로 바로 엽니다. 프로젝트 템플릿이나 개발 환경은 만들지 않습니다.
+
 **위치 추가 → 폴더 찾아보기**를 누르면 홈 폴더부터 하위 폴더를 눌러가며 선택할 수
 있습니다. 경로를 알고 있다면 절대 경로를 직접 입력하는 방식도 그대로 사용할 수 있습니다.
 
 ### SSH 서버
 
-웹 화면에서 **SSH 컴퓨터 추가**를 선택한 뒤:
+웹 화면에서 **SSH 컴퓨터 연결**을 선택한 뒤:
 
 ```text
 SSH 주소 입력
@@ -168,7 +186,10 @@ SSH 주소 입력
 → Workspace 열기
 ```
 
-원격 Linux에는 SSH 서버와 `tmux`가 설치되어 있어야 합니다.
+원격 폴더 탐색 화면에서도 같은 **새 프로젝트** 동작을 사용할 수 있습니다. SFTP로 폴더를
+만든 뒤 일반 SSH Workspace로 엽니다.
+
+원격 Linux에는 SSH 서버, `/bin/bash`, `tmux`가 설치되어 있어야 합니다.
 
 ## 자주 쓰는 명령
 
@@ -326,6 +347,7 @@ uv sync --all-groups
 uv run --frozen ruff check termroom tests
 uv run --frozen pytest
 node --check termroom/static/app.js
+node --check termroom/static/remote_run.js
 node --check termroom/static/terminal.js
 docker compose config
 ```

@@ -1,12 +1,18 @@
 [project]
 name = "termroom"
-version = "0.1.1"
+version = "0.2.0"
 description = "Self-hosted Linux workspace for persistent tmux terminals and files"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Termroom contributors" }]
 license = "MIT"
-license-files = ["LICENSE", "termroom/static/vendor/xterm.LICENSE"]
+license-files = [
+  "LICENSE",
+  "termroom/static/vendor/xterm.LICENSE",
+  "termroom/static/vendor/d2koding-nerd-font.OFL.txt",
+  "termroom/static/vendor/nerd-fonts.LICENSE",
+  "termroom/static/vendor/d2koding-nerd-font.NOTICE.md",
+]
 dependencies = [
   "cryptography>=43,<51",
   "fastapi>=0.115,<1",

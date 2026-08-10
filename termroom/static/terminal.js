@@ -1,4 +1,4 @@
-(() => {
+(async () => {
   const host = document.querySelector("#terminal");
   if (!host || typeof window.Terminal !== "function") return;
   const messages = window.TermroomI18n || {};
@@ -15,6 +15,11 @@
   const DEFAULT_TERMINAL_FONT_SIZE = 14;
   const MIN_TERMINAL_FONT_SIZE = 12;
   const MAX_TERMINAL_FONT_SIZE = 20;
+  const BUNDLED_TERMINAL_FONT_FAMILY = '"Termroom D2Koding Nerd Mono"';
+  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C\uE0B0\uF013\u{F0001}";
+  const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 5000;
+  const BUNDLED_TERMINAL_FONT_DESCRIPTOR =
+    `normal 400 ${DEFAULT_TERMINAL_FONT_SIZE}px ${BUNDLED_TERMINAL_FONT_FAMILY}`;
   const clampTerminalFontSize = (value) =>
     Math.max(
       MIN_TERMINAL_FONT_SIZE,
@@ -29,41 +34,90 @@
   };
   const initialTerminalFontSize = loadTerminalFontSize();
 
+  const terminalTheme = () => {
+    const styles = window.getComputedStyle(document.documentElement);
+    const color = (name, fallback) => styles.getPropertyValue(name).trim() || fallback;
+    const background = color("--terminal-bg", "#151b23");
+    return {
+      background,
+      foreground: color("--terminal-text", "#d1d7e0"),
+      cursor: color("--terminal-cursor", "#adbbff"),
+      cursorAccent: background,
+      selectionBackground: color("--terminal-selection", "#3b4965"),
+      black: color("--terminal-black", "#20262e"),
+      brightBlack: color("--terminal-bright-black", "#7f8996"),
+      red: color("--terminal-red", "#ff8585"),
+      brightRed: color("--terminal-bright-red", "#ffaaaa"),
+      green: color("--terminal-green", "#57d09b"),
+      brightGreen: color("--terminal-bright-green", "#7de2b4"),
+      yellow: color("--terminal-yellow", "#e7bd68"),
+      brightYellow: color("--terminal-bright-yellow", "#f3d38d"),
+      blue: color("--terminal-blue", "#8fa4ff"),
+      brightBlue: color("--terminal-bright-blue", "#adbbff"),
+      magenta: color("--terminal-magenta", "#cba2e8"),
+      brightMagenta: color("--terminal-bright-magenta", "#dfbdf3"),
+      cyan: color("--terminal-cyan", "#71c8d4"),
+      brightCyan: color("--terminal-bright-cyan", "#91dce4"),
+      white: color("--terminal-white", "#d1d7e0"),
+      brightWhite: color("--terminal-bright-white", "#f3f6fa"),
+    };
+  };
+
+  const systemTerminalFontFamily = () => {
+    const configured = window
+      .getComputedStyle(document.documentElement)
+      .getPropertyValue("--font-mono")
+      .trim();
+    return (
+      configured ||
+      'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Cascadia Mono", "Segoe UI Mono", "Noto Sans Mono CJK KR", D2Coding, "Nanum Gothic Coding", "Liberation Mono", monospace'
+    );
+  };
+  const terminalFontFamily = (includeBundledFont) => {
+    const systemFamily = systemTerminalFontFamily();
+    return includeBundledFont
+      ? `${BUNDLED_TERMINAL_FONT_FAMILY}, ${systemFamily}`
+      : systemFamily;
+  };
+
+  const loadBundledTerminalFont = async () => {
+    if (typeof document.fonts?.load !== "function") return false;
+    const loadFace = document.fonts
+      .load(BUNDLED_TERMINAL_FONT_DESCRIPTOR, BUNDLED_TERMINAL_FONT_PROBE)
+      .then((faces) => faces.length > 0)
+      .catch(() => false);
+    let timeoutId;
+    const timeout = new Promise((resolve) => {
+      timeoutId = window.setTimeout(
+        () => resolve(false),
+        BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS,
+      );
+    });
+    const loaded = await Promise.race([loadFace, timeout]);
+    window.clearTimeout(timeoutId);
+    return loaded;
+  };
+
   const status = document.querySelector("#terminal-status");
   const statusLabel = status.querySelector(".terminal-status-label");
+  const bundledTerminalFontLoaded = await loadBundledTerminalFont();
+  host.dataset.terminalFont = bundledTerminalFontLoaded ? "bundled" : "system-fallback";
   const term = new window.Terminal({
     cursorBlink: true,
     cursorStyle: "bar",
-    fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", monospace',
+    fontFamily: terminalFontFamily(bundledTerminalFontLoaded),
     fontSize: initialTerminalFontSize,
     lineHeight: 1.2,
     scrollback: 5000,
     allowProposedApi: false,
-    theme: {
-      background: "#0b0d10",
-      foreground: "#d9dce3",
-      cursor: "#aab8ff",
-      cursorAccent: "#0b0d10",
-      selectionBackground: "#30394f",
-      black: "#191c22",
-      brightBlack: "#737986",
-      red: "#ef7c7c",
-      brightRed: "#ff9494",
-      green: "#65d6a6",
-      brightGreen: "#7de5b9",
-      yellow: "#d9ba68",
-      brightYellow: "#ebcd7d",
-      blue: "#8da2fb",
-      brightBlue: "#aab8ff",
-      magenta: "#c99be8",
-      brightMagenta: "#d9b1f1",
-      cyan: "#69c8d3",
-      brightCyan: "#81dae3",
-      white: "#d9dce3",
-      brightWhite: "#f5f6f8",
-    },
+    theme: terminalTheme(),
   });
   term.open(host);
+  window.addEventListener("themechange", () => {
+    term.options.theme = terminalTheme();
+    term.options.fontFamily = terminalFontFamily(bundledTerminalFontLoaded);
+    term.refresh(0, Math.max(0, term.rows - 1));
+  });
 
   // xterm owns the actual IME/composition lifecycle. Do not mirror the hidden
   // textarea ourselves: composition updates must only reach the PTY after
@@ -94,10 +148,12 @@
   let presenceInitialized = false;
   let otherInputTimer = null;
   const mobileInput = window.matchMedia("(max-width: 1023px)");
+  const coarsePrimaryPointer = window.matchMedia("(pointer: coarse)");
   const composePane = document.querySelector(".terminal-compose-pane");
   const composerRoot = document.querySelector(".terminal-composer");
   const openCommandEditor = document.querySelector("#open-command-editor");
   const closeCommandEditor = document.querySelector("#close-command-editor");
+  const moreKeys = document.querySelector("details.more-keys");
   let composerOpen = false;
   let mobileViewportBaseline = window.visualViewport?.height || window.innerHeight;
   let mobileViewportBaselineWidth = window.visualViewport?.width || window.innerWidth;
@@ -293,7 +349,7 @@
       setStatus(tr("terminal.status.connected"), true);
       claimVisibleTerminal();
       updatePresence();
-      if (!mobileInput.matches) term.focus();
+      if (!coarsePrimaryPointer.matches) term.focus();
     });
     socket.addEventListener("message", (event) => term.write(event.data));
     socket.addEventListener("close", (event) => {
@@ -321,7 +377,6 @@
   });
   terminalTextarea?.addEventListener("focus", updateMobileKeyboardState);
   terminalTextarea?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
-  document.fonts?.ready.then(() => scheduleResize());
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     if (socket?.readyState === WebSocket.CLOSED) {
@@ -363,6 +418,10 @@
 
   let ctrlArmed = false;
   const ctrlButton = document.querySelector("#ctrl-key");
+  const closeMoreKeys = ({ focus = true } = {}) => {
+    if (moreKeys) moreKeys.open = false;
+    if (focus) term.focus();
+  };
   ctrlButton?.addEventListener("click", () => {
     ctrlArmed = !ctrlArmed;
     ctrlButton.setAttribute("aria-pressed", String(ctrlArmed));
@@ -381,12 +440,18 @@
         ctrlButton?.setAttribute("aria-pressed", "false");
       }
       term.input(value, true);
-      term.focus();
+      if (button.closest(".more-keys-panel")) {
+        closeMoreKeys();
+      } else {
+        term.focus();
+      }
     });
   });
 
-  document.querySelector("#focus-terminal")?.addEventListener("click", () => term.focus());
+  document.querySelector("#close-more-keys")?.addEventListener("click", () => closeMoreKeys());
+  document.querySelector("#focus-terminal")?.addEventListener("click", () => closeMoreKeys());
   document.querySelector("#paste-terminal")?.addEventListener("click", async () => {
+    closeMoreKeys({ focus: false });
     if (!window.isSecureContext || !navigator.clipboard?.readText) {
       setStatus(tr("terminal.status.clipboard_insecure"));
       term.focus();
@@ -400,6 +465,7 @@
       term.focus();
     } catch {
       setStatus(tr("terminal.status.clipboard"));
+      term.focus();
     }
   });
 

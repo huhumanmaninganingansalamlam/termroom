@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import subprocess
+import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -46,11 +47,533 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
         assert authenticated.status_code == 200
         assert "Termroom" in authenticated.text
         assert "로컬 전용" in authenticated.text
-        assert "컴퓨터" not in authenticated.text
         assert "작업공간 열기" in authenticated.text
+        assert "SSH 컴퓨터 연결" not in authenticated.text
+        assert "빠른 실행" not in authenticated.text
+        assert "최근 원격 실행" not in authenticated.text
         assert authenticated.headers["cache-control"] == "no-store"
         assert authenticated.headers["x-frame-options"] == "SAMEORIGIN"
         assert authenticated.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_home_lists_remote_runs_without_polling_and_schedules_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU QA",
+        ssh_alias="",
+        host="gpu.example.test",
+        port=22,
+        username="runner",
+        identity_file="",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    run_id = str(uuid.uuid4())
+    app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "git",
+            "source_workspace_id": None,
+            "source_path": None,
+            "source_label": "vision/model",
+            "source_url": "https://example.test/vision/model.git",
+            "source_options_json": '{"policy":1}',
+            "source_revision": None,
+            "source_size": None,
+            "target_computer_id": str(computer["id"]),
+            "command": "python inference.py\necho done",
+            "run_base": "/home/runner/.cache/termroom/runs",
+            "workspace_id": None,
+            "state": "running",
+            "phase": None,
+            "created_at": "2026-08-09T00:00:00+00:00",
+        }
+    )
+    def unexpected_poll(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("the home page must not poll Remote Runs")
+
+    cleanup_calls = 0
+
+    def schedule_cleanup() -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        return True
+
+    monkeypatch.setattr(app.state.remote_runs, "poll", unexpected_poll)
+    monkeypatch.setattr(app.state.remote_runs, "schedule_cleanup", schedule_cleanup)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    assert "최근 원격 실행" in response.text
+    assert "vision/model" in response.text
+    assert "GPU QA" in response.text
+    assert cleanup_calls == 1
+    assert f'href="/remote-runs/{run_id}"' in response.text
+    run_row_start = response.text.index(f'href="/remote-runs/{run_id}"')
+    run_row_end = response.text.index("</a>", run_row_start)
+    assert "python inference.py" not in response.text[run_row_start:run_row_end]
+    assert 'data-run-state="running"' in response.text
+    assert f'data-status-url="/api/remote-runs/{run_id}/status"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    parent = root / "projects"
+    parent.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            "/open/local/projects",
+            data={
+                "_csrf": settings.csrf_token,
+                "root_id": app.state.workspaces.root_record["id"],
+                "parent": "projects",
+                "name": "새 프로젝트",
+            },
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"].endswith("/terminal")
+        assert (parent / "새 프로젝트").is_dir()
+        workspace_id = response.headers["location"].split("/")[2]
+        workspace = app.state.workspaces.require(workspace_id)
+        assert workspace["path"] == parent / "새 프로젝트"
+        assert app.state.store.list_terminals(workspace_id)
+
+        terminal_page = await client.get(response.headers["location"])
+        assert terminal_page.status_code == 200
+        assert '<span class="workspace-mode">이 컴퓨터 · 로컬 작업공간</span>' in terminal_page.text
+        assert "<small>로컬 작업공간</small>" in terminal_page.text
+
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_local_project_route_keeps_created_folder_when_tmux_open_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+
+    def fail_workspace(_workspace):  # type: ignore[no-untyped-def]
+        raise OSError("tmux unavailable")
+
+    monkeypatch.setattr(app.state.terminals, "ensure_workspace", fail_workspace)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        created = await client.post(
+            "/open/local/projects",
+            data={
+                "_csrf": settings.csrf_token,
+                "root_id": app.state.workspaces.root_record["id"],
+                "parent": ".",
+                "name": "keep-after-error",
+            },
+            follow_redirects=False,
+        )
+        assert created.status_code == 303
+        assert (root / "keep-after-error").is_dir()
+
+        notice = await client.get(created.headers["location"])
+        assert notice.status_code == 200
+        assert "폴더는 만들었지만 작업공간을 열지 못했습니다" in notice.text
+        assert str(root / "keep-after-error") in notice.text
+        assert "다시 열기" in notice.text
+
+
+@pytest.mark.asyncio
+async def test_remote_run_zip_api_is_ssh_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU QA",
+        ssh_alias="",
+        host="gpu.example.test",
+        port=22,
+        username="runner",
+        identity_file="",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+
+    monkeypatch.setattr(
+        app.state.ssh,
+        "preflight_remote_run_target",
+        lambda _computer, **_kwargs: {
+            "run_base": "/home/runner/.cache/termroom/runs",
+            "tools": {"bash": "/bin/bash", "tmux": "/usr/bin/tmux"},
+            "available_bytes": 1024 * 1024,
+            "warnings": [],
+        },
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        new_page = await client.get("/remote-runs/new")
+        assert new_page.status_code == 200
+        assert "원격 실행" in new_page.text
+        assert "GPU QA" in new_page.text
+        assert "공개 Git" in new_page.text
+        assert "ZIP" in new_page.text
+
+        run_id = str(uuid.uuid4())
+        created = await client.post(
+            "/api/remote-runs",
+            json={
+                "id": run_id,
+                "source_kind": "zip",
+                "archive_name": "private-source.zip",
+                "target_computer_id": str(computer["id"]),
+                "command": "python inference.py",
+            },
+            headers={"X-Termroom-CSRF": settings.csrf_token},
+        )
+        assert created.status_code == 202
+        payload = created.json()
+        assert payload["detail_url"] == f"/remote-runs/{run_id}"
+        assert payload["archive_url"] == f"/api/remote-runs/{run_id}/archive"
+        stored = app.state.store.get_remote_run(run_id)
+        assert stored is not None
+        assert stored["target_computer_id"] == computer["id"]
+        assert stored["state"] == "preparing"
+        assert stored["phase"] == "waiting_upload"
+
+        legacy = await client.get("/runs/new")
+        assert legacy.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_remote_run_empty_state_connects_an_ssh_server_directly(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings), raise_app_exceptions=False
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        response = await client.get("/remote-runs/new")
+
+    assert response.status_code == 200
+    assert "등록한 SSH 서버가 없습니다" in response.text
+    assert '<a class="primary-button" href="/computers/new">SSH 서버 연결</a>' in response.text
+
+
+@pytest.mark.asyncio
+async def test_remote_run_input_errors_are_localized_in_korean(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU QA",
+        ssh_alias="",
+        host="gpu.example.test",
+        port=22,
+        username="runner",
+        identity_file="",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    target_id = str(computer["id"])
+    cases = (
+        (
+            {
+                "source_kind": "zip",
+                "archive_name": "source.zip",
+                "target_computer_id": "",
+                "command": "printf done",
+            },
+            "실행할 SSH 서버를 선택하세요",
+        ),
+        (
+            {
+                "source_kind": "zip",
+                "archive_name": "source.zip",
+                "target_computer_id": target_id,
+                "command": "",
+            },
+            "실행할 명령을 입력하세요",
+        ),
+        (
+            {
+                "source_kind": "workspace",
+                "source_workspace_id": "",
+                "target_computer_id": target_id,
+                "command": "printf done",
+            },
+            "snapshot으로 보낼 Workspace 폴더를 선택하세요",
+        ),
+        (
+            {
+                "source_kind": "git",
+                "source_url": "git@example.test:private/repo.git",
+                "target_computer_id": target_id,
+                "command": "printf done",
+            },
+            "공개 HTTPS clone URL을 입력하세요",
+        ),
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        for payload, expected in cases:
+            response = await client.post(
+                "/api/remote-runs",
+                json={"id": str(uuid.uuid4()), **payload},
+                headers={"X-Termroom-CSRF": settings.csrf_token},
+            )
+            assert response.status_code == 400
+            message = response.json()["error"]
+            assert expected in message
+            assert "Remote Run" not in message
+            assert "Git repository" not in message
+
+
+@pytest.mark.asyncio
+async def test_remote_run_preparation_error_detail_never_leaks_raw_english(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU QA",
+        ssh_alias="",
+        host="gpu.example.test",
+        port=22,
+        username="runner",
+        identity_file="",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    run_id = str(uuid.uuid4())
+    app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "workspace",
+            "source_workspace_id": None,
+            "source_path": ".",
+            "source_label": "source",
+            "source_url": None,
+            "source_options_json": '{"policy":1}',
+            "source_revision": None,
+            "source_size": None,
+            "target_computer_id": str(computer["id"]),
+            "command": "printf done",
+            "run_base": "/home/runner/.cache/termroom/runs",
+            "workspace_id": None,
+            "state": "failed",
+            "phase": None,
+            "error_code": "prepare_failed",
+            "error_detail": "Remote Run work root is invalid",
+            "created_at": "2026-08-09T00:00:00+00:00",
+        }
+    )
+    assert app.state.store.transition_remote_run(
+        run_id,
+        expected_states={"failed"},
+        error_code="prepare_failed",
+        error_detail="Remote Run work root is invalid",
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        page = await client.get(f"/remote-runs/{run_id}")
+        status = await client.get(f"/api/remote-runs/{run_id}/status")
+
+    expected = "원격 작업공간을 준비하지 못했습니다"
+    assert page.status_code == 200
+    assert expected in page.text
+    assert "Remote Run work root is invalid" not in page.text
+    assert status.status_code == 200
+    assert status.json()["error_detail"] == expected + "."
+
+
+@pytest.mark.asyncio
+async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU QA",
+        ssh_alias="",
+        host="gpu.example.test",
+        port=22,
+        username="runner",
+        identity_file="",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    run_id = str(uuid.uuid4())
+    run_base = "/home/runner/.cache/termroom/runs"
+    run, created = app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "zip",
+            "source_workspace_id": None,
+            "source_path": None,
+            "source_label": "source.zip",
+            "source_url": None,
+            "source_options_json": '{"archive_name":"source.zip","policy":1}',
+            "source_revision": None,
+            "source_size": 10,
+            "target_computer_id": str(computer["id"]),
+            "command": "python main.py",
+            "run_base": run_base,
+            "workspace_id": None,
+            "state": "finished",
+            "phase": None,
+            "created_at": "2026-08-09T00:00:00+00:00",
+        }
+    )
+    assert created is True
+    workspace = app.state.workspaces.open_remote_run(
+        run,
+        f"termroom-run-{run_id}",
+        f"{run_base}/{run_id}/work",
+    )
+    terminal = app.state.store.create_terminal(workspace["id"], "run", "@run")
+    monkeypatch.setattr(
+        app.state.ssh,
+        "ensure_workspace",
+        lambda _workspace: [terminal],
+    )
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        detail = await client.get(f"/remote-runs/{run_id}", follow_redirects=False)
+        assert detail.status_code == 303
+        assert detail.headers["location"] == f"/w/{workspace['id']}/terminal"
+
+        failed_action = await client.get(
+            f"/remote-runs/{run_id}?error=server+offline",
+            follow_redirects=False,
+        )
+        assert failed_action.status_code == 303
+        assert failed_action.headers["location"].startswith(
+            f"/w/{workspace['id']}/terminal?error="
+        )
+
+        terminal_page = await client.get(detail.headers["location"])
+        assert terminal_page.status_code == 200
+        assert (
+            '<span class="workspace-mode">GPU QA · 원격 실행 작업공간</span>'
+            in terminal_page.text
+        )
+        assert "<small>원격 실행 작업공간</small>" in terminal_page.text
+        assert "로컬 전용" not in terminal_page.text
+        assert 'aria-label="컴퓨터 · Termroom"' not in terminal_page.text
+        assert "source.zip" in terminal_page.text
+        assert f"/w/{workspace['id']}/files" in terminal_page.text
+        assert "python main.py" in terminal_page.text
+        assert 'value="rename"' not in terminal_page.text
+        assert 'value="delete"' not in terminal_page.text
+
+        blocked = await client.post(
+            f"/w/{workspace['id']}/terminals/{terminal['id']}",
+            data={
+                "_csrf": settings.csrf_token,
+                "action": "delete",
+            },
+            follow_redirects=False,
+        )
+        assert blocked.status_code == 303
+        assert "error=" in blocked.headers["location"]
+        assert app.state.store.get_terminal(str(terminal["id"])) is not None
+
+    assert workspace["id"] not in {
+        item["id"] for item in app.state.workspaces.list_recent()
+    }
 
 
 @pytest.mark.asyncio
@@ -89,11 +612,24 @@ async def test_running_core_rejects_mixed_runtime_after_package_files_change(
         await _login(client)
         monkeypatch.setattr("termroom.app.runtime_stamp", lambda: "new-runtime")
         response = await client.get("/")
+        api_response = await client.post(
+            "/api/remote-runs",
+            headers={"Accept": "application/json"},
+            json={},
+        )
 
     assert response.status_code == 503
     assert response.headers["x-termroom-restart-required"] == "1"
     assert "termroom ." in response.text
     assert "The running Core is using older code" in response.text
+    assert api_response.status_code == 503
+    assert api_response.headers["x-termroom-restart-required"] == "1"
+    assert api_response.headers["content-type"].startswith("application/json")
+    assert api_response.json() == {
+        "ok": False,
+        "code": "restart_required",
+        "error": "Termroom이 업데이트되었습니다. Core를 다시 시작한 뒤 이 페이지를 새로고침하세요.",
+    }
 
 
 @pytest.mark.asyncio
@@ -378,7 +914,7 @@ async def test_open_workspace_keeps_computer_hub_before_first_ssh_host(tmp_path:
 
     assert response.status_code == 200
     assert "이 컴퓨터" in response.text
-    assert "SSH 컴퓨터 추가" in response.text
+    assert "SSH 서버 연결" in response.text
     assert 'href="/open/local"' in response.text
     assert 'href="/computers/new"' in response.text
 
@@ -472,7 +1008,7 @@ async def test_local_location_picker_can_browse_absolute_directories(tmp_path: P
     assert "visible-location" in {entry["name"] for entry in api_data["entries"]}
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
-    assert "이 폴더 선택" in picker.text
+    assert "현재 폴더 열기" in picker.text
     assert 'class="secondary-button folder-picker-button"' in picker.text
     assert "취소" in picker.text
     assert 'data-close-popover' in picker.text
@@ -547,6 +1083,11 @@ async def test_remote_workspace_picker_renders_browsable_directories(
     assert 'class="secondary-button folder-picker-button"' in picker.text
     assert 'class="remote-workspace-path-section"' in picker.text
     assert 'class="remote-workspace-submit-row"' in picker.text
+    assert 'class="path-picker-control path-picker-close-control"' in picker.text
+    assert "이 위치에 새 프로젝트" in picker.text
+    assert "data-folder-picker-submit" not in picker.text
+    assert "data-folder-picker-default-actions" not in picker.text
+    assert 'class="path-picker-control" type="button" data-new-project' in picker.text
     browse_url = f'/api/computers/{computer["id"]}/browse-directories'
     assert f'data-folder-picker-url="{browse_url}"' in picker.text
     assert "data-folder-picker-open" in picker.text
@@ -554,9 +1095,22 @@ async def test_remote_workspace_picker_renders_browsable_directories(
     assert "/home/dev" in picker.text
     assert "projects" in picker.text
     assert "work" in picker.text
-    assert "이 폴더 선택" in picker.text
+    assert "현재 폴더 열기" in picker.text
     assert "닫기" in picker.text
     assert f'href="/open/{computer["id"]}"' in picker.text
+
+
+def test_remote_workspace_ajax_picker_uses_the_same_header_actions() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "termroom/static/app.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'class="path-picker-control" type="button" data-new-project' in script
+    assert "data-folder-picker-submit" not in script
+    assert 'form.querySelector("[data-folder-picker-default-actions]")' not in script
+    assert 'const submitButton = form.querySelector(\'button[type="submit"]\')' in script
+    assert 'form.classList.contains("remote-workspace-form")' in script
+    assert 'tr("browse.open_current")' in script
 
 
 @pytest.mark.asyncio
@@ -604,6 +1158,124 @@ async def test_remote_workspace_picker_can_close_after_browse_failure(
     assert "SSH connection failed" in response.text
     assert "닫기" in response.text
     assert f'href="/open/{computer["id"]}"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_remote_project_route_creates_workspace_from_one_folder_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU Server",
+        ssh_alias="",
+        host="gpu.example",
+        port=22,
+        username="dev",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    created_path = "/workspace/새 프로젝트"
+
+    def create_project(_computer, parent, name):  # type: ignore[no-untyped-def]
+        assert str(_computer["id"]) == str(computer["id"])
+        assert parent == "/workspace"
+        assert name == "새 프로젝트"
+        return created_path
+
+    def ensure_workspace(workspace):  # type: ignore[no-untyped-def]
+        if not app.state.store.list_terminals(str(workspace["id"])):
+            app.state.store.create_terminal(str(workspace["id"]), "shell", "@1")
+        return app.state.store.list_terminals(str(workspace["id"]))
+
+    monkeypatch.setattr(app.state.ssh, "create_project_directory", create_project)
+    monkeypatch.setattr(app.state.ssh, "ensure_workspace", ensure_workspace)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            f"/computers/{computer['id']}/projects",
+            data={
+                "_csrf": settings.csrf_token,
+                "parent": "/workspace",
+                "name": "새 프로젝트",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"].endswith("/terminal")
+    workspace = app.state.store.find_remote_workspace(str(computer["id"]), created_path)
+    assert workspace is not None
+    assert workspace["display_name"] == "새 프로젝트"
+    assert app.state.store.list_terminals(str(workspace["id"]))
+
+
+@pytest.mark.asyncio
+async def test_remote_project_route_keeps_created_folder_when_workspace_open_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU Server",
+        ssh_alias="",
+        host="gpu.example",
+        port=22,
+        username="dev",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    created_path = "/workspace/keep-me"
+    monkeypatch.setattr(
+        app.state.ssh,
+        "create_project_directory",
+        lambda *_args, **_kwargs: created_path,
+    )
+    monkeypatch.setattr(
+        app.state.workspaces,
+        "open_remote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            f"/computers/{computer['id']}/projects",
+            data={
+                "_csrf": settings.csrf_token,
+                "parent": "/workspace",
+                "name": "keep-me",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert "project_created=%2Fworkspace%2Fkeep-me" in location
+    assert "project_existing=%2Fworkspace%2Fkeep-me" in location
+    assert "project_error=" in location
+    assert "database+unavailable" in location
 
 
 @pytest.mark.asyncio
@@ -1088,6 +1760,14 @@ async def test_remote_terminal_page_stays_available_while_ssh_is_down(
     assert "shell" in response.text
     assert str(terminal["id"]) in response.text
     assert "SSH 연결이 거부되었습니다" in response.text
+    assert (
+        '<span class="workspace-mode">QA server · SSH 작업공간</span>'
+        in response.text
+    )
+    assert "<small>SSH 작업공간</small>" in response.text
+    assert "로컬 전용" not in response.text
+    assert 'aria-label="컴퓨터 · Termroom"' not in response.text
+    assert 'class="status-dot is-active"' not in response.text
 
 
 @pytest.mark.asyncio
@@ -1307,7 +1987,9 @@ async def test_command_history_can_be_cleared_from_workspace(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_remove_ssh_computer_cleans_termroom_registration_only(tmp_path: Path) -> None:
+async def test_remove_ssh_computer_cleans_termroom_registration_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -1359,6 +2041,72 @@ async def test_remove_ssh_computer_cleans_termroom_registration_only(tmp_path: P
     assert app.state.store.get_terminal(str(terminal["id"])) is None
     assert not credential.exists()
     assert f"termroom-{computer['id']} " not in app.state.ssh.known_hosts_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_remove_ssh_computer_keeps_credentials_when_remote_run_exists(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="Busy GPU",
+        ssh_alias="",
+        host="127.0.0.1",
+        port=22,
+        username="qa",
+        identity_file="",
+        auth_kind="password",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    run_id = str(uuid.uuid4())
+    app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "zip",
+            "source_workspace_id": None,
+            "source_path": None,
+            "source_label": "source.zip",
+            "source_url": None,
+            "source_options_json": '{"archive_name":"source.zip","policy":1}',
+            "source_revision": None,
+            "source_size": None,
+            "target_computer_id": str(computer["id"]),
+            "command": "python main.py",
+            "run_base": "/home/qa/.cache/termroom/runs",
+            "workspace_id": None,
+            "state": "preparing",
+            "phase": "waiting_upload",
+            "created_at": "2026-08-09T00:00:00+00:00",
+        }
+    )
+    app.state.ssh.save_password(str(computer["id"]), "keep-this-password")
+    credential = settings.state_dir / "credentials" / str(computer["id"])
+    assert credential.is_file()
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            f"/computers/{computer['id']}/delete",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"].startswith(f"/computers/{computer['id']}?")
+
+    assert app.state.store.get_computer(str(computer["id"])) is not None
+    assert app.state.store.get_remote_run(run_id) is not None
+    assert credential.is_file()
 
 
 @pytest.mark.asyncio

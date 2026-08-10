@@ -9,6 +9,89 @@
   };
   window.TermroomT = tr;
 
+  const THEME_STORAGE_KEY = "termroom.theme";
+  const themeMedia = window.matchMedia?.("(prefers-color-scheme: light)");
+  const readSavedTheme = () => {
+    try {
+      const value = window.localStorage.getItem(THEME_STORAGE_KEY);
+      return value === "dark" || value === "light" ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const systemTheme = () => (themeMedia?.matches ? "light" : "dark");
+  const themeToggleTemplate = document.querySelector("#theme-toggle-template");
+  if (!document.querySelector("[data-theme-toggle]") && themeToggleTemplate) {
+    document
+      .querySelectorAll(".workspace-brand-actions, .workspace-mobile-actions")
+      .forEach((target) => {
+        const toggle = themeToggleTemplate.content.firstElementChild?.cloneNode(true);
+        if (toggle) target.prepend(toggle);
+      });
+  }
+
+  const themeToggles = () => [...document.querySelectorAll("[data-theme-toggle]")];
+  const updateThemeControls = (theme) => {
+    const nextTheme = theme === "dark" ? "light" : "dark";
+    const label = tr(nextTheme === "light" ? "app.theme_use_light" : "app.theme_use_dark");
+    themeToggles().forEach((toggle) => {
+      toggle.setAttribute("aria-label", label);
+      toggle.setAttribute("title", label);
+      toggle.dataset.currentTheme = theme;
+    });
+  };
+  const applyTheme = (theme, { persist = false, emit = true, source = "app" } = {}) => {
+    const nextTheme = theme === "light" ? "light" : "dark";
+    const previousTheme = document.documentElement.dataset.theme;
+    document.documentElement.dataset.theme = nextTheme;
+    document.documentElement.style.colorScheme = nextTheme;
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute("content", nextTheme === "light" ? "#d9d6ce" : "#212830");
+    if (persist) {
+      try {
+        window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+      } catch {
+        // Storage is optional; the live theme still changes immediately.
+      }
+    }
+    updateThemeControls(nextTheme);
+    if (emit && previousTheme !== nextTheme) {
+      window.dispatchEvent(
+        new CustomEvent("themechange", { detail: { theme: nextTheme, source } }),
+      );
+    }
+    return nextTheme;
+  };
+
+  applyTheme(
+    document.documentElement.dataset.theme || readSavedTheme() || systemTheme(),
+    { emit: false },
+  );
+  themeToggles().forEach((toggle) => {
+    toggle.addEventListener("click", () => {
+      const currentTheme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+      applyTheme(currentTheme === "dark" ? "light" : "dark", {
+        persist: true,
+        source: "toggle",
+      });
+    });
+  });
+  themeMedia?.addEventListener("change", () => {
+    if (!readSavedTheme()) applyTheme(systemTheme(), { source: "system" });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key !== THEME_STORAGE_KEY) return;
+    const storedTheme = event.newValue === "dark" || event.newValue === "light"
+      ? event.newValue
+      : null;
+    applyTheme(storedTheme || systemTheme(), { source: "storage" });
+  });
+  window.TermroomTheme = Object.freeze({
+    get: () => document.documentElement.dataset.theme,
+    set: (theme) => applyTheme(theme, { persist: true, source: "api" }),
+  });
+
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
@@ -466,14 +549,18 @@
     );
   };
 
-  const closePopover = (details) => {
-    if (!(details instanceof HTMLDetailsElement)) return;
+  const closePopover = (details, { restoreFocus = false } = {}) => {
+    if (!(details instanceof HTMLDetailsElement)) return false;
+    if (!details.open) return false;
     details.open = false;
     if (details.dataset.popoverClearQuery === "1" && details.dataset.popoverCloseUrl) {
       window.history.replaceState(null, "", details.dataset.popoverCloseUrl);
       details.dataset.popoverClearQuery = "0";
     }
-    details.querySelector("summary")?.focus({ preventScroll: true });
+    if (restoreFocus) {
+      details.querySelector("summary")?.focus({ preventScroll: true });
+    }
+    return true;
   };
 
   locationPopovers.forEach((details) => {
@@ -492,7 +579,7 @@
   document.addEventListener("click", (event) => {
     const closeButton = event.target.closest("[data-close-popover]");
     if (closeButton) {
-      closePopover(closeButton.closest("details"));
+      closePopover(closeButton.closest("details"), { restoreFocus: true });
       return;
     }
 
@@ -506,11 +593,18 @@
       }
       return;
     }
-    popoverDetails.forEach(closePopover);
+    popoverDetails.filter((details) => details.open).forEach(closePopover);
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      popoverDetails.forEach(closePopover);
+      const openPopovers = popoverDetails.filter((details) => details.open);
+      const activePopover = event.target.closest(popoverSelector);
+      const focusPopover = openPopovers.includes(activePopover)
+        ? activePopover
+        : openPopovers.at(-1);
+      openPopovers.forEach((details) =>
+        closePopover(details, { restoreFocus: details === focusPopover }),
+      );
       syncLocationModalState();
       return;
     }
@@ -562,6 +656,7 @@
       <header class="path-picker-header">
         <div><span>${tr("open.current_folder")}</span><code data-folder-picker-current></code></div>
         <div class="path-picker-header-actions">
+          ${form.classList.contains("remote-workspace-form") ? `<button class="path-picker-control" type="button" data-new-project>＋ ${tr("project.new")}</button>` : ""}
           <a class="path-picker-control" href="#" data-folder-picker-parent hidden>↑ ${tr("open.parent_folder")}</a>
           <button class="path-picker-control path-picker-close-control" type="button" data-folder-picker-close>${tr("common.close")}</button>
         </div>
@@ -639,6 +734,10 @@
       const list = panel.querySelector("[data-folder-picker-list]");
       if (current) current.textContent = data.current || "";
       if (input && data.current) input.value = data.current;
+      panel.querySelectorAll("[data-new-project]").forEach((button) => {
+        button.dataset.projectParent = data.current || "";
+        button.dataset.projectParentDisplay = data.current || "";
+      });
       if (parent) {
         parent.hidden = !data.parent;
         parent.dataset.folderPath = data.parent || "";
@@ -667,7 +766,11 @@
       panel.hidden = false;
       panel.removeAttribute("aria-busy");
       errorBox.hidden = true;
-      if (submitButton) submitButton.textContent = tr("open.use_current_folder");
+      if (submitButton) {
+        submitButton.textContent = form.classList.contains("remote-workspace-form")
+          ? tr("browse.open_current")
+          : tr("open.use_current_folder");
+      }
       cleanFolderPickerQuery();
     };
 
@@ -727,6 +830,91 @@
       }
     });
   });
+
+  const projectDialog = document.querySelector("#new-project-dialog");
+  const projectForm = projectDialog?.querySelector("[data-project-form]");
+  const projectName = projectForm?.querySelector("[data-project-name]");
+  const projectParentInput = projectForm?.querySelector("[data-project-parent-input]");
+  const projectParentLabel = projectForm?.querySelector("[data-project-parent-label]");
+  const projectFinalPath = projectForm?.querySelector("[data-project-final-path]");
+  let projectDialogOpener = null;
+
+  const updateProjectFinalPath = () => {
+    if (!projectFinalPath) return;
+    const parent = projectParentLabel?.textContent?.trim() || projectParentInput?.value || "";
+    const name = projectName?.value || "";
+    const separator = parent && parent !== "/" ? "/" : "";
+    projectFinalPath.textContent = `${parent}${separator}${name}` || parent;
+  };
+
+  const openProjectDialog = (opener = null) => {
+    if (!projectDialog || !projectForm) return;
+    projectDialogOpener = opener;
+    if (opener) {
+      const pickerCurrent = opener.closest("[data-folder-picker-panel]")
+        ?.querySelector("[data-folder-picker-current]")?.textContent?.trim();
+      const parent = pickerCurrent || opener.dataset.projectParent || "";
+      const display = pickerCurrent || opener.dataset.projectParentDisplay || parent;
+      if (projectParentInput) projectParentInput.value = parent;
+      if (projectParentLabel) projectParentLabel.textContent = display;
+      if (projectName && opener.dataset.projectName !== undefined) {
+        projectName.value = opener.dataset.projectName;
+      }
+    }
+    updateProjectFinalPath();
+    projectDialog.showModal();
+    window.setTimeout(() => projectName?.focus({ preventScroll: true }), 0);
+  };
+
+  document.addEventListener("click", (event) => {
+    const opener = event.target.closest("[data-new-project]");
+    if (opener && projectDialog && projectForm) {
+      event.preventDefault();
+      openProjectDialog(opener);
+      return;
+    }
+    const closer = event.target.closest("[data-project-close]");
+    if (closer && projectDialog) {
+      event.preventDefault();
+      projectDialog.close();
+    }
+  });
+  projectName?.addEventListener("input", updateProjectFinalPath);
+  projectForm?.addEventListener("submit", (event) => {
+    if (event.submitter?.form !== projectForm) return;
+    projectForm.querySelectorAll("button[type='submit']").forEach((button) => {
+      button.disabled = true;
+    });
+    projectForm.setAttribute("aria-busy", "true");
+  });
+  projectDialog?.addEventListener("click", (event) => {
+    if (event.target === projectDialog) projectDialog.close();
+  });
+  projectDialog?.addEventListener("close", () => {
+    projectDialogOpener?.focus?.({ preventScroll: true });
+    projectDialogOpener = null;
+  });
+  projectDialog?.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab") return;
+    const focusable = [
+      ...projectDialog.querySelectorAll(
+        "a[href], button:not([disabled]), input:not([type='hidden']):not([disabled])",
+      ),
+    ].filter((element) => !element.hidden && element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  if (projectDialog?.hasAttribute("data-project-autopen")) {
+    openProjectDialog();
+  }
 
   const shareButton = document.querySelector("#file-share");
   if (shareButton && navigator.share && navigator.canShare && window.File) {

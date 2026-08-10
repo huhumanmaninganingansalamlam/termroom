@@ -6,8 +6,8 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#08090b",
-  "theme_color": "#08090b",
+  "background_color": "#212830",
+  "theme_color": "#212830",
   "icons": [
     {
       "src": "/icons/termroom-192.png",

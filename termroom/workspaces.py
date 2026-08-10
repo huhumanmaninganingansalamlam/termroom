@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+import sqlite3
+import stat as stat_module
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -12,6 +17,54 @@ from termroom.security import resolve_inside
 class DirectoryEntry:
     name: str
     relative_path: str
+
+
+class ProjectNameError(ValueError):
+    def __init__(self, message: str, *, locale_key: str) -> None:
+        super().__init__(message)
+        self.locale_key = locale_key
+        self.locale_values: dict[str, Any] = {}
+
+
+class ProjectPathExists(FileExistsError):
+    def __init__(self, path: str | Path, *, is_directory: bool) -> None:
+        self.path = str(path)
+        self.is_directory = is_directory
+        super().__init__(self.path)
+
+
+class ProjectCreatedButWorkspaceFailed(RuntimeError):
+    def __init__(self, path: str | Path, cause: BaseException) -> None:
+        self.path = str(path)
+        self.cause = cause
+        super().__init__(str(cause))
+
+
+def validate_project_name(value: str, *, max_bytes: int = 255) -> str:
+    if value != value.strip():
+        raise ProjectNameError(
+            "Project folder name cannot start or end with whitespace",
+            locale_key="project.error.edge_whitespace",
+        )
+    if not value or value in {".", ".."}:
+        raise ProjectNameError(
+            "Project folder name is invalid", locale_key="project.error.invalid_name"
+        )
+    if any(character in value for character in ("/", "\\")):
+        raise ProjectNameError(
+            "Project folder name must be one folder name",
+            locale_key="project.error.single_name",
+        )
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ProjectNameError(
+            "Project folder name cannot contain control characters",
+            locale_key="project.error.invalid_name",
+        )
+    if len(value.encode("utf-8")) > max_bytes:
+        raise ProjectNameError(
+            "Project folder name is too long", locale_key="project.error.name_too_long"
+        )
+    return value
 
 
 class RootManager:
@@ -64,6 +117,37 @@ class WorkspaceManager:
         workspace = self.store.create_workspace(str(root_record["id"]), normalized, display_name)
         return self.require(workspace["id"])
 
+    def create_local_project(
+        self, root_path: str | Path, parent_relative: str, name: str
+    ) -> tuple[dict[str, Any], Path]:
+        root_manager = RootManager(Path(root_path))
+        parent = root_manager.resolve(parent_relative)
+        if not parent.is_dir():
+            raise NotADirectoryError(parent)
+        try:
+            max_bytes = int(os.pathconf(parent, "PC_NAME_MAX"))
+        except (OSError, ValueError):
+            max_bytes = 255
+        safe_name = validate_project_name(name, max_bytes=max_bytes)
+        target = parent / safe_name
+        try:
+            existing = target.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ProjectPathExists(
+                target,
+                is_directory=stat_module.S_ISDIR(existing.st_mode),
+            )
+        target.mkdir(mode=0o755)
+        try:
+            workspace = self.open_local(root_manager.root, root_manager.relative(target))
+        except Exception as exc:
+            # The directory may already contain user data by the time a later
+            # Workspace registration step fails. Never roll it back here.
+            raise ProjectCreatedButWorkspaceFailed(target, exc) from exc
+        return workspace, target
+
     def require(self, workspace_id: str) -> dict[str, Any]:
         workspace = self.store.get_workspace(workspace_id)
         if not workspace:
@@ -87,10 +171,30 @@ class WorkspaceManager:
             workspace["canonical_path"] = str(workspace["path"])
             workspace["backend_kind"] = "local"
             workspace["connection_label"] = ""
+        remote_run = self.store.get_remote_run_for_workspace(workspace_id)
+        workspace_kind = str(workspace.get("workspace_kind") or "workspace")
+        workspace["remote_run"] = remote_run
+        workspace["remote_run_id"] = str(remote_run["id"]) if remote_run else None
+        workspace["is_remote_run"] = remote_run is not None
+        workspace["is_server_terminal"] = workspace_kind == "server_terminal"
+        workspace["transient"] = remote_run is not None or workspace["is_server_terminal"]
+        if workspace["is_server_terminal"]:
+            workspace["display_name"] = str(workspace["computer"]["name"])
         return workspace
 
     def list_recent(self) -> list[dict[str, Any]]:
         workspaces = self.store.list_recent_workspaces()
+        return self._hydrate_persistent_workspaces(workspaces)
+
+    def list_all(self) -> list[dict[str, Any]]:
+        """Return every persistent Workspace as a selectable Source."""
+
+        workspaces = self.store.list_recent_workspaces(limit=None)
+        return self._hydrate_persistent_workspaces(workspaces)
+
+    def _hydrate_persistent_workspaces(
+        self, workspaces: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for workspace in workspaces:
             try:
@@ -124,3 +228,193 @@ class WorkspaceManager:
             canonical_path=normalized,
         )
         return self.require(str(workspace["id"]))
+
+    def open_server_terminal(
+        self, computer_id: str, canonical_home: str
+    ) -> dict[str, Any]:
+        """Create or reuse the hidden SSH-home bridge used by Server Terminal."""
+
+        computer = self.store.get_computer(computer_id)
+        if not computer:
+            raise KeyError(f"Unknown computer: {computer_id}")
+        raw_home = str(canonical_home)
+        normalized_home = PurePosixPath(raw_home).as_posix()
+        if (
+            not raw_home.startswith("/")
+            or normalized_home != raw_home
+            or "\\" in raw_home
+            or any(unicodedata.category(character) == "Cc" for character in raw_home)
+        ):
+            raise ValueError("SSH home directory must be a canonical absolute POSIX path")
+
+        existing = self.store.find_server_terminal_workspace(computer_id)
+        if existing:
+            if str(existing.get("canonical_path") or "") != normalized_home:
+                raise RuntimeError("Stored Server Terminal home directory has changed")
+            self.store.touch_workspace(str(existing["id"]))
+            return self.require(str(existing["id"]))
+
+        virtual_root = self.store.ensure_root_value(f"ssh://{computer_id}")
+        try:
+            workspace = self.store.create_workspace(
+                str(virtual_root["id"]),
+                ".termroom-server-terminal",
+                str(computer["name"]),
+                tmux_session=f"termroom-server-{computer_id[:12]}",
+                backend_kind="ssh",
+                computer_id=computer_id,
+                canonical_path=normalized_home,
+                workspace_kind="server_terminal",
+            )
+        except sqlite3.IntegrityError as exc:
+            workspace = self.store.find_server_terminal_workspace(computer_id)
+            if workspace is None:
+                raise
+            if str(workspace.get("canonical_path") or "") != normalized_home:
+                raise RuntimeError(
+                    "Stored Server Terminal home directory has changed"
+                ) from exc
+        return self.require(str(workspace["id"]))
+
+    def open_remote_run(
+        self,
+        run: Mapping[str, Any],
+        tmux_session: str,
+        remote_work_path: str,
+    ) -> dict[str, Any]:
+        """Create or reopen the transient Workspace shell for a Remote Run."""
+
+        run_id = str(run.get("id") or "")
+        if not run_id:
+            raise ValueError("Remote Run id is required")
+        stored_run = self.store.get_remote_run(run_id)
+        if not stored_run:
+            raise KeyError(f"Unknown Remote Run: {run_id}")
+        computer_id = str(stored_run.get("target_computer_id") or "")
+        computer = self.store.get_computer(computer_id)
+        if not computer:
+            raise KeyError(f"Unknown computer for Remote Run: {run_id}")
+
+        safe_session = str(tmux_session)
+        expected_session = f"termroom-run-{run_id}"
+        if safe_session != expected_session:
+            raise ValueError("Remote Run Workspace must use the Run's tmux session")
+
+        raw_path = str(remote_work_path)
+        if (
+            not raw_path.startswith("/")
+            or "\\" in raw_path
+            or any(unicodedata.category(character) == "Cc" for character in raw_path)
+        ):
+            raise ValueError("Remote Run work path must be an absolute POSIX path")
+        normalized_path = PurePosixPath(raw_path).as_posix()
+        if normalized_path != raw_path or any(
+            part in {".", ".."} for part in raw_path.split("/")
+        ):
+            raise ValueError("Remote Run work path must already be canonical")
+        expected_path = (
+            PurePosixPath(str(stored_run["run_base"])) / run_id / "work"
+        ).as_posix()
+        if normalized_path != expected_path:
+            raise ValueError("Remote Run work path does not match its managed Run root")
+
+        attached_id = stored_run.get("workspace_id")
+        if attached_id:
+            workspace = self.store.get_workspace(str(attached_id))
+            if not workspace:
+                raise RuntimeError("Remote Run references a missing Workspace")
+            self._assert_remote_run_workspace(
+                workspace,
+                computer_id=computer_id,
+                tmux_session=safe_session,
+                remote_work_path=normalized_path,
+            )
+            self.store.touch_workspace(str(workspace["id"]))
+            return self.require(str(workspace["id"]))
+
+        existing = self.store.find_remote_workspace(
+            computer_id, normalized_path, workspace_kind="remote_run"
+        )
+        if existing:
+            self._assert_remote_run_workspace(
+                existing,
+                computer_id=computer_id,
+                tmux_session=safe_session,
+                remote_work_path=normalized_path,
+            )
+            self.store.attach_remote_run_workspace(run_id, str(existing["id"]))
+            return self.require(str(existing["id"]))
+
+        # Recover bridge rows created by an older Core between the Workspace
+        # insert and Remote Run attachment. A real user Workspace cannot pass
+        # the owned tmux-session assertion below.
+        legacy = self.store.find_remote_workspace(computer_id, normalized_path)
+        if legacy:
+            self._assert_remote_run_workspace(
+                legacy,
+                computer_id=computer_id,
+                tmux_session=safe_session,
+                remote_work_path=normalized_path,
+            )
+            self.store.update_workspace_kind(str(legacy["id"]), "remote_run")
+            self.store.attach_remote_run_workspace(run_id, str(legacy["id"]))
+            return self.require(str(legacy["id"]))
+
+        virtual_root = self.store.ensure_root_value(f"ssh://{computer_id}")
+        display_name = str(stored_run.get("source_label") or "Remote Run").strip()
+        try:
+            workspace = self.store.create_workspace(
+                str(virtual_root["id"]),
+                normalized_path,
+                display_name[:120] or "Remote Run",
+                tmux_session=safe_session,
+                backend_kind="ssh",
+                computer_id=computer_id,
+                canonical_path=normalized_path,
+                workspace_kind="remote_run",
+            )
+        except sqlite3.IntegrityError:
+            # Status requests can discover the same remote tmux session at the
+            # same time. Reuse the row that won the insert race instead of
+            # returning a 500 for an otherwise valid transient Workspace.
+            workspace = self.store.find_remote_workspace(
+                computer_id, normalized_path, workspace_kind="remote_run"
+            )
+            if workspace is None:
+                raise
+            self._assert_remote_run_workspace(
+                workspace,
+                computer_id=computer_id,
+                tmux_session=safe_session,
+                remote_work_path=normalized_path,
+            )
+        try:
+            self.store.attach_remote_run_workspace(run_id, str(workspace["id"]))
+        except Exception:
+            self.store.delete_workspace(str(workspace["id"]))
+            raise
+        return self.require(str(workspace["id"]))
+
+    def create_remote_run_workspace(
+        self,
+        run: Mapping[str, Any],
+        tmux_session: str,
+        remote_work_path: str,
+    ) -> dict[str, Any]:
+        return self.open_remote_run(run, tmux_session, remote_work_path)
+
+    @staticmethod
+    def _assert_remote_run_workspace(
+        workspace: Mapping[str, Any],
+        *,
+        computer_id: str,
+        tmux_session: str,
+        remote_work_path: str,
+    ) -> None:
+        if (
+            workspace.get("backend_kind") != "ssh"
+            or str(workspace.get("computer_id") or "") != computer_id
+            or str(workspace.get("tmux_session") or "") != tmux_session
+            or str(workspace.get("canonical_path") or "") != remote_work_path
+        ):
+            raise RuntimeError("Remote Run Workspace metadata does not match the Run")

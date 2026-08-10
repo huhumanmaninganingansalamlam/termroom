@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% set run_phase_key = 'remote_run.phase.' ~ (run.phase or 'scanning') %}
+{% block body_class %}remote-run-wait-page{% endblock %}
+{% block content %}
+<section id="remote-run-wait"
+         class="panel remote-run-wait"
+         data-status-url="/api/remote-runs/{{ run.id }}/status"
+         data-state="{{ run.state }}">
+  <a class="text-back-link" href="/">← {{ t('common.home') }}</a>
+  <p class="eyebrow">{{ t('remote_run.eyebrow') }}</p>
+  <h1>{{ run.source_label }} <span aria-hidden="true">→</span> {{ target_label }}</h1>
+  {% if run.state in ('preparing', 'running') %}
+  <div class="remote-run-wait-status" role="status">
+    <span class="status-dot is-active" aria-hidden="true"></span>
+    <strong data-run-state>{% if run.state == 'running' %}{{ t('remote_run.state.running') }}{% else %}{{ t(run_phase_key) }}{% endif %}</strong>
+  </div>
+  <div class="connection-notice error" role="status" aria-live="polite" data-run-connection hidden>
+    <strong>{{ t('remote_run.connection_lost', computer=target_label) }}</strong>
+    <p>{{ t('remote_run.connection_lost_copy') }}</p>
+  </div>
+  <p>{{ t('remote_run.workspace_ready_copy') }}</p>
+  {% else %}
+  <p class="notice error" role="alert" data-run-error>{{ run.error_detail or t('remote_run.error.prepare_failed') }}</p>
+  {% endif %}
+  <p class="notice error" role="alert" data-run-error hidden></p>
+  <div class="remote-run-wait-actions">
+    {% if run.state in ('preparing', 'running') %}
+    {% if run.stop_requested_at %}
+    <span class="remote-run-stop-waiting">{{ t('remote_run.stop_waiting') }}</span>
+    <form method="post"
+          action="/remote-runs/{{ run.id }}/kill"
+          data-run-force-stop
+          data-stop-requested-at="{{ run.stop_requested_at }}"
+          hidden>
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="danger-button" type="submit" data-confirm="{{ t('remote_run.stop_waiting_copy') }}">{{ t('remote_run.force_stop') }}</button>
+    </form>
+    {% else %}
+    <form method="post" action="/remote-runs/{{ run.id }}/stop">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="secondary-button" type="submit">{{ t('remote_run.cancel_preparation') }}</button>
+    </form>
+    {% endif %}
+    {% else %}
+    <a class="secondary-button" href="/remote-runs/new">{{ t('remote_run.try_again') }}</a>
+    <form method="post" action="/remote-runs/{{ run.id }}/delete">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="danger-button" type="submit">{{ t('remote_run.delete_now') }}</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>
+{% endblock %}

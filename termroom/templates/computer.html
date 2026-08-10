@@ -37,6 +37,31 @@
     <p>{{ t('ssh.detail.password_updated_copy') }}</p>
   </div>
   {% endif %}
+  {% if run_base_updated %}
+  <div class="connection-notice success">
+    <strong>{{ t('ssh.detail.run_base_saved') }}</strong>
+  </div>
+  {% endif %}
+  {% if name_updated %}
+  <div class="connection-notice success">
+    <strong>{{ t('ssh.detail.name_saved') }}</strong>
+  </div>
+  {% endif %}
+
+  <section class="computer-run-base panel">
+    <div>
+      <h2>{{ t('ssh.detail.connection_name') }}</h2>
+      <p>{{ t('ssh.detail.connection_name_copy') }}</p>
+    </div>
+    <form method="post" action="/computers/{{ computer.id }}/name">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <label>
+        <span>{{ t('ssh.detail.display_name') }}</span>
+        <input name="name" value="{{ computer.name }}" maxlength="80" required autocomplete="off">
+      </label>
+      <button class="secondary-button" type="submit">{{ t('ssh.detail.name_save') }}</button>
+    </form>
+  </section>
 
   <section class="computer-facts">
     <span><small>{{ t('ssh.detail.host_key') }}</small><code>{{ computer.host_fingerprint }}</code></span>
@@ -44,10 +69,36 @@
     <span><small>{{ t('ssh.detail.requirements') }}</small><strong>SSH + tmux</strong></span>
   </section>
 
+  <section class="computer-workspace-return panel">
+    <div>
+      <strong>{{ t('server_terminal.title') }}</strong>
+      <p>{{ t('server_terminal.copy', username=computer.username) }}</p>
+    </div>
+    <form method="post" action="/computers/{{ computer.id }}/server-terminal">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="primary-button" type="submit">{{ t('server_terminal.open') }}</button>
+    </form>
+  </section>
+
   <div class="computer-workspace-return panel">
     <div><strong>{{ t('open.workspaces_live_elsewhere') }}</strong><p>{{ t('open.workspaces_live_elsewhere_copy') }}</p></div>
     <a class="primary-button" href="/open/{{ computer.id }}">{{ t('home.open_workspace') }}</a>
   </div>
+
+  <section class="computer-run-base panel">
+    <div>
+      <h2>{{ t('ssh.detail.run_base') }}</h2>
+      <p>{{ t('ssh.detail.run_base_copy') }}</p>
+    </div>
+    <form method="post" action="/computers/{{ computer.id }}/run-base">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <label>
+        <span>{{ t('ssh.detail.run_base') }}</span>
+        <input name="run_base_dir" value="{{ computer.run_base_dir or '' }}" placeholder="{{ t('ssh.detail.run_base_placeholder') }}" autocapitalize="off" spellcheck="false">
+      </label>
+      <button class="secondary-button" type="submit">{{ t('ssh.detail.run_base_save') }}</button>
+    </form>
+  </section>
 
   {% if computer.auth_kind == 'password' %}
   <details class="computer-password-update panel">
