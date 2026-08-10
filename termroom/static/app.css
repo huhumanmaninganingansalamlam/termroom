@@ -190,6 +190,7 @@ button,
 
 .open-page-heading > div {
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .open-page-heading h1 {
@@ -237,7 +238,17 @@ button,
 .open-computer-main {
   display: grid;
   min-width: 0;
+  overflow: hidden;
   gap: 5px;
+}
+
+.open-computer-main strong,
+.open-computer-main small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .open-computer-main strong {
@@ -246,12 +257,9 @@ button,
 }
 
 .open-computer-main small {
-  overflow: hidden;
   color: var(--text-tertiary);
   font-family: var(--font-mono);
   font-size: 0.65rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .open-computer-meta {
@@ -1398,6 +1406,7 @@ details:not([open]) > :not(summary) {
 
 .notice {
   display: flex;
+  min-width: 0;
   align-items: flex-start;
   gap: 9px;
   width: min(var(--content-max), 100%);
@@ -1409,6 +1418,7 @@ details:not([open]) > :not(summary) {
   color: var(--text-secondary);
   font-size: 0.74rem;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .notice.error {
@@ -2061,6 +2071,22 @@ details:not([open]) > :not(summary) {
 .workspace-nav-label,
 .workspace-sidebar-footer {
   display: none;
+}
+
+.workspace-title,
+.workspace-sidebar-copy {
+  min-width: 0;
+}
+
+.workspace-title strong,
+.workspace-title small,
+.workspace-sidebar-copy strong,
+.workspace-sidebar-copy small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (min-width: 1024px) {
@@ -5218,15 +5244,22 @@ details:not([open]) > :not(summary) {
   gap: 16px;
 }
 
+.computer-detail-heading > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .computer-detail-heading form {
   margin: 0;
 }
 
 .connection-notice {
+  min-width: 0;
   margin-bottom: 14px;
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
+  overflow-wrap: anywhere;
 }
 
 .connection-notice strong,

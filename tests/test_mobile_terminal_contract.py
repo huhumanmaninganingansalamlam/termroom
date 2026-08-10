@@ -106,6 +106,91 @@ def test_workspace_shell_scrolls_long_content_and_terminal_owns_remaining_height
     assert ".terminal-top-actions" in styles
 
 
+def test_workspace_shell_contains_long_labels_and_exposes_full_values() -> None:
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+    template = (ROOT / "termroom/templates/workspace_base.html").read_text(encoding="utf-8")
+    base_template = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
+
+    text_owner = re.search(
+        r"\.workspace-title,\s*\.workspace-sidebar-copy\s*\{(?P<body>.*?)\}",
+        styles,
+        re.S,
+    )
+    assert text_owner
+    assert "min-width: 0" in text_owner.group("body")
+
+    clipping = re.search(
+        r"\.workspace-title strong,\s*"
+        r"\.workspace-title small,\s*"
+        r"\.workspace-sidebar-copy strong,\s*"
+        r"\.workspace-sidebar-copy small\s*\{(?P<body>.*?)\}",
+        styles,
+        re.S,
+    )
+    assert clipping
+    for declaration in (
+        "display: block",
+        "overflow: hidden",
+        "text-overflow: ellipsis",
+        "white-space: nowrap",
+    ):
+        assert declaration in clipping.group("body")
+
+    assert 'title="{{ workspace.display_name }}"' in template
+    assert 'title="{{ workspace.canonical_path }}"' in template
+    assert 'class="workspace-sidebar-copy"' in template
+    assert 'title="{{ workspace_sidebar_status }}"' in template
+    assert 'title="{{ workspace_sidebar_detail }}"' in template
+    assert "path='app.css') }}?v=20" in base_template
+
+
+def test_dynamic_headings_and_notices_wrap_long_unbroken_values() -> None:
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+
+    for selector in (
+        r"\.open-page-heading > div",
+        r"\.notice",
+        r"\.computer-detail-heading > div",
+        r"\.connection-notice",
+    ):
+        rule = re.search(rf"{selector}\s*\{{(?P<body>.*?)\}}", styles, re.S)
+        assert rule
+        assert "overflow-wrap: anywhere" in rule.group("body")
+
+
+def test_computer_picker_contains_long_labels_and_exposes_full_values() -> None:
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+    template = (ROOT / "termroom/templates/workspace_open.html").read_text(encoding="utf-8")
+
+    text_owner = re.search(
+        r"\.open-computer-main\s*\{(?P<body>.*?)\}",
+        styles,
+        re.S,
+    )
+    assert text_owner
+    assert "min-width: 0" in text_owner.group("body")
+    assert "overflow: hidden" in text_owner.group("body")
+
+    clipping = re.search(
+        r"\.open-computer-main strong,\s*"
+        r"\.open-computer-main small\s*\{(?P<body>.*?)\}",
+        styles,
+        re.S,
+    )
+    assert clipping
+    for declaration in (
+        "display: block",
+        "min-width: 0",
+        "overflow: hidden",
+        "text-overflow: ellipsis",
+        "white-space: nowrap",
+    ):
+        assert declaration in clipping.group("body")
+
+    assert 'title="{{ computer.name }}"' in template
+    assert 'title="{{ computer.username }}@{{ computer.host }}' in template
+
+
 def test_terminal_status_updates_label_without_replacing_status_structure() -> None:
     template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
     script = (ROOT / "termroom/static/terminal.js").read_text(encoding="utf-8")

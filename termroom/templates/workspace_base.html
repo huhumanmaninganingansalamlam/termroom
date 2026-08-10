@@ -12,6 +12,9 @@
 {% else %}
   {% set workspace_kind_label = 'workspace.kind.local' %}
 {% endif %}
+{% set workspace_sidebar_status = t('server_terminal.mode') if server_terminal else t(session_status_label) %}
+{% set workspace_sidebar_path = workspace.canonical_path if server_terminal else workspace.relative_path %}
+{% set workspace_sidebar_detail = t('common.terminal') ~ ' ' ~ terminal_count ~ ' · ' ~ workspace_sidebar_path %}
 {% block body_class %}workspace-page{% endblock %}
 {% block body %}
 <header class="workspace-header">
@@ -38,8 +41,8 @@
       <span aria-hidden="true">←</span>
     </a>
     <div class="workspace-title">
-      <strong>{{ workspace.display_name }}</strong>
-      <small>{{ workspace.canonical_path }}</small>
+      <strong title="{{ workspace.display_name }}">{{ workspace.display_name }}</strong>
+      <small title="{{ workspace.canonical_path }}">{{ workspace.canonical_path }}</small>
     </div>
     <span class="workspace-mobile-actions">
       <span class="workspace-mobile-mode">
@@ -136,9 +139,9 @@
 </nav>
 <footer class="workspace-sidebar-footer" aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}">
   <span class="status-dot {% if session_active %}is-active{% endif %}"></span>
-  <span>
-    <strong>{% if server_terminal %}{{ t('server_terminal.mode') }}{% else %}{{ t(session_status_label) }}{% endif %}</strong>
-    <small>{{ t('common.terminal') }} {{ terminal_count }} · {% if server_terminal %}{{ workspace.canonical_path }}{% else %}{{ workspace.relative_path }}{% endif %}</small>
+  <span class="workspace-sidebar-copy">
+    <strong title="{{ workspace_sidebar_status }}">{{ workspace_sidebar_status }}</strong>
+    <small title="{{ workspace_sidebar_detail }}">{{ workspace_sidebar_detail }}</small>
   </span>
 </footer>
 {% block workspace_scripts %}{% endblock %}

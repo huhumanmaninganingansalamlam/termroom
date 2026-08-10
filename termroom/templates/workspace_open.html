@@ -28,8 +28,8 @@
   <a class="open-computer-card" href="/open/{{ computer.id }}">
     <span class="computer-icon remote" aria-hidden="true"></span>
     <span class="open-computer-main">
-      <strong>{{ computer.name }}</strong>
-      <small>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</small>
+      <strong title="{{ computer.name }}">{{ computer.name }}</strong>
+      <small title="{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}">{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</small>
     </span>
     <span class="open-computer-meta {% if computer.last_error %}has-error{% endif %}">
       {% if computer.last_error %}{{ t('home.needs_check') }}{% else %}{{ t('open.workspace_count', count=workspace_counts.get(computer.id, 0)) }}{% endif %}
