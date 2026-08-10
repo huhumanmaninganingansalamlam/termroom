@@ -136,7 +136,7 @@
   "project.error.created_not_opened": "폴더는 만들었지만 작업공간을 열지 못했습니다. 생성된 폴더는 그대로 보존했습니다. {error}",
   "remote_run.action": "원격 실행",
   "remote_run.action_copy": "Workspace, 공개 HTTPS Git 저장소 또는 ZIP을 SSH 서버에서 실행합니다.",
-  "remote_run.run_elsewhere": "다른 서버에서 실행",
+  "remote_run.run_elsewhere": "이 위치를 다른 서버에서 실행",
   "remote_run.server_entry_heading": "이 서버에서 실행",
   "remote_run.run_public_git": "공개 Git 실행",
   "remote_run.run_zip": "ZIP 실행",

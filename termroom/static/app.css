@@ -2149,6 +2149,7 @@ details:not([open]) > :not(summary) {
   }
 
   .workspace-mode {
+    display: none;
     overflow: hidden;
     color: var(--text-tertiary);
     font-size: 0.55rem;
@@ -2223,8 +2224,8 @@ details:not([open]) > :not(summary) {
     min-height: 40px;
     align-items: center;
     justify-content: flex-start;
-    gap: 10px;
-    padding: 0 10px;
+    gap: 0;
+    padding: 0 14px;
     border-radius: 6px;
     color: var(--text-tertiary);
     font-size: 0.77rem;
@@ -2239,7 +2240,8 @@ details:not([open]) > :not(summary) {
 
   .bottom-nav a.active {
     background: var(--surface-active);
-    color: var(--text);
+    color: var(--accent-hover);
+    font-weight: 680;
   }
 
   .bottom-nav a.active::before {
@@ -2254,10 +2256,7 @@ details:not([open]) > :not(summary) {
   }
 
   .bottom-nav svg {
-    width: 18px;
-    height: 18px;
-    margin: 0;
-    stroke-width: 1.8;
+    display: none;
   }
 
   .workspace-sidebar-footer {
@@ -3141,23 +3140,62 @@ details:not([open]) > :not(summary) {
   min-width: 0;
 }
 
-.file-location-bar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, 360px);
-  align-items: center;
-  gap: 12px;
+.file-context-bar {
+  display: flex;
   max-width: var(--content-max);
-  margin: 0 auto 14px;
+  align-items: center;
+  gap: 16px;
+  margin: 0 auto 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
-.file-location-bar .compact-path-panel {
-  width: 100%;
-  max-width: none;
-  margin: 0;
+.file-current-location {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 4px;
+}
+
+.file-current-location .breadcrumbs {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  scrollbar-width: thin;
+  white-space: nowrap;
+}
+
+.file-current-location .breadcrumbs a:last-of-type {
+  color: var(--text);
+  font-weight: 620;
+}
+
+.file-remote-run {
+  min-height: 38px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  background: var(--control-bg);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.file-list-tools {
+  display: flex;
+  max-width: var(--content-max);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 auto 14px;
 }
 
 .file-search-form {
   display: grid;
+  width: min(100%, 520px);
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 7px;
@@ -3179,6 +3217,36 @@ details:not([open]) > :not(summary) {
 .file-search-form:focus-within input[type="search"] {
   border-color: color-mix(in srgb, var(--accent) 62%, transparent);
   background: var(--surface);
+}
+
+.file-visibility-form {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.file-visibility-toggle {
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--control-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.7rem;
+  font-weight: 560;
+  white-space: nowrap;
+}
+
+.file-visibility-toggle:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.file-visibility-toggle.is-active {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: var(--accent-muted);
+  color: var(--accent-hover);
 }
 
 #file-results[aria-busy="true"] {
@@ -3475,7 +3543,7 @@ details:not([open]) > :not(summary) {
 
 @media (max-width: 760px) {
   .quiet-action,
-  .file-heading-actions .upload-trigger,
+  .file-primary-actions .upload-trigger,
   details > summary {
     min-height: 44px;
   }
@@ -3650,7 +3718,7 @@ details:not([open]) > :not(summary) {
 }
 
 .workspace-mobile-mode {
-  display: grid;
+  display: none;
   min-width: 0;
   gap: 2px;
   color: var(--text-tertiary);
@@ -4285,15 +4353,11 @@ details:not([open]) > :not(summary) {
 
 /* Files, recent results, and local workspace completion */
 
-.file-heading-actions {
+.file-primary-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-}
-
-.file-noise-toggle {
-  white-space: nowrap;
 }
 
 .upload-form {
@@ -4438,35 +4502,52 @@ details:not([open]) > :not(summary) {
     flex-direction: column;
   }
 
-  .file-heading-actions {
+  .file-primary-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
   }
 
-  .file-heading-actions > * {
+  .file-primary-actions > * {
     min-width: 0;
   }
 
-  .file-heading-actions .file-noise-toggle {
-    grid-column: 1 / -1;
-    justify-self: start;
-  }
-
-  .file-heading-actions .upload-form,
-  .file-heading-actions .upload-trigger,
-  .file-heading-actions .create-entry,
-  .file-heading-actions .create-entry > summary {
+  .file-primary-actions .upload-form,
+  .file-primary-actions .upload-trigger,
+  .file-primary-actions .create-entry,
+  .file-primary-actions .create-entry > summary {
     width: 100%;
   }
 
-  .file-location-bar {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 9px;
+  .file-context-bar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 10px;
+  }
+
+  .file-remote-run {
+    width: fit-content;
+    min-height: 44px;
+  }
+
+  .file-list-tools {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .file-search-form {
+    width: 100%;
     grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .file-visibility-form {
+    align-self: flex-start;
+  }
+
+  .file-visibility-toggle {
+    min-height: 44px;
   }
 
   .file-search-form input[type="search"],
@@ -4969,20 +5050,14 @@ details:not([open]) > :not(summary) {
 }
 
 @media (max-width: 760px) {
-  .file-heading-actions {
+  .file-primary-actions {
     display: grid;
     width: 100%;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
   }
 
-  .file-noise-toggle {
-    min-height: 44px;
-    grid-column: 1 / -1;
-    justify-self: end;
-  }
-
-  .file-heading-actions .secondary-button,
+  .file-primary-actions .secondary-button,
   .upload-trigger {
     width: 100%;
     min-height: 44px;

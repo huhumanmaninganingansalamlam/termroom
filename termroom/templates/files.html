@@ -4,19 +4,7 @@
   <div>
     <h1>{{ t('files.heading') }}</h1>
   </div>
-  <div class="file-heading-actions">
-    {% if not workspace.is_remote_run %}
-    <a class="quiet-action"
-       href="/remote-runs/new?source_workspace_id={{ workspace.id | urlencode }}&source_path={{ path | urlencode }}">
-      {{ t('remote_run.run_elsewhere') }}
-    </a>
-    {% endif %}
-    {% if noise_count %}
-    <a class="quiet-action file-noise-toggle"
-       href="/w/{{ workspace.id }}/files?path={{ path | urlencode }}&noise={{ 0 if show_noise else 1 }}{% if query %}&q={{ query | urlencode }}{% endif %}">
-      {% if show_noise %}{{ t('files.hide_noise') }}{% else %}{{ t('files.show_noise', count=noise_count) }}{% endif %}
-    </a>
-    {% endif %}
+  <div class="file-primary-actions">
     <form id="file-upload-form"
           method="post"
           action="/w/{{ workspace.id }}/files/upload"
@@ -50,8 +38,8 @@
   </div>
 </section>
 
-<section class="file-location-bar">
-  <div class="path-panel compact-path-panel">
+<section class="file-context-bar" aria-label="{{ t('files.current') }}">
+  <div class="file-current-location">
     <span class="path-label">{{ t('files.current') }}</span>
     <nav class="breadcrumbs" aria-label="{{ t('files.current') }}">
       {% for crumb in breadcrumbs %}
@@ -60,6 +48,15 @@
       {% endfor %}
     </nav>
   </div>
+  {% if not workspace.is_remote_run %}
+  <a class="secondary-button file-remote-run"
+     href="/remote-runs/new?source_workspace_id={{ workspace.id | urlencode }}&source_path={{ path | urlencode }}">
+    {{ t('remote_run.run_elsewhere') }}
+  </a>
+  {% endif %}
+</section>
+
+<section class="file-list-tools" aria-label="{{ t('files.actions') }}">
   <form class="file-search-form" method="get" action="/w/{{ workspace.id }}/files" role="search" data-live-file-search>
     <input type="hidden" name="path" value="{{ path }}">
     {% if show_noise %}<input type="hidden" name="noise" value="1">{% endif %}
@@ -73,6 +70,18 @@
     <button class="secondary-button" type="submit">{{ t('files.search') }}</button>
     <button id="file-search-clear" class="quiet-action" type="button" {% if not query %}hidden{% endif %}>{{ t('common.clear') }}</button>
   </form>
+  {% if noise_count %}
+  <form class="file-visibility-form" method="get" action="/w/{{ workspace.id }}/files">
+    <input type="hidden" name="path" value="{{ path }}">
+    <input type="hidden" name="noise" value="{{ 0 if show_noise else 1 }}">
+    {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+    <button class="file-visibility-toggle{% if show_noise %} is-active{% endif %}"
+            type="submit"
+            aria-pressed="{{ 'true' if show_noise else 'false' }}">
+      {% if show_noise %}{{ t('files.hide_noise') }}{% else %}{{ t('files.show_noise', count=noise_count) }}{% endif %}
+    </button>
+  </form>
+  {% endif %}
 </section>
 
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}

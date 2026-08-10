@@ -13,8 +13,7 @@
   {% set workspace_kind_label = 'workspace.kind.local' %}
 {% endif %}
 {% set workspace_sidebar_status = t('server_terminal.mode') if server_terminal else t(session_status_label) %}
-{% set workspace_sidebar_path = workspace.canonical_path if server_terminal else workspace.relative_path %}
-{% set workspace_sidebar_detail = t('common.terminal') ~ ' ' ~ terminal_count ~ ' · ' ~ workspace_sidebar_path %}
+{% set workspace_sidebar_detail = t('common.terminal') ~ ' ' ~ terminal_count %}
 {% block body_class %}workspace-page{% endblock %}
 {% block body %}
 <header class="workspace-header">
@@ -42,7 +41,7 @@
     </a>
     <div class="workspace-title">
       <strong title="{{ workspace.display_name }}">{{ workspace.display_name }}</strong>
-      <small title="{{ workspace.canonical_path }}">{{ workspace.canonical_path }}</small>
+      <small title="{{ workspace.canonical_path }}">{{ workspace.connection_label or t('home.this_computer') }} · {{ t(workspace_kind_label) }}</small>
     </div>
     <span class="workspace-mobile-actions">
       <span class="workspace-mobile-mode">
@@ -132,7 +131,7 @@
     <span>{{ t('common.files') }}</span>
   </a>
   <a class="{% if active_tab == 'recent' %}active{% endif %}" href="/w/{{ workspace.id }}/recent">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v6l4 2M4 12a8 8 0 1 0 2-5.3M4 4v4h4"/></svg>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg>
     <span>{{ t('common.recent') }}</span>
   </a>
   {% endif %}

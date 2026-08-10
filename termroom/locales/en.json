@@ -136,7 +136,7 @@
   "project.error.created_not_opened": "The folder was created, but Termroom could not open the Workspace. The folder was kept. {error}",
   "remote_run.action": "Remote Run",
   "remote_run.action_copy": "Run a Workspace, public HTTPS Git repository, or ZIP on an SSH server.",
-  "remote_run.run_elsewhere": "Run on another server",
+  "remote_run.run_elsewhere": "Run this location on another server",
   "remote_run.server_entry_heading": "Run on this server",
   "remote_run.run_public_git": "Run public Git",
   "remote_run.run_zip": "Run ZIP",
