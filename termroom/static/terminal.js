@@ -1,4 +1,4 @@
-(() => {
+(async () => {
   const host = document.querySelector("#terminal");
   if (!host || typeof window.Terminal !== "function") return;
   const messages = window.TermroomI18n || {};
@@ -15,6 +15,11 @@
   const DEFAULT_TERMINAL_FONT_SIZE = 14;
   const MIN_TERMINAL_FONT_SIZE = 12;
   const MAX_TERMINAL_FONT_SIZE = 20;
+  const BUNDLED_TERMINAL_FONT_FAMILY = '"Termroom D2Koding Nerd Mono"';
+  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C\uE0B0\uF013\u{F0001}";
+  const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 5000;
+  const BUNDLED_TERMINAL_FONT_DESCRIPTOR =
+    `normal 400 ${DEFAULT_TERMINAL_FONT_SIZE}px ${BUNDLED_TERMINAL_FONT_FAMILY}`;
   const clampTerminalFontSize = (value) =>
     Math.max(
       MIN_TERMINAL_FONT_SIZE,
@@ -58,7 +63,7 @@
     };
   };
 
-  const terminalFontFamily = () => {
+  const systemTerminalFontFamily = () => {
     const configured = window
       .getComputedStyle(document.documentElement)
       .getPropertyValue("--font-mono")
@@ -68,13 +73,39 @@
       'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Cascadia Mono", "Segoe UI Mono", "Noto Sans Mono CJK KR", D2Coding, "Nanum Gothic Coding", "Liberation Mono", monospace'
     );
   };
+  const terminalFontFamily = (includeBundledFont) => {
+    const systemFamily = systemTerminalFontFamily();
+    return includeBundledFont
+      ? `${BUNDLED_TERMINAL_FONT_FAMILY}, ${systemFamily}`
+      : systemFamily;
+  };
+
+  const loadBundledTerminalFont = async () => {
+    if (typeof document.fonts?.load !== "function") return false;
+    const loadFace = document.fonts
+      .load(BUNDLED_TERMINAL_FONT_DESCRIPTOR, BUNDLED_TERMINAL_FONT_PROBE)
+      .then((faces) => faces.length > 0)
+      .catch(() => false);
+    let timeoutId;
+    const timeout = new Promise((resolve) => {
+      timeoutId = window.setTimeout(
+        () => resolve(false),
+        BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS,
+      );
+    });
+    const loaded = await Promise.race([loadFace, timeout]);
+    window.clearTimeout(timeoutId);
+    return loaded;
+  };
 
   const status = document.querySelector("#terminal-status");
   const statusLabel = status.querySelector(".terminal-status-label");
+  const bundledTerminalFontLoaded = await loadBundledTerminalFont();
+  host.dataset.terminalFont = bundledTerminalFontLoaded ? "bundled" : "system-fallback";
   const term = new window.Terminal({
     cursorBlink: true,
     cursorStyle: "bar",
-    fontFamily: terminalFontFamily(),
+    fontFamily: terminalFontFamily(bundledTerminalFontLoaded),
     fontSize: initialTerminalFontSize,
     lineHeight: 1.2,
     scrollback: 5000,
@@ -84,7 +115,7 @@
   term.open(host);
   window.addEventListener("themechange", () => {
     term.options.theme = terminalTheme();
-    term.options.fontFamily = terminalFontFamily();
+    term.options.fontFamily = terminalFontFamily(bundledTerminalFontLoaded);
     term.refresh(0, Math.max(0, term.rows - 1));
   });
 
@@ -346,7 +377,6 @@
   });
   terminalTextarea?.addEventListener("focus", updateMobileKeyboardState);
   terminalTextarea?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
-  document.fonts?.ready.then(() => scheduleResize());
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     if (socket?.readyState === WebSocket.CLOSED) {

@@ -1,6 +1,12 @@
 {% extends "workspace_base.html" %}
 {% block body_class %}workspace-page terminal-page{% endblock %}
 {% block extra_head %}
+<link rel="preload"
+      href="{{ url_for('static', path='vendor/d2koding-ligature-nerd-font-mono-3.5.0.woff2') }}?v=3.5.0"
+      as="font"
+      type="font/woff2"
+      crossorigin>
+<link rel="stylesheet" href="{{ url_for('static', path='terminal-font.css') }}?v=1">
 <link rel="stylesheet" href="{{ url_for('static', path='vendor/xterm.css') }}?v=6.0.0">
 {% endblock %}
 {% block workspace_content_class %}terminal-screen{% endblock %}
@@ -163,5 +169,5 @@
 {% endblock %}
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=35"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=36"></script>
 {% endblock %}

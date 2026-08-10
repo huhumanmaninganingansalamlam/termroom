@@ -9,6 +9,18 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_DIR = PACKAGE_ROOT / "static" / "vendor"
 XTERM_VERSION = "6.0.0"
 XTERM_VERSION_FILE = VENDOR_DIR / "xterm.version"
+TERMINAL_FONT_VERSION = "3.5.0"
+TERMINAL_FONT_FILENAME = f"d2koding-ligature-nerd-font-mono-{TERMINAL_FONT_VERSION}.woff2"
+TERMINAL_FONT_SHA256 = "6d491d86d652cf6886afe1a37c50877a7bbf91c9369f529049d0d27cd77131be"
+TERMINAL_FONT_SOURCE_ARCHIVE_URL = (
+    "https://github.com/ryanoasis/nerd-fonts/releases/download/"
+    f"v{TERMINAL_FONT_VERSION}/D2Coding.tar.xz"
+)
+TERMINAL_FONT_SOURCE_ARCHIVE_SHA256 = (
+    "c1d4e7cbee20b9e55d2481762bbb8413124fda224cee26863b805fe2f863aaec"
+)
+TERMINAL_FONT_SOURCE_TTF = "D2KodingLigatureNerdFontMono-Regular.ttf"
+TERMINAL_FONT_SOURCE_TTF_SHA256 = "be8964904705f43a1e5a62339629d9e20eb37316008dda4de5b5681547ea2996"
 
 ASSETS = {
     "xterm.js": {
