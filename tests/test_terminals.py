@@ -15,8 +15,10 @@ from termroom.terminals import (
     TerminalManager,
     TerminalOutputDecoder,
     normalize_terminal_name,
+    parse_tmux_terminal_records,
     terminal_size,
 )
+from termroom.workspace_usage import WorkspaceUsageStale
 from termroom.workspaces import RootManager, WorkspaceManager
 
 
@@ -46,6 +48,63 @@ def test_terminal_output_decoder_preserves_multibyte_characters_across_chunks() 
     ]
 
     assert "".join(pieces) == "한글🙂"
+
+
+def test_managed_terminal_row_survives_tmux_window_id_drift(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "project").mkdir(parents=True)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(root), store).open("project")
+    workspace_id = str(workspace["id"])
+    shell = store.create_terminal(workspace_id, "shell", "@1")
+    managed = store.create_terminal(
+        workspace_id,
+        "Run",
+        "@2",
+        role="file_run",
+        managed_run_id="old-run",
+    )
+
+    reconciled = store.reconcile_terminals(
+        workspace_id,
+        [
+            {
+                "tmux_window": "@1",
+                "name": "Run",
+                "role": "file_run",
+                "managed_run_id": "new-run",
+            },
+            {
+                "tmux_window": "@2",
+                "name": "shell",
+                "role": "shell",
+                "managed_run_id": None,
+            },
+        ],
+    )
+
+    by_role = {str(item["role"]): item for item in reconciled}
+    assert by_role["file_run"]["id"] == managed["id"]
+    assert by_role["file_run"]["tmux_window"] == "@1"
+    assert by_role["file_run"]["managed_run_id"] == "new-run"
+    assert by_role["shell"]["id"] == shell["id"]
+    assert by_role["shell"]["tmux_window"] == "@2"
+
+
+def test_tmux_terminal_records_preserve_printable_delimiters_in_names() -> None:
+    records = parse_tmux_terminal_records(
+        "@7|worker|with|pipes|file_run|run-123\n"
+    )
+
+    assert records == [
+        {
+            "tmux_window": "@7",
+            "name": "worker|with|pipes",
+            "role": "file_run",
+            "managed_run_id": "run-123",
+        }
+    ]
 
 
 def test_tmux_commands_do_not_inherit_termroom_or_legacy_password(
@@ -94,6 +153,46 @@ def test_tmux_session_survives_detached_commands(tmp_path: Path) -> None:
         assert manager.session_exists(workspace["tmux_session"])
         assert workspace["tmux_session"] in manager.existing_sessions()
         assert "TERMROOM_TMUX_TEST" in manager.capture_scrollback(workspace, terminal)
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", workspace["tmux_session"]],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_local_workspace_usage_tracks_tmux_descendants(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+
+    try:
+        terminal = manager.ensure_workspace(workspace)[0]
+        subprocess.run(
+            ["tmux", "send-keys", "-t", terminal["tmux_window"], "sleep 30", "Enter"],
+            check=True,
+        )
+        deadline = time.monotonic() + 2
+        while True:
+            usage = manager.workspace_usage(workspace)
+            if usage.process_count >= 2 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        assert usage.process_count >= 2
+        assert usage.memory_bytes > 0
+        assert usage.cpu_percent >= 0
+
+        subprocess.run(
+            ["tmux", "kill-session", "-t", workspace["tmux_session"]],
+            check=True,
+        )
+        with pytest.raises(WorkspaceUsageStale):
+            manager.workspace_usage(workspace)
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", workspace["tmux_session"]],

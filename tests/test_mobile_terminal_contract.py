@@ -141,7 +141,7 @@ def test_workspace_shell_contains_long_labels_and_exposes_full_values() -> None:
     assert 'class="workspace-sidebar-copy"' in template
     assert 'title="{{ workspace_sidebar_status }}"' in template
     assert 'title="{{ workspace_sidebar_detail }}"' in template
-    assert "path='app.css') }}?v=20" in base_template
+    assert "path='app.css') }}?v=22" in base_template
 
 
 def test_dynamic_headings_and_notices_wrap_long_unbroken_values() -> None:

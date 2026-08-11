@@ -4,13 +4,16 @@ import asyncio
 import contextlib
 import io
 import os
+import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -21,8 +24,11 @@ from starlette.datastructures import UploadFile
 from termroom.app import create_app
 from termroom.config import Settings
 from termroom.db import StateStore
+from termroom.file_runs import FILE_RUN_TERMINAL_STATES, FileRunManager
+from termroom.files import FileService, UnsupportedFileError
 from termroom.remote_runs import RemoteRunManager
 from termroom.ssh_backend import SSHBackend, SSHBackendError, SSHHostKeyChanged
+from termroom.terminals import TerminalManager
 from termroom.workspaces import ProjectPathExists, RootManager, WorkspaceManager
 
 
@@ -462,6 +468,21 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             remaining_terminals = backend.close_terminal(workspace, extra_terminal)
             assert [item["id"] for item in remaining_terminals] == [terminal["id"]]
 
+            backend._exec(
+                computer,
+                "tmux send-keys -t "
+                f"{shlex.quote(str(terminal['tmux_window']))} {shlex.quote('sleep 30')} Enter",
+            )
+            deadline = time.monotonic() + 2
+            while True:
+                workspace_usage = backend.workspace_usage(workspace)
+                if workspace_usage.process_count >= 2 or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            assert workspace_usage.process_count >= 2
+            assert workspace_usage.memory_bytes > 0
+            assert workspace_usage.cpu_percent >= 0
+
             assert backend.read_text(workspace, "readme.txt", 1024).content == "hello remote\n"
             remote_range = backend.read_text_preview(
                 workspace,
@@ -613,6 +634,14 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 terminal_page = await client.get(f"/w/{workspace['id']}/terminal")
                 assert terminal_page.status_code == 200
                 assert "Loopback QA" in terminal_page.text
+                assert f'/api/workspaces/{workspace["id"]}/usage' in terminal_page.text
+
+                usage_response = await client.get(
+                    f"/api/workspaces/{workspace['id']}/usage"
+                )
+                assert usage_response.status_code == 200
+                assert usage_response.json()["state"] == "fresh"
+                assert usage_response.json()["sample"]["process_count"] >= 2
 
                 server_open = await client.post(
                     f"/computers/{computer['id']}/server-terminal",
@@ -629,6 +658,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 assert remote_home in server_page.text
                 assert server_terminal["id"] in server_page.text
                 assert f'/w/{server_workspace["id"]}/files' not in server_page.text
+                assert f'/api/workspaces/{server_workspace["id"]}/usage' not in server_page.text
 
                 picker_page = await client.get(f"/open/{computer['id']}")
                 assert picker_page.status_code == 200
@@ -641,6 +671,242 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                     computer,
                     f"tmux kill-session -t {server_workspace['tmux_session']}",
                 )
+
+
+def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "remote-file-run"
+    project.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("print('outside')\n", encoding="utf-8")
+    (project / "escape.py").symlink_to(outside)
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    with _test_sshd(tmp_path) as server:
+        store = StateStore(state_dir / "termroom.sqlite3")
+        store.initialize()
+        backend = SSHBackend(store, state_dir)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="File Run QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        backend.remember_host_key(computer)
+        workspaces = WorkspaceManager(RootManager(local_root), store)
+        workspace = workspaces.open_remote(
+            str(computer["id"]),
+            backend.validate_workspace_path(computer, str(project)),
+            "file-run-qa",
+        )
+        manager = FileRunManager(
+            store,
+            workspaces,
+            FileService(),
+            TerminalManager(store),
+            backend,
+            state_dir=state_dir,
+            max_edit_bytes=1024 * 1024,
+        )
+        remote_home = backend.home_directory(computer)
+        metadata_workspace = (
+            Path(remote_home) / ".termroom-file-runs" / str(workspace["id"])
+        )
+
+        def wait_for(run_id: str, *, terminal: bool) -> dict[str, object]:
+            deadline = time.monotonic() + 8
+            latest: dict[str, object] = {}
+            while time.monotonic() < deadline:
+                latest = manager.reconcile(run_id)
+                if bool(latest.get("state") in FILE_RUN_TERMINAL_STATES) == terminal:
+                    return latest
+                time.sleep(0.05)
+            raise AssertionError(f"SSH File Run did not settle: {latest}")
+
+        try:
+            (project / "ask.py").write_text(
+                "value = input('remote value: ')\nprint('seen:' + value)\n",
+                encoding="utf-8",
+            )
+            digest = backend.inspect_runnable(
+                workspace, "ask.py", max_bytes=1024 * 1024
+            ).digest
+            interactive = manager.start(
+                workspace,
+                "ask.py",
+                expected_digest=digest,
+                idempotency_key=str(uuid.uuid4()),
+            )
+            wait_for(str(interactive["id"]), terminal=False)
+            terminal = store.get_managed_terminal(str(workspace["id"]), "file_run")
+            assert terminal is not None
+            first_terminal_id = str(terminal["id"])
+            backend._exec(
+                computer,
+                "tmux send-keys -t "
+                f"{shlex.quote(str(terminal['tmux_window']))} "
+                f"{shlex.quote('SSH 한글 value')} Enter",
+            )
+            completed = wait_for(str(interactive["id"]), terminal=True)
+            assert completed["state"] == "finished"
+            assert completed["exit_code"] == 0
+            assert "seen:SSH 한글 value" in backend.capture_scrollback(
+                workspace, terminal
+            )
+
+            special_path = "한글 $(touch PWNED); value.py"
+            (project / special_path).write_text("print('safe remote path')\n", encoding="utf-8")
+            special_digest = backend.inspect_runnable(
+                workspace, special_path, max_bytes=1024 * 1024
+            ).digest
+            special = manager.start(
+                workspace,
+                special_path,
+                expected_digest=special_digest,
+                idempotency_key=str(uuid.uuid4()),
+            )
+            special_done = wait_for(str(special["id"]), terminal=True)
+            assert special_done["state"] == "finished"
+            assert special_done["exit_code"] == 0
+            assert not (project / "PWNED").exists()
+            reused = store.get_managed_terminal(str(workspace["id"]), "file_run")
+            assert reused is not None
+            assert reused["id"] == first_terminal_id
+
+            missing_interpreter = project / "missing-interpreter"
+            missing_interpreter.write_text(
+                "#!/termroom-interpreter-that-does-not-exist\nprintf 'never\\n'\n",
+                encoding="utf-8",
+            )
+            missing_interpreter.chmod(0o700)
+            missing_digest = backend.inspect_runnable(
+                workspace, missing_interpreter.name, max_bytes=1024 * 1024
+            ).digest
+            missing_run = manager.start(
+                workspace,
+                missing_interpreter.name,
+                expected_digest=missing_digest,
+                idempotency_key=str(uuid.uuid4()),
+            )
+            missing_failed = wait_for(str(missing_run["id"]), terminal=True)
+            assert missing_failed["state"] == "failed"
+            assert missing_failed["error_code"] == "direct_runner_failed"
+            assert missing_failed["exit_code"] is None
+
+            (project / "restart.py").write_text(
+                "import time\ntime.sleep(2)\nprint('reconciled remotely')\n",
+                encoding="utf-8",
+            )
+            restart_digest = backend.inspect_runnable(
+                workspace, "restart.py", max_bytes=1024 * 1024
+            ).digest
+            restarting = manager.start(
+                workspace,
+                "restart.py",
+                expected_digest=restart_digest,
+                idempotency_key=str(uuid.uuid4()),
+            )
+            wait_for(str(restarting["id"]), terminal=False)
+            restarted_backend = SSHBackend(store, state_dir)
+            restarted = FileRunManager(
+                store,
+                workspaces,
+                FileService(),
+                TerminalManager(store),
+                restarted_backend,
+                state_dir=state_dir,
+                max_edit_bytes=1024 * 1024,
+            )
+            time.sleep(2.2)
+            recovered = restarted.reconcile(str(restarting["id"]))
+            assert recovered["state"] == "finished"
+            assert recovered["exit_code"] == 0
+
+            (project / "wait.py").write_text(
+                "import signal, time\n"
+                "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                "while True: time.sleep(0.1)\n",
+                encoding="utf-8",
+            )
+            wait_digest = backend.inspect_runnable(
+                workspace, "wait.py", max_bytes=1024 * 1024
+            ).digest
+            waiting = manager.start(
+                workspace,
+                "wait.py",
+                expected_digest=wait_digest,
+                idempotency_key=str(uuid.uuid4()),
+            )
+            wait_for(str(waiting["id"]), terminal=False)
+            waiting_terminal = store.get_managed_terminal(
+                str(workspace["id"]), "file_run"
+            )
+            assert waiting_terminal is not None
+            waiting_window = str(waiting_terminal["tmux_window"])
+            original_windows = backend._remote_file_run_windows
+
+            def drift_identity(client, selected_workspace):  # type: ignore[no-untyped-def]
+                windows = original_windows(client, selected_workspace)
+                backend._exec_client(
+                    client,
+                    "tmux set-window-option -t "
+                    f"{shlex.quote(waiting_window)} @termroom_managed_run_id other-run",
+                )
+                return windows
+
+            monkeypatch.setattr(
+                backend, "_remote_file_run_windows", drift_identity
+            )
+            assert backend.interrupt_file_run(
+                workspace, run_id=str(waiting["id"])
+            ) is False
+            monkeypatch.setattr(
+                backend, "_remote_file_run_windows", original_windows
+            )
+            backend._exec(
+                computer,
+                "tmux set-window-option -t "
+                f"{shlex.quote(waiting_window)} @termroom_managed_run_id "
+                f"{shlex.quote(str(waiting['id']))}",
+            )
+            pane_dead = backend._exec(
+                computer,
+                "tmux display-message -p -t "
+                f"{shlex.quote(waiting_window)} '#{{pane_dead}}'",
+            ).strip()
+            assert pane_dead == "0"
+            interrupted = manager.stop(str(waiting["id"]))
+            assert interrupted["needs_force"] is True
+            killed = manager.kill(str(waiting["id"]))
+            assert killed["state"] == "stopped"
+            assert backend.session_exists(workspace)
+
+            with pytest.raises(UnsupportedFileError):
+                manager.start(
+                    workspace,
+                    "escape.py",
+                    expected_digest="0" * 64,
+                    idempotency_key=str(uuid.uuid4()),
+                )
+            assert store.get_active_file_run(str(workspace["id"])) is None
+        finally:
+            with contextlib.suppress(Exception):
+                backend._exec(
+                    computer,
+                    f"tmux kill-session -t {shlex.quote(str(workspace['tmux_session']))}",
+                )
+            shutil.rmtree(metadata_workspace, ignore_errors=True)
 
 
 def test_ssh_backend_rejects_changed_host_key(tmp_path: Path) -> None:
@@ -725,6 +991,102 @@ async def test_ssh_new_project_end_to_end(tmp_path: Path) -> None:
                     computer,
                     f"tmux kill-session -t {workspace['tmux_session']}",
                 )
+
+
+@pytest.mark.asyncio
+async def test_remote_model_upgrade_preserves_live_ssh_tmux_and_files(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "upgrade-project"
+    project.mkdir()
+    (project / "upgrade.txt").write_text("preserved through upgrade\n", encoding="utf-8")
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    with _test_sshd(tmp_path) as server:
+        settings = Settings.create(
+            local_root,
+            state_dir=state_dir,
+            access_token="test-token",
+            default_locale="ko",
+        )
+        store = StateStore(state_dir / "termroom.sqlite3")
+        store.initialize()
+        backend = SSHBackend(store, state_dir)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Upgrade QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        backend.remember_host_key(computer)
+        manager = WorkspaceManager(RootManager(local_root), store)
+        workspace = manager.open_remote(str(computer["id"]), str(project), "Upgrade project")
+        terminal = backend.ensure_workspace(workspace)[0]
+        before_panes = backend._exec(
+            computer,
+            f"tmux list-panes -t {workspace['tmux_session']} -F '#{{pane_id}}:#{{pane_pid}}'",
+        ).strip()
+
+        with sqlite3.connect(store.path) as legacy:
+            legacy.execute(
+                "ALTER TABLE computers RENAME COLUMN connection_method TO kind"
+            )
+            legacy.execute(
+                "ALTER TABLE remote_runs RENAME COLUMN archive_format "
+                "TO legacy_archive_format"
+            )
+            legacy.execute(
+                "UPDATE workspaces SET backend_kind = 'ssh' WHERE backend_kind = 'remote'"
+            )
+
+        app = create_app(settings)
+        migrated_workspace = app.state.workspaces.require(str(workspace["id"]))
+        migrated_computer = app.state.store.get_computer(str(computer["id"]))
+        assert migrated_workspace["backend_kind"] == "remote"
+        assert migrated_workspace["tmux_session"] == workspace["tmux_session"]
+        assert migrated_computer is not None
+        assert migrated_computer["connection_method"] == "ssh"
+        assert app.state.ssh.ensure_workspace(migrated_workspace)[0]["id"] == terminal["id"]
+        after_panes = app.state.ssh._exec(
+            migrated_computer,
+            f"tmux list-panes -t {workspace['tmux_session']} -F '#{{pane_id}}:#{{pane_pid}}'",
+        ).strip()
+        assert after_panes == before_panes
+
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            login = await client.post(
+                "/login",
+                data={"password": "test-token"},
+                follow_redirects=False,
+            )
+            assert login.status_code == 303
+            files_page = await client.get(f"/w/{workspace['id']}/files")
+            terminal_page = await client.get(f"/w/{workspace['id']}/terminal")
+        assert files_page.status_code == 200
+        assert "upgrade.txt" in files_page.text
+        assert terminal_page.status_code == 200
+        assert "원격 작업공간" in terminal_page.text
+        assert app.state.ssh.read_text(
+            migrated_workspace, "upgrade.txt", 1024
+        ).content == "preserved through upgrade\n"
+
+        with contextlib.suppress(Exception):
+            app.state.ssh._exec(
+                migrated_computer,
+                f"tmux kill-session -t {workspace['tmux_session']}",
+            )
 
 
 @pytest.mark.asyncio
@@ -819,6 +1181,232 @@ async def test_remote_run_end_to_end_uses_real_ssh_sftp_tmux_and_workspace(
                 if terminal_run and terminal_run.get("workspace_id"):
                     store.delete_remote_run_workspace(run_id)
             await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_archive_remote_run_end_to_end_uses_real_ssh_and_one_event(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    remote_run_base = tmp_path / "archive-runs"
+
+    with _test_sshd(tmp_path) as server:
+        store = StateStore(state_dir / "termroom.sqlite3")
+        store.initialize()
+        backend = SSHBackend(store, state_dir)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Archive QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        store.update_computer_run_base(str(computer["id"]), str(remote_run_base))
+        computer = store.get_computer(str(computer["id"]))
+        assert computer is not None
+        backend.remember_host_key(computer)
+        workspaces = WorkspaceManager(RootManager(local_root), store)
+        manager = RemoteRunManager(
+            store,
+            workspaces,
+            backend,
+            state_dir=state_dir,
+            max_archive_bytes=64 * 1024 * 1024,
+        )
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            output.writestr("project/input.txt", "archive-source\n")
+        archive_bytes = archive.getvalue()
+        run_id = str(uuid.uuid4())
+        run, created = await manager.create(
+            {
+                "id": run_id,
+                "source_kind": "archive",
+                "archive_format": "zip",
+                "archive_name": "source.zip",
+                "target_computer_id": str(computer["id"]),
+                "command": (
+                    "test \"$(cat input.txt)\" = archive-source\n"
+                    "printf 'archive-result\\n' > result.txt"
+                ),
+            }
+        )
+        assert created is True
+        assert run["source_kind"] == "archive"
+        assert run["archive_format"] == "zip"
+
+        async def archive_chunks():  # type: ignore[no-untyped-def]
+            yield archive_bytes[:17]
+            yield archive_bytes[17:]
+
+        try:
+            await manager.upload_archive(
+                run_id,
+                "source.zip",
+                archive_chunks(),
+                content_length=len(archive_bytes),
+            )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                run = await asyncio.to_thread(manager.poll, run_id, offset=0)
+                if run["state"] in {"finished", "stopped", "failed", "lost"}:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                pytest.fail("Archive Remote Run did not finish through real SSH/tmux")
+
+            assert run["state"] == "finished"
+            assert run["exit_code"] == 0
+            workspace = workspaces.require(str(run["workspace_id"]))
+            assert backend.read_text(workspace, "project/result.txt", 1024).content == (
+                "archive-result\n"
+            )
+            matching_events = [
+                event
+                for event in store.list_activity_events()
+                if event["subject_id"] == run_id
+            ]
+            assert len(matching_events) == 1
+            assert matching_events[0]["kind"] == "remote_run.completed"
+
+            deleted = manager.request_delete(run_id)
+            assert deleted["deleted"] is True
+            assert not remote_run_base.joinpath(run_id).exists()
+            retained = store.get_activity_event(str(matching_events[0]["id"]))
+            assert retained is not None
+            assert retained["subject_exists"] == 0
+        finally:
+            with contextlib.suppress(Exception):
+                manager.kill(run_id)
+            await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_remote_run_observer_reconciles_real_ssh_completion_after_restart(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    source_project = local_root / "source-project"
+    source_project.mkdir(parents=True)
+    (source_project / "input.txt").write_text("observer-source\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    remote_run_base = tmp_path / "remote-runs"
+
+    with _test_sshd(tmp_path) as server:
+        store = StateStore(state_dir / "termroom.sqlite3")
+        store.initialize()
+        backend = SSHBackend(store, state_dir)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Observer QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        store.update_computer_run_base(str(computer["id"]), str(remote_run_base))
+        computer = store.get_computer(str(computer["id"]))
+        assert computer is not None
+        backend.remember_host_key(computer)
+
+        workspaces = WorkspaceManager(RootManager(local_root), store)
+        source = workspaces.open("source-project")
+        first_manager = RemoteRunManager(
+            store,
+            workspaces,
+            backend,
+            state_dir=state_dir,
+            max_archive_bytes=64 * 1024 * 1024,
+        )
+        await first_manager.startup()
+        run_id = str(uuid.uuid4())
+        second_manager: RemoteRunManager | None = None
+        try:
+            run, created = await first_manager.create(
+                {
+                    "id": run_id,
+                    "source_kind": "workspace",
+                    "source_workspace_id": str(source["id"]),
+                    "source_path": ".",
+                    "target_computer_id": str(computer["id"]),
+                    "command": (
+                        "sleep 3\n"
+                        "test \"$(cat input.txt)\" = observer-source\n"
+                        "printf 'observed-after-restart\\n' > observed.txt"
+                    ),
+                }
+            )
+            assert created is True
+            assert run["state"] == "preparing"
+
+            running_deadline = time.monotonic() + 10
+            while time.monotonic() < running_deadline:
+                stored = store.get_remote_run(run_id)
+                assert stored is not None
+                if stored["state"] == "running":
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("Remote Run did not reach running before Core restart")
+
+            await first_manager.shutdown()
+            second_manager = RemoteRunManager(
+                store,
+                workspaces,
+                backend,
+                state_dir=state_dir,
+                max_archive_bytes=64 * 1024 * 1024,
+            )
+            await second_manager.startup()
+
+            completion_deadline = time.monotonic() + 15
+            while time.monotonic() < completion_deadline:
+                matching_events = [
+                    event
+                    for event in store.list_activity_events()
+                    if event["subject_id"] == run_id
+                ]
+                if matching_events:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                pytest.fail(
+                    "Background observer did not record the real SSH completion"
+                )
+
+            stored = store.get_remote_run(run_id)
+            assert stored is not None
+            assert stored["state"] == "finished"
+            assert stored["exit_code"] == 0
+            assert len(matching_events) == 1
+            assert matching_events[0]["kind"] == "remote_run.completed"
+            assert remote_run_base.joinpath(run_id, "work", "observed.txt").read_text(
+                encoding="utf-8"
+            ) == "observed-after-restart\n"
+
+            deleted = second_manager.request_delete(run_id)
+            assert deleted["deleted"] is True
+            retained_event = store.get_activity_event(str(matching_events[0]["id"]))
+            assert retained_event is not None
+            assert retained_event["subject_exists"] == 0
+        finally:
+            if second_manager is None:
+                await first_manager.shutdown()
+            else:
+                await second_manager.shutdown()
 
 
 def test_ssh_backend_rejects_overly_permissive_private_key(tmp_path: Path) -> None:

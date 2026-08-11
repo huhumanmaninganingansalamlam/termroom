@@ -1331,7 +1331,7 @@ def test_remote_workspace_source_to_remote_run_sink_uses_tree_contract(
     (source_root / ".git" / "config").write_text("secret")
     os.symlink("pkg/run.sh", source_root / "entrypoint")
     workspace = {
-        "backend_kind": "ssh",
+        "backend_kind": "remote",
         "computer": computer,
         "remote_path": "/source",
         "canonical_path": "/source",
@@ -1366,7 +1366,7 @@ def test_remote_workspace_deep_exclusion_does_not_drop_its_parent_siblings(
     (source_root / "parent" / "excluded" / "secret.txt").write_text("secret")
     (source_root / "parent" / "keep.txt").write_text("keep")
     workspace = {
-        "backend_kind": "ssh",
+        "backend_kind": "remote",
         "computer": computer,
         "remote_path": "/source",
         "canonical_path": "/source",

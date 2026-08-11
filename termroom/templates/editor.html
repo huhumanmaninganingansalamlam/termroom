@@ -5,6 +5,7 @@
   <input type="hidden" name="_csrf" value="{{ csrf_token }}">
   <input type="hidden" name="digest" value="{{ snapshot.digest }}">
   <input type="hidden" name="mtime_ns" value="{{ snapshot.mtime_ns }}">
+  <input type="hidden" name="file_run_idempotency_key" value="{{ file_run_idempotency_key }}">
   <header class="editor-header">
     <a class="editor-back" href="/w/{{ workspace.id }}/files?path={{ (snapshot.relative_path.rsplit('/', 1)[0] if '/' in snapshot.relative_path else '.') | urlencode }}">←</a>
     <span class="editor-file-title">
@@ -13,7 +14,18 @@
     </span>
     <span class="editor-header-actions">
       <a class="secondary-button editor-terminal-link" href="/w/{{ workspace.id }}/terminal">{{ t('common.terminal') }}</a>
-      <button class="primary-button" type="submit">{{ t('common.save') }}</button>
+      <button class="secondary-button" type="submit" name="intent" value="save">{{ t('common.save') }}</button>
+      {% if file_run_supported %}
+        {% if active_file_run %}
+        <button class="primary-button" type="button" data-file-run-submit disabled>{{ t('file_run.running') }}</button>
+        {% else %}
+        <button class="primary-button"
+                type="submit"
+                name="intent"
+                value="save_and_run"
+                data-file-run-submit>{{ t('file_run.run_again') if latest_file_run else t('file_run.run') }}</button>
+        {% endif %}
+      {% endif %}
     </span>
   </header>
   {% if saved %}
@@ -32,6 +44,12 @@
   <div class="notice error conflict-notice">
     <strong>{{ t('editor.save_failed') }}</strong>
     <span>{{ save_error }}</span>
+  </div>
+  {% endif %}
+  {% if run_error %}
+  <div class="notice error conflict-notice" role="alert">
+    <strong>{{ t('file_run.could_not_start') }}</strong>
+    <span>{{ run_error }}</span>
   </div>
   {% endif %}
   <div class="editor-toolbar" role="toolbar" aria-label="{{ t('editor.tools') }}">
@@ -54,6 +72,53 @@
             autocapitalize="off"
             autocorrect="off">{{ submitted_content if submitted_content is defined else snapshot.content }}</textarea>
 </form>
+{% set shown_file_run = active_file_run or latest_file_run %}
+{% if shown_file_run %}
+<aside class="file-run-bar {{ shown_file_run.state }}"
+       data-file-run
+       data-state="{{ shown_file_run.state }}"
+       data-status-url="{{ shown_file_run.status_url }}"
+       data-started-at="{{ shown_file_run.started_at or '' }}">
+  <span class="file-run-summary">
+    <span class="state-chip {% if shown_file_run.active %}running{% endif %}">
+      <span class="status-dot" aria-hidden="true"></span>
+      <strong data-file-run-state>{{ shown_file_run.state_label }}</strong>
+    </span>
+    <code title="{{ shown_file_run.relative_path }}">{{ shown_file_run.relative_path }}</code>
+    <small data-file-run-duration>
+      {% if shown_file_run.duration_seconds is not none %}{{ t('file_run.duration', seconds=shown_file_run.duration_seconds) }}{% endif %}
+    </small>
+    <small data-file-run-exit>
+      {% if shown_file_run.exit_code is not none %}{{ t('file_run.exit_code', code=shown_file_run.exit_code) }}{% endif %}
+    </small>
+    {% if active_file_run and active_file_run.relative_path != snapshot.relative_path %}
+    <small>{{ t('file_run.other_file_running') }}</small>
+    {% endif %}
+    <small class="file-run-error" data-file-run-error {% if not shown_file_run.error_detail %}hidden{% endif %}>{{ shown_file_run.error_detail or '' }}</small>
+  </span>
+  <span class="file-run-actions">
+    {% if shown_file_run.terminal_url %}
+    <a class="secondary-button" href="{{ shown_file_run.terminal_url }}">{{ t('file_run.open_terminal') }}</a>
+    {% endif %}
+    <form method="post"
+          action="{{ shown_file_run.stop_url }}"
+          data-file-run-stop
+          {% if not shown_file_run.active or shown_file_run.needs_force %}hidden{% endif %}>
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="return_to" value="editor">
+      <button class="secondary-button" type="submit">{{ t('file_run.stop') }}</button>
+    </form>
+    <form method="post"
+          action="{{ shown_file_run.kill_url }}"
+          data-file-run-force
+          {% if not shown_file_run.needs_force %}hidden{% endif %}>
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="return_to" value="editor">
+      <button class="danger-button" type="submit" data-confirm="{{ t('file_run.force_confirm') }}">{{ t('file_run.force_stop') }}</button>
+    </form>
+  </span>
+</aside>
+{% endif %}
 <dialog id="diff-dialog" class="diff-dialog">
   <header><strong>{{ t('editor.diff') }}</strong><button type="button" data-close-dialog>{{ t('common.close') }}</button></header>
   <pre id="diff-output"></pre>

@@ -19,6 +19,7 @@ def isolate_test_tmux(tmp_path_factory: pytest.TempPathFactory):
     """
 
     old_tmux = os.environ.pop("TMUX", None)
+    old_tmux_pane = os.environ.pop("TMUX_PANE", None)
     old_tmux_tmpdir = os.environ.get("TMUX_TMPDIR")
     socket_root = Path(tmp_path_factory.mktemp("termroom-test-tmux"))
     socket_root.chmod(0o700)
@@ -39,3 +40,5 @@ def isolate_test_tmux(tmp_path_factory: pytest.TempPathFactory):
             os.environ["TMUX_TMPDIR"] = old_tmux_tmpdir
         if old_tmux is not None:
             os.environ["TMUX"] = old_tmux
+        if old_tmux_pane is not None:
+            os.environ["TMUX_PANE"] = old_tmux_pane

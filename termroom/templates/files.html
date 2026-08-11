@@ -48,7 +48,7 @@
       {% endfor %}
     </nav>
   </div>
-  {% if not workspace.is_remote_run %}
+  {% if can_remote_run_source %}
   <a class="secondary-button file-remote-run"
      href="/remote-runs/new?source_workspace_id={{ workspace.id | urlencode }}&source_path={{ path | urlencode }}">
     {{ t('remote_run.run_elsewhere') }}

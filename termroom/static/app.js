@@ -96,6 +96,324 @@
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
 
+  const activityLink = document.querySelector("[data-activity-link]");
+  const activityBadges = [...document.querySelectorAll("[data-activity-unread]")];
+  const notificationButton = document.querySelector("[data-notification-enable]");
+  const updateUnread = (value) => {
+    const count = Math.max(0, Number(value) || 0);
+    activityBadges.forEach((badge) => {
+      badge.hidden = count === 0;
+      badge.textContent = count > 99 ? "99+" : String(count);
+    });
+  };
+  const refreshActivitySummary = async () => {
+    if (!activityLink?.dataset.summaryUrl) return;
+    try {
+      const response = await fetch(activityLink.dataset.summaryUrl, {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      const result = await response.json();
+      if (response.ok && result.ok !== false) updateUnread(result.unread_count);
+    } catch {
+      // Activity is durable on the Core. A later refresh can recover this badge.
+    }
+  };
+  const notificationSupported = (
+    window.isSecureContext
+    && "Notification" in window
+    && Boolean(activityLink?.dataset.claimUrl)
+  );
+  const syncNotificationButton = () => {
+    if (!notificationButton) return;
+    if (!notificationSupported) {
+      notificationButton.disabled = true;
+      notificationButton.textContent = tr("activity.notifications_unsupported");
+      return;
+    }
+    if (Notification.permission === "granted") {
+      notificationButton.disabled = true;
+      notificationButton.textContent = tr("activity.notifications_enabled");
+      return;
+    }
+    if (Notification.permission === "denied") {
+      notificationButton.disabled = true;
+      notificationButton.textContent = tr("activity.notifications_denied");
+      return;
+    }
+    notificationButton.disabled = false;
+    notificationButton.textContent = tr("activity.notifications_enable");
+  };
+  const claimActivityNotifications = async () => {
+    if (!notificationSupported || Notification.permission !== "granted") return;
+    try {
+      const response = await fetch(activityLink.dataset.claimUrl, {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Termroom-CSRF": activityLink.dataset.csrf || "",
+        },
+        body: "{}",
+      });
+      const result = await response.json();
+      if (!response.ok || result.ok === false) return;
+      updateUnread(result.unread_count);
+      (result.events || []).forEach((activityEvent) => {
+        const notification = new Notification(activityEvent.title, {
+          body: activityEvent.body,
+          tag: `termroom-${activityEvent.id}`,
+          renotify: false,
+        });
+        notification.addEventListener("click", () => {
+          notification.close();
+          window.focus();
+          window.location.assign(activityEvent.url || "/activity");
+        });
+      });
+    } catch {
+      // Notification delivery is optional; the Activity record remains available.
+    }
+  };
+  let activityNotificationTimer = 0;
+  const startActivityNotificationPolling = () => {
+    if (!notificationSupported || Notification.permission !== "granted") return;
+    claimActivityNotifications();
+    if (!activityNotificationTimer) {
+      activityNotificationTimer = window.setInterval(claimActivityNotifications, 5000);
+    }
+  };
+  notificationButton?.addEventListener("click", async () => {
+    if (!notificationSupported) return;
+    const permission = await Notification.requestPermission();
+    syncNotificationButton();
+    if (permission === "granted") startActivityNotificationPolling();
+  });
+  if (activityLink) {
+    refreshActivitySummary();
+    window.setInterval(refreshActivitySummary, 15000);
+    if (notificationSupported && Notification.permission === "granted") {
+      startActivityNotificationPolling();
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshActivitySummary();
+    });
+  }
+  syncNotificationButton();
+
+  const workspaceUsageViews = [...document.querySelectorAll("[data-workspace-usage-view]")];
+  if (workspaceUsageViews.length) {
+    const usageUrl = workspaceUsageViews.find((view) => view.dataset.usageUrl)?.dataset.usageUrl;
+    const numberFormat = new Intl.NumberFormat(document.documentElement.lang || undefined, {
+      maximumFractionDigits: 1,
+    });
+    let usageTimer = 0;
+    let lastUsage = null;
+
+    const formatAge = (seconds) => {
+      const value = Math.max(0, Math.floor(Number(seconds) || 0));
+      if (value < 60) return tr("time.just_now");
+      const minutes = Math.floor(value / 60);
+      if (minutes < 60) return tr("time.minutes_ago", { count: minutes });
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return tr("time.hours_ago", { count: hours });
+      const days = Math.floor(hours / 24);
+      return tr(days === 1 ? "time.day_ago" : "time.days_ago", { count: days });
+    };
+    const timestampAge = (value) => {
+      const timestamp = Date.parse(value || "");
+      return Number.isFinite(timestamp) ? Math.max(0, (Date.now() - timestamp) / 1000) : 0;
+    };
+    const formatMemory = (bytes) => {
+      const value = Math.max(0, Number(bytes) || 0);
+      if (value >= 1024 ** 3) return `${numberFormat.format(value / 1024 ** 3)} GB`;
+      return `${numberFormat.format(value / 1024 ** 2)} MB`;
+    };
+    const usageStateLabel = (state) => tr(`workspace.usage.state.${state}`);
+
+    const renderWorkspaceUsage = (result) => {
+      const state = ["fresh", "stale", "unavailable", "offline"].includes(result?.state)
+        ? result.state
+        : "unavailable";
+      const sample = state === "fresh" && result?.sample ? result.sample : null;
+      const cpu = sample ? `${numberFormat.format(sample.cpu_percent)}%` : "—";
+      const memory = sample ? formatMemory(sample.memory_bytes) : "—";
+      const processes = sample ? numberFormat.format(sample.process_count) : "—";
+      const stateLabel = usageStateLabel(state);
+      const checked = tr("workspace.usage.checked", {
+        time: formatAge(timestampAge(result?.last_checked_at)),
+      });
+      const lastSample = result?.last_observed_at
+        ? tr("workspace.usage.last_sample", {
+            time: formatAge(result.age_seconds ?? timestampAge(result.last_observed_at)),
+          })
+        : tr("workspace.usage.no_sample");
+      const summary = sample
+        ? `CPU ${cpu} · ${memory} · ${tr("workspace.usage.process_short", { count: processes })}`
+        : stateLabel;
+      const meta = sample
+        ? `${tr("workspace.usage.estimated")} · ${checked}`
+        : `${stateLabel} · ${checked} · ${lastSample}`;
+      const accessible = `${tr("workspace.usage.heading")}. ${summary}. ${meta}`;
+
+      workspaceUsageViews.forEach((view) => {
+        view.dataset.usageState = state;
+        view.querySelectorAll("[data-workspace-usage-cpu]").forEach((node) => {
+          node.textContent = cpu;
+        });
+        view.querySelectorAll("[data-workspace-usage-memory]").forEach((node) => {
+          node.textContent = memory;
+        });
+        view.querySelectorAll("[data-workspace-usage-processes]").forEach((node) => {
+          node.textContent = processes;
+        });
+        view.querySelectorAll("[data-workspace-usage-summary]").forEach((node) => {
+          node.textContent = summary;
+          node.title = accessible;
+        });
+        view.querySelectorAll("[data-workspace-usage-meta]").forEach((node) => {
+          node.textContent = meta;
+          node.title = accessible;
+        });
+        view.querySelectorAll("[data-workspace-usage-dot]").forEach((node) => {
+          node.classList.toggle("is-active", state === "fresh");
+          node.classList.toggle("is-warning", state === "stale" || state === "unavailable");
+          node.classList.toggle("is-offline", state === "offline");
+        });
+        const summaryNode = view.matches("details") ? view.querySelector("summary") : null;
+        summaryNode?.setAttribute("aria-label", accessible);
+        summaryNode?.setAttribute("title", accessible);
+      });
+      lastUsage = {
+        ...result,
+        state,
+        sample,
+      };
+      return state;
+    };
+
+    const scheduleUsagePoll = (state) => {
+      window.clearTimeout(usageTimer);
+      const delay = document.hidden ? 30000 : state === "fresh" ? 10000 : 5000;
+      usageTimer = window.setTimeout(pollWorkspaceUsage, delay);
+    };
+    const pollWorkspaceUsage = async () => {
+      if (!usageUrl) return;
+      let state = lastUsage?.state || "unavailable";
+      try {
+        const response = await fetch(usageUrl, {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        const result = await response.json();
+        if (!response.ok || result.ok === false) throw new Error("workspace usage unavailable");
+        state = renderWorkspaceUsage(result);
+      } catch {
+        state = renderWorkspaceUsage({
+          state: lastUsage?.last_observed_at ? "stale" : "unavailable",
+          sample: null,
+          last_observed_at: lastUsage?.last_observed_at || null,
+          last_checked_at: new Date().toISOString(),
+          age_seconds: lastUsage?.last_observed_at
+            ? timestampAge(lastUsage.last_observed_at)
+            : null,
+        });
+      }
+      scheduleUsagePoll(state);
+    };
+    pollWorkspaceUsage();
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollWorkspaceUsage();
+    });
+  }
+
+  document.querySelectorAll("[data-file-run]").forEach((panel) => {
+    const stateNode = panel.querySelector("[data-file-run-state]");
+    const stateChip = panel.querySelector(".state-chip");
+    const durationNode = panel.querySelector("[data-file-run-duration]");
+    const exitNode = panel.querySelector("[data-file-run-exit]");
+    const errorNode = panel.querySelector("[data-file-run-error]");
+    const stopForm = panel.querySelector("[data-file-run-stop]");
+    const forceForm = panel.querySelector("[data-file-run-force]");
+    const submitButton = document.querySelector("[data-file-run-submit]");
+    let active = ["preparing", "running"].includes(panel.dataset.state || "");
+    let failures = 0;
+    let timer = 0;
+
+    const render = (result) => {
+      const previousState = panel.dataset.state || "";
+      panel.dataset.state = result.state || previousState;
+      panel.classList.remove(
+        "preparing",
+        "running",
+        "finished",
+        "stopped",
+        "failed",
+        "lost",
+      );
+      if (result.state) panel.classList.add(result.state);
+      if (stateNode && result.state_label) stateNode.textContent = result.state_label;
+      if (durationNode) {
+        durationNode.textContent = result.duration_seconds === null
+          || result.duration_seconds === undefined
+          ? ""
+          : tr("file_run.duration", { seconds: result.duration_seconds });
+      }
+      if (exitNode) {
+        exitNode.textContent = result.exit_code === null
+          || result.exit_code === undefined
+          ? ""
+          : tr("file_run.exit_code", { code: result.exit_code });
+      }
+      if (errorNode) {
+        const message = result.error_detail
+          || (result.connection === "offline" ? tr("file_run.connection_offline") : "");
+        errorNode.textContent = message;
+        errorNode.hidden = !message;
+      }
+      active = Boolean(result.active);
+      if (stateChip) stateChip.classList.toggle("running", active);
+      if (stopForm) stopForm.hidden = !active || Boolean(result.needs_force);
+      if (forceForm) forceForm.hidden = !active || !result.needs_force;
+      if (!active && submitButton) {
+        submitButton.disabled = false;
+        submitButton.type = "submit";
+        submitButton.name = "intent";
+        submitButton.value = "save_and_run";
+        submitButton.textContent = tr("file_run.run_again");
+      }
+    };
+
+    const schedule = (delay) => {
+      window.clearTimeout(timer);
+      if (active) timer = window.setTimeout(poll, delay);
+    };
+    const poll = async () => {
+      if (!active || !panel.dataset.statusUrl) return;
+      try {
+        const response = await fetch(panel.dataset.statusUrl, {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        const result = await response.json();
+        if (!response.ok || result.ok === false) throw new Error(result.error || response.status);
+        failures = 0;
+        render(result);
+      } catch {
+        failures += 1;
+      }
+      if (active) {
+        const normalDelay = document.hidden ? 5000 : 1000;
+        schedule(Math.min(15000, normalDelay * (2 ** Math.min(failures, 3))));
+      }
+    };
+    if (active) schedule(250);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && active) schedule(0);
+    });
+  });
+
   const setViewportHeight = () => {
     const height = window.visualViewport?.height || window.innerHeight;
     document.documentElement.style.setProperty("--app-height", `${height}px`);

@@ -1,15 +1,102 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import unicodedata
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 WORKSPACE_KINDS = frozenset({"workspace", "remote_run", "server_terminal"})
+WORKSPACE_BACKEND_KINDS = frozenset({"local", "remote"})
+REMOTE_RUN_TERMINAL_STATES = frozenset({"finished", "stopped", "failed", "lost"})
+FILE_RUN_STATES = frozenset(
+    {"preparing", "running", "finished", "stopped", "failed", "lost"}
+)
+FILE_RUN_TERMINAL_STATES = frozenset({"finished", "stopped", "failed", "lost"})
+TERMINAL_ROLES = frozenset({"shell", "file_run", "remote_run"})
+
+
+def _computers_table_sql(
+    table: str = "computers", *, if_not_exists: bool = False
+) -> str:
+    clause = "IF NOT EXISTS " if if_not_exists else ""
+    return f"""
+        CREATE TABLE {clause}{table} (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            connection_method TEXT NOT NULL
+                CHECK(connection_method IN ('ssh', 'node')),
+            auth_kind TEXT NOT NULL DEFAULT 'key',
+            ssh_alias TEXT NOT NULL DEFAULT '',
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL DEFAULT 22,
+            username TEXT NOT NULL,
+            identity_file TEXT NOT NULL DEFAULT '',
+            host_key_type TEXT NOT NULL,
+            host_key_data TEXT NOT NULL,
+            host_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_connected_at TEXT,
+            last_seen_at TEXT,
+            last_error TEXT,
+            run_base_dir TEXT,
+            node_public_key TEXT NOT NULL DEFAULT '',
+            node_fingerprint TEXT NOT NULL DEFAULT '',
+            node_protocol_version INTEGER,
+            node_capabilities_json TEXT NOT NULL DEFAULT '[]',
+            node_revoked_at TEXT
+        );
+    """
+
+
+def _remote_runs_table_sql(
+    table: str = "remote_runs", *, if_not_exists: bool = False
+) -> str:
+    clause = "IF NOT EXISTS " if if_not_exists else ""
+    return f"""
+        CREATE TABLE {clause}{table} (
+            id TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL
+                CHECK(source_kind IN ('workspace', 'git', 'archive')),
+            archive_format TEXT,
+            source_workspace_id TEXT
+                REFERENCES workspaces(id) ON DELETE SET NULL,
+            source_path TEXT,
+            source_label TEXT NOT NULL,
+            source_url TEXT,
+            source_options_json TEXT NOT NULL DEFAULT '{{}}',
+            source_revision TEXT,
+            source_size INTEGER,
+            target_computer_id TEXT NOT NULL REFERENCES computers(id),
+            command TEXT NOT NULL,
+            run_base TEXT NOT NULL,
+            workspace_id TEXT
+                REFERENCES workspaces(id) ON DELETE SET NULL,
+            state TEXT NOT NULL
+                CHECK(state IN (
+                    'preparing', 'running', 'finished',
+                    'stopped', 'failed', 'lost'
+                )),
+            phase TEXT,
+            exit_code INTEGER,
+            error_code TEXT,
+            error_detail TEXT,
+            lifecycle_revision INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            stop_requested_at TEXT,
+            ended_at TEXT,
+            expires_at TEXT,
+            CHECK(
+                (source_kind = 'archive' AND archive_format = 'zip')
+                OR (source_kind != 'archive' AND archive_format IS NULL)
+            )
+        );
+    """
 
 
 def normalize_computer_name(value: str) -> str:
@@ -51,7 +138,7 @@ class StateStore:
     def initialize(self) -> None:
         with self.connect() as db:
             db.executescript(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS roots (
                     id TEXT PRIMARY KEY,
                     path TEXT NOT NULL UNIQUE,
@@ -73,29 +160,16 @@ class StateStore:
                     UNIQUE(root_id, relative_path)
                 );
 
-                CREATE TABLE IF NOT EXISTS computers (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    kind TEXT NOT NULL CHECK(kind IN ('ssh')),
-                    auth_kind TEXT NOT NULL DEFAULT 'key',
-                    ssh_alias TEXT NOT NULL DEFAULT '',
-                    host TEXT NOT NULL,
-                    port INTEGER NOT NULL DEFAULT 22,
-                    username TEXT NOT NULL,
-                    identity_file TEXT NOT NULL DEFAULT '',
-                    host_key_type TEXT NOT NULL,
-                    host_key_data TEXT NOT NULL,
-                    host_fingerprint TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    last_connected_at TEXT,
-                    last_error TEXT
-                );
+                {_computers_table_sql(if_not_exists=True)}
 
                 CREATE TABLE IF NOT EXISTS terminals (
                     id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
                     name TEXT NOT NULL,
                     tmux_window TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'shell'
+                        CHECK(role IN ('shell', 'file_run', 'remote_run')),
+                    managed_run_id TEXT,
                     created_at TEXT NOT NULL,
                     last_opened_at TEXT NOT NULL,
                     last_output_at TEXT,
@@ -110,43 +184,77 @@ class StateStore:
                     created_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS remote_runs (
+                CREATE TABLE IF NOT EXISTS file_runs (
                     id TEXT PRIMARY KEY,
-                    source_kind TEXT NOT NULL
-                        CHECK(source_kind IN ('workspace', 'git', 'zip')),
-                    source_workspace_id TEXT
-                        REFERENCES workspaces(id) ON DELETE SET NULL,
-                    source_path TEXT,
-                    source_label TEXT NOT NULL,
-                    source_url TEXT,
-                    source_options_json TEXT NOT NULL DEFAULT '{}',
-                    source_revision TEXT,
-                    source_size INTEGER,
-                    target_computer_id TEXT NOT NULL REFERENCES computers(id),
-                    command TEXT NOT NULL,
-                    run_base TEXT NOT NULL,
-                    workspace_id TEXT
-                        REFERENCES workspaces(id) ON DELETE SET NULL,
+                    workspace_id TEXT NOT NULL
+                        REFERENCES workspaces(id) ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    runner_id TEXT NOT NULL,
+                    runner_version INTEGER NOT NULL,
+                    argv_json TEXT NOT NULL,
+                    terminal_id TEXT REFERENCES terminals(id) ON DELETE SET NULL,
                     state TEXT NOT NULL
                         CHECK(state IN (
                             'preparing', 'running', 'finished',
                             'stopped', 'failed', 'lost'
                         )),
-                    phase TEXT,
-                    exit_code INTEGER,
-                    error_code TEXT,
-                    error_detail TEXT,
+                    lifecycle_revision INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     stop_requested_at TEXT,
                     ended_at TEXT,
-                    expires_at TEXT
+                    exit_code INTEGER,
+                    error_code TEXT,
+                    error_detail TEXT,
+                    UNIQUE(workspace_id, idempotency_key)
+                );
+
+                {_remote_runs_table_sql(if_not_exists=True)}
+
+                CREATE TABLE IF NOT EXISTS events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    subject_revision INTEGER NOT NULL,
+                    primary_label TEXT NOT NULL,
+                    secondary_label TEXT NOT NULL,
+                    exit_code INTEGER,
+                    duration_seconds INTEGER,
+                    occurred_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    read_at TEXT,
+                    notify INTEGER NOT NULL DEFAULT 1 CHECK(notify IN (0, 1)),
+                    UNIQUE(subject_type, subject_id, subject_revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_devices (
+                    id TEXT PRIMARY KEY,
+                    start_sequence INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS event_notification_claims (
+                    event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    device_id TEXT NOT NULL
+                        REFERENCES notification_devices(id) ON DELETE CASCADE,
+                    claimed_at TEXT NOT NULL,
+                    PRIMARY KEY(event_id, device_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_workspaces_recent
                     ON workspaces(last_opened_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_history_recent
                     ON command_history(workspace_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_file_runs_workspace_recent
+                    ON file_runs(workspace_id, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_file_runs_workspace_active
+                    ON file_runs(workspace_id)
+                    WHERE state IN ('preparing', 'running');
 
                 CREATE INDEX IF NOT EXISTS idx_computers_name
                     ON computers(name COLLATE NOCASE);
@@ -157,9 +265,21 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_remote_runs_expired
                     ON remote_runs(expires_at)
                     WHERE expires_at IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_events_recent
+                    ON events(sequence DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_unread
+                    ON events(sequence DESC)
+                    WHERE read_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_event_notification_claims_device
+                    ON event_notification_claims(device_id, claimed_at DESC);
                 """
             )
             self._ensure_column(db, "terminals", "last_output_at", "TEXT")
+            self._ensure_column(
+                db, "terminals", "role", "TEXT NOT NULL DEFAULT 'shell'"
+            )
+            self._ensure_column(db, "terminals", "managed_run_id", "TEXT")
+            self._ensure_column(db, "events", "duration_seconds", "INTEGER")
             self._ensure_column(
                 db, "workspaces", "backend_kind", "TEXT NOT NULL DEFAULT 'local'"
             )
@@ -175,11 +295,77 @@ class StateStore:
                 db, "computers", "auth_kind", "TEXT NOT NULL DEFAULT 'key'"
             )
             self._ensure_column(db, "computers", "run_base_dir", "TEXT")
+            self._ensure_column(db, "computers", "last_seen_at", "TEXT")
+            self._ensure_column(
+                db, "computers", "node_public_key", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(
+                db, "computers", "node_fingerprint", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(db, "computers", "node_protocol_version", "INTEGER")
+            self._ensure_column(
+                db,
+                "computers",
+                "node_capabilities_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column(db, "computers", "node_revoked_at", "TEXT")
             self._ensure_column(
                 db,
                 "remote_runs",
                 "workspace_id",
                 "TEXT REFERENCES workspaces(id) ON DELETE SET NULL",
+            )
+            self._ensure_column(
+                db,
+                "remote_runs",
+                "lifecycle_revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._migrate_remote_archive_model(db)
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS node_pairing_codes (
+                    id TEXT PRIMARY KEY,
+                    code_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS node_enrollments (
+                    id TEXT PRIMARY KEY,
+                    pairing_code_id TEXT NOT NULL UNIQUE
+                        REFERENCES node_pairing_codes(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    protocol_version INTEGER NOT NULL,
+                    polling_secret_hash TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('pending', 'approved', 'rejected')),
+                    computer_id TEXT REFERENCES computers(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_computers_name
+                    ON computers(name COLLATE NOCASE);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_node_public_key
+                    ON computers(node_public_key)
+                    WHERE connection_method = 'node';
+                CREATE INDEX IF NOT EXISTS idx_node_pairing_codes_expiry
+                    ON node_pairing_codes(expires_at);
+                CREATE INDEX IF NOT EXISTS idx_node_enrollments_status
+                    ON node_enrollments(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_remote_runs_recent
+                    ON remote_runs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_remote_runs_target
+                    ON remote_runs(target_computer_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_remote_runs_expired
+                    ON remote_runs(expires_at)
+                    WHERE expires_at IS NOT NULL;
+                """
             )
             db.execute(
                 """
@@ -197,21 +383,12 @@ class StateStore:
                 )
                 """
             )
-            remote_workspace_index_columns = [
-                str(row["name"])
-                for row in db.execute("PRAGMA index_info(idx_remote_workspace_unique)")
-            ]
-            if remote_workspace_index_columns != [
-                "computer_id",
-                "canonical_path",
-                "workspace_kind",
-            ]:
-                db.execute("DROP INDEX IF EXISTS idx_remote_workspace_unique")
+            db.execute("DROP INDEX IF EXISTS idx_remote_workspace_unique")
             db.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_workspace_unique
                 ON workspaces(computer_id, canonical_path, workspace_kind)
-                WHERE backend_kind = 'ssh'
+                WHERE backend_kind = 'remote'
                 """
             )
             db.execute(
@@ -219,6 +396,31 @@ class StateStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_server_terminal_computer
                 ON workspaces(computer_id)
                 WHERE workspace_kind = 'server_terminal'
+                """
+            )
+            db.execute(
+                """
+                UPDATE terminals
+                SET role = 'remote_run',
+                    managed_run_id = (
+                        SELECT remote_runs.id
+                        FROM remote_runs
+                        WHERE remote_runs.workspace_id = terminals.workspace_id
+                    )
+                WHERE role = 'shell'
+                  AND name = 'run'
+                  AND workspace_id IN (
+                      SELECT workspace_id
+                      FROM remote_runs
+                      WHERE workspace_id IS NOT NULL
+                  )
+                """
+            )
+            db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_terminals_managed_role
+                ON terminals(workspace_id, role)
+                WHERE role != 'shell'
                 """
             )
             # Removed in the password-login redesign. Drop prototype pairing
@@ -238,6 +440,16 @@ class StateStore:
             }
             if "runs" in tables and "legacy_runs" not in tables:
                 db.execute("ALTER TABLE runs RENAME TO legacy_runs")
+            for row in db.execute(
+                """
+                SELECT rr.*, computers.name AS target_name
+                FROM remote_runs AS rr
+                JOIN computers ON computers.id = rr.target_computer_id
+                WHERE rr.state IN ('finished', 'stopped', 'failed', 'lost')
+                ORDER BY rr.created_at
+                """
+            ).fetchall():
+                self._insert_remote_run_event(db, row, historical=True)
         self.path.chmod(0o600)
 
     @staticmethod
@@ -247,6 +459,142 @@ class StateStore:
         columns = {str(row["name"]) for row in db.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _migrate_remote_archive_model(db: sqlite3.Connection) -> None:
+        """Atomically replace the legacy SSH/ZIP persistence vocabulary."""
+
+        computer_columns = {
+            str(row["name"]) for row in db.execute("PRAGMA table_info(computers)")
+        }
+        remote_run_columns = {
+            str(row["name"]) for row in db.execute("PRAGMA table_info(remote_runs)")
+        }
+        remote_run_schema_row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'remote_runs'"
+        ).fetchone()
+        remote_run_schema = " ".join(
+            str(remote_run_schema_row["sql"] or "").lower().split()
+        )
+        rebuild_computers = "connection_method" not in computer_columns
+        rebuild_remote_runs = rebuild_computers or (
+            "archive_format" not in remote_run_columns
+            or "source_kind in ('workspace', 'git', 'archive')"
+            not in remote_run_schema
+        )
+        legacy_workspace = db.execute(
+            "SELECT 1 FROM workspaces WHERE backend_kind = 'ssh' LIMIT 1"
+        ).fetchone()
+        if not rebuild_computers and not rebuild_remote_runs and legacy_workspace is None:
+            return
+
+        computer_method_column = "kind" if rebuild_computers else "connection_method"
+        invalid_computer = db.execute(
+            f"SELECT id FROM computers WHERE {computer_method_column} "
+            "NOT IN ('ssh', 'node') LIMIT 1"
+        ).fetchone()
+        if invalid_computer is not None:
+            raise RuntimeError("Cannot migrate an unsupported Remote connection method")
+        invalid_workspace = db.execute(
+            """
+            SELECT id FROM workspaces
+            WHERE backend_kind NOT IN ('local', 'ssh', 'remote')
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_workspace is not None:
+            raise RuntimeError("Cannot migrate an unsupported Workspace backend")
+        invalid_source = db.execute(
+            """
+            SELECT id FROM remote_runs
+            WHERE source_kind NOT IN ('workspace', 'git', 'zip', 'archive')
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_source is not None:
+            raise RuntimeError("Cannot migrate an unsupported Remote Run Source")
+        if "archive_format" in remote_run_columns:
+            invalid_archive = db.execute(
+                """
+                SELECT id FROM remote_runs
+                WHERE archive_format IS NOT NULL AND archive_format != 'zip'
+                LIMIT 1
+                """
+            ).fetchone()
+            if invalid_archive is not None:
+                raise RuntimeError("Cannot migrate an unsupported Archive format")
+
+        db.execute("SAVEPOINT remote_archive_model")
+        try:
+            if rebuild_computers:
+                db.execute("ALTER TABLE computers RENAME TO computers_legacy_remote_model")
+                db.execute(_computers_table_sql())
+                db.execute(
+                    """
+                    INSERT INTO computers(
+                        id, name, connection_method, auth_kind, ssh_alias, host, port,
+                        username, identity_file, host_key_type, host_key_data,
+                        host_fingerprint, created_at, last_connected_at, last_error,
+                        run_base_dir
+                    )
+                    SELECT
+                        id, name, kind, auth_kind, ssh_alias, host, port,
+                        username, identity_file, host_key_type, host_key_data,
+                        host_fingerprint, created_at, last_connected_at, last_error,
+                        run_base_dir
+                    FROM computers_legacy_remote_model
+                    """
+                )
+
+            if rebuild_remote_runs:
+                db.execute("ALTER TABLE remote_runs RENAME TO remote_runs_legacy_remote_model")
+                db.execute(_remote_runs_table_sql())
+                archive_format = (
+                    "CASE "
+                    "WHEN source_kind IN ('zip', 'archive') "
+                    "THEN COALESCE(archive_format, 'zip') ELSE NULL END"
+                    if "archive_format" in remote_run_columns
+                    else "CASE WHEN source_kind = 'zip' THEN 'zip' ELSE NULL END"
+                )
+                db.execute(
+                    f"""
+                    INSERT INTO remote_runs(
+                        id, source_kind, archive_format, source_workspace_id,
+                        source_path, source_label, source_url, source_options_json,
+                        source_revision, source_size, target_computer_id, command,
+                        run_base, workspace_id, state, phase, exit_code, error_code,
+                        error_detail, lifecycle_revision, created_at, started_at,
+                        stop_requested_at, ended_at, expires_at
+                    )
+                    SELECT
+                        id,
+                        CASE WHEN source_kind = 'zip' THEN 'archive' ELSE source_kind END,
+                        {archive_format},
+                        source_workspace_id, source_path, source_label, source_url,
+                        source_options_json, source_revision, source_size,
+                        target_computer_id, command, run_base, workspace_id, state,
+                        phase, exit_code, error_code, error_detail,
+                        lifecycle_revision, created_at, started_at,
+                        stop_requested_at, ended_at, expires_at
+                    FROM remote_runs_legacy_remote_model
+                    """
+                )
+
+            db.execute(
+                "UPDATE workspaces SET backend_kind = 'remote' WHERE backend_kind = 'ssh'"
+            )
+            if rebuild_remote_runs:
+                db.execute("DROP TABLE remote_runs_legacy_remote_model")
+            if rebuild_computers:
+                db.execute("DROP TABLE computers_legacy_remote_model")
+            foreign_key_issue = db.execute("PRAGMA foreign_key_check").fetchone()
+            if foreign_key_issue is not None:
+                raise RuntimeError("Remote/Archive migration violated a foreign key")
+        except Exception:
+            db.execute("ROLLBACK TO remote_archive_model")
+            db.execute("RELEASE remote_archive_model")
+            raise
+        db.execute("RELEASE remote_archive_model")
 
     def ensure_root(self, path: Path) -> dict[str, Any]:
         normalized = str(path.resolve())
@@ -280,6 +628,7 @@ class StateStore:
                 """
                 SELECT * FROM roots
                 WHERE path NOT LIKE 'ssh://%'
+                  AND path NOT LIKE 'node://%'
                 ORDER BY created_at, path COLLATE NOCASE
                 """
             ).fetchall()
@@ -305,6 +654,8 @@ class StateStore:
         canonical_path: str | None = None,
         workspace_kind: str = "workspace",
     ) -> dict[str, Any]:
+        if backend_kind not in WORKSPACE_BACKEND_KINDS:
+            raise ValueError(f"Unsupported Workspace backend: {backend_kind}")
         if workspace_kind not in WORKSPACE_KINDS:
             raise ValueError(f"Unsupported Workspace kind: {workspace_kind}")
         workspace_id = uuid.uuid4().hex
@@ -361,7 +712,7 @@ class StateStore:
             row = db.execute(
                 """
                 SELECT * FROM workspaces
-                WHERE backend_kind = 'ssh'
+                WHERE backend_kind = 'remote'
                   AND computer_id = ?
                   AND canonical_path = ?
                   AND workspace_kind = ?
@@ -375,7 +726,7 @@ class StateStore:
             row = db.execute(
                 """
                 SELECT * FROM workspaces
-                WHERE backend_kind = 'ssh'
+                WHERE backend_kind = 'remote'
                   AND computer_id = ?
                   AND workspace_kind = 'server_terminal'
                 """,
@@ -517,22 +868,220 @@ class StateStore:
             row = db.execute("SELECT * FROM terminals WHERE id = ?", (terminal_id,)).fetchone()
             return dict(row) if row else None
 
+    @staticmethod
+    def _terminal_role(value: Any) -> str:
+        role = str(value or "shell")
+        if role not in TERMINAL_ROLES:
+            raise ValueError(f"Unsupported Terminal role: {role}")
+        return role
+
     def create_terminal(
-        self, workspace_id: str, name: str, tmux_window: str
+        self,
+        workspace_id: str,
+        name: str,
+        tmux_window: str,
+        *,
+        role: str = "shell",
+        managed_run_id: str | None = None,
     ) -> dict[str, Any]:
+        safe_role = self._terminal_role(role)
+        safe_managed_run_id = str(managed_run_id) if managed_run_id else None
+        if safe_role == "shell":
+            safe_managed_run_id = None
         terminal_id = uuid.uuid4().hex
         now = utc_now()
         with self.connect() as db:
             db.execute(
                 """
                 INSERT INTO terminals(
-                    id, workspace_id, name, tmux_window, created_at, last_opened_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, workspace_id, name, tmux_window, role, managed_run_id,
+                    created_at, last_opened_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (terminal_id, workspace_id, name, tmux_window, now, now),
+                (
+                    terminal_id,
+                    workspace_id,
+                    name,
+                    tmux_window,
+                    safe_role,
+                    safe_managed_run_id,
+                    now,
+                    now,
+                ),
             )
             row = db.execute("SELECT * FROM terminals WHERE id = ?", (terminal_id,)).fetchone()
             return dict(row)
+
+    def get_managed_terminal(
+        self, workspace_id: str, role: str
+    ) -> dict[str, Any] | None:
+        safe_role = self._terminal_role(role)
+        if safe_role == "shell":
+            raise ValueError("A shell Terminal is not a managed slot")
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM terminals WHERE workspace_id = ? AND role = ?",
+                (workspace_id, safe_role),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def reconcile_terminals(
+        self,
+        workspace_id: str,
+        windows: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Project live tmux windows into SQLite without churning stable row IDs."""
+
+        desired: list[dict[str, str | None]] = []
+        seen_windows: set[str] = set()
+        seen_managed_roles: set[str] = set()
+        for raw in windows:
+            tmux_window = str(raw.get("tmux_window") or "")
+            if not tmux_window or tmux_window in seen_windows:
+                raise ValueError("tmux exposed an invalid or duplicate window identity")
+            seen_windows.add(tmux_window)
+            role = self._terminal_role(raw.get("role"))
+            managed_run_id = str(raw.get("managed_run_id") or "") or None
+            if role == "shell":
+                managed_run_id = None
+            elif role in seen_managed_roles:
+                raise ValueError(f"tmux exposed more than one {role} Terminal")
+            else:
+                seen_managed_roles.add(role)
+            desired.append(
+                {
+                    "tmux_window": tmux_window,
+                    "name": str(raw.get("name") or "shell"),
+                    "role": role,
+                    "managed_run_id": managed_run_id,
+                }
+            )
+
+        now = utc_now()
+        with self.connect() as db:
+            stored_rows = db.execute(
+                "SELECT * FROM terminals WHERE workspace_id = ? ORDER BY created_at",
+                (workspace_id,),
+            ).fetchall()
+            stored = [dict(row) for row in stored_rows]
+            by_window = {str(row["tmux_window"]): row for row in stored}
+            by_managed_role = {
+                str(row["role"]): row
+                for row in stored
+                if str(row.get("role") or "shell") != "shell"
+            }
+            claimed_ids: set[str] = set()
+            assigned_by_window: dict[str, dict[str, Any]] = {}
+
+            # A managed role is the stable identity. Match those rows before
+            # considering tmux window ids so a server/window-id drift cannot
+            # silently turn the File Run row into an ordinary shell row.
+            for item in desired:
+                if item["role"] == "shell":
+                    continue
+                candidate = by_managed_role.get(str(item["role"]))
+                if candidate is None:
+                    same_window = by_window.get(str(item["tmux_window"]))
+                    if same_window is not None and str(
+                        same_window.get("role") or "shell"
+                    ) == "shell":
+                        candidate = same_window
+                if candidate is not None and str(candidate["id"]) not in claimed_ids:
+                    claimed_ids.add(str(candidate["id"]))
+                    assigned_by_window[str(item["tmux_window"])] = candidate
+
+            # Shell rows may follow their exact live window, but never claim a
+            # stored managed row merely because an id was reused.
+            for item in desired:
+                if item["role"] != "shell":
+                    continue
+                candidate = by_window.get(str(item["tmux_window"]))
+                if not (
+                    candidate is not None
+                    and str(candidate.get("role") or "shell") == "shell"
+                    and str(candidate["id"]) not in claimed_ids
+                ):
+                    remaining_shells = [
+                        row
+                        for row in stored
+                        if str(row.get("role") or "shell") == "shell"
+                        and str(row["id"]) not in claimed_ids
+                    ]
+                    candidate = next(
+                        (
+                            row
+                            for row in remaining_shells
+                            if str(row.get("name") or "shell") == item["name"]
+                        ),
+                        remaining_shells[0] if remaining_shells else None,
+                    )
+                if candidate is not None:
+                    claimed_ids.add(str(candidate["id"]))
+                    assigned_by_window[str(item["tmux_window"])] = candidate
+
+            assignments = [
+                (item, assigned_by_window.get(str(item["tmux_window"])))
+                for item in desired
+            ]
+
+            for row in stored:
+                if str(row["id"]) not in claimed_ids:
+                    db.execute("DELETE FROM terminals WHERE id = ?", (str(row["id"]),))
+
+            # Temporary values make externally-induced window-id and role swaps
+            # safe under both Terminal uniqueness constraints.
+            for _item, row in assignments:
+                if row is not None:
+                    db.execute(
+                        """
+                        UPDATE terminals
+                        SET tmux_window = ?, role = 'shell', managed_run_id = NULL
+                        WHERE id = ?
+                        """,
+                        (f"__termroom_sync__{row['id']}", str(row["id"])),
+                    )
+
+            for item, row in assignments:
+                if row is None:
+                    terminal_id = uuid.uuid4().hex
+                    db.execute(
+                        """
+                        INSERT INTO terminals(
+                            id, workspace_id, name, tmux_window, role, managed_run_id,
+                            created_at, last_opened_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            terminal_id,
+                            workspace_id,
+                            item["name"],
+                            item["tmux_window"],
+                            item["role"],
+                            item["managed_run_id"],
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    db.execute(
+                        """
+                        UPDATE terminals
+                        SET name = ?, tmux_window = ?, role = ?, managed_run_id = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            item["name"],
+                            item["tmux_window"],
+                            item["role"],
+                            item["managed_run_id"],
+                            str(row["id"]),
+                        ),
+                    )
+            rows = db.execute(
+                "SELECT * FROM terminals WHERE workspace_id = ? ORDER BY created_at",
+                (workspace_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def reset_terminals(self, workspace_id: str) -> None:
         with self.connect() as db:
@@ -606,6 +1155,308 @@ class StateStore:
         with self.connect() as db:
             db.execute("DELETE FROM command_history WHERE workspace_id = ?", (workspace_id,))
 
+    def claim_file_run(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        """Atomically create, replay, or reject a Workspace File Run claim."""
+
+        required = {
+            "id",
+            "workspace_id",
+            "idempotency_key",
+            "relative_path",
+            "source_digest",
+            "runner_id",
+            "runner_version",
+            "argv",
+        }
+        missing = required - payload.keys()
+        if missing:
+            raise ValueError(f"Missing File Run fields: {', '.join(sorted(missing))}")
+        values = {
+            "id": str(payload["id"]),
+            "workspace_id": str(payload["workspace_id"]),
+            "idempotency_key": str(payload["idempotency_key"]),
+            "relative_path": str(payload["relative_path"]),
+            "source_digest": str(payload["source_digest"]),
+            "runner_id": str(payload["runner_id"]),
+            "runner_version": int(payload["runner_version"]),
+            "argv_json": json.dumps(
+                [str(value) for value in payload["argv"]],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                """
+                SELECT * FROM file_runs
+                WHERE workspace_id = ? AND idempotency_key = ?
+                """,
+                (values["workspace_id"], values["idempotency_key"]),
+            ).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                compared = (
+                    "relative_path",
+                    "source_digest",
+                    "runner_id",
+                    "runner_version",
+                    "argv_json",
+                )
+                if any(row[key] != values[key] for key in compared):
+                    raise ValueError(
+                        "File Run idempotency key was reused with a different payload"
+                    )
+                row["argv"] = json.loads(str(row["argv_json"]))
+                return "idempotent", row
+
+            active = db.execute(
+                """
+                SELECT * FROM file_runs
+                WHERE workspace_id = ? AND state IN ('preparing', 'running')
+                """,
+                (values["workspace_id"],),
+            ).fetchone()
+            if active is not None:
+                row = dict(active)
+                row["argv"] = json.loads(str(row["argv_json"]))
+                return "occupied", row
+
+            now = utc_now()
+            db.execute(
+                """
+                INSERT INTO file_runs(
+                    id, workspace_id, idempotency_key, relative_path,
+                    source_digest, runner_id, runner_version, argv_json,
+                    state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?)
+                """,
+                (
+                    values["id"],
+                    values["workspace_id"],
+                    values["idempotency_key"],
+                    values["relative_path"],
+                    values["source_digest"],
+                    values["runner_id"],
+                    values["runner_version"],
+                    values["argv_json"],
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM file_runs WHERE id = ?", (values["id"],)
+            ).fetchone()
+            result = dict(row)
+            result["argv"] = json.loads(str(result["argv_json"]))
+            return "created", result
+
+    @staticmethod
+    def _file_run_select() -> str:
+        return """
+            SELECT file_runs.*, workspaces.display_name AS workspace_name,
+                   workspaces.backend_kind AS workspace_backend_kind,
+                   workspaces.workspace_kind AS workspace_kind
+            FROM file_runs
+            JOIN workspaces ON workspaces.id = file_runs.workspace_id
+        """
+
+    @staticmethod
+    def _decode_file_run(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["argv"] = json.loads(str(result["argv_json"]))
+        return result
+
+    def get_file_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                f"{self._file_run_select()} WHERE file_runs.id = ?", (run_id,)
+            ).fetchone()
+            return self._decode_file_run(row)
+
+    def get_file_run_by_idempotency(
+        self, workspace_id: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                f"{self._file_run_select()} "
+                "WHERE file_runs.workspace_id = ? "
+                "AND file_runs.idempotency_key = ?",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+            return self._decode_file_run(row)
+
+    def get_active_file_run(self, workspace_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                f"{self._file_run_select()} "
+                "WHERE file_runs.workspace_id = ? "
+                "AND file_runs.state IN ('preparing', 'running')",
+                (workspace_id,),
+            ).fetchone()
+            return self._decode_file_run(row)
+
+    def get_latest_file_run(
+        self, workspace_id: str, relative_path: str | None = None
+    ) -> dict[str, Any] | None:
+        where = "WHERE file_runs.workspace_id = ?"
+        parameters: list[Any] = [workspace_id]
+        if relative_path is not None:
+            where += " AND file_runs.relative_path = ?"
+            parameters.append(relative_path)
+        with self.connect() as db:
+            row = db.execute(
+                f"{self._file_run_select()} {where} "
+                "ORDER BY file_runs.created_at DESC LIMIT 1",
+                tuple(parameters),
+            ).fetchone()
+            return self._decode_file_run(row)
+
+    def list_active_file_runs(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                f"{self._file_run_select()} "
+                "WHERE file_runs.state IN ('preparing', 'running') "
+                "ORDER BY file_runs.created_at"
+            ).fetchall()
+            return [self._decode_file_run(row) or {} for row in rows]
+
+    def set_file_run_terminal(self, run_id: str, terminal_id: str) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE file_runs SET terminal_id = ?
+                WHERE id = ? AND state IN ('preparing', 'running')
+                """,
+                (terminal_id, run_id),
+            )
+            return cursor.rowcount == 1
+
+    def transition_file_run(
+        self,
+        run_id: str,
+        *,
+        expected_states: set[str] | frozenset[str],
+        state: str | object = ...,
+        started_at: str | None | object = ...,
+        stop_requested_at: str | None | object = ...,
+        ended_at: str | None | object = ...,
+        exit_code: int | None | object = ...,
+        error_code: str | None | object = ...,
+        error_detail: str | None | object = ...,
+    ) -> bool:
+        if not expected_states or not expected_states <= FILE_RUN_STATES:
+            raise ValueError("Invalid expected File Run states")
+        if state is not ... and state not in FILE_RUN_STATES:
+            raise ValueError("Invalid File Run state")
+        assignments: list[str] = []
+        parameters: list[Any] = []
+        for column, value in {
+            "state": state,
+            "started_at": started_at,
+            "stop_requested_at": stop_requested_at,
+            "ended_at": ended_at,
+            "exit_code": exit_code,
+            "error_code": error_code,
+            "error_detail": error_detail,
+        }.items():
+            if value is ...:
+                continue
+            assignments.append(f"{column} = ?")
+            parameters.append(value)
+        if not assignments:
+            return False
+        assignments.append("lifecycle_revision = lifecycle_revision + 1")
+        ordered_states = sorted(expected_states)
+        parameters.append(run_id)
+        parameters.extend(ordered_states)
+        with self.connect() as db:
+            previous = db.execute(
+                "SELECT state FROM file_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            cursor = db.execute(
+                f"UPDATE file_runs SET {', '.join(assignments)} "
+                f"WHERE id = ? AND state IN ({', '.join('?' for _ in ordered_states)})",
+                tuple(parameters),
+            )
+            if cursor.rowcount != 1:
+                return False
+            updated = db.execute(
+                f"{self._file_run_select()} WHERE file_runs.id = ?", (run_id,)
+            ).fetchone()
+            if (
+                previous is not None
+                and str(previous["state"]) not in FILE_RUN_TERMINAL_STATES
+                and updated is not None
+                and str(updated["state"]) in FILE_RUN_TERMINAL_STATES
+            ):
+                self._insert_file_run_event(db, updated)
+            return True
+
+    @staticmethod
+    def _run_duration_seconds(run: Mapping[str, Any]) -> int | None:
+        started = run.get("started_at")
+        ended = run.get("ended_at")
+        if not started or not ended:
+            return None
+        try:
+            seconds = (
+                datetime.fromisoformat(str(ended))
+                - datetime.fromisoformat(str(started))
+            ).total_seconds()
+        except ValueError:
+            return None
+        return max(0, int(seconds))
+
+    def _insert_file_run_event(
+        self, db: sqlite3.Connection, run: Mapping[str, Any]
+    ) -> None:
+        values = dict(run)
+        state = str(values.get("state") or "")
+        if state not in FILE_RUN_TERMINAL_STATES:
+            return
+        duration = self._run_duration_seconds(values)
+        if state == "finished":
+            completed = values.get("exit_code") == 0
+            kind = "file_run.completed" if completed else "file_run.failed"
+            notify = not completed or bool(duration is not None and duration >= 30)
+        elif state == "failed":
+            kind = "file_run.failed"
+            notify = True
+        elif state == "stopped":
+            kind = "file_run.stopped"
+            notify = True
+        else:
+            kind = "file_run.attention"
+            notify = True
+        occurred_at = str(values.get("ended_at") or values.get("created_at") or utc_now())
+        db.execute(
+            """
+            INSERT INTO events(
+                id, kind, subject_type, subject_id, subject_revision,
+                primary_label, secondary_label, exit_code, duration_seconds,
+                occurred_at, created_at, notify
+            ) VALUES (?, ?, 'file_run', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subject_type, subject_id, subject_revision) DO NOTHING
+            """,
+            (
+                uuid.uuid4().hex,
+                kind,
+                str(values["id"]),
+                int(values.get("lifecycle_revision") or 0),
+                self._event_label(values.get("relative_path"), "File"),
+                self._event_label(values.get("workspace_name"), "Workspace"),
+                values.get("exit_code"),
+                duration,
+                occurred_at,
+                utc_now(),
+                1 if notify else 0,
+            ),
+        )
+
     def create_remote_run(
         self,
         values: Mapping[str, Any],
@@ -615,6 +1466,7 @@ class StateStore:
         columns = (
             "id",
             "source_kind",
+            "archive_format",
             "source_workspace_id",
             "source_path",
             "source_label",
@@ -682,7 +1534,7 @@ class StateStore:
         run_id: str,
         workspace_id: str,
     ) -> dict[str, Any]:
-        """Attach one SSH Workspace shell to one Remote Run idempotently."""
+        """Attach one Remote Workspace shell to one Remote Run idempotently."""
 
         with self.connect() as db:
             run = db.execute(
@@ -697,11 +1549,11 @@ class StateStore:
             ).fetchone()
             if workspace is None:
                 raise KeyError(f"Unknown Workspace: {workspace_id}")
-            if workspace["backend_kind"] != "ssh" or (
+            if workspace["backend_kind"] != "remote" or (
                 str(workspace["computer_id"] or "")
                 != str(run["target_computer_id"])
             ):
-                raise ValueError("Remote Run Workspace must use its SSH target computer")
+                raise ValueError("Remote Run Workspace must use its target Remote")
 
             attached = run["workspace_id"]
             if attached is not None and str(attached) != workspace_id:
@@ -796,6 +1648,21 @@ class StateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_active_remote_runs(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM remote_runs
+                WHERE state = 'running'
+                   OR (
+                        state = 'preparing'
+                    AND (phase IS NULL OR phase != 'waiting_upload')
+                   )
+                ORDER BY created_at
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_expired_remote_runs(self, now: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
@@ -819,7 +1686,8 @@ class StateStore:
                 SELECT * FROM remote_runs
                 WHERE state = 'preparing'
                   AND phase = 'waiting_upload'
-                  AND source_kind = 'zip'
+                  AND source_kind = 'archive'
+                  AND archive_format = 'zip'
                   AND expires_at IS NOT NULL
                   AND expires_at <= ?
                 ORDER BY expires_at
@@ -883,6 +1751,7 @@ class StateStore:
             parameters.append(value)
         if not assignments:
             return False
+        assignments.append("lifecycle_revision = lifecycle_revision + 1")
 
         ordered_states = sorted(expected_states)
         where = [
@@ -899,11 +1768,245 @@ class StateStore:
                 parameters.append(expected_phase)
 
         with self.connect() as db:
+            previous = db.execute(
+                "SELECT state FROM remote_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
             cursor = db.execute(
                 f"UPDATE remote_runs SET {', '.join(assignments)} WHERE {' AND '.join(where)}",
                 tuple(parameters),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return False
+            updated = db.execute(
+                """
+                SELECT rr.*, computers.name AS target_name
+                FROM remote_runs AS rr
+                JOIN computers ON computers.id = rr.target_computer_id
+                WHERE rr.id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if (
+                previous is not None
+                and str(previous["state"]) not in REMOTE_RUN_TERMINAL_STATES
+                and updated is not None
+                and str(updated["state"]) in REMOTE_RUN_TERMINAL_STATES
+            ):
+                self._insert_remote_run_event(db, updated)
+            return True
+
+    @staticmethod
+    def _event_label(value: Any, fallback: str) -> str:
+        label = " ".join(str(value or "").split())[:160]
+        return label or fallback
+
+    def _insert_remote_run_event(
+        self,
+        db: sqlite3.Connection,
+        run: Mapping[str, Any],
+        *,
+        historical: bool = False,
+    ) -> None:
+        values = dict(run)
+        state = str(values.get("state") or "")
+        if state not in REMOTE_RUN_TERMINAL_STATES:
+            return
+        if state == "finished":
+            kind = (
+                "remote_run.completed"
+                if values.get("exit_code") == 0
+                else "remote_run.failed"
+            )
+        elif state == "failed":
+            kind = "remote_run.failed"
+        elif state == "stopped":
+            kind = "remote_run.stopped"
+        else:
+            kind = "remote_run.attention"
+        occurred_at = str(
+            values.get("ended_at") or values.get("created_at") or utc_now()
+        )
+        db.execute(
+            """
+            INSERT INTO events(
+                id, kind, subject_type, subject_id, subject_revision,
+                primary_label, secondary_label, exit_code,
+                occurred_at, created_at, read_at, notify
+            ) VALUES (?, ?, 'remote_run', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subject_type, subject_id, subject_revision) DO NOTHING
+            """,
+            (
+                uuid.uuid4().hex,
+                kind,
+                str(values["id"]),
+                int(values.get("lifecycle_revision") or 0),
+                self._event_label(values.get("source_label"), "Remote Run"),
+                self._event_label(values.get("target_name"), "Remote"),
+                values.get("exit_code"),
+                occurred_at,
+                utc_now(),
+                occurred_at if historical else None,
+                0 if historical else 1,
+            ),
+        )
+
+    @staticmethod
+    def _activity_select() -> str:
+        return """
+            SELECT
+                events.*,
+                CASE
+                    WHEN events.subject_type = 'remote_run'
+                         AND remote_runs.id IS NOT NULL THEN 1
+                    WHEN events.subject_type = 'file_run'
+                         AND file_runs.id IS NOT NULL
+                         AND file_workspaces.id IS NOT NULL THEN 1
+                    ELSE 0
+                END AS subject_exists,
+                COALESCE(
+                    remote_runs.source_label,
+                    file_runs.relative_path,
+                    events.primary_label
+                )
+                    AS current_primary_label,
+                COALESCE(
+                    computers.name,
+                    file_workspaces.display_name,
+                    events.secondary_label
+                ) AS current_secondary_label,
+                file_runs.workspace_id AS current_workspace_id,
+                file_runs.relative_path AS current_relative_path,
+                CASE
+                    WHEN file_terminals.role = 'file_run'
+                         AND file_terminals.managed_run_id = file_runs.id
+                    THEN file_terminals.id
+                    ELSE NULL
+                END AS current_terminal_id
+            FROM events
+            LEFT JOIN remote_runs
+              ON events.subject_type = 'remote_run'
+             AND remote_runs.id = events.subject_id
+            LEFT JOIN computers
+              ON computers.id = remote_runs.target_computer_id
+            LEFT JOIN file_runs
+              ON events.subject_type = 'file_run'
+             AND file_runs.id = events.subject_id
+            LEFT JOIN workspaces AS file_workspaces
+              ON file_workspaces.id = file_runs.workspace_id
+            LEFT JOIN terminals AS file_terminals
+              ON file_terminals.id = file_runs.terminal_id
+        """
+
+    def list_activity_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        with self.connect() as db:
+            rows = db.execute(
+                f"{self._activity_select()} ORDER BY events.sequence DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_activity_event(self, event_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                f"{self._activity_select()} WHERE events.id = ?",
+                (event_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def count_unread_events(self) -> int:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS count FROM events WHERE read_at IS NULL"
+            ).fetchone()
+            return int(row["count"] if row else 0)
+
+    def mark_event_read(self, event_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE events SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+                (utc_now(), event_id),
+            )
+        return self.get_activity_event(event_id)
+
+    def mark_all_events_read(self) -> int:
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE events SET read_at = ? WHERE read_at IS NULL",
+                (utc_now(),),
+            )
+            return cursor.rowcount
+
+    def claim_event_notifications(
+        self,
+        device_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 50))
+        now = utc_now()
+        claimed_ids: list[str] = []
+        with self.connect() as db:
+            device = db.execute(
+                "SELECT * FROM notification_devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if device is None:
+                latest = db.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events"
+                ).fetchone()
+                db.execute(
+                    """
+                    INSERT INTO notification_devices(
+                        id, start_sequence, created_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (device_id, int(latest["sequence"]), now, now),
+                )
+                return []
+            db.execute(
+                "UPDATE notification_devices SET last_seen_at = ? WHERE id = ?",
+                (now, device_id),
+            )
+            candidates = db.execute(
+                """
+                SELECT events.id
+                FROM events
+                WHERE events.notify = 1
+                  AND events.sequence > ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event_notification_claims AS claims
+                      WHERE claims.event_id = events.id
+                        AND claims.device_id = ?
+                  )
+                ORDER BY events.sequence
+                LIMIT ?
+                """,
+                (int(device["start_sequence"]), device_id, safe_limit),
+            ).fetchall()
+            for candidate in candidates:
+                event_id = str(candidate["id"])
+                cursor = db.execute(
+                    """
+                    INSERT INTO event_notification_claims(
+                        event_id, device_id, claimed_at
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(event_id, device_id) DO NOTHING
+                    """,
+                    (event_id, device_id, now),
+                )
+                if cursor.rowcount == 1:
+                    claimed_ids.append(event_id)
+            if not claimed_ids:
+                return []
+            placeholders = ", ".join("?" for _ in claimed_ids)
+            rows = db.execute(
+                f"{self._activity_select()} "
+                f"WHERE events.id IN ({placeholders}) ORDER BY events.sequence",
+                tuple(claimed_ids),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def expire_remote_run_now(self, run_id: str, now: str) -> bool:
         with self.connect() as db:
@@ -970,7 +2073,8 @@ class StateStore:
             db.execute(
                 """
                 INSERT INTO computers(
-                    id, name, kind, auth_kind, ssh_alias, host, port, username, identity_file,
+                    id, name, connection_method, auth_kind, ssh_alias, host, port,
+                    username, identity_file,
                     host_key_type, host_key_data, host_fingerprint, created_at
                 ) VALUES (?, ?, 'ssh', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -990,6 +2094,249 @@ class StateStore:
                 ),
             )
             row = db.execute("SELECT * FROM computers WHERE id = ?", (computer_id,)).fetchone()
+            return dict(row)
+
+    def create_node_pairing_code(
+        self, *, code_hash: str, expires_at: str
+    ) -> dict[str, Any]:
+        pairing_id = uuid.uuid4().hex
+        now = utc_now()
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM node_pairing_codes WHERE expires_at < ? AND consumed_at IS NULL",
+                (now,),
+            )
+            db.execute(
+                """
+                INSERT INTO node_pairing_codes(id, code_hash, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (pairing_id, code_hash, now, expires_at),
+            )
+            row = db.execute(
+                "SELECT * FROM node_pairing_codes WHERE id = ?", (pairing_id,)
+            ).fetchone()
+            return dict(row)
+
+    def submit_node_enrollment(
+        self,
+        *,
+        code_hash: str,
+        name: str,
+        public_key: str,
+        fingerprint: str,
+        protocol_version: int,
+        polling_secret_hash: str,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        enrollment_id = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            pairing = db.execute(
+                """
+                SELECT * FROM node_pairing_codes
+                WHERE code_hash = ? AND consumed_at IS NULL AND expires_at >= ?
+                """,
+                (code_hash, now),
+            ).fetchone()
+            if pairing is None:
+                return None
+            existing = db.execute(
+                "SELECT id FROM computers WHERE node_public_key = ? LIMIT 1",
+                (public_key,),
+            ).fetchone()
+            if existing is not None:
+                return None
+            consumed = db.execute(
+                """
+                UPDATE node_pairing_codes SET consumed_at = ?
+                WHERE id = ? AND consumed_at IS NULL
+                """,
+                (now, pairing["id"]),
+            )
+            if consumed.rowcount != 1:
+                return None
+            db.execute(
+                """
+                INSERT INTO node_enrollments(
+                    id, pairing_code_id, name, public_key, fingerprint,
+                    protocol_version, polling_secret_hash, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    enrollment_id,
+                    pairing["id"],
+                    normalize_computer_name(name),
+                    public_key,
+                    fingerprint,
+                    protocol_version,
+                    polling_secret_hash,
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM node_enrollments WHERE id = ?", (enrollment_id,)
+            ).fetchone()
+            return dict(row)
+
+    def get_node_pairing(self, pairing_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT pc.*, ne.id AS enrollment_id, ne.name AS node_name,
+                       ne.public_key, ne.fingerprint, ne.protocol_version,
+                       ne.status, ne.computer_id, ne.decided_at
+                FROM node_pairing_codes AS pc
+                LEFT JOIN node_enrollments AS ne ON ne.pairing_code_id = pc.id
+                WHERE pc.id = ?
+                """,
+                (pairing_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_node_enrollment(
+        self, enrollment_id: str, *, polling_secret_hash: str | None = None
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            if polling_secret_hash is None:
+                row = db.execute(
+                    "SELECT * FROM node_enrollments WHERE id = ?", (enrollment_id,)
+                ).fetchone()
+            else:
+                row = db.execute(
+                    """
+                    SELECT * FROM node_enrollments
+                    WHERE id = ? AND polling_secret_hash = ?
+                    """,
+                    (enrollment_id, polling_secret_hash),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def approve_node_enrollment(self, enrollment_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            enrollment = db.execute(
+                "SELECT * FROM node_enrollments WHERE id = ?", (enrollment_id,)
+            ).fetchone()
+            if enrollment is None:
+                raise KeyError(f"Unknown Node enrollment: {enrollment_id}")
+            if enrollment["status"] != "pending":
+                if enrollment["status"] == "approved" and enrollment["computer_id"]:
+                    row = db.execute(
+                        "SELECT * FROM computers WHERE id = ?",
+                        (enrollment["computer_id"],),
+                    ).fetchone()
+                    if row is not None:
+                        return dict(row)
+                raise RuntimeError("Node enrollment is no longer pending")
+            existing = db.execute(
+                "SELECT id FROM computers WHERE node_public_key = ? LIMIT 1",
+                (enrollment["public_key"],),
+            ).fetchone()
+            if existing is not None:
+                raise RuntimeError("This Node identity is already registered")
+            computer_id = uuid.uuid4().hex
+            db.execute(
+                """
+                INSERT INTO computers(
+                    id, name, connection_method, auth_kind, ssh_alias, host, port,
+                    username, identity_file, host_key_type, host_key_data,
+                    host_fingerprint, created_at, node_public_key,
+                    node_fingerprint, node_protocol_version,
+                    node_capabilities_json
+                ) VALUES (?, ?, 'node', 'node', '', '', 0, '', '', '', '', '', ?, ?, ?, ?, '[]')
+                """,
+                (
+                    computer_id,
+                    enrollment["name"],
+                    now,
+                    enrollment["public_key"],
+                    enrollment["fingerprint"],
+                    enrollment["protocol_version"],
+                ),
+            )
+            db.execute(
+                """
+                UPDATE node_enrollments
+                SET status = 'approved', computer_id = ?, decided_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (computer_id, now, enrollment_id),
+            )
+            row = db.execute(
+                "SELECT * FROM computers WHERE id = ?", (computer_id,)
+            ).fetchone()
+            return dict(row)
+
+    def reject_node_enrollment(self, enrollment_id: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE node_enrollments
+                SET status = 'rejected', decided_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (utc_now(), enrollment_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Node enrollment is no longer pending")
+
+    def update_node_connection(
+        self,
+        computer_id: str,
+        *,
+        protocol_version: int,
+        capabilities: tuple[str, ...],
+    ) -> None:
+        now = utc_now()
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE computers
+                SET node_protocol_version = ?, node_capabilities_json = ?,
+                    last_seen_at = ?, last_connected_at = ?, last_error = NULL
+                WHERE id = ? AND connection_method = 'node' AND node_revoked_at IS NULL
+                """,
+                (
+                    protocol_version,
+                    json.dumps(capabilities, separators=(",", ":")),
+                    now,
+                    now,
+                    computer_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown or revoked Node: {computer_id}")
+
+    def touch_node(self, computer_id: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE computers SET last_seen_at = ?
+                WHERE id = ? AND connection_method = 'node' AND node_revoked_at IS NULL
+                """,
+                (utc_now(), computer_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown or revoked Node: {computer_id}")
+
+    def revoke_node(self, computer_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE computers
+                SET node_revoked_at = ?, last_error = 'node_revoked'
+                WHERE id = ? AND connection_method = 'node' AND node_revoked_at IS NULL
+                """,
+                (now, computer_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown or already revoked Node: {computer_id}")
+            row = db.execute(
+                "SELECT * FROM computers WHERE id = ?", (computer_id,)
+            ).fetchone()
             return dict(row)
 
     def get_computer(self, computer_id: str) -> dict[str, Any] | None:
@@ -1054,5 +2401,6 @@ class StateStore:
             workspace_ids = [str(row["id"]) for row in rows]
             db.execute("DELETE FROM workspaces WHERE computer_id = ?", (computer_id,))
             db.execute("DELETE FROM roots WHERE path = ?", (f"ssh://{computer_id}",))
+            db.execute("DELETE FROM roots WHERE path = ?", (f"node://{computer_id}",))
             db.execute("DELETE FROM computers WHERE id = ?", (computer_id,))
             return workspace_ids

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -107,7 +109,8 @@ def test_waiting_zip_upload_expiry_is_persisted_and_queryable(tmp_path: Path) ->
     computer = _computer(store)
     values = _remote_run_values(str(computer["id"]))
     values.update(
-        source_kind="zip",
+        source_kind="archive",
+        archive_format="zip",
         source_url=None,
         source_label="source.zip",
         source_options_json='{"archive_name":"source.zip"}',
@@ -138,3 +141,208 @@ def test_computer_run_base_setting_is_optional_and_mutable(tmp_path: Path) -> No
     store.update_computer_run_base(str(computer["id"]), "/scratch/termroom-runs")
 
     assert store.get_computer(str(computer["id"]))["run_base_dir"] == "/scratch/termroom-runs"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code", "kind"),
+    [
+        ("finished", 0, "remote_run.completed"),
+        ("finished", 7, "remote_run.failed"),
+        ("failed", None, "remote_run.failed"),
+        ("stopped", None, "remote_run.stopped"),
+        ("lost", None, "remote_run.attention"),
+    ],
+)
+def test_terminal_transition_atomically_creates_one_safe_event(
+    tmp_path: Path,
+    state: str,
+    exit_code: int | None,
+    kind: str,
+) -> None:
+    store = _store(tmp_path)
+    computer = _computer(store)
+    values = _remote_run_values(str(computer["id"]))
+    values["command"] = "TOKEN=do-not-copy python /private/project/main.py"
+    store.create_remote_run(values)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        transitions = list(
+            executor.map(
+                lambda _index: store.transition_remote_run(
+                    str(values["id"]),
+                    expected_states={"preparing"},
+                    state=state,
+                    phase=None,
+                    ended_at=utc_now(),
+                    exit_code=exit_code,
+                    error_detail="private output must not be copied",
+                ),
+                range(8),
+            )
+        )
+
+    assert transitions.count(True) == 1
+    events = store.list_activity_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event["kind"] == kind
+    assert event["subject_id"] == values["id"]
+    assert event["primary_label"] == values["source_label"]
+    assert event["secondary_label"] == computer["name"]
+    assert event["exit_code"] == exit_code
+    serialized = repr(event)
+    assert "TOKEN=" not in serialized
+    assert "/private/project" not in serialized
+    assert "private output" not in serialized
+
+
+def test_event_revision_preserves_a_later_retry_outcome(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    computer = _computer(store)
+    values = _remote_run_values(str(computer["id"]))
+    store.create_remote_run(values)
+
+    assert store.transition_remote_run(
+        str(values["id"]),
+        expected_states={"preparing"},
+        state="failed",
+        phase=None,
+        ended_at=utc_now(),
+        error_code="prepare_failed",
+    )
+    assert store.transition_remote_run(
+        str(values["id"]),
+        expected_states={"failed"},
+        state="preparing",
+        phase="checking",
+        ended_at=None,
+        error_code=None,
+    )
+    assert store.transition_remote_run(
+        str(values["id"]),
+        expected_states={"preparing"},
+        state="finished",
+        phase=None,
+        ended_at=utc_now(),
+        exit_code=0,
+    )
+
+    events = list(reversed(store.list_activity_events()))
+    assert [event["kind"] for event in events] == [
+        "remote_run.failed",
+        "remote_run.completed",
+    ]
+    assert events[0]["subject_revision"] < events[1]["subject_revision"]
+
+
+def test_event_insert_failure_rolls_back_the_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    computer = _computer(store)
+    values = _remote_run_values(str(computer["id"]))
+    store.create_remote_run(values)
+
+    def fail_event(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("event write failed")
+
+    monkeypatch.setattr(store, "_insert_remote_run_event", fail_event)
+
+    with pytest.raises(sqlite3.OperationalError, match="event write failed"):
+        store.transition_remote_run(
+            str(values["id"]),
+            expected_states={"preparing"},
+            state="finished",
+            phase=None,
+            ended_at=utc_now(),
+            exit_code=0,
+        )
+
+    run = store.get_remote_run(str(values["id"]))
+    assert run is not None
+    assert run["state"] == "preparing"
+    assert store.list_activity_events() == []
+
+
+def test_deleted_subject_keeps_activity_and_device_claim_is_exactly_once(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    computer = _computer(store)
+    first = _remote_run_values(str(computer["id"]))
+    store.create_remote_run(first)
+    assert store.transition_remote_run(
+        str(first["id"]),
+        expected_states={"preparing"},
+        state="finished",
+        phase=None,
+        ended_at=utc_now(),
+        exit_code=0,
+    )
+
+    device_id = "b28003fe-56b0-4e52-a41c-591a1259ad02"
+    assert store.claim_event_notifications(device_id) == []
+
+    second = {**first, "id": "fcd204bb-ae46-4f1a-b620-abfa09200c03"}
+    store.create_remote_run(second)
+    assert store.transition_remote_run(
+        str(second["id"]),
+        expected_states={"preparing"},
+        state="finished",
+        phase=None,
+        ended_at=utc_now(),
+        exit_code=7,
+    )
+    claimed = store.claim_event_notifications(device_id)
+    assert [event["subject_id"] for event in claimed] == [second["id"]]
+    assert store.claim_event_notifications(device_id) == []
+
+    event_id = str(claimed[0]["id"])
+    store.delete_remote_run(str(second["id"]))
+    retained = store.get_activity_event(event_id)
+    assert retained is not None
+    assert retained["subject_exists"] == 0
+    assert retained["primary_label"] == second["source_label"]
+    assert store.count_unread_events() == 2
+    assert store.mark_event_read(event_id)["read_at"] is not None  # type: ignore[index]
+    assert store.mark_all_events_read() == 1
+    assert store.count_unread_events() == 0
+
+
+def test_initialize_migrates_existing_terminal_run_without_new_notification(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
+    store.initialize()
+    computer = _computer(store)
+    values = _remote_run_values(str(computer["id"]))
+    store.create_remote_run(values)
+    assert store.transition_remote_run(
+        str(values["id"]),
+        expected_states={"preparing"},
+        state="finished",
+        phase=None,
+        ended_at=utc_now(),
+        exit_code=0,
+    )
+    with store.connect() as db:
+        db.execute("DROP TABLE event_notification_claims")
+        db.execute("DROP TABLE notification_devices")
+        db.execute("DROP TABLE events")
+        db.execute("ALTER TABLE remote_runs DROP COLUMN lifecycle_revision")
+
+    migrated = StateStore(database)
+    migrated.initialize()
+
+    run = migrated.get_remote_run(str(values["id"]))
+    assert run is not None
+    assert run["id"] == values["id"]
+    assert run["state"] == "finished"
+    assert run["lifecycle_revision"] == 0
+    events = migrated.list_activity_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "remote_run.completed"
+    assert events[0]["read_at"] is not None
+    assert events[0]["notify"] == 0

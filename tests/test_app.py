@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import shutil
 import subprocess
 import uuid
 import zipfile
@@ -170,6 +172,15 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
         assert terminal_page.status_code == 200
         assert '<span class="workspace-mode">이 컴퓨터 · 로컬 작업공간</span>' in terminal_page.text
         assert "<small>로컬 작업공간</small>" in terminal_page.text
+        assert f'/api/workspaces/{workspace_id}/usage' in terminal_page.text
+        assert "작업공간 사용량" in terminal_page.text
+
+        usage = await client.get(f"/api/workspaces/{workspace_id}/usage")
+        assert usage.status_code == 200
+        assert usage.json()["estimated"] is True
+        assert usage.json()["state"] == "fresh"
+        assert usage.json()["sample"]["process_count"] >= 1
+        assert usage.json()["last_checked_at"].endswith("Z")
 
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
@@ -220,7 +231,7 @@ async def test_local_project_route_keeps_created_folder_when_tmux_open_fails(
 
 
 @pytest.mark.asyncio
-async def test_remote_run_zip_api_is_ssh_only(
+async def test_remote_run_archive_api_normalizes_legacy_zip_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
@@ -262,6 +273,7 @@ async def test_remote_run_zip_api_is_ssh_only(
         assert "원격 실행" in new_page.text
         assert "GPU QA" in new_page.text
         assert "공개 Git" in new_page.text
+        assert "Archive" in new_page.text
         assert "ZIP" in new_page.text
 
         run_id = str(uuid.uuid4())
@@ -283,6 +295,8 @@ async def test_remote_run_zip_api_is_ssh_only(
         stored = app.state.store.get_remote_run(run_id)
         assert stored is not None
         assert stored["target_computer_id"] == computer["id"]
+        assert stored["source_kind"] == "archive"
+        assert stored["archive_format"] == "zip"
         assert stored["state"] == "preparing"
         assert stored["phase"] == "waiting_upload"
 
@@ -291,7 +305,7 @@ async def test_remote_run_zip_api_is_ssh_only(
 
 
 @pytest.mark.asyncio
-async def test_remote_run_empty_state_connects_an_ssh_server_directly(
+async def test_remote_run_empty_state_connects_a_remote_directly(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
@@ -313,8 +327,8 @@ async def test_remote_run_empty_state_connects_an_ssh_server_directly(
         response = await client.get("/remote-runs/new")
 
     assert response.status_code == 200
-    assert "등록한 SSH 서버가 없습니다" in response.text
-    assert '<a class="primary-button" href="/computers/new">SSH 서버 연결</a>' in response.text
+    assert "등록한 Remote가 없습니다" in response.text
+    assert '<a class="primary-button" href="/computers/new">컴퓨터 연결</a>' in response.text
 
 
 @pytest.mark.asyncio
@@ -345,16 +359,16 @@ async def test_remote_run_input_errors_are_localized_in_korean(
     cases = (
         (
             {
-                "source_kind": "zip",
+                "source_kind": "archive",
                 "archive_name": "source.zip",
                 "target_computer_id": "",
                 "command": "printf done",
             },
-            "실행할 SSH 서버를 선택하세요",
+            "실행할 Remote를 선택하세요",
         ),
         (
             {
-                "source_kind": "zip",
+                "source_kind": "archive",
                 "archive_name": "source.zip",
                 "target_computer_id": target_id,
                 "command": "",
@@ -378,6 +392,16 @@ async def test_remote_run_input_errors_are_localized_in_korean(
                 "command": "printf done",
             },
             "공개 HTTPS clone URL을 입력하세요",
+        ),
+        (
+            {
+                "source_kind": "archive",
+                "archive_format": "tar.gz",
+                "archive_name": "source.tar.gz",
+                "target_computer_id": target_id,
+                "command": "printf done",
+            },
+            "현재 Archive 형식은 ZIP만 지원합니다",
         ),
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
@@ -498,7 +522,8 @@ async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
     run, created = app.state.store.create_remote_run(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
+            "archive_format": "zip",
             "source_workspace_id": None,
             "source_path": None,
             "source_label": "source.zip",
@@ -521,7 +546,9 @@ async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
         f"termroom-run-{run_id}",
         f"{run_base}/{run_id}/work",
     )
-    terminal = app.state.store.create_terminal(workspace["id"], "run", "@run")
+    terminal = app.state.store.create_terminal(
+        workspace["id"], "run", "@run", role="remote_run", managed_run_id=run_id
+    )
     monkeypatch.setattr(
         app.state.ssh,
         "ensure_workspace",
@@ -897,7 +924,7 @@ async def test_open_workspace_flow_chooses_computer_then_workspace(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_open_workspace_keeps_computer_hub_before_first_ssh_host(tmp_path: Path) -> None:
+async def test_open_workspace_keeps_computer_hub_before_first_remote(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -914,7 +941,7 @@ async def test_open_workspace_keeps_computer_hub_before_first_ssh_host(tmp_path:
 
     assert response.status_code == 200
     assert "이 컴퓨터" in response.text
-    assert "SSH 서버 연결" in response.text
+    assert "컴퓨터 연결" in response.text
     assert 'href="/open/local"' in response.text
     assert 'href="/computers/new"' in response.text
 
@@ -1602,6 +1629,157 @@ async def test_editor_conflict_marks_preserved_content_as_unsaved(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_save_and_run_conflict_creates_no_run_or_managed_terminal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "main.py"
+    target.write_text("print('before')\n", encoding="utf-8")
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "main.py")
+    target.write_text("print('changed elsewhere')\n", encoding="utf-8")
+    key = str(uuid.uuid4())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        response = await client.post(
+            f"/w/{workspace['id']}/edit/main.py",
+            data={
+                "_csrf": settings.csrf_token,
+                "digest": snapshot.digest,
+                "mtime_ns": str(snapshot.mtime_ns),
+                "content": "print('my change')\n",
+                "intent": "save_and_run",
+                "file_run_idempotency_key": key,
+            },
+        )
+
+    assert response.status_code == 409
+    assert app.state.store.get_file_run_by_idempotency(str(workspace["id"]), key) is None
+    assert app.state.store.get_managed_terminal(str(workspace["id"]), "file_run") is None
+    assert "print(&#39;my change&#39;)" in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_file_run_http_lifecycle_is_idempotent_and_csrf_protected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "wait.py"
+    content = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "while True: time.sleep(0.1)\n"
+    )
+    target.write_text(content, encoding="utf-8")
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "wait.py")
+    key = str(uuid.uuid4())
+    payload = {
+        "_csrf": settings.csrf_token,
+        "digest": snapshot.digest,
+        "mtime_ns": str(snapshot.mtime_ns),
+        "content": content,
+        "intent": "save_and_run",
+        "file_run_idempotency_key": key,
+    }
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            await _login(client)
+            started = await client.post(
+                f"/w/{workspace['id']}/edit/wait.py",
+                data=payload,
+                follow_redirects=False,
+            )
+            assert started.status_code == 303
+            run = app.state.store.get_file_run_by_idempotency(
+                str(workspace["id"]), key
+            )
+            assert run is not None
+            run_id = str(run["id"])
+
+            replay = await client.post(
+                f"/w/{workspace['id']}/edit/wait.py",
+                data=payload,
+                follow_redirects=False,
+            )
+            assert replay.status_code == 303
+            assert app.state.store.get_file_run_by_idempotency(
+                str(workspace["id"]), key
+            )["id"] == run_id
+
+            conflict = await client.post(
+                f"/w/{workspace['id']}/edit/wait.py",
+                data={**payload, "content": "print('different')\n"},
+            )
+            assert conflict.status_code == 409
+            assert "다른 파일 내용에 이미 사용되었습니다" in conflict.text
+
+            status_payload: dict[str, object] = {}
+            for _attempt in range(40):
+                status = await client.get(f"/api/file-runs/{run_id}/status")
+                assert status.status_code == 200
+                status_payload = status.json()
+                if status_payload.get("state") == "running":
+                    break
+                await asyncio.sleep(0.05)
+            assert status_payload["state"] == "running"
+
+            assert (await client.post(f"/file-runs/{run_id}/stop")).status_code == 403
+            stopped = await client.post(
+                f"/file-runs/{run_id}/stop",
+                data={"_csrf": settings.csrf_token, "return_to": "editor"},
+                follow_redirects=False,
+            )
+            assert stopped.status_code == 303
+            after_stop = await client.get(f"/api/file-runs/{run_id}/status")
+            assert after_stop.json()["needs_force"] is True
+
+            assert (await client.post(f"/file-runs/{run_id}/kill")).status_code == 403
+            killed = await client.post(
+                f"/file-runs/{run_id}/kill",
+                data={"_csrf": settings.csrf_token, "return_to": "editor"},
+                follow_redirects=False,
+            )
+            assert killed.status_code == 303
+            final = await client.get(f"/api/file-runs/{run_id}/status")
+            assert final.json()["state"] == "stopped"
+
+        events = app.state.store.list_activity_events()
+        assert [event["kind"] for event in events] == ["file_run.stopped"]
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_missing_and_nonempty_paths_return_localized_errors(tmp_path: Path) -> None:
     root = tmp_path / "root"
     project = root / "project"
@@ -1761,10 +1939,10 @@ async def test_remote_terminal_page_stays_available_while_ssh_is_down(
     assert str(terminal["id"]) in response.text
     assert "SSH 연결이 거부되었습니다" in response.text
     assert (
-        '<span class="workspace-mode">QA server · SSH 작업공간</span>'
+        '<span class="workspace-mode">QA server · 원격 작업공간</span>'
         in response.text
     )
-    assert "<small>SSH 작업공간</small>" in response.text
+    assert "<small>원격 작업공간</small>" in response.text
     assert "로컬 전용" not in response.text
     assert 'aria-label="컴퓨터 · Termroom"' not in response.text
     assert 'class="status-dot is-active"' not in response.text
@@ -2072,7 +2250,8 @@ async def test_remove_ssh_computer_keeps_credentials_when_remote_run_exists(
     app.state.store.create_remote_run(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
+            "archive_format": "zip",
             "source_workspace_id": None,
             "source_path": None,
             "source_label": "source.zip",

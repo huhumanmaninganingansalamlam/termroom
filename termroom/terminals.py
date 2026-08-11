@@ -11,6 +11,7 @@ import struct
 import subprocess
 import termios
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,13 @@ from fastapi import WebSocket, WebSocketDisconnect
 from termroom.db import StateStore
 from termroom.pty_process import spawn_pty_process
 from termroom.terminal_control import TerminalControl
+from termroom.workspace_usage import (
+    RawWorkspaceUsage,
+    WorkspaceUsageStale,
+    WorkspaceUsageUnavailable,
+    read_system_process_output,
+    workspace_usage_from_outputs,
+)
 
 
 class TerminalError(RuntimeError):
@@ -30,6 +38,123 @@ MIN_TERMINAL_ROWS = 4
 MAX_TERMINAL_ROWS = 500
 MIN_TERMINAL_COLS = 20
 MAX_TERMINAL_COLS = 1000
+TMUX_TERMINAL_ROLE_OPTION = "@termroom_terminal_role"
+TMUX_MANAGED_RUN_OPTION = "@termroom_managed_run_id"
+TMUX_TERMINAL_RECORD_FORMAT = (
+    "#{window_id}|#{window_name}|"
+    f"#{{{TMUX_TERMINAL_ROLE_OPTION}}}|#{{{TMUX_MANAGED_RUN_OPTION}}}"
+)
+
+
+def parse_tmux_terminal_records(output: str) -> list[dict[str, str | None]]:
+    """Decode the printable tmux record format shared by Local and SSH."""
+
+    records: list[dict[str, str | None]] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        window_id, separator, remainder = line.partition("|")
+        identity = remainder.rsplit("|", 2)
+        if (
+            not separator
+            or not window_id.startswith("@")
+            or len(identity) != 3
+        ):
+            raise ValueError("tmux exposed an invalid Terminal record")
+        name, role, managed_run_id = identity
+        records.append(
+            {
+                "tmux_window": window_id,
+                "name": name or "shell",
+                "role": role or "shell",
+                "managed_run_id": managed_run_id or None,
+            }
+        )
+    return records
+
+
+FILE_RUN_WRAPPER_SCRIPT = r"""#!/bin/sh
+set -u
+umask 077
+
+meta_dir=$1
+run_id=$2
+runner_id=$3
+missing_code=$4
+shift 4
+
+atomic_record() {
+    destination=$1
+    temporary="${destination}.tmp.$$"
+    cat > "$temporary" || return 1
+    chmod 0600 "$temporary" || return 1
+    mv -f -- "$temporary" "$destination"
+}
+
+utc_now() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+prepare_failed() {
+    code=$1
+    ended_at=$(utc_now)
+    printf '{"run_id":"%s","state":"failed","error_code":"%s","ended_at":"%s"}\n' \
+        "$run_id" "$code" "$ended_at" | atomic_record "$meta_dir/prepare.json"
+    exit 127
+}
+
+test -d "$meta_dir" || exit 120
+test "$(cat -- "$meta_dir/request-id")" = "$run_id" || exit 120
+test "$#" -gt 0 || prepare_failed runner_metadata_invalid
+
+program=$1
+if test "$runner_id" = direct; then
+    IFS= read -r shebang < "$program" || prepare_failed "$missing_code"
+    case "$shebang" in
+        '#!'*) interpreter=${shebang#\#!} ;;
+        *) prepare_failed "$missing_code" ;;
+    esac
+    leading_space=${interpreter%%[![:space:]]*}
+    interpreter=${interpreter#"$leading_space"}
+    interpreter=${interpreter%%[[:space:]]*}
+    test -n "$interpreter" && test -x "$interpreter" \
+        || prepare_failed "$missing_code"
+elif ! command -v "$program" >/dev/null 2>&1; then
+    prepare_failed "$missing_code"
+fi
+
+started_at=$(utc_now)
+printf '{"run_id":"%s","state":"running","started_at":"%s"}\n' \
+    "$run_id" "$started_at" | atomic_record "$meta_dir/state.json" || exit 120
+
+status=0
+stop_signal=
+trap 'stop_signal=INT' INT
+trap 'stop_signal=TERM' TERM
+trap 'stop_signal=HUP' HUP
+"$@" || status=$?
+trap - INT TERM HUP
+stop_requested=false
+stop_signal_json=null
+if test -n "$stop_signal" && test -f "$meta_dir/stop-requested-at"; then
+    stop_requested=true
+    stop_signal_json="\"$stop_signal\""
+fi
+ended_at=$(utc_now)
+printf '{"run_id":"%s","exit_code":%s,"stop_requested":%s,'\
+'"stop_signal":%s,"started_at":"%s","ended_at":"%s"}\n' \
+    "$run_id" "$status" "$stop_requested" "$stop_signal_json" "$started_at" "$ended_at" \
+    | atomic_record "$meta_dir/completion.json"
+exit "$status"
+"""
+
+
+def file_run_completion_was_stopped(record: dict[str, Any]) -> bool:
+    return bool(record.get("stop_requested")) and record.get("stop_signal") in {
+        "INT",
+        "TERM",
+        "HUP",
+    }
 
 
 class TerminalOutputDecoder:
@@ -93,6 +218,25 @@ class TerminalManager:
             return set()
         return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
+    def workspace_usage(self, workspace: dict[str, Any]) -> RawWorkspaceUsage:
+        try:
+            result = self._run_tmux(
+                "list-panes",
+                "-s",
+                "-t",
+                str(workspace["tmux_session"]),
+                "-F",
+                "#{pane_pid}",
+                check=False,
+            )
+        except OSError as exc:
+            raise WorkspaceUsageUnavailable(
+                "tmux is not available", code="pane_tool_missing"
+            ) from exc
+        if result.returncode:
+            raise WorkspaceUsageStale("Workspace tmux session is not available")
+        return workspace_usage_from_outputs(result.stdout, read_system_process_output())
+
     def ensure_workspace(self, workspace: dict[str, Any]) -> list[dict[str, Any]]:
         session = workspace["tmux_session"]
         workspace_path = Path(workspace["path"])
@@ -113,7 +257,6 @@ class TerminalManager:
                 "-n",
                 "shell",
             )
-            self.store.reset_terminals(workspace["id"])
 
         # The most recently resized browser client should control the tmux
         # window dimensions. Without this, a detached 80x24 session can keep
@@ -127,32 +270,407 @@ class TerminalManager:
             check=False,
         )
 
-        tmux_windows = self._list_tmux_windows(session)
-        stored = self.store.list_terminals(workspace["id"])
-        known_windows = {terminal["tmux_window"] for terminal in stored}
-        live_windows = {window_id for window_id, _ in tmux_windows}
+        return self.store.reconcile_terminals(
+            str(workspace["id"]), self._list_tmux_window_records(session)
+        )
 
-        if known_windows != live_windows:
-            self.store.reset_terminals(workspace["id"])
-            for window_id, name in tmux_windows:
-                self.store.create_terminal(workspace["id"], name, window_id)
-        return self.store.list_terminals(workspace["id"])
-
-    def _list_tmux_windows(self, session_name: str) -> list[tuple[str, str]]:
+    def _list_tmux_window_records(self, session_name: str) -> list[dict[str, str | None]]:
         result = self._run_tmux(
             "list-windows",
             "-t",
             session_name,
             "-F",
-            "#{window_id}\t#{window_name}",
+            TMUX_TERMINAL_RECORD_FORMAT,
         )
-        windows: list[tuple[str, str]] = []
-        for line in result.stdout.splitlines():
-            if not line.strip():
-                continue
-            window_id, _, name = line.partition("\t")
-            windows.append((window_id, name or "shell"))
-        return windows
+        return parse_tmux_terminal_records(result.stdout)
+
+    def _list_tmux_windows(self, session_name: str) -> list[tuple[str, str]]:
+        return [
+            (str(item["tmux_window"]), str(item["name"]))
+            for item in self._list_tmux_window_records(session_name)
+        ]
+
+    def set_managed_identity(
+        self,
+        workspace: dict[str, Any],
+        tmux_window: str,
+        *,
+        role: str,
+        managed_run_id: str,
+    ) -> dict[str, Any]:
+        if role not in {"file_run", "remote_run"} or not managed_run_id:
+            raise TerminalError("Managed Terminal identity is invalid")
+        self._run_tmux(
+            "set-window-option",
+            "-t",
+            tmux_window,
+            TMUX_TERMINAL_ROLE_OPTION,
+            role,
+        )
+        self._run_tmux(
+            "set-window-option",
+            "-t",
+            tmux_window,
+            TMUX_MANAGED_RUN_OPTION,
+            managed_run_id,
+        )
+        terminals = self.ensure_workspace(workspace)
+        terminal = next(
+            (item for item in terminals if item["tmux_window"] == tmux_window), None
+        )
+        if terminal is None:
+            raise TerminalError("Managed Terminal disappeared while recording identity")
+        return terminal
+
+    @staticmethod
+    def _write_file_run_metadata(
+        metadata_dir: Path,
+        *,
+        run_id: str,
+    ) -> Path:
+        metadata_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata_dir.chmod(0o700)
+        request_id = metadata_dir / "request-id"
+        if request_id.exists() and request_id.read_text(encoding="utf-8").strip() != run_id:
+            raise TerminalError("File Run metadata identity does not match")
+        request_id.write_text(run_id + "\n", encoding="utf-8")
+        request_id.chmod(0o600)
+        wrapper = metadata_dir / "runner.sh"
+        temporary = metadata_dir / f".runner-{uuid.uuid4().hex}.tmp"
+        temporary.write_text(FILE_RUN_WRAPPER_SCRIPT, encoding="utf-8")
+        temporary.chmod(0o700)
+        os.replace(temporary, wrapper)
+        return wrapper
+
+    def _file_run_pane(self, tmux_window: str) -> dict[str, Any] | None:
+        result = self._run_tmux(
+            "list-panes",
+            "-t",
+            tmux_window,
+            "-F",
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t"
+            "#{pane_dead_time}",
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        line = next((value for value in result.stdout.splitlines() if value.strip()), "")
+        if not line:
+            return None
+        parts = line.split("\t", 4)
+        parts.extend([""] * (5 - len(parts)))
+        pane_id, dead, dead_status, pane_pid, dead_time = parts
+        return {
+            "pane_id": pane_id,
+            "dead": dead == "1",
+            "exit_code": int(dead_status) if dead_status.lstrip("-").isdigit() else None,
+            "pane_pid": int(pane_pid) if pane_pid.isdigit() else None,
+            "dead_at": int(dead_time) if dead_time.isdigit() else None,
+        }
+
+    def _rollback_file_run_slot(
+        self,
+        workspace: dict[str, Any],
+        tmux_window: str,
+        *,
+        run_id: str,
+        created: bool,
+        previous_role: str,
+        previous_run_id: str | None,
+    ) -> None:
+        with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+            current = next(
+                (
+                    item
+                    for item in self._list_tmux_window_records(
+                        str(workspace["tmux_session"])
+                    )
+                    if item["tmux_window"] == tmux_window
+                ),
+                None,
+            )
+            if current is None or current.get("role") != "file_run":
+                return
+            current_run_id = current.get("managed_run_id")
+            if current_run_id not in {run_id, previous_run_id}:
+                return
+            if created:
+                result = self._run_tmux(
+                    "kill-window", "-t", tmux_window, check=False
+                )
+                if result.returncode == 0:
+                    self.ensure_workspace(workspace)
+                    return
+            if previous_role == "shell":
+                self._run_tmux(
+                    "set-window-option",
+                    "-u",
+                    "-t",
+                    tmux_window,
+                    TMUX_TERMINAL_ROLE_OPTION,
+                    check=False,
+                )
+                self._run_tmux(
+                    "set-window-option",
+                    "-u",
+                    "-t",
+                    tmux_window,
+                    TMUX_MANAGED_RUN_OPTION,
+                    check=False,
+                )
+            else:
+                self._run_tmux(
+                    "set-window-option",
+                    "-t",
+                    tmux_window,
+                    TMUX_TERMINAL_ROLE_OPTION,
+                    previous_role,
+                    check=False,
+                )
+                if previous_run_id:
+                    self._run_tmux(
+                        "set-window-option",
+                        "-t",
+                        tmux_window,
+                        TMUX_MANAGED_RUN_OPTION,
+                        previous_run_id,
+                        check=False,
+                    )
+                else:
+                    self._run_tmux(
+                        "set-window-option",
+                        "-u",
+                        "-t",
+                        tmux_window,
+                        TMUX_MANAGED_RUN_OPTION,
+                        check=False,
+                    )
+            self.ensure_workspace(workspace)
+
+    @staticmethod
+    def _read_file_run_record(path: Path, run_id: str) -> dict[str, Any] | None:
+        try:
+            if path.is_symlink() or path.stat().st_size > 16 * 1024:
+                return None
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(value, dict) or value.get("run_id") != run_id:
+            return None
+        return value
+
+    def start_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+        runner_id: str,
+        runtime_error_code: str,
+        argv: tuple[str, ...],
+        metadata_dir: Path,
+    ) -> dict[str, Any]:
+        if not argv:
+            raise TerminalError("File Run argv is empty")
+        wrapper = self._write_file_run_metadata(metadata_dir, run_id=run_id)
+        terminals = self.ensure_workspace(workspace)
+        terminal = next(
+            (item for item in terminals if item.get("role") == "file_run"), None
+        )
+        created = terminal is None
+        if terminal is None:
+            terminal = self.create_terminal(workspace, "Run")
+        else:
+            pane = self._file_run_pane(str(terminal["tmux_window"]))
+            if pane is not None and not pane["dead"]:
+                raise TerminalError("The managed File Run Terminal is still active")
+
+        tmux_window = str(terminal["tmux_window"])
+        previous_role = str(terminal.get("role") or "shell")
+        previous_run_id = str(terminal.get("managed_run_id") or "") or None
+        try:
+            self._run_tmux(
+                "set-window-option", "-t", tmux_window, "remain-on-exit", "on"
+            )
+            terminal = self.set_managed_identity(
+                workspace,
+                tmux_window,
+                role="file_run",
+                managed_run_id=run_id,
+            )
+            command = (
+                "/bin/sh",
+                str(wrapper),
+                str(metadata_dir),
+                run_id,
+                runner_id,
+                runtime_error_code,
+                *argv,
+            )
+            result = self._run_tmux(
+                "respawn-pane",
+                "-k",
+                "-c",
+                str(workspace["path"]),
+                "-t",
+                tmux_window,
+                *command,
+                check=False,
+            )
+            if result.returncode:
+                raise TerminalError(
+                    result.stderr.strip() or "File Run could not start"
+                )
+            return terminal
+        except TerminalError:
+            self._rollback_file_run_slot(
+                workspace,
+                tmux_window,
+                run_id=run_id,
+                created=created,
+                previous_role=previous_role,
+                previous_run_id=previous_run_id,
+            )
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._rollback_file_run_slot(
+                workspace,
+                tmux_window,
+                run_id=run_id,
+                created=created,
+                previous_role=previous_role,
+                previous_run_id=previous_run_id,
+            )
+            raise TerminalError("File Run Terminal could not be prepared") from exc
+
+    def inspect_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+        metadata_dir: Path,
+    ) -> dict[str, Any]:
+        completion = self._read_file_run_record(metadata_dir / "completion.json", run_id)
+        if completion is not None and isinstance(completion.get("exit_code"), int):
+            return {
+                "state": "stopped"
+                if file_run_completion_was_stopped(completion)
+                else "finished",
+                "started_at": completion.get("started_at"),
+                "ended_at": completion.get("ended_at"),
+                "exit_code": int(completion["exit_code"]),
+            }
+        prepare = self._read_file_run_record(metadata_dir / "prepare.json", run_id)
+        if prepare is not None and prepare.get("state") == "failed":
+            return {
+                "state": "failed",
+                "ended_at": prepare.get("ended_at"),
+                "error_code": prepare.get("error_code"),
+            }
+
+        if not self.session_exists(str(workspace["tmux_session"])):
+            return {"state": "lost", "error_code": "managed_terminal_missing"}
+        windows = self._list_tmux_window_records(str(workspace["tmux_session"]))
+        self.store.reconcile_terminals(str(workspace["id"]), windows)
+        slot = next((item for item in windows if item["role"] == "file_run"), None)
+        if slot is None or slot.get("managed_run_id") != run_id:
+            return {"state": "lost", "error_code": "managed_terminal_missing"}
+        pane = self._file_run_pane(str(slot["tmux_window"]))
+        state = self._read_file_run_record(metadata_dir / "state.json", run_id)
+        if pane is not None and not pane["dead"]:
+            return {
+                "state": "running" if state and state.get("state") == "running" else "preparing",
+                "started_at": state.get("started_at") if state else None,
+            }
+        if (metadata_dir / "force-stopped").is_file():
+            return {
+                "state": "stopped",
+                "started_at": state.get("started_at") if state else None,
+                "ended_at": None,
+                "exit_code": pane.get("exit_code") if pane else None,
+                "error_code": "forced",
+            }
+        dead_at = pane.get("dead_at") if pane else None
+        if isinstance(dead_at, int) and time.time() - dead_at < 2:
+            return {
+                "state": "running" if state else "preparing",
+                "started_at": state.get("started_at") if state else None,
+            }
+        return {
+            "state": "lost",
+            "started_at": state.get("started_at") if state else None,
+            "error_code": "completion_missing",
+        }
+
+    def interrupt_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+        metadata_dir: Path,
+    ) -> bool:
+        terminals = self.ensure_workspace(workspace)
+        terminal = next(
+            (
+                item
+                for item in terminals
+                if item.get("role") == "file_run"
+                and item.get("managed_run_id") == run_id
+            ),
+            None,
+        )
+        if terminal is None:
+            return False
+        pane = self._file_run_pane(str(terminal["tmux_window"]))
+        if pane is None or pane["dead"]:
+            return False
+        (metadata_dir / "stop-requested-at").write_text(
+            str(time.time()) + "\n", encoding="utf-8"
+        )
+        result = self._run_tmux(
+            "send-keys",
+            "-t",
+            str(terminal["tmux_window"]),
+            "C-c",
+            check=False,
+        )
+        return result.returncode == 0
+
+    def kill_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+        metadata_dir: Path,
+    ) -> bool:
+        terminals = self.ensure_workspace(workspace)
+        terminal = next(
+            (
+                item
+                for item in terminals
+                if item.get("role") == "file_run"
+                and item.get("managed_run_id") == run_id
+            ),
+            None,
+        )
+        if terminal is None:
+            return False
+        pane = self._file_run_pane(str(terminal["tmux_window"]))
+        if pane is None or pane["dead"]:
+            return False
+        pane_pid = pane.get("pane_pid")
+        if not isinstance(pane_pid, int):
+            raise TerminalError("Managed File Run process identity is unavailable")
+        (metadata_dir / "stop-requested-at").write_text(
+            str(time.time()) + "\n", encoding="utf-8"
+        )
+        try:
+            os.killpg(pane_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        (metadata_dir / "force-stopped").write_text(
+            str(time.time()) + "\n", encoding="utf-8"
+        )
+        return True
 
     def create_terminal(self, workspace: dict[str, Any], name: str = "shell") -> dict[str, Any]:
         self.ensure_workspace(workspace)
@@ -176,6 +694,8 @@ class TerminalManager:
         self, workspace: dict[str, Any], terminal: dict[str, Any], name: str
     ) -> dict[str, Any]:
         self.ensure_workspace(workspace)
+        if str(terminal.get("role") or "shell") != "shell":
+            raise TerminalError("Managed Terminals cannot be renamed")
         safe_name = normalize_terminal_name(name)
         result = self._run_tmux(
             "rename-window",
@@ -196,6 +716,8 @@ class TerminalManager:
         self, workspace: dict[str, Any], terminal: dict[str, Any]
     ) -> list[dict[str, Any]]:
         self.ensure_workspace(workspace)
+        if str(terminal.get("role") or "shell") != "shell":
+            raise TerminalError("Managed Terminals cannot be closed")
         result = self._run_tmux(
             "kill-window",
             "-t",

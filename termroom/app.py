@@ -6,10 +6,12 @@ import csv
 import io
 import json
 import os
+import secrets
 import tempfile
+import uuid
 import zipfile
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
@@ -32,6 +34,7 @@ from starlette.datastructures import UploadFile
 from termroom.auth import AuthManager, AuthRateLimited
 from termroom.config import Settings
 from termroom.db import StateStore
+from termroom.file_runs import FileRunConflict, FileRunError, FileRunManager
 from termroom.files import (
     DEFAULT_FILE_BROWSER_NOISE,
     FileConflictError,
@@ -50,14 +53,33 @@ from termroom.i18n import (
     template_context,
     translate,
 )
+from termroom.node_core import NodeCore, NodePairingRateLimiter
+from termroom.node_protocol import (
+    PAIRING_CODE_TTL_SECONDS,
+    NodeProtocolError,
+    generate_pairing_code,
+    pairing_code_digest,
+    public_key_fingerprint,
+    secret_digest,
+    validate_protocol_version,
+)
+from termroom.node_remote_runs import NodeRemoteRunClient
 from termroom.pwa_icon import termroom_png_icon
+from termroom.remote_access import RemoteAccess, RemoteAccessError
 from termroom.remote_runs import RemoteRunConflict, RemoteRunError, RemoteRunManager
 from termroom.run_sources import normalize_source_relative_path
 from termroom.runtime import runtime_stamp
-from termroom.security import PathBoundaryError, is_within, resolve_inside, secure_compare
+from termroom.security import (
+    PathBoundaryError,
+    file_digest,
+    is_within,
+    resolve_inside,
+    secure_compare,
+)
 from termroom.ssh_backend import SSHBackend, SSHBackendError
 from termroom.terminal_control import TerminalControl
 from termroom.terminals import TerminalError, TerminalManager
+from termroom.workspace_usage import WorkspaceUsageOffline, WorkspaceUsageService
 from termroom.workspaces import (
     ProjectCreatedButWorkspaceFailed,
     ProjectNameError,
@@ -70,6 +92,20 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 FILE_BROWSER_PAGE_SIZE = 200
 MAX_INLINE_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_INLINE_PDF_BYTES = 100 * 1024 * 1024
+FILE_RUN_ERROR_KEYS = {
+    "workspace_not_supported": "file_run.error.workspace_not_supported",
+    "runner_not_supported": "file_run.error.runner_not_supported",
+    "python3_missing": "file_run.error.python3_missing",
+    "nodejs_missing": "file_run.error.nodejs_missing",
+    "bash_missing": "file_run.error.bash_missing",
+    "direct_runner_failed": "file_run.error.direct_runner_failed",
+    "source_changed": "file_run.error.source_changed",
+    "start_status_unknown": "file_run.error.start_status_unknown",
+    "start_failed": "file_run.error.start_failed",
+    "managed_terminal_missing": "file_run.error.managed_terminal_missing",
+    "completion_missing": "file_run.error.completion_missing",
+    "runner_metadata_invalid": "file_run.error.start_failed",
+}
 templates = Jinja2Templates(
     directory=PACKAGE_ROOT / "templates",
     context_processors=[template_context],
@@ -90,13 +126,29 @@ def create_app(settings: Settings) -> FastAPI:
     terminal_control = TerminalControl()
     terminals = TerminalManager(store, terminal_control)
     ssh = SSHBackend(store, settings.state_dir, terminal_control)
+    node_core = NodeCore(store)
+    node_remote_runs = NodeRemoteRunClient(node_core)
+    node_pairing_limiter = NodePairingRateLimiter()
+    remote = RemoteAccess(store, ssh, node_core, terminal_control)
     remote_runs = RemoteRunManager(
         store,
         workspaces,
         ssh,
+        node_remote_runs,
         state_dir=settings.state_dir,
         max_archive_bytes=settings.max_upload_bytes,
     )
+    file_runs = FileRunManager(
+        store,
+        workspaces,
+        files,
+        terminals,
+        ssh,
+        state_dir=settings.state_dir,
+        max_edit_bytes=settings.max_edit_bytes,
+        remote=remote,
+    )
+    workspace_usage = WorkspaceUsageService()
     auth = AuthManager(settings)
     active_websockets: dict[str, list[WebSocket]] = {}
     active_terminal_websockets: dict[str, list[WebSocket]] = {}
@@ -112,12 +164,19 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.terminals = terminals
     app.state.terminal_control = terminal_control
     app.state.ssh = ssh
+    app.state.node_core = node_core
+    app.state.remote = remote
     app.state.remote_runs = remote_runs
+    app.state.file_runs = file_runs
+    app.state.workspace_usage = workspace_usage
     app.state.auth = auth
     app.state.runtime_stamp = runtime_stamp()
     app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
     app.router.add_event_handler("startup", remote_runs.startup)
+    app.router.add_event_handler("startup", file_runs.startup)
+    app.router.add_event_handler("shutdown", file_runs.shutdown)
     app.router.add_event_handler("shutdown", remote_runs.shutdown)
+    app.router.add_event_handler("shutdown", node_core.shutdown)
 
     @app.middleware("http")
     async def reject_mixed_runtime(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -179,7 +238,7 @@ def create_app(settings: Settings) -> FastAPI:
         return response
 
     def is_remote(workspace: Mapping[str, Any]) -> bool:
-        return workspace.get("backend_kind") == "ssh"
+        return workspace.get("backend_kind") == "remote"
 
     def ensure_exposed_local_path(
         workspace: Mapping[str, Any],
@@ -207,37 +266,60 @@ def create_app(settings: Settings) -> FastAPI:
 
     async def ensure_terminal_list(workspace: dict[str, Any]) -> list[dict[str, Any]]:
         if is_remote(workspace):
-            return await asyncio.to_thread(ssh.ensure_workspace, workspace)
+            return await remote.ensure_workspace(workspace)
         return terminals.ensure_workspace(workspace)
 
     async def list_workspace_dir(
         workspace: dict[str, Any], relative_path: str
     ) -> tuple[Any, list[Any]]:
         if is_remote(workspace):
-            return await asyncio.to_thread(ssh.list_dir, workspace, relative_path)
+            return await remote.list_dir(workspace, relative_path)
         ensure_exposed_local_path(workspace, relative_path)
         return files.list_dir(workspace["path"], relative_path)
 
     async def stat_workspace_file(workspace: dict[str, Any], relative_path: str):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
-            return await asyncio.to_thread(ssh.stat, workspace, relative_path)
+            return await remote.stat(workspace, relative_path)
         ensure_exposed_local_path(workspace, relative_path)
         return files.stat(workspace["path"], relative_path)
 
     async def read_workspace_text(workspace: dict[str, Any], relative_path: str):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
-            return await asyncio.to_thread(
-                ssh.read_text, workspace, relative_path, settings.max_edit_bytes
-            )
+            return await remote.read_text(workspace, relative_path, settings.max_edit_bytes)
         ensure_exposed_local_path(workspace, relative_path)
         return files.read_text(workspace["path"], relative_path)
+
+    async def write_workspace_text(
+        workspace: dict[str, Any],
+        relative_path: str,
+        content: str,
+        *,
+        expected_digest: str,
+        expected_mtime_ns: int,
+    ) -> FileSnapshot:
+        if is_remote(workspace):
+            return await remote.write_text(
+                workspace,
+                relative_path,
+                content,
+                expected_digest=expected_digest,
+                expected_mtime_ns=expected_mtime_ns,
+                max_bytes=settings.max_edit_bytes,
+            )
+        ensure_exposed_local_path(workspace, relative_path)
+        return files.write_text(
+            workspace["path"],
+            relative_path,
+            content,
+            expected_digest=expected_digest,
+            expected_mtime_ns=expected_mtime_ns,
+        )
 
     async def read_workspace_preview(
         workspace: dict[str, Any], relative_path: str, mode: str, offset: int = 0
     ):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
-            return await asyncio.to_thread(
-                ssh.read_text_preview,
+            return await remote.read_text_preview(
                 workspace,
                 relative_path,
                 mode=mode,
@@ -255,7 +337,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     async def recent_workspace_files(workspace: dict[str, Any]):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
-            return await asyncio.to_thread(ssh.recent_files, workspace)
+            return await remote.recent_files(workspace)
         return await asyncio.to_thread(files.recent_files, workspace["path"])
 
     async def managed_key_display(locale: str) -> tuple[str, str | None]:
@@ -267,7 +349,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     def workspace_content_type(workspace: dict[str, Any], relative_path: str) -> str:
         if is_remote(workspace):
-            return ssh.content_type(relative_path)
+            return remote.content_type(relative_path)
         return files.content_type(relative_path)
 
     async def build_workspace_archive(
@@ -353,7 +435,7 @@ def create_app(settings: Settings) -> FastAPI:
                 for entry in selected_entries:
                     add_path(zf, entry.relative_path, entry.name)
 
-        def write_remote_archive() -> None:
+        async def write_remote_archive() -> None:
             added = 0
             with zipfile.ZipFile(
                 archive_path,
@@ -369,7 +451,7 @@ def create_app(settings: Settings) -> FastAPI:
                     relative_path, archive_name, directory_entry = stack.pop()
                     if directory_entry:
                         zf.writestr(archive_name.rstrip("/") + "/", b"")
-                        _, children = ssh.list_dir(workspace, relative_path)
+                        _, children = await remote.list_dir(workspace, relative_path)
                         for child in reversed(children):
                             stack.append(
                                 (
@@ -382,13 +464,15 @@ def create_app(settings: Settings) -> FastAPI:
                     if added >= 10_000:
                         raise ValueError("Archive contains too many files")
                     with zf.open(archive_name, "w", force_zip64=True) as output:
-                        for chunk in ssh.download_iter(workspace, relative_path):
-                            output.write(chunk)
+                        async for chunk in remote.download_stream(
+                            workspace, relative_path
+                        ):
+                            await asyncio.to_thread(output.write, chunk)
                     added += 1
 
         try:
             if is_remote(workspace):
-                await asyncio.to_thread(write_remote_archive)
+                await write_remote_archive()
             else:
                 await asyncio.to_thread(write_local_archive)
         except Exception:
@@ -401,6 +485,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def authenticate(request: Request, call_next):  # type: ignore[no-untyped-def]
         if (
             request.url.path in {"/health", "/login", "/sw.js"}
+            or request.url.path.startswith("/api/node/enroll")
             or request.url.path.startswith("/static/")
             or request.url.path.startswith("/icons/")
             or request.url.path.startswith("/locale/")
@@ -441,6 +526,16 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.exception_handler(SSHBackendError)
     async def ssh_error(request: Request, exc: SSHBackendError) -> HTMLResponse:
+        return _error_page(
+            request,
+            _localized_exception(locale_from_request(request), exc),
+            502,
+        )
+
+    @app.exception_handler(RemoteAccessError)
+    async def remote_access_error(
+        request: Request, exc: RemoteAccessError
+    ) -> HTMLResponse:
         return _error_page(
             request,
             _localized_exception(locale_from_request(request), exc),
@@ -631,6 +726,113 @@ def create_app(settings: Settings) -> FastAPI:
             ),
         )
 
+    @app.get("/activity", response_class=HTMLResponse)
+    async def activity_page(
+        request: Request,
+        unavailable: bool = False,
+    ) -> HTMLResponse:
+        locale = locale_from_request(request)
+        events = [
+            _activity_event_view(event, locale=locale)
+            for event in store.list_activity_events()
+        ]
+        return templates.TemplateResponse(
+            request=request,
+            name="activity.html",
+            context=_context(
+                settings,
+                title=translate(locale, "activity.heading"),
+                events=events,
+                unread_count=store.count_unread_events(),
+                unavailable=unavailable,
+            ),
+        )
+
+    @app.post("/activity/read-all")
+    async def activity_read_all(request: Request) -> RedirectResponse:
+        await _verified_form(request, settings)
+        store.mark_all_events_read()
+        return RedirectResponse("/activity", status_code=303)
+
+    @app.post("/activity/{event_id}/read")
+    async def activity_read(
+        request: Request,
+        event_id: str,
+    ) -> RedirectResponse:
+        await _verified_form(request, settings)
+        if store.mark_event_read(event_id) is None:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        return RedirectResponse("/activity", status_code=303)
+
+    @app.post("/activity/{event_id}/open")
+    async def activity_open(
+        request: Request,
+        event_id: str,
+    ) -> RedirectResponse:
+        form = await _verified_form(request, settings)
+        event = store.mark_event_read(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        if event["subject_type"] == "remote_run" and event["subject_exists"]:
+            return RedirectResponse(
+                f"/remote-runs/{event['subject_id']}",
+                status_code=303,
+            )
+        if event["subject_type"] == "file_run" and event["subject_exists"]:
+            workspace_id = str(event.get("current_workspace_id") or "")
+            relative_path = str(event.get("current_relative_path") or "")
+            terminal_id = str(event.get("current_terminal_id") or "")
+            if str(form.get("destination") or "") == "terminal" and terminal_id:
+                return RedirectResponse(
+                    _url_with_query(
+                        f"/w/{workspace_id}/terminal", terminal=terminal_id
+                    ),
+                    status_code=303,
+                )
+            try:
+                workspace = _require_workspace(workspaces, workspace_id)
+                entry = await stat_workspace_file(workspace, relative_path)
+                if entry.is_dir:
+                    raise FileNotFoundError(relative_path)
+            except (FileNotFoundError, KeyError, NotADirectoryError, UnsupportedFileError):
+                return RedirectResponse("/activity?unavailable=1", status_code=303)
+            except SSHBackendError:
+                pass
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/edit/{quote(relative_path, safe='/')}",
+                    run=event["subject_id"],
+                ),
+                status_code=303,
+            )
+        return RedirectResponse("/activity?unavailable=1", status_code=303)
+
+    @app.get("/api/activity/summary", response_class=JSONResponse)
+    async def activity_summary() -> JSONResponse:
+        return JSONResponse(
+            {"ok": True, "unread_count": store.count_unread_events()}
+        )
+
+    @app.post(
+        "/api/activity/notifications/claim",
+        response_class=JSONResponse,
+    )
+    async def claim_activity_notifications(request: Request) -> JSONResponse:
+        _verified_csrf_header(request, settings)
+        device_id = str(request.state.session["id"])
+        locale = locale_from_request(request)
+        events = [
+            _activity_notification_payload(event, locale=locale)
+            for event in store.claim_event_notifications(device_id)
+        ]
+        return JSONResponse(
+            {
+                "ok": True,
+                "events": events,
+                "unread_count": store.count_unread_events(),
+            }
+        )
+
     @app.get("/remote-runs/new", response_class=HTMLResponse)
     async def remote_run_new_page(
         request: Request,
@@ -640,8 +842,20 @@ def create_app(settings: Settings) -> FastAPI:
         target_computer_id: str | None = None,
     ) -> HTMLResponse:
         remote_runs.schedule_cleanup()
-        computers = store.list_computers()
-        source_workspaces = workspaces.list_all()
+        computers = [
+            computer
+            for computer in store.list_computers()
+            if remote.supports_capability(computer, "remote_run")
+        ]
+        source_workspaces = [
+            workspace
+            for workspace in workspaces.list_all()
+            if not workspace.get("transient")
+            and (
+                not remote.is_node(workspace)
+                or remote.supports_capability(workspace, "remote_run_source")
+            )
+        ]
         source_workspace_by_id = {
             str(workspace["id"]): workspace for workspace in source_workspaces
         }
@@ -653,11 +867,12 @@ def create_app(settings: Settings) -> FastAPI:
                     source_path or ".",
                     allow_root=True,
                 )
+        requested_source_kind = "archive" if source_kind == "zip" else source_kind
         selected_source_kind = (
             "workspace"
             if source_workspace is not None
-            else source_kind
-            if source_kind in {"workspace", "git", "zip"}
+            else requested_source_kind
+            if requested_source_kind in {"workspace", "git", "archive"}
             else "workspace"
         )
         computer_ids = {str(computer["id"]) for computer in computers}
@@ -727,7 +942,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "run_id": run_id,
                 "detail_url": f"/remote-runs/{run_id}",
                 "archive_url": f"/api/remote-runs/{run_id}/archive"
-                if run["source_kind"] == "zip"
+                if run["source_kind"] == "archive"
                 else None,
             },
             status_code=202 if created else 200,
@@ -959,6 +1174,11 @@ def create_app(settings: Settings) -> FastAPI:
                         store.list_workspaces_for_computer(str(computer["id"]))
                     )
                     for computer in computers
+                },
+                node_statuses={
+                    str(computer["id"]): remote.status(computer)
+                    for computer in computers
+                    if computer.get("connection_method") == "node"
                 },
             ),
         )
@@ -1291,8 +1511,7 @@ def create_app(settings: Settings) -> FastAPI:
         remote_browse_close_url = f"/open/{computer_id}"
         if browse:
             try:
-                remote_picker = await asyncio.to_thread(
-                    ssh.list_browse_directories,
+                remote_picker = await remote.list_browse_directories(
                     computer,
                     browse_path,
                     show_hidden=browse_hidden,
@@ -1322,7 +1541,7 @@ def create_app(settings: Settings) -> FastAPI:
                     browse_path=remote_picker["current"],
                     browse_hidden=None if browse_hidden else 1,
                 )
-            except (OSError, ValueError, SSHBackendError) as exc:
+            except (OSError, ValueError, SSHBackendError, RemoteAccessError) as exc:
                 browse_error = _localized_exception(locale, exc)
         return templates.TemplateResponse(
             request=request,
@@ -1332,6 +1551,9 @@ def create_app(settings: Settings) -> FastAPI:
                 title=str(computer["name"]),
                 mode="remote",
                 computer=computer,
+                node_status=remote.status(computer)
+                if computer.get("connection_method") == "node"
+                else None,
                 remote_workspaces=remote_workspaces,
                 remote_runs=computer_runs,
                 error=error,
@@ -1363,13 +1585,12 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         computer = _require_computer(store, computer_id)
         try:
-            picker = await asyncio.to_thread(
-                ssh.list_browse_directories,
+            picker = await remote.list_browse_directories(
                 computer,
                 path,
                 show_hidden=hidden,
             )
-        except (OSError, ValueError, SSHBackendError) as exc:
+        except (OSError, ValueError, SSHBackendError, RemoteAccessError) as exc:
             return JSONResponse(
                 {"ok": False, "error": _localized_exception(locale, exc)},
                 status_code=400,
@@ -1387,9 +1608,7 @@ def create_app(settings: Settings) -> FastAPI:
         name = str(form.get("name", ""))
         target_hint = f"{parent.rstrip('/')}/{name}" if parent else name
         try:
-            canonical = await asyncio.to_thread(
-                ssh.create_project_directory, computer, parent, name
-            )
+            canonical = await remote.create_project_directory(computer, parent, name)
         except ProjectPathExists as exc:
             message = translate(
                 locale,
@@ -1434,7 +1653,7 @@ def create_app(settings: Settings) -> FastAPI:
                 ),
                 status_code=303,
             )
-        except (OSError, ValueError, SSHBackendError) as exc:
+        except (OSError, ValueError, SSHBackendError, RemoteAccessError) as exc:
             return RedirectResponse(
                 _url_with_query(
                     f"/open/{computer_id}",
@@ -1471,8 +1690,8 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=303,
             )
         try:
-            await asyncio.to_thread(ssh.ensure_workspace, workspace)
-        except (OSError, ValueError, SSHBackendError) as exc:
+            await remote.ensure_workspace(workspace)
+        except (OSError, ValueError, SSHBackendError, RemoteAccessError) as exc:
             return RedirectResponse(
                 _url_with_query(
                     f"/open/{computer_id}",
@@ -1491,6 +1710,172 @@ def create_app(settings: Settings) -> FastAPI:
             )
         return RedirectResponse(f"/w/{workspace['id']}/terminal", status_code=303)
 
+    @app.get("/computers/node/pair", response_class=HTMLResponse)
+    async def node_pair_page(
+        request: Request, pairing_id: str | None = None
+    ) -> HTMLResponse:
+        pairing = store.get_node_pairing(pairing_id) if pairing_id else None
+        if pairing_id and pairing is None:
+            raise HTTPException(status_code=404, detail="Node pairing not found")
+        return templates.TemplateResponse(
+            request=request,
+            name="node_pair.html",
+            context=_context(
+                settings,
+                title=translate(locale_from_request(request), "node.pair.heading"),
+                pairing=pairing,
+                code=None,
+                core_url=str(request.base_url).rstrip("/"),
+                error=None,
+            ),
+        )
+
+    @app.post("/computers/node/pair", response_class=HTMLResponse)
+    async def create_node_pairing(request: Request) -> HTMLResponse:
+        await _verified_form(request, settings)
+        code = generate_pairing_code()
+        expires_at = (
+            datetime.now(UTC) + timedelta(seconds=PAIRING_CODE_TTL_SECONDS)
+        ).isoformat(timespec="seconds")
+        pairing = store.create_node_pairing_code(
+            code_hash=pairing_code_digest(code), expires_at=expires_at
+        )
+        return templates.TemplateResponse(
+            request=request,
+            name="node_pair.html",
+            context=_context(
+                settings,
+                title=translate(locale_from_request(request), "node.pair.heading"),
+                pairing=pairing,
+                code=code,
+                core_url=str(request.base_url).rstrip("/"),
+                error=None,
+            ),
+            status_code=201,
+        )
+
+    @app.post("/computers/node/pair/{enrollment_id}/approve")
+    async def approve_node_pairing(
+        request: Request, enrollment_id: str
+    ) -> RedirectResponse:
+        await _verified_form(request, settings)
+        try:
+            computer = store.approve_node_enrollment(enrollment_id)
+        except (KeyError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return RedirectResponse(f"/computers/{computer['id']}?connected=1", status_code=303)
+
+    @app.post("/computers/node/pair/{enrollment_id}/reject")
+    async def reject_node_pairing(
+        request: Request, enrollment_id: str
+    ) -> RedirectResponse:
+        await _verified_form(request, settings)
+        enrollment = store.get_node_enrollment(enrollment_id)
+        if enrollment is None:
+            raise HTTPException(status_code=404, detail="Node enrollment not found")
+        try:
+            store.reject_node_enrollment(enrollment_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/computers/node/pair?pairing_id={enrollment['pairing_code_id']}",
+            status_code=303,
+        )
+
+    @app.post("/api/node/enroll", response_class=JSONResponse)
+    async def enroll_node(request: Request) -> JSONResponse:
+        remote_key = request.client.host if request.client else "unknown"
+        if not node_pairing_limiter.allow(remote_key, "enroll"):
+            return JSONResponse(
+                {"ok": False, "code": "rate_limited", "error": "Too many pairing attempts"},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise NodeProtocolError("Pairing request is invalid", code="pairing_invalid")
+            polling_secret = str(payload.get("polling_secret") or "")
+            if not 32 <= len(polling_secret) <= 256:
+                raise NodeProtocolError(
+                    "Pairing polling secret is invalid", code="pairing_invalid"
+                )
+            public_key = str(payload.get("public_key") or "")
+            fingerprint = public_key_fingerprint(public_key)
+            if not secrets.compare_digest(
+                fingerprint, str(payload.get("fingerprint") or "")
+            ):
+                raise NodeProtocolError(
+                    "Node fingerprint does not match its key", code="identity_invalid"
+                )
+            version = validate_protocol_version(payload.get("protocol_version"))
+            enrollment = store.submit_node_enrollment(
+                code_hash=pairing_code_digest(str(payload.get("code") or "")),
+                name=str(payload.get("name") or "Node"),
+                public_key=public_key,
+                fingerprint=fingerprint,
+                protocol_version=version,
+                polling_secret_hash=secret_digest(polling_secret),
+            )
+            if enrollment is None:
+                raise NodeProtocolError(
+                    "Pairing code is expired, used, or invalid", code="pairing_invalid"
+                )
+        except (NodeProtocolError, ValueError, json.JSONDecodeError) as exc:
+            code = exc.code if isinstance(exc, NodeProtocolError) else "pairing_invalid"
+            return JSONResponse(
+                {"ok": False, "code": code, "error": str(exc)}, status_code=400
+            )
+        return JSONResponse(
+            {"ok": True, "enrollment_id": enrollment["id"], "status": "pending"},
+            status_code=202,
+        )
+
+    @app.post("/api/node/enroll/status", response_class=JSONResponse)
+    async def node_enrollment_status(request: Request) -> JSONResponse:
+        remote_key = request.client.host if request.client else "unknown"
+        if not node_pairing_limiter.allow(remote_key, "status"):
+            return JSONResponse(
+                {"ok": False, "code": "rate_limited", "error": "Too many status requests"},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Pairing status request is invalid")
+            enrollment = store.get_node_enrollment(
+                str(payload.get("enrollment_id") or ""),
+                polling_secret_hash=secret_digest(str(payload.get("polling_secret") or "")),
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse(
+                {"ok": False, "code": "pairing_invalid", "error": str(exc)},
+                status_code=400,
+            )
+        if enrollment is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "code": "pairing_unknown",
+                    "error": "Pairing enrollment was not found",
+                },
+                status_code=404,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "status": enrollment["status"],
+                "node_id": enrollment["computer_id"]
+                if enrollment["status"] == "approved"
+                else None,
+            }
+        )
+
+    @app.websocket("/api/node/control")
+    async def node_control_socket(websocket: WebSocket, node_id: str = "") -> None:
+        await node_core.handle_socket(websocket, node_id)
+
     @app.get("/computers/new", response_class=HTMLResponse)
     async def new_computer_page(request: Request) -> HTMLResponse:
         locale = locale_from_request(request)
@@ -1500,7 +1885,7 @@ def create_app(settings: Settings) -> FastAPI:
             name="computer_new.html",
             context=_context(
                 settings,
-                title=translate(locale, "title.ssh_add"),
+                title=translate(locale, "title.computer_add"),
                 values={},
                 error=None,
                 managed_public_key=managed_public_key,
@@ -1623,7 +2008,7 @@ def create_app(settings: Settings) -> FastAPI:
                 name="computer_new.html",
                 context=_context(
                     settings,
-                    title=translate(locale, "title.ssh_add"),
+                    title=translate(locale, "title.computer_add"),
                     values=values,
                     error=_localized_exception(locale, exc),
                     managed_public_key=managed_public_key,
@@ -1668,6 +2053,9 @@ def create_app(settings: Settings) -> FastAPI:
                 run_base_updated=run_base_updated,
                 name_updated=name_updated,
                 managed_key_path=str(ssh.managed_key_path),
+                node_status=remote.status(computer)
+                if computer.get("connection_method") == "node"
+                else None,
             ),
         )
 
@@ -1700,6 +2088,8 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         await _verified_form(request, settings)
         computer = _require_computer(store, computer_id)
+        if computer.get("connection_method") != "ssh":
+            raise HTTPException(status_code=404, detail="Server Terminal is not supported")
         try:
             home = await asyncio.to_thread(ssh.home_directory, computer)
             workspace = workspaces.open_server_terminal(computer_id, home)
@@ -1727,6 +2117,8 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         await _verified_form(request, settings)
         computer = _require_computer(store, computer_id)
+        if computer.get("connection_method") != "ssh":
+            raise HTTPException(status_code=404, detail="SSH connection test is not supported")
         try:
             await asyncio.to_thread(ssh.test_connection, computer)
         except SSHBackendError as exc:
@@ -1824,7 +2216,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def delete_computer(request: Request, computer_id: str):  # type: ignore[no-untyped-def]
         locale = locale_from_request(request)
         await _verified_form(request, settings)
-        _require_computer(store, computer_id)
+        computer = _require_computer(store, computer_id)
         if store.list_remote_runs_for_computer(computer_id):
             return RedirectResponse(
                 _url_with_query(
@@ -1843,8 +2235,11 @@ def create_app(settings: Settings) -> FastAPI:
             for terminal in store.list_terminals(workspace_id)
         ]
         try:
-            await asyncio.to_thread(ssh.delete_password, computer_id)
-            await asyncio.to_thread(ssh.forget_host_key, computer_id)
+            if computer.get("connection_method") == "node":
+                await node_core.revoke(computer_id)
+            else:
+                await asyncio.to_thread(ssh.delete_password, computer_id)
+                await asyncio.to_thread(ssh.forget_host_key, computer_id)
             store.remove_computer_registration(computer_id)
         except (OSError, RuntimeError, ValueError, SSHBackendError) as exc:
             return RedirectResponse(
@@ -1862,6 +2257,19 @@ def create_app(settings: Settings) -> FastAPI:
             recent_file_snapshots.pop(workspace_id, None)
         return RedirectResponse("/open?computer_removed=1", status_code=303)
 
+    @app.post("/computers/{computer_id}/revoke")
+    async def revoke_node(request: Request, computer_id: str) -> RedirectResponse:
+        await _verified_form(request, settings)
+        computer = _require_computer(store, computer_id)
+        if computer.get("connection_method") != "node":
+            raise HTTPException(status_code=404, detail="Node not found")
+        try:
+            store.revoke_node(computer_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await node_core.revoke(computer_id)
+        return RedirectResponse(f"/computers/{computer_id}", status_code=303)
+
     @app.post("/computers/{computer_id}/workspaces")
     async def create_remote_workspace(request: Request, computer_id: str):  # type: ignore[no-untyped-def]
         locale = locale_from_request(request)
@@ -1871,15 +2279,13 @@ def create_app(settings: Settings) -> FastAPI:
         display_name = str(form.get("display_name", "")).strip() or None
         created_workspace_id: str | None = None
         try:
-            canonical = await asyncio.to_thread(
-                ssh.validate_workspace_path, computer, remote_path
-            )
+            canonical = await remote.validate_workspace_path(computer, remote_path)
             existing = store.find_remote_workspace(computer_id, canonical)
             workspace = workspaces.open_remote(computer_id, canonical, display_name)
             if existing is None:
                 created_workspace_id = str(workspace["id"])
-            await asyncio.to_thread(ssh.ensure_workspace, workspace)
-        except (ValueError, SSHBackendError) as exc:
+            await remote.ensure_workspace(workspace)
+        except (ValueError, SSHBackendError, RemoteAccessError) as exc:
             if created_workspace_id:
                 store.delete_workspace(created_workspace_id)
             return RedirectResponse(
@@ -1896,7 +2302,7 @@ def create_app(settings: Settings) -> FastAPI:
         if not root_id:
             raise HTTPException(status_code=400, detail="Local folder location is required")
         root_record = store.get_root(root_id)
-        if not root_record or str(root_record["path"]).startswith("ssh://"):
+        if not root_record or str(root_record["path"]).startswith(("ssh://", "node://")):
             raise HTTPException(status_code=404, detail="Local folder location not found")
         workspace = workspaces.open_local(
             str(root_record["path"]), str(form.get("path", "."))
@@ -1912,6 +2318,29 @@ def create_app(settings: Settings) -> FastAPI:
             tab = "terminal"
         return RedirectResponse(f"/w/{workspace_id}/{tab}", status_code=303)
 
+    @app.get("/api/workspaces/{workspace_id}/usage", response_class=JSONResponse)
+    async def workspace_usage_status(workspace_id: str) -> dict[str, Any]:
+        workspace = _require_workspace(workspaces, workspace_id)
+        if workspace.get("transient"):
+            raise HTTPException(
+                status_code=404,
+                detail="Workspace activity is not available for transient Workspaces",
+            )
+
+        if remote.is_node(workspace) and not remote.status(workspace["computer"])["online"]:
+            view = await workspace_usage.record_failure(
+                workspace_id, WorkspaceUsageOffline()
+            )
+            return view.payload()
+
+        async def collect():  # type: ignore[no-untyped-def]
+            if is_remote(workspace):
+                return await remote.workspace_usage(workspace)
+            return await asyncio.to_thread(terminals.workspace_usage, workspace)
+
+        view = await workspace_usage.observe(workspace_id, collect)
+        return view.payload()
+
     @app.get("/w/{workspace_id}/terminal", response_class=HTMLResponse)
     async def terminal_page(
         request: Request,
@@ -1924,7 +2353,7 @@ def create_app(settings: Settings) -> FastAPI:
         terminal_error = error
         try:
             terminal_list = await ensure_terminal_list(workspace)
-        except SSHBackendError as exc:
+        except (SSHBackendError, RemoteAccessError) as exc:
             if not is_remote(workspace):
                 raise
             terminal_list = store.list_terminals(workspace_id)
@@ -1933,6 +2362,21 @@ def create_app(settings: Settings) -> FastAPI:
             terminal_error = _localized_exception(locale, exc)
         selected = next((item for item in terminal_list if item["id"] == terminal), None)
         selected = selected or terminal_list[0]
+        selected_file_run = None
+        if selected.get("role") == "file_run" and selected.get("managed_run_id"):
+            with contextlib.suppress(KeyError, ValueError):
+                run = file_runs.get(str(selected["managed_run_id"]))
+                if str(run["workspace_id"]) == workspace_id:
+                    if run["state"] in {"preparing", "running"}:
+                        with contextlib.suppress(
+                            OSError, SSHBackendError, TerminalError
+                        ):
+                            run = await asyncio.to_thread(
+                                file_runs.reconcile, str(run["id"])
+                            )
+                    selected_file_run = _file_run_status_payload(
+                        store, run, locale=locale
+                    )
         store.touch_workspace(workspace_id, tab="terminal")
         return templates.TemplateResponse(
             request=request,
@@ -1944,6 +2388,7 @@ def create_app(settings: Settings) -> FastAPI:
                 terminals=terminal_list,
                 terminal=selected,
                 commands=store.list_commands(workspace_id),
+                file_run=selected_file_run,
                 error=terminal_error,
                 current_device_id=str(getattr(request.state, "session", {}).get("id", "")),
                 **_workspace_status(store, terminals, workspace),
@@ -1962,7 +2407,7 @@ def create_app(settings: Settings) -> FastAPI:
         workspace = _require_workspace(workspaces, workspace_id)
         name = str(form.get("name", "shell"))
         if is_remote(workspace):
-            terminal = await asyncio.to_thread(ssh.create_terminal, workspace, name)
+            terminal = await remote.create_terminal(workspace, name)
         else:
             terminal = terminals.create_terminal(workspace, name)
         return RedirectResponse(
@@ -1992,16 +2437,12 @@ def create_app(settings: Settings) -> FastAPI:
         form = await _verified_form(request, settings)
         action = str(form.get("action", "rename"))
         try:
-            if workspace.get("is_remote_run") and str(terminal["name"]) == "run":
-                raise ValueError(
-                    translate(locale, "remote_run.managed_terminal_locked")
-                )
+            if str(terminal.get("role") or "shell") != "shell":
+                raise ValueError(translate(locale, "terminal.managed_locked"))
             if action == "rename":
                 name = str(form.get("name", "shell"))
                 if is_remote(workspace):
-                    updated = await asyncio.to_thread(
-                        ssh.rename_terminal, workspace, terminal, name
-                    )
+                    updated = await remote.rename_terminal(workspace, terminal, name)
                 else:
                     updated = terminals.rename_terminal(workspace, terminal, name)
                 return RedirectResponse(
@@ -2009,9 +2450,7 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             if action == "delete":
                 if is_remote(workspace):
-                    remaining = await asyncio.to_thread(
-                        ssh.close_terminal, workspace, terminal
-                    )
+                    remaining = await remote.close_terminal(workspace, terminal)
                 else:
                     remaining = terminals.close_terminal(workspace, terminal)
                 selected = remaining[0]
@@ -2019,7 +2458,7 @@ def create_app(settings: Settings) -> FastAPI:
                     f"/w/{workspace_id}/terminal?terminal={selected['id']}", status_code=303
                 )
             raise ValueError("Unknown terminal action")
-        except (ValueError, TerminalError, SSHBackendError) as exc:
+        except (ValueError, TerminalError, SSHBackendError, RemoteAccessError) as exc:
             return RedirectResponse(
                 f"/w/{workspace_id}/terminal?terminal={terminal_id}&error="
                 f"{quote(_localized_exception(locale, exc))}",
@@ -2035,9 +2474,7 @@ def create_app(settings: Settings) -> FastAPI:
         workspace = _require_workspace(workspaces, workspace_id)
         terminal = _require_terminal(store, workspace_id, terminal_id)
         if is_remote(workspace):
-            output = await asyncio.to_thread(
-                ssh.capture_scrollback, workspace, terminal, recent
-            )
+            output = await remote.capture_scrollback(workspace, terminal, recent)
         else:
             output = terminals.capture_scrollback(workspace, terminal, recent)
         return templates.TemplateResponse(
@@ -2117,6 +2554,13 @@ def create_app(settings: Settings) -> FastAPI:
             page_count=page_count,
             total_entries=total_entries,
             query=query,
+            can_remote_run_source=(
+                not workspace.get("transient")
+                and (
+                    not remote.is_node(workspace)
+                    or remote.supports_capability(workspace, "remote_run_source")
+                )
+            ),
             max_upload_bytes=settings.max_upload_bytes,
             format_size=_format_size,
             format_time_ns=lambda value: _relative_time_ns(value, locale),
@@ -2266,7 +2710,9 @@ def create_app(settings: Settings) -> FastAPI:
             if range_request is not None:
                 headers["Content-Range"] = f"bytes {start}-{end}/{entry.size}"
             return StreamingResponse(
-                ssh.download_iter(workspace, file_path, offset=start, length=length),
+                remote.download_stream(
+                    workspace, file_path, offset=start, length=length
+                ),
                 media_type=content_type,
                 headers=headers,
                 status_code=206 if range_request is not None else 200,
@@ -2310,7 +2756,9 @@ def create_app(settings: Settings) -> FastAPI:
             if range_request is not None:
                 headers["Content-Range"] = f"bytes {start}-{end}/{entry.size}"
             return StreamingResponse(
-                ssh.download_iter(workspace, file_path, offset=start, length=length),
+                remote.download_stream(
+                    workspace, file_path, offset=start, length=length
+                ),
                 media_type="application/octet-stream",
                 headers=headers,
                 status_code=206 if range_request is not None else 200,
@@ -2448,7 +2896,7 @@ def create_app(settings: Settings) -> FastAPI:
                             translate(locale, "files.error.exists", name=conflicts[0])
                         )
                 for upload in uploads:
-                    await ssh.upload(
+                    await remote.upload(
                         workspace,
                         parent,
                         upload,
@@ -2482,6 +2930,7 @@ def create_app(settings: Settings) -> FastAPI:
             OSError,
             UnsupportedFileError,
             SSHBackendError,
+            RemoteAccessError,
         ) as exc:
             return RedirectResponse(
                 _url_with_query(
@@ -2586,7 +3035,7 @@ def create_app(settings: Settings) -> FastAPI:
             if content_length and int(content_length) > settings.max_upload_bytes:
                 raise ValueError("Upload exceeds the configured size limit")
             if is_remote(workspace):
-                await ssh.upload_stream(
+                await remote.upload_stream(
                     workspace,
                     parent,
                     filename,
@@ -2612,6 +3061,7 @@ def create_app(settings: Settings) -> FastAPI:
             PathBoundaryError,
             UnsupportedFileError,
             SSHBackendError,
+            RemoteAccessError,
         ) as exc:
             status_code = _upload_error_status(exc)
             return JSONResponse(
@@ -2620,10 +3070,106 @@ def create_app(settings: Settings) -> FastAPI:
             )
         return JSONResponse({"ok": True, "name": filename})
 
-    @app.get("/w/{workspace_id}/edit/{file_path:path}", response_class=HTMLResponse)
-    async def editor(request: Request, workspace_id: str, file_path: str) -> HTMLResponse:
-        workspace = _require_workspace(workspaces, workspace_id)
-        snapshot = await read_workspace_text(workspace, file_path)
+    async def editor_file_run_context(
+        workspace: dict[str, Any],
+        snapshot: FileSnapshot,
+        *,
+        locale: str,
+        selected_run_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        runner = None
+        with contextlib.suppress(
+            FileNotFoundError,
+            FileRunError,
+            OSError,
+            RemoteAccessError,
+            SSHBackendError,
+            UnsupportedFileError,
+            ValueError,
+        ):
+            runner = await asyncio.to_thread(
+                file_runs.runner_for_file,
+                workspace,
+                snapshot.relative_path,
+            )
+
+        active = file_runs.active_for_workspace(str(workspace["id"]))
+        if active is not None:
+            with contextlib.suppress(
+                KeyError,
+                OSError,
+                RemoteAccessError,
+                SSHBackendError,
+                TerminalError,
+                ValueError,
+            ):
+                active = await asyncio.to_thread(
+                    file_runs.reconcile, str(active["id"])
+                )
+            if active["state"] not in {"preparing", "running"}:
+                active = None
+        latest = file_runs.latest_for_file(
+            str(workspace["id"]), snapshot.relative_path
+        )
+        if selected_run_id:
+            with contextlib.suppress(KeyError, ValueError):
+                selected = file_runs.get(selected_run_id)
+                if (
+                    str(selected["workspace_id"]) == str(workspace["id"])
+                    and str(selected["relative_path"]) == snapshot.relative_path
+                ):
+                    latest = selected
+        return {
+            "file_run_supported": runner is not None,
+            "file_run_runner_id": runner.id if runner is not None else None,
+            "file_run_idempotency_key": idempotency_key or str(uuid.uuid4()),
+            "active_file_run": _file_run_status_payload(
+                store, active, locale=locale
+            )
+            if active is not None
+            else None,
+            "latest_file_run": _file_run_status_payload(
+                store, latest, locale=locale
+            )
+            if latest is not None
+            else None,
+        }
+
+    async def render_editor(
+        request: Request,
+        workspace: dict[str, Any],
+        snapshot: FileSnapshot,
+        *,
+        saved: bool,
+        conflict: str | None,
+        save_error: str | None,
+        run_error: str | None,
+        editor_unsaved: bool,
+        submitted_content: str | None = None,
+        selected_run_id: str | None = None,
+        idempotency_key: str | None = None,
+        status_code: int = 200,
+    ) -> HTMLResponse:
+        locale = locale_from_request(request)
+        values: dict[str, Any] = {
+            "snapshot": snapshot,
+            "saved": saved,
+            "conflict": conflict,
+            "save_error": save_error,
+            "run_error": run_error,
+            "editor_unsaved": editor_unsaved,
+            **await editor_file_run_context(
+                workspace,
+                snapshot,
+                locale=locale,
+                selected_run_id=selected_run_id,
+                idempotency_key=idempotency_key,
+            ),
+            **_workspace_status(store, terminals, workspace),
+        }
+        if submitted_content is not None:
+            values["submitted_content"] = submitted_content
         return templates.TemplateResponse(
             request=request,
             name="editor.html",
@@ -2631,67 +3177,109 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="files",
-                snapshot=snapshot,
-                saved=request.query_params.get("saved") == "1",
-                conflict=None,
-                save_error=None,
-                editor_unsaved=False,
-                **_workspace_status(store, terminals, workspace),
+                **values,
             ),
+            status_code=status_code,
+        )
+
+    @app.get("/w/{workspace_id}/edit/{file_path:path}", response_class=HTMLResponse)
+    async def editor(request: Request, workspace_id: str, file_path: str) -> HTMLResponse:
+        workspace = _require_workspace(workspaces, workspace_id)
+        snapshot = await read_workspace_text(workspace, file_path)
+        return await render_editor(
+            request,
+            workspace,
+            snapshot,
+            saved=request.query_params.get("saved") == "1",
+            conflict=None,
+            save_error=None,
+            run_error=request.query_params.get("file_run_error"),
+            editor_unsaved=False,
+            selected_run_id=request.query_params.get("run"),
         )
 
     @app.post("/w/{workspace_id}/edit/{file_path:path}", response_class=HTMLResponse)
     async def save_file(request: Request, workspace_id: str, file_path: str):  # type: ignore[no-untyped-def]
         workspace = _require_workspace(workspaces, workspace_id)
-        form = await _verified_form(request, settings)
+        form = await _verified_form(
+            request,
+            settings,
+            max_part_size=settings.max_edit_bytes * 3 + 1024,
+        )
+        locale = locale_from_request(request)
         content = str(form.get("content", ""))
         expected_digest = str(form.get("digest", ""))
         expected_mtime_ns = int(str(form.get("mtime_ns", "0")))
-        try:
-            if is_remote(workspace):
-                await asyncio.to_thread(
-                    ssh.write_text,
+        intent = str(form.get("intent", "save"))
+        idempotency_key = str(form.get("file_run_idempotency_key", ""))
+
+        if intent == "save_and_run":
+            existing = store.get_file_run_by_idempotency(
+                workspace_id, idempotency_key
+            )
+            if existing is not None:
+                submitted_digest = file_digest(content.encode("utf-8"))
+                if (
+                    str(existing["relative_path"]) == file_path
+                    and str(existing["source_digest"]) == submitted_digest
+                ):
+                    return RedirectResponse(
+                        _file_run_destination(store, existing, prefer_terminal=True),
+                        status_code=303,
+                    )
+                current = await read_workspace_text(workspace, file_path)
+                return await render_editor(
+                    request,
                     workspace,
-                    file_path,
-                    content,
-                    expected_digest=expected_digest,
-                    expected_mtime_ns=expected_mtime_ns,
-                    max_bytes=settings.max_edit_bytes,
-                )
-            else:
-                ensure_exposed_local_path(workspace, file_path)
-                files.write_text(
-                    workspace["path"],
-                    file_path,
-                    content,
-                    expected_digest=expected_digest,
-                    expected_mtime_ns=expected_mtime_ns,
-                )
-        except FileConflictError as exc:
-            locale = locale_from_request(request)
-            current = await read_workspace_text(workspace, file_path)
-            return templates.TemplateResponse(
-                request=request,
-                name="editor.html",
-                context=_workspace_context(
-                    settings,
-                    workspace,
-                    active_tab="files",
-                    snapshot=current,
-                    submitted_content=content,
+                    current,
                     saved=False,
-                    conflict=_localized_exception(locale, exc),
+                    conflict=None,
                     save_error=None,
+                    run_error=translate(locale, "file_run.error.idempotency_conflict"),
                     editor_unsaved=True,
-                    **_workspace_status(store, terminals, workspace),
-                ),
+                    submitted_content=content,
+                    idempotency_key=idempotency_key,
+                    status_code=409,
+                )
+        try:
+            saved_snapshot = await write_workspace_text(
+                workspace,
+                file_path,
+                content,
+                expected_digest=expected_digest,
+                expected_mtime_ns=expected_mtime_ns,
+            )
+        except FileConflictError as exc:
+            current = await read_workspace_text(workspace, file_path)
+            return await render_editor(
+                request,
+                workspace,
+                current,
+                submitted_content=content,
+                saved=False,
+                conflict=_localized_exception(locale, exc),
+                save_error=None,
+                run_error=None,
+                editor_unsaved=True,
+                idempotency_key=idempotency_key or None,
                 status_code=409,
             )
-        except (OSError, UnsupportedFileError, SSHBackendError, ValueError) as exc:
-            locale = locale_from_request(request)
+        except (
+            OSError,
+            RemoteAccessError,
+            SSHBackendError,
+            UnsupportedFileError,
+            ValueError,
+        ) as exc:
             try:
                 current = await read_workspace_text(workspace, file_path)
-            except (OSError, UnsupportedFileError, SSHBackendError, ValueError):
+            except (
+                OSError,
+                RemoteAccessError,
+                SSHBackendError,
+                UnsupportedFileError,
+                ValueError,
+            ):
                 current = FileSnapshot(
                     path=Path(file_path),
                     relative_path=file_path,
@@ -2699,27 +3287,151 @@ def create_app(settings: Settings) -> FastAPI:
                     digest=expected_digest,
                     mtime_ns=expected_mtime_ns,
                 )
-            return templates.TemplateResponse(
-                request=request,
-                name="editor.html",
-                context=_workspace_context(
-                    settings,
+            return await render_editor(
+                request,
+                workspace,
+                current,
+                submitted_content=content,
+                saved=False,
+                conflict=None,
+                save_error=_localized_exception(locale, exc),
+                run_error=None,
+                editor_unsaved=True,
+                idempotency_key=idempotency_key or None,
+                status_code=502
+                if isinstance(exc, (RemoteAccessError, SSHBackendError))
+                else 409,
+            )
+
+        if intent == "save_and_run":
+            try:
+                run = await asyncio.to_thread(
+                    file_runs.start,
                     workspace,
-                    active_tab="files",
-                    snapshot=current,
-                    submitted_content=content,
-                    saved=False,
+                    saved_snapshot.relative_path,
+                    expected_digest=saved_snapshot.digest,
+                    idempotency_key=idempotency_key,
+                )
+            except FileRunConflict as exc:
+                return await render_editor(
+                    request,
+                    workspace,
+                    saved_snapshot,
+                    saved=True,
                     conflict=None,
-                    save_error=_localized_exception(locale, exc),
-                    editor_unsaved=True,
-                    **_workspace_status(store, terminals, workspace),
-                ),
-                status_code=502 if isinstance(exc, SSHBackendError) else 409,
+                    save_error=None,
+                    run_error=_localized_file_run_exception(locale, exc),
+                    editor_unsaved=False,
+                    idempotency_key=idempotency_key,
+                    status_code=409,
+                )
+            except (
+                FileConflictError,
+                FileRunError,
+                OSError,
+                RemoteAccessError,
+                SSHBackendError,
+                UnsupportedFileError,
+                ValueError,
+            ) as exc:
+                return await render_editor(
+                    request,
+                    workspace,
+                    saved_snapshot,
+                    saved=True,
+                    conflict=None,
+                    save_error=None,
+                    run_error=_localized_file_run_exception(locale, exc),
+                    editor_unsaved=False,
+                    idempotency_key=idempotency_key or None,
+                    status_code=502
+                    if isinstance(exc, (RemoteAccessError, SSHBackendError))
+                    else 409,
+                )
+            file_runs.wake()
+            return RedirectResponse(
+                _file_run_destination(store, run, prefer_terminal=True),
+                status_code=303,
             )
         return RedirectResponse(
             _url_with_query(
                 f"/w/{workspace_id}/edit/{quote(file_path, safe='/')}",
                 saved=1,
+            ),
+            status_code=303,
+        )
+
+    @app.get("/api/file-runs/{run_id}/status", response_class=JSONResponse)
+    async def file_run_status(request: Request, run_id: str) -> JSONResponse:
+        locale = locale_from_request(request)
+        try:
+            run = await asyncio.to_thread(file_runs.get, run_id)
+            if run["state"] in {"preparing", "running"}:
+                run = await asyncio.to_thread(file_runs.reconcile, run_id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="File Run not found") from exc
+        except (OSError, RemoteAccessError, SSHBackendError, TerminalError) as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": _localized_file_run_exception(locale, exc),
+                },
+                status_code=502,
+            )
+        return JSONResponse(
+            {"ok": True, **_file_run_status_payload(store, run, locale=locale)}
+        )
+
+    @app.post("/file-runs/{run_id}/stop")
+    async def stop_file_run(request: Request, run_id: str) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        try:
+            current = file_runs.get(run_id)
+            result = await asyncio.to_thread(file_runs.stop, run_id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="File Run not found") from exc
+        except (OSError, RemoteAccessError, SSHBackendError, TerminalError) as exc:
+            return RedirectResponse(
+                _file_run_editor_url(
+                    current,
+                    file_run_error=_localized_file_run_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        file_runs.wake()
+        return RedirectResponse(
+            _file_run_destination(
+                store,
+                result["run"],
+                prefer_terminal=str(form.get("return_to", "")) == "terminal",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/file-runs/{run_id}/kill")
+    async def kill_file_run(request: Request, run_id: str) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        try:
+            current = file_runs.get(run_id)
+            run = await asyncio.to_thread(file_runs.kill, run_id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="File Run not found") from exc
+        except (OSError, RemoteAccessError, SSHBackendError, TerminalError) as exc:
+            return RedirectResponse(
+                _file_run_editor_url(
+                    current,
+                    file_run_error=_localized_file_run_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        file_runs.wake()
+        return RedirectResponse(
+            _file_run_destination(
+                store,
+                run,
+                prefer_terminal=str(form.get("return_to", "")) == "terminal",
             ),
             status_code=303,
         )
@@ -2744,11 +3456,19 @@ def create_app(settings: Settings) -> FastAPI:
             name = str(form.get("name", ""))
             directory = str(form.get("kind", "file")) == "directory"
             if is_remote(workspace):
-                await asyncio.to_thread(ssh.create, workspace, parent, name, directory=directory)
+                await remote.create(
+                    workspace, parent, name, directory=directory
+                )
             else:
                 ensure_exposed_local_path(workspace, parent)
                 files.create(workspace["path"], parent, name, directory=directory)
-        except (ValueError, FileExistsError, OSError, SSHBackendError) as exc:
+        except (
+            ValueError,
+            FileExistsError,
+            OSError,
+            SSHBackendError,
+            RemoteAccessError,
+        ) as exc:
             return RedirectResponse(
                 _url_with_query(
                     f"/w/{workspace_id}/files",
@@ -2772,11 +3492,17 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             new_name = str(form.get("new_name", ""))
             if is_remote(workspace):
-                await asyncio.to_thread(ssh.rename, workspace, source, new_name)
+                await remote.rename(workspace, source, new_name)
             else:
                 ensure_exposed_local_path(workspace, source)
                 files.rename(workspace["path"], source, new_name)
-        except (ValueError, FileExistsError, OSError, SSHBackendError) as exc:
+        except (
+            ValueError,
+            FileExistsError,
+            OSError,
+            SSHBackendError,
+            RemoteAccessError,
+        ) as exc:
             return RedirectResponse(
                 _url_with_query(
                     f"/w/{workspace_id}/files",
@@ -2799,11 +3525,16 @@ def create_app(settings: Settings) -> FastAPI:
         parent = _relative_parent(target)
         try:
             if is_remote(workspace):
-                await asyncio.to_thread(ssh.delete, workspace, target)
+                await remote.delete(workspace, target)
             else:
                 ensure_exposed_local_path(workspace, target)
                 files.delete(workspace["path"], target)
-        except (OSError, UnsupportedFileError, SSHBackendError) as exc:
+        except (
+            OSError,
+            UnsupportedFileError,
+            SSHBackendError,
+            RemoteAccessError,
+        ) as exc:
             return RedirectResponse(
                 _url_with_query(
                     f"/w/{workspace_id}/files",
@@ -2821,6 +3552,8 @@ def create_app(settings: Settings) -> FastAPI:
     async def recent_page(request: Request, workspace_id: str) -> HTMLResponse:
         locale = locale_from_request(request)
         workspace = _require_workspace(workspaces, workspace_id)
+        if remote.is_node(workspace):
+            raise HTTPException(status_code=404, detail="Workspace activity is not supported")
         refresh_errors: list[str] = []
         try:
             recent_scan = await recent_workspace_files(workspace)
@@ -2930,7 +3663,7 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             if is_remote(workspace):
                 bridge_task = asyncio.create_task(
-                    ssh.bridge(websocket, workspace, terminal, device_id=device_id)
+                    remote.bridge(websocket, workspace, terminal, device_id=device_id)
                 )
             else:
                 bridge_task = asyncio.create_task(
@@ -2943,23 +3676,29 @@ def create_app(settings: Settings) -> FastAPI:
                 {bridge_task, expiry_task}, return_when=asyncio.FIRST_COMPLETED
             )
             if expiry_task in done and not bridge_task.done():
-                with contextlib.suppress(RuntimeError):
-                    await websocket.close(code=4401, reason="Session expired")
+                await _close_websocket(
+                    websocket, code=4401, reason="Session expired"
+                )
                 bridge_task.cancel()
             try:
                 await bridge_task
-            except (SSHBackendError, TerminalError, OSError):
-                with contextlib.suppress(RuntimeError):
-                    await websocket.close(
-                        code=1013,
-                        reason="Terminal backend temporarily unavailable",
-                    )
+            except (SSHBackendError, RemoteAccessError, TerminalError, OSError):
+                await _close_websocket(
+                    websocket,
+                    code=1013,
+                    reason="Terminal backend temporarily unavailable",
+                )
             except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError):
                 pass
         finally:
-            for task in (bridge_task, expiry_task):
-                if task is not None and not task.done():
+            tasks = tuple(
+                task for task in (bridge_task, expiry_task) if task is not None
+            )
+            for task in tasks:
+                if not task.done():
                     task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             sockets = active_websockets.get(device_id, [])
             with contextlib.suppress(ValueError):
                 sockets.remove(websocket)
@@ -3018,11 +3757,11 @@ def _workspace_status(
     session_active: bool | None = None,
 ) -> dict[str, Any]:
     terminal_count = len(store.list_terminals(str(workspace["id"])))
-    if workspace.get("backend_kind") == "ssh":
+    if workspace.get("backend_kind") == "remote":
         return {
             "session_active": None,
             "terminal_count": terminal_count,
-            "session_status_label": "workspace.status.ssh",
+            "session_status_label": "workspace.status.remote",
             "session_status_class": "remote",
         }
     local_active = (
@@ -3060,6 +3799,219 @@ def _remote_run_status_payload(
         "cleanup_pending": bool(run.get("cleanup_pending", False)),
         "workspace_id": workspace_id or None,
         "workspace_url": f"/w/{workspace_id}/terminal" if workspace_id else None,
+    }
+
+
+def _file_run_editor_url(
+    run: Mapping[str, Any],
+    *,
+    file_run_error: str | None = None,
+) -> str:
+    path = quote(str(run.get("relative_path") or ""), safe="/")
+    return _url_with_query(
+        f"/w/{run['workspace_id']}/edit/{path}",
+        run=run.get("id"),
+        file_run_error=file_run_error,
+    )
+
+
+def _file_run_terminal_url(
+    store: StateStore, run: Mapping[str, Any]
+) -> str | None:
+    terminal_id = str(run.get("terminal_id") or "")
+    if not terminal_id:
+        return None
+    terminal = store.get_terminal(terminal_id)
+    if (
+        terminal is None
+        or str(terminal.get("workspace_id")) != str(run.get("workspace_id"))
+        or str(terminal.get("role") or "shell") != "file_run"
+        or str(terminal.get("managed_run_id") or "") != str(run.get("id"))
+    ):
+        return None
+    return _url_with_query(
+        f"/w/{run['workspace_id']}/terminal", terminal=terminal_id
+    )
+
+
+def _file_run_destination(
+    store: StateStore,
+    run: Mapping[str, Any],
+    *,
+    prefer_terminal: bool,
+) -> str:
+    terminal_url = _file_run_terminal_url(store, run)
+    if prefer_terminal and terminal_url:
+        return terminal_url
+    return _file_run_editor_url(run)
+
+
+def _file_run_duration_seconds(run: Mapping[str, Any]) -> int | None:
+    started_at = run.get("started_at")
+    if not started_at:
+        return None
+    ended_at = run.get("ended_at")
+    try:
+        started = datetime.fromisoformat(str(started_at))
+        ended = datetime.fromisoformat(str(ended_at)) if ended_at else datetime.now(UTC)
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=UTC)
+    return max(0, int((ended - started).total_seconds()))
+
+
+def _localized_file_run_error_code(locale: str, code: Any) -> str | None:
+    key = FILE_RUN_ERROR_KEYS.get(str(code or ""))
+    return translate(locale, key) if key else None
+
+
+def _localized_file_run_exception(locale: str, exc: BaseException) -> str:
+    if isinstance(exc, FileRunConflict):
+        active = exc.values.get("active_run") or {}
+        return translate(
+            locale,
+            "file_run.error.slot_occupied",
+            file=str(active.get("relative_path") or translate(locale, "common.file")),
+        )
+    coded = _localized_file_run_error_code(locale, getattr(exc, "code", None))
+    if coded:
+        return coded
+    if isinstance(exc, FileConflictError):
+        return translate(locale, "file_run.error.source_changed")
+    localized = _localized_exception(locale, exc)
+    if localized != str(exc):
+        return localized
+    return translate(locale, "file_run.error.start_failed")
+
+
+def _file_run_status_payload(
+    store: StateStore,
+    run: Mapping[str, Any],
+    *,
+    locale: str,
+) -> dict[str, Any]:
+    state = str(run.get("state") or "preparing")
+    duration_seconds = _file_run_duration_seconds(run)
+    terminal_url = _file_run_terminal_url(store, run)
+    return {
+        "id": str(run.get("id") or ""),
+        "workspace_id": str(run.get("workspace_id") or ""),
+        "relative_path": str(run.get("relative_path") or ""),
+        "runner_id": str(run.get("runner_id") or ""),
+        "state": state,
+        "state_label": translate(locale, f"file_run.state.{state}"),
+        "exit_code": run.get("exit_code"),
+        "created_at": run.get("created_at"),
+        "started_at": run.get("started_at"),
+        "stop_requested_at": run.get("stop_requested_at"),
+        "ended_at": run.get("ended_at"),
+        "duration_seconds": duration_seconds,
+        "error_code": run.get("error_code"),
+        "error_detail": _localized_file_run_error_code(
+            locale, run.get("error_code")
+        ),
+        "connection": str(run.get("connection") or "online"),
+        "active": state in {"preparing", "running"},
+        "needs_force": bool(
+            state in {"preparing", "running"} and run.get("stop_requested_at")
+        ),
+        "editor_url": _file_run_editor_url(run),
+        "terminal_url": terminal_url,
+        "status_url": f"/api/file-runs/{run['id']}/status",
+        "stop_url": f"/file-runs/{run['id']}/stop",
+        "kill_url": f"/file-runs/{run['id']}/kill",
+    }
+
+
+def _activity_event_view(
+    event: Mapping[str, Any],
+    *,
+    locale: str,
+) -> dict[str, Any]:
+    kind = str(event.get("kind") or "")
+    primary = str(event.get("current_primary_label") or event.get("primary_label") or "")
+    secondary = str(
+        event.get("current_secondary_label") or event.get("secondary_label") or ""
+    )
+    exit_code = event.get("exit_code")
+    file_event = event.get("subject_type") == "file_run"
+    prefix = "activity.file_run" if file_event else "activity.remote_run"
+    if kind.endswith(".completed"):
+        title_key = f"{prefix}.completed"
+        message_key = f"{prefix}.completed_copy"
+        status_class = "completed"
+    elif kind.endswith(".failed"):
+        title_key = f"{prefix}.failed"
+        message_key = (
+            f"{prefix}.failed_exit_copy"
+            if exit_code is not None
+            else f"{prefix}.failed_start_copy"
+        )
+        status_class = "failed"
+    elif kind.endswith(".stopped"):
+        title_key = f"{prefix}.stopped"
+        message_key = f"{prefix}.stopped_copy"
+        status_class = "stopped"
+    else:
+        title_key = f"{prefix}.attention"
+        message_key = f"{prefix}.attention_copy"
+        status_class = "attention"
+    values = {
+        "source": primary,
+        "remote": secondary,
+        "file": primary,
+        "workspace": secondary,
+        "code": exit_code if exit_code is not None else "—",
+    }
+    subject_exists = bool(event.get("subject_exists"))
+    target_url = None
+    terminal_url = None
+    if subject_exists and event.get("subject_type") == "remote_run":
+        target_url = f"/remote-runs/{event['subject_id']}"
+    elif subject_exists and file_event:
+        workspace_id = str(event.get("current_workspace_id") or "")
+        relative_path = quote(
+            str(event.get("current_relative_path") or ""), safe="/"
+        )
+        target_url = _url_with_query(
+            f"/w/{workspace_id}/edit/{relative_path}",
+            run=event["subject_id"],
+        )
+        terminal_id = str(event.get("current_terminal_id") or "")
+        if terminal_id:
+            terminal_url = _url_with_query(
+                f"/w/{workspace_id}/terminal", terminal=terminal_id
+            )
+    return {
+        **dict(event),
+        "source_label": primary,
+        "remote_label": secondary,
+        "title": translate(locale, title_key),
+        "summary": translate(locale, message_key, **values),
+        "occurred_label": _relative_time(str(event.get("occurred_at") or ""), locale),
+        "status_class": status_class,
+        "target_url": target_url,
+        "terminal_url": terminal_url,
+        "subject_exists": subject_exists,
+        "unread": event.get("read_at") is None,
+    }
+
+
+def _activity_notification_payload(
+    event: Mapping[str, Any],
+    *,
+    locale: str,
+) -> dict[str, Any]:
+    view = _activity_event_view(event, locale=locale)
+    return {
+        "id": str(view["id"]),
+        "kind": str(view["kind"]),
+        "title": str(view["title"]),
+        "body": str(view["summary"]),
+        "url": view["target_url"],
     }
 
 
@@ -3275,8 +4227,13 @@ def _require_terminal(
     return terminal
 
 
-async def _verified_form(request: Request, settings: Settings):  # type: ignore[no-untyped-def]
-    form = await request.form()
+async def _verified_form(
+    request: Request,
+    settings: Settings,
+    *,
+    max_part_size: int = 1024 * 1024,
+):  # type: ignore[no-untyped-def]
+    form = await request.form(max_part_size=max_part_size)
     supplied = str(form.get("_csrf", ""))
     if not secure_compare(supplied, settings.csrf_token):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
@@ -3298,6 +4255,11 @@ def _valid_websocket_origin(websocket: WebSocket) -> bool:
         "http",
         "https",
     }
+
+
+async def _close_websocket(websocket: WebSocket, *, code: int, reason: str) -> None:
+    with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+        await websocket.close(code=code, reason=reason)
 
 
 def _breadcrumbs(relative_path: str) -> list[dict[str, str]]:
@@ -3376,7 +4338,7 @@ def _is_internal_state_entry(
     relative_directory: str,
     entry_name: str,
 ) -> bool:
-    if workspace.get("backend_kind") == "ssh":
+    if workspace.get("backend_kind") == "remote":
         return False
     workspace_root = Path(workspace["path"]).resolve(strict=True)
     current = resolve_inside(

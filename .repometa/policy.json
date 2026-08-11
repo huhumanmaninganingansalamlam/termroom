@@ -1,0 +1,155 @@
+{
+  "coverage": {
+    "require_annotations": []
+  },
+  "defaults": {
+    "areas": {
+      "backend": [
+        "backend/**",
+        "server/**",
+        "api/**"
+      ],
+      "frontend": [
+        "frontend/**",
+        "web/**"
+      ],
+      "infra": [
+        ".github/**",
+        "docker/**",
+        "deploy/**",
+        "**/Dockerfile"
+      ],
+      "mobile": [
+        "android/**",
+        "ios/**",
+        "lib/**"
+      ]
+    },
+    "topics": {
+      "auth": [
+        "**/auth/**",
+        "**/*token*",
+        "**/*login*"
+      ],
+      "billing": [
+        "**/billing/**",
+        "**/pricing/**",
+        "**/checkout/**"
+      ],
+      "tests": [
+        "**/tests/**",
+        "**/*test*",
+        "**/*.spec.*"
+      ]
+    }
+  },
+  "indexing": {
+    "exclude": [
+      ".git/**",
+      ".repometa/**",
+      ".repoctl-state/**",
+      ".cache/**",
+      ".gstack/**",
+      "*.lock",
+      "*.log",
+      "**/*.log",
+      "**/*.png",
+      "**/*.jpg",
+      "**/*.jpeg",
+      "**/*.gif",
+      "**/*.webp",
+      "**/*.zip",
+      "**/*.tar",
+      "**/*.gz",
+      ".venv/**",
+      "venv/**",
+      "env/**",
+      ".pytest_cache/**",
+      ".mypy_cache/**",
+      ".ruff_cache/**",
+      ".tox/**",
+      ".nox/**",
+      "*.egg-info/**",
+      "__pycache__/**",
+      "**/__pycache__/**",
+      "*.pyc",
+      "*.pyo",
+      "**/*.pyc",
+      "**/*.pyo",
+      "node_modules/**",
+      ".next/**",
+      ".nuxt/**",
+      ".svelte-kit/**",
+      ".turbo/**",
+      ".parcel-cache/**",
+      ".firebase/**",
+      ".playwright-browsers/**",
+      "dist/**",
+      "build/**",
+      "coverage/**",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "yarn.lock",
+      "bun.lockb",
+      "*.tsbuildinfo",
+      ".dart_tool/**",
+      ".flutter-plugins",
+      ".flutter-plugins-dependencies",
+      "Library/**",
+      "Temp/**",
+      "Obj/**",
+      "obj/**",
+      "bin/**",
+      "Build/**",
+      "Builds/**",
+      "Logs/**",
+      "UserSettings/**",
+      "MemoryCaptures/**",
+      "vendor/**",
+      "target/**",
+      ".gradle/**",
+      "out/**",
+      ".build/**",
+      "DerivedData/**"
+    ]
+  },
+  "schema_version": 1,
+  "vocab": {
+    "declared_effects": {
+      "base": [
+        "none",
+        "db",
+        "net",
+        "fs",
+        "ui",
+        "time",
+        "crypto",
+        "config"
+      ],
+      "extend": [
+        "cache",
+        "queue",
+        "email",
+        "sms",
+        "webhook",
+        "push",
+        "third_party"
+      ]
+    },
+    "roles": {
+      "base": [
+        "service",
+        "handler",
+        "adapter",
+        "component",
+        "config",
+        "test",
+        "workflow",
+        "migration",
+        "spec",
+        "script"
+      ],
+      "extend": []
+    }
+  }
+}

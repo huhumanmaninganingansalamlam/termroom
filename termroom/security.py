@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import hmac
 import os
+import stat
 from pathlib import Path
 
 
@@ -40,6 +41,33 @@ def resolve_inside(
     if not is_within(resolved, boundary):
         raise PathBoundaryError("Path escapes the allowed boundary")
     return resolved
+
+
+def resolve_no_symlink_inside(
+    boundary: Path,
+    relative_path: str | Path,
+) -> Path:
+    """Resolve an existing path while rejecting every symlink component."""
+
+    root = boundary.resolve(strict=True)
+    raw = Path(relative_path)
+    if raw.is_absolute():
+        raise PathBoundaryError("Absolute paths are not allowed")
+    parts = raw.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise PathBoundaryError("Path must be a normalized Workspace-relative path")
+
+    current = root
+    for index, part in enumerate(parts):
+        current = current / part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise PathBoundaryError("Symbolic links are not allowed")
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(current)
+    if not is_within(current, root):
+        raise PathBoundaryError("Path escapes the allowed boundary")
+    return current
 
 
 def file_digest(content: bytes) -> str:

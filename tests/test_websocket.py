@@ -4,15 +4,26 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from termroom.app import create_app
+from termroom.app import _close_websocket, create_app
 from termroom.config import Settings
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+
+
+@pytest.mark.asyncio
+async def test_closing_an_already_disconnected_terminal_socket_is_quiet() -> None:
+    websocket = AsyncMock(spec=WebSocket)
+    websocket.close.side_effect = WebSocketDisconnect(code=1006)
+
+    await _close_websocket(websocket, code=1013, reason="backend unavailable")
+
+    websocket.close.assert_awaited_once_with(code=1013, reason="backend unavailable")
 
 
 def _app(tmp_path: Path):  # type: ignore[no-untyped-def]

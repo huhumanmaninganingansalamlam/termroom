@@ -15,14 +15,14 @@ def test_source_switch_disables_only_inactive_panel_controls() -> None:
 def test_remote_run_pages_load_current_form_script() -> None:
     for template_name in ("remote_run_new.html", "remote_run_wait.html"):
         template = (ROOT / "termroom/templates" / template_name).read_text(encoding="utf-8")
-        assert "remote_run.js') }}?v=9" in template
+        assert "remote_run.js') }}?v=10" in template
 
     workspace_template = (
         ROOT / "termroom/templates/workspace_base.html"
     ).read_text(encoding="utf-8")
     assert "data-remote-run-workspace" in workspace_template
     assert "data-run-retention" in workspace_template
-    assert "remote_run.js') }}?v=9" in workspace_template
+    assert "remote_run.js') }}?v=10" in workspace_template
 
     home_template = (ROOT / "termroom/templates/home.html").read_text(encoding="utf-8")
     assert "/remote-runs/new" not in home_template
@@ -30,7 +30,7 @@ def test_remote_run_pages_load_current_form_script() -> None:
     assert "run.command_summary" not in home_template
     assert "run.target_label" in home_template
     assert "run.created_label" in home_template
-    assert "remote_run.js') }}?v=9" in home_template
+    assert "remote_run.js') }}?v=10" in home_template
 
     new_template = (ROOT / "termroom/templates/remote_run_new.html").read_text(
         encoding="utf-8"
@@ -60,11 +60,11 @@ def test_wait_page_surfaces_offline_status_and_clears_it_after_recovery() -> Non
     assert "remote_run.connection_lost_copy" in template
 
 
-def test_zip_retry_reuses_the_claimed_run_and_workspace_keeps_polling() -> None:
+def test_archive_retry_reuses_the_claimed_run_and_workspace_keeps_polling() -> None:
     script = (ROOT / "termroom/static/remote_run.js").read_text(encoding="utf-8")
 
-    assert "pendingZipRun?.fingerprint === fingerprint" in script
-    assert "pendingZipRun = { id: runId, fingerprint }" in script
+    assert "pendingArchiveRun?.fingerprint === fingerprint" in script
+    assert "pendingArchiveRun = { id: runId, fingerprint }" in script
     assert 'document.querySelector("[data-remote-run-workspace]")' in script
     assert '["preparing", "running"].includes(workspaceRun.dataset.state)' in script
     assert "4000 - (Date.now() - requestedAt)" in script

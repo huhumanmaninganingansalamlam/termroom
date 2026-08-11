@@ -48,7 +48,7 @@
             <button id="terminal-font-reset" class="terminal-font-reset" type="button">{{ t('terminal.font_reset') }}</button>
           </div>
         </section>
-        {% if not (remote_run and terminal.name == 'run') %}
+        {% if (terminal.role | default('shell')) == 'shell' %}
           <label>
             <span>{{ t('terminal.name') }}</span>
             <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}">
@@ -76,6 +76,43 @@
   </div>
 </div>
 {% if error %}<p class="terminal-error-banner" role="alert">{{ error }}</p>{% endif %}
+{% if file_run %}
+<aside class="file-run-bar file-run-terminal-bar {{ file_run.state }}"
+       data-file-run
+       data-state="{{ file_run.state }}"
+       data-status-url="{{ file_run.status_url }}"
+       data-started-at="{{ file_run.started_at or '' }}">
+  <span class="file-run-summary">
+    <span class="state-chip {% if file_run.active %}running{% endif %}">
+      <span class="status-dot" aria-hidden="true"></span>
+      <strong data-file-run-state>{{ file_run.state_label }}</strong>
+    </span>
+    <code title="{{ file_run.relative_path }}">{{ file_run.relative_path }}</code>
+    <small data-file-run-duration>{% if file_run.duration_seconds is not none %}{{ t('file_run.duration', seconds=file_run.duration_seconds) }}{% endif %}</small>
+    <small data-file-run-exit>{% if file_run.exit_code is not none %}{{ t('file_run.exit_code', code=file_run.exit_code) }}{% endif %}</small>
+    <small class="file-run-error" data-file-run-error {% if not file_run.error_detail %}hidden{% endif %}>{{ file_run.error_detail or '' }}</small>
+  </span>
+  <span class="file-run-actions">
+    <a class="secondary-button" href="{{ file_run.editor_url }}">{{ t('file_run.back_to_file') }}</a>
+    <form method="post"
+          action="{{ file_run.stop_url }}"
+          data-file-run-stop
+          {% if not file_run.active or file_run.needs_force %}hidden{% endif %}>
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="return_to" value="terminal">
+      <button class="secondary-button" type="submit">{{ t('file_run.stop') }}</button>
+    </form>
+    <form method="post"
+          action="{{ file_run.kill_url }}"
+          data-file-run-force
+          {% if not file_run.needs_force %}hidden{% endif %}>
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="return_to" value="terminal">
+      <button class="danger-button" type="submit" data-confirm="{{ t('file_run.force_confirm') }}">{{ t('file_run.force_stop') }}</button>
+    </form>
+  </span>
+</aside>
+{% endif %}
 <div id="terminal"
      class="terminal-host"
      data-terminal-id="{{ terminal.id }}"

@@ -34,7 +34,7 @@
   <title>{{ title }} · Termroom</title>
   <link rel="icon" href="data:,">
   <link rel="manifest" href="/static/manifest.webmanifest?v=3">
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=20.1">
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=22">
   <script>
     window.TermroomLocale = {{ locale | tojson }};
     window.TermroomI18n = {{ i18n_messages | tojson }};
@@ -71,6 +71,18 @@
           <span class="status-dot"></span>{{ t(access_scope_label) }}
         </span>
         {% if authenticated %}
+        <a class="header-utility-button activity-header-link"
+           href="/activity"
+           data-activity-link
+           data-summary-url="/api/activity/summary"
+           data-claim-url="/api/activity/notifications/claim"
+           data-csrf="{{ csrf_token }}"
+           aria-label="{{ t('activity.heading') }}"
+           title="{{ t('activity.heading') }}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 7H3s3 0 3-7M9.5 19h5"/></svg>
+          <span>{{ t('activity.heading') }}</span>
+          <strong class="activity-unread-badge" data-activity-unread hidden></strong>
+        </a>
         <form class="header-logout" method="post" action="/logout">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <button class="header-utility-button" type="submit" aria-label="{{ t('home.logout') }}" title="{{ t('home.logout') }}">
@@ -96,7 +108,7 @@
       <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.4A8.2 8.2 0 0 1 8.6 4a8.2 8.2 0 1 0 11.4 11.4Z"/></svg>
     </button>
   </template>
-  <script src="{{ url_for('static', path='app.js') }}?v=47" defer></script>
+  <script src="{{ url_for('static', path='app.js') }}?v=50" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

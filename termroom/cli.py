@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import json
 import os
@@ -21,6 +22,24 @@ from termroom.app import create_app
 from termroom.assets import ensure_xterm_assets
 from termroom.config import Settings, default_state_dir
 from termroom.db import StateStore
+from termroom.node_agent import (
+    NodeAgent,
+    NodeAgentError,
+    NodePermanentError,
+    ensure_node_identity,
+    load_node_config,
+    load_node_identity,
+    pair_node,
+)
+from termroom.node_protocol import public_key_fingerprint, public_key_text
+from termroom.node_service import (
+    NODE_PERMANENT_EXIT_STATUS,
+    NodeProcessLock,
+    NodeServiceError,
+    NodeServiceManager,
+    NodeServiceStatus,
+    write_node_runtime_status,
+)
 from termroom.runtime import runtime_fingerprint
 from termroom.terminals import TerminalManager
 from termroom.workspaces import RootManager, WorkspaceManager
@@ -73,6 +92,52 @@ def _build_stop_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_node_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="termroom node",
+        description="Connect this Linux computer to a Termroom Core without inbound SSH.",
+    )
+    _add_config_dir_argument(parser)
+    parser.add_argument(
+        "--allow-root-user",
+        action="store_true",
+        help="Allow running the Node process as the root OS user (strongly discouraged)",
+    )
+    commands = parser.add_subparsers(dest="node_command")
+    pair_parser = commands.add_parser(
+        "pair", help="Pair this computer with a Termroom Core"
+    )
+    pair_parser.add_argument("--core", required=True, help="Termroom Core base URL")
+    pair_parser.add_argument("--code", required=True, help="One-time pairing code")
+    pair_parser.add_argument(
+        "--allow-root",
+        action="append",
+        required=True,
+        dest="allowed_roots",
+        metavar="PATH",
+        help="Folder the Node may expose; repeat to allow more than one",
+    )
+    pair_parser.add_argument("--name", help="Computer name shown in Termroom")
+    pair_parser.add_argument(
+        "--run-root",
+        help="Node-local folder for managed Remote Runs (default: Node state/runs)",
+    )
+    pair_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Seconds to wait for fingerprint approval (default: 600)",
+    )
+    commands.add_parser(
+        "install-service", help="Install and start the systemd user service"
+    )
+    commands.add_parser("status", help="Show the Node user service and Core connection state")
+    commands.add_parser(
+        "uninstall-service", help="Stop and remove the systemd user service"
+    )
+    return parser
+
+
 def _add_config_dir_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config-dir",
@@ -91,6 +156,14 @@ def main(argv: list[str] | None = None) -> None:
         return
     if argv and argv[0] == "stop":
         _stop(_build_stop_parser().parse_args(argv[1:]))
+        return
+    if argv and argv[0] == "node":
+        node_parser = _build_node_parser()
+        node_args = node_parser.parse_args(argv[1:])
+        _validate_user(node_parser, node_args.allow_root_user)
+        if node_args.node_command not in {"status", "uninstall-service"}:
+            _require_tmux(node_parser)
+        _run_node(node_parser, node_args)
         return
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -234,6 +307,131 @@ def _open_in_running_core(
         _open_browser(url)
 
 
+def _run_node(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    state_dir = _node_state_path(args.state_dir)
+    try:
+        if args.node_command == "pair":
+            private_key = ensure_node_identity(state_dir)
+            fingerprint = public_key_fingerprint(public_key_text(private_key.public_key()))
+            print(f"Node fingerprint: {fingerprint}", flush=True)
+            print("Waiting for approval in Termroom Core...", flush=True)
+            config = pair_node(
+                state_dir=state_dir,
+                core_url=args.core,
+                code=args.code,
+                allowed_roots=args.allowed_roots,
+                name=args.name,
+                run_root=args.run_root,
+                timeout_seconds=args.timeout,
+            )
+            print(f"Node paired: {config.name} ({config.node_id})", flush=True)
+            print("Run `termroom node` to connect.", flush=True)
+            return
+        if args.node_command == "status":
+            _print_node_service_status(NodeServiceManager(state_dir).status())
+            return
+        if args.node_command == "uninstall-service":
+            status = NodeServiceManager(state_dir).uninstall()
+            print("Termroom Node service removed.", flush=True)
+            _print_node_service_status(status)
+            print("Node identity and allowed roots were preserved.", flush=True)
+            return
+        config = load_node_config(state_dir)
+        private_key = load_node_identity(state_dir)
+        fingerprint = public_key_fingerprint(public_key_text(private_key.public_key()))
+        if args.node_command == "install-service":
+            manager = NodeServiceManager(state_dir)
+            status = manager.install(_node_service_command(state_dir))
+            print("Termroom Node service installed and started.", flush=True)
+            _print_node_service_status(status)
+            if status.linger == "disabled":
+                print(
+                    "Automatic start before login requires lingering. Ask an administrator to run: "
+                    f"loginctl enable-linger {os.getuid()}",
+                    flush=True,
+                )
+            elif status.linger == "unknown":
+                print(
+                    "Could not determine lingering. The service starts at login; an administrator "
+                    "can enable lingering for start before login.",
+                    flush=True,
+                )
+            return
+    except (OSError, ValueError, NodeAgentError, NodeServiceError) as exc:
+        parser.error(str(exc))
+
+    print(f"Termroom Node: {config.name}", flush=True)
+    print(f"Core:          {config.core_url}", flush=True)
+    print(f"Fingerprint:   {fingerprint}", flush=True)
+    print("Allowed roots:", flush=True)
+    for root in config.allowed_roots:
+        print(f"  {root}", flush=True)
+    print(f"Remote Run root: {config.run_root}", flush=True)
+    permanent_failure = False
+    try:
+        with NodeProcessLock(state_dir, config.node_id):
+            write_node_runtime_status(state_dir, config.node_id, "starting")
+            try:
+                asyncio.run(_run_node_agent(NodeAgent(config, private_key)))
+            except KeyboardInterrupt:
+                return
+            except NodePermanentError as exc:
+                permanent_failure = True
+                print(f"Termroom Node stopped: {exc}", file=sys.stderr, flush=True)
+                raise SystemExit(NODE_PERMANENT_EXIT_STATUS) from exc
+            finally:
+                if not permanent_failure:
+                    write_node_runtime_status(state_dir, config.node_id, "stopped")
+    except NodeServiceError as exc:
+        parser.error(str(exc))
+
+
+async def _run_node_agent(agent: NodeAgent) -> None:
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(agent.run_forever())
+    stop_requested = False
+
+    def request_stop() -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        task.cancel()
+
+    signal_handler_installed = False
+    with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+        loop.add_signal_handler(signal.SIGTERM, request_stop)
+        signal_handler_installed = True
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not stop_requested:
+            raise
+    finally:
+        if signal_handler_installed:
+            loop.remove_signal_handler(signal.SIGTERM)
+
+
+def _node_service_command(state_dir: Path) -> list[str]:
+    executable = Path(os.path.abspath(sys.executable))
+    return [
+        str(executable),
+        "-m",
+        "termroom.cli",
+        "node",
+        "--state-dir",
+        str(state_dir),
+    ]
+
+
+def _print_node_service_status(status: NodeServiceStatus) -> None:
+    print(f"Installed: {'yes' if status.installed else 'no'}", flush=True)
+    print(f"Enabled:   {'yes' if status.enabled else 'no'}", flush=True)
+    print(f"Active:    {'yes' if status.active else 'no'} ({status.service_state})", flush=True)
+    print(f"Core:      {status.core_state}", flush=True)
+    print(f"Lingering: {status.linger}", flush=True)
+    if status.last_error_code:
+        print(f"Last error: {status.last_error_code}", flush=True)
+
+
 def _start_background_core(
     parser: argparse.ArgumentParser, args: argparse.Namespace, settings: Settings
 ) -> None:
@@ -366,6 +564,11 @@ def _require_tmux(parser: argparse.ArgumentParser) -> None:
 
 def _state_path(value: str | None) -> Path:
     return (Path(value).expanduser() if value else default_state_dir()).resolve()
+
+
+def _node_state_path(value: str | None) -> Path:
+    path = Path(value).expanduser() if value else default_state_dir() / "node"
+    return path.resolve(strict=False)
 
 
 def _open_existing_store(state_dir_value: str | None) -> StateStore:

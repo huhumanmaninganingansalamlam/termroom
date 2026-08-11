@@ -38,6 +38,7 @@ from termroom.files import (
     FileEntry,
     FileSnapshot,
     RecentFiles,
+    RunnableFile,
     TextPreview,
     UnsupportedFileError,
     decode_utf8_preview,
@@ -49,10 +50,26 @@ from termroom.secrets import SecretStore, SecretStoreError
 from termroom.security import file_digest
 from termroom.terminal_control import TerminalControl
 from termroom.terminals import (
+    FILE_RUN_WRAPPER_SCRIPT,
     MAX_TERMINAL_MESSAGE_BYTES,
+    TMUX_MANAGED_RUN_OPTION,
+    TMUX_TERMINAL_RECORD_FORMAT,
+    TMUX_TERMINAL_ROLE_OPTION,
     TerminalOutputDecoder,
+    file_run_completion_was_stopped,
     normalize_terminal_name,
+    parse_tmux_terminal_records,
     terminal_size,
+)
+from termroom.workspace_usage import (
+    WORKSPACE_USAGE_PANES_MARKER,
+    WORKSPACE_USAGE_PROCESSES_MARKER,
+    RawWorkspaceUsage,
+    WorkspaceUsageOffline,
+    WorkspaceUsageStale,
+    WorkspaceUsageUnavailable,
+    split_remote_workspace_usage_output,
+    workspace_usage_from_outputs,
 )
 from termroom.workspaces import ProjectPathExists, validate_project_name
 
@@ -2942,32 +2959,490 @@ class SSHBackend:
         session = str(workspace["tmux_session"])
         quoted_session = shlex.quote(session)
         quoted_path = shlex.quote(remote_path)
+        managed_identity = ""
+        if str(workspace.get("workspace_kind") or "workspace") == "remote_run":
+            run_id = str(workspace.get("remote_run_id") or "")
+            if not run_id:
+                raise SSHBackendError("Remote Run Workspace identity is missing")
+            quoted_target = shlex.quote(f"{session}:0")
+            managed_identity = (
+                f"tmux set-window-option -t {quoted_target} "
+                f"{TMUX_TERMINAL_ROLE_OPTION} remote_run; "
+                f"tmux set-window-option -t {quoted_target} "
+                f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(run_id)}; "
+            )
         command = (
             f"test -d {quoted_path} || {{ echo '__TERMROOM_NO_DIR__' >&2; exit 44; }}; "
             "command -v tmux >/dev/null 2>&1 || "
             "{ echo '__TERMROOM_NO_TMUX__' >&2; exit 45; }; "
             f"tmux has-session -t {quoted_session} 2>/dev/null || "
             f"tmux new-session -d -s {quoted_session} -c {quoted_path} -n shell; "
+            f"{managed_identity}"
             f"tmux set-window-option -t {quoted_session} window-size latest "
             ">/dev/null 2>&1 || true; "
-            f"tmux list-windows -t {quoted_session} -F '#{{window_id}}|#{{window_name}}'"
+            f"tmux list-windows -t {quoted_session} "
+            f"-F {shlex.quote(TMUX_TERMINAL_RECORD_FORMAT)}"
         )
         output = self._exec(computer, self._remote_posix_command(command))
-        windows: list[tuple[str, str]] = []
-        for line in output.splitlines():
-            window_id, separator, name = line.partition("|")
-            if separator and window_id.startswith("@"):
-                windows.append((window_id, name or "shell"))
+        try:
+            windows = parse_tmux_terminal_records(output)
+        except ValueError as exc:
+            raise SSHBackendError("Remote tmux exposed an invalid Terminal record") from exc
         if not windows:
             raise SSHBackendError("Remote tmux session did not expose any terminal windows")
-        stored = self.store.list_terminals(str(workspace["id"]))
-        known = {item["tmux_window"] for item in stored}
-        live = {window_id for window_id, _ in windows}
-        if known != live:
-            self.store.reset_terminals(str(workspace["id"]))
-            for window_id, name in windows:
-                self.store.create_terminal(str(workspace["id"]), name, window_id)
-        return self.store.list_terminals(str(workspace["id"]))
+        return self.store.reconcile_terminals(str(workspace["id"]), windows)
+
+    def workspace_usage(self, workspace: dict[str, Any]) -> RawWorkspaceUsage:
+        session = shlex.quote(str(workspace["tmux_session"]))
+        command = (
+            "command -v tmux >/dev/null 2>&1 || exit 45; "
+            "command -v ps >/dev/null 2>&1 || exit 46; "
+            f"tmux has-session -t {session} 2>/dev/null || exit 47; "
+            f"printf '%s\\n' {shlex.quote(WORKSPACE_USAGE_PANES_MARKER)}; "
+            f"tmux list-panes -s -t {session} -F '#{{pane_pid}}' || exit 48; "
+            f"printf '%s\\n' {shlex.quote(WORKSPACE_USAGE_PROCESSES_MARKER)}; "
+            "LC_ALL=C ps -eo pid=,ppid=,pcpu=,rss="
+        )
+        try:
+            output = self._exec(
+                self._computer(workspace), self._remote_posix_command(command)
+            )
+        except SSHCommandStatusUnknown as exc:
+            raise WorkspaceUsageStale() from exc
+        except SSHBackendError as exc:
+            if exc.locale_key in {
+                "ssh.backend.refused",
+                "ssh.backend.timeout",
+                "ssh.backend.dns",
+                "ssh.backend.connection",
+            }:
+                raise WorkspaceUsageOffline() from exc
+            raise WorkspaceUsageUnavailable(
+                "Remote Workspace activity is unavailable",
+                code="remote_measurement_unavailable",
+            ) from exc
+        panes, processes = split_remote_workspace_usage_output(output)
+        return workspace_usage_from_outputs(panes, processes)
+
+    def set_managed_identity(
+        self,
+        workspace: dict[str, Any],
+        tmux_window: str,
+        *,
+        role: str,
+        managed_run_id: str,
+    ) -> dict[str, Any]:
+        if role not in {"file_run", "remote_run"} or not managed_run_id:
+            raise SSHBackendError("Managed Terminal identity is invalid")
+        command = (
+            f"tmux set-window-option -t {shlex.quote(tmux_window)} "
+            f"{TMUX_TERMINAL_ROLE_OPTION} {shlex.quote(role)}; "
+            f"tmux set-window-option -t {shlex.quote(tmux_window)} "
+            f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(managed_run_id)}"
+        )
+        self._exec(self._computer(workspace), command)
+        terminals = self.ensure_workspace(workspace)
+        terminal = next(
+            (item for item in terminals if item["tmux_window"] == tmux_window), None
+        )
+        if terminal is None:
+            raise SSHBackendError(
+                "Managed Terminal disappeared while recording identity"
+            )
+        return terminal
+
+    @staticmethod
+    def _file_run_metadata_paths(
+        home: str, workspace_id: str, run_id: str
+    ) -> dict[str, str]:
+        root = posixpath.join(home, ".termroom-file-runs")
+        workspace_root = posixpath.join(root, workspace_id)
+        metadata = posixpath.join(workspace_root, run_id)
+        return {
+            "root": root,
+            "workspace": workspace_root,
+            "metadata": metadata,
+            "request_id": posixpath.join(metadata, "request-id"),
+            "wrapper": posixpath.join(metadata, "runner.sh"),
+            "state": posixpath.join(metadata, "state.json"),
+            "prepare": posixpath.join(metadata, "prepare.json"),
+            "completion": posixpath.join(metadata, "completion.json"),
+            "stop": posixpath.join(metadata, "stop-requested-at"),
+            "force": posixpath.join(metadata, "force-stopped"),
+        }
+
+    @staticmethod
+    def _ensure_private_file_run_directory(
+        sftp: paramiko.SFTPClient, path: str
+    ) -> None:
+        try:
+            attr = sftp.lstat(path)
+        except OSError as exc:
+            if not SSHBackend._is_missing_sftp_error(exc):
+                raise
+            sftp.mkdir(path, mode=0o700)
+            attr = sftp.lstat(path)
+        if stat_module.S_ISLNK(attr.st_mode) or not stat_module.S_ISDIR(attr.st_mode):
+            raise SSHBackendError("Remote File Run metadata path is not a real directory")
+        if int(attr.st_mode or 0) & 0o077:
+            sftp.chmod(path, 0o700)
+
+    def _prepare_remote_file_run_metadata(
+        self,
+        sftp: paramiko.SFTPClient,
+        workspace: dict[str, Any],
+        run_id: str,
+    ) -> dict[str, str]:
+        home = posixpath.normpath(sftp.normalize("."))
+        paths = self._file_run_metadata_paths(home, str(workspace["id"]), run_id)
+        current = home
+        for component in (
+            ".termroom-file-runs",
+            str(workspace["id"]),
+            run_id,
+        ):
+            current = posixpath.join(current, component)
+            self._ensure_private_file_run_directory(sftp, current)
+            if posixpath.normpath(sftp.normalize(current)) != current:
+                raise SSHBackendError(
+                    "Remote File Run metadata path is not canonical"
+                )
+        try:
+            existing = self._read_sftp_bytes(
+                sftp, paths["request_id"], max_bytes=128
+            ).decode("utf-8").strip()
+        except OSError as exc:
+            if not self._is_missing_sftp_error(exc):
+                raise
+            existing = ""
+        if existing and existing != run_id:
+            raise SSHBackendError("Remote File Run metadata identity does not match")
+        self._sftp_atomic_write(
+            sftp, paths["request_id"], (run_id + "\n").encode("utf-8")
+        )
+        self._sftp_atomic_write(
+            sftp,
+            paths["wrapper"],
+            FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"),
+            mode=0o700,
+        )
+        return paths
+
+    @staticmethod
+    def _valid_file_run_record(value: Any, run_id: str) -> dict[str, Any] | None:
+        if not isinstance(value, dict) or value.get("run_id") != run_id:
+            return None
+        return value
+
+    def _remote_file_run_windows(
+        self,
+        client: paramiko.SSHClient,
+        workspace: dict[str, Any],
+    ) -> list[dict[str, str | None]]:
+        session = str(workspace["tmux_session"])
+        command = (
+            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
+            "{ printf '__TERMROOM_MISSING_SESSION__\\n'; exit 0; }; "
+            f"tmux list-windows -t {shlex.quote(session)} "
+            f"-F {shlex.quote(TMUX_TERMINAL_RECORD_FORMAT)}"
+        )
+        output = self._exec_client(client, self._remote_posix_command(command))
+        if output.strip() == "__TERMROOM_MISSING_SESSION__":
+            return []
+        try:
+            return parse_tmux_terminal_records(output)
+        except ValueError as exc:
+            raise SSHBackendError("Remote tmux exposed an invalid Terminal record") from exc
+
+    def _remote_file_run_pane(
+        self, client: paramiko.SSHClient, tmux_window: str
+    ) -> dict[str, Any] | None:
+        command = (
+            f"tmux list-panes -t {shlex.quote(tmux_window)} "
+            "-F '#{pane_id}|#{pane_dead}|#{pane_dead_status}|#{pane_pid}|"
+            "#{pane_dead_time}' "
+            "2>/dev/null || true"
+        )
+        line = self._exec_client(client, self._remote_posix_command(command)).strip()
+        if not line:
+            return None
+        parts = line.splitlines()[0].split("|", 4)
+        parts.extend([""] * (5 - len(parts)))
+        pane_id, dead, dead_status, pane_pid, dead_time = parts
+        return {
+            "pane_id": pane_id,
+            "dead": dead == "1",
+            "exit_code": int(dead_status) if dead_status.lstrip("-").isdigit() else None,
+            "pane_pid": int(pane_pid) if pane_pid.isdigit() else None,
+            "dead_at": int(dead_time) if dead_time.isdigit() else None,
+        }
+
+    def start_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+        runner_id: str,
+        runtime_error_code: str,
+        argv: tuple[str, ...],
+    ) -> dict[str, Any]:
+        if not argv:
+            raise SSHBackendError("File Run argv is empty")
+        created = False
+        terminal: dict[str, Any] | dict[str, str | None] | None = None
+        client, sftp = self._sftp(workspace)
+        try:
+            paths = self._prepare_remote_file_run_metadata(sftp, workspace, run_id)
+            windows = self._remote_file_run_windows(client, workspace)
+            if not windows:
+                # This path also validates the Workspace and creates its ordinary shell.
+                self.ensure_workspace(workspace)
+                windows = self._remote_file_run_windows(client, workspace)
+            self.store.reconcile_terminals(str(workspace["id"]), windows)
+            terminal = next(
+                (item for item in windows if item.get("role") == "file_run"), None
+            )
+            created = terminal is None
+            if terminal is None:
+                safe_name = "Run"
+                create_command = (
+                    "tmux new-window -d -P -F '#{window_id}' "
+                    f"-t {shlex.quote(str(workspace['tmux_session']))} "
+                    f"-n {safe_name} -c {shlex.quote(self._remote_root(workspace))}"
+                )
+                window_id = self._exec_client(client, create_command).strip()
+                terminal = {"tmux_window": window_id}
+            else:
+                pane = self._remote_file_run_pane(
+                    client, str(terminal["tmux_window"])
+                )
+                if pane is not None and not pane["dead"]:
+                    raise SSHBackendError(
+                        "The managed File Run Terminal is still active"
+                    )
+
+            tmux_window = str(terminal["tmux_window"])
+            previous_role = str(terminal.get("role") or "shell")
+            previous_run_id = str(terminal.get("managed_run_id") or "") or None
+            tokens = [
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-c",
+                self._remote_root(workspace),
+                "-t",
+                tmux_window,
+                "/bin/sh",
+                paths["wrapper"],
+                paths["metadata"],
+                run_id,
+                runner_id,
+                runtime_error_code,
+                *argv,
+            ]
+            quoted_target = shlex.quote(tmux_window)
+            identity_matches = (
+                f"test \"$(tmux show-options -wv -t {quoted_target} "
+                f"{TMUX_TERMINAL_ROLE_OPTION})\" = file_run && "
+                f"test \"$(tmux show-options -wv -t {quoted_target} "
+                f"{TMUX_MANAGED_RUN_OPTION})\" = {shlex.quote(run_id)}"
+            )
+            if created:
+                rollback = f"tmux kill-window -t {quoted_target} >/dev/null 2>&1 || true"
+            elif previous_role == "shell":
+                rollback = (
+                    f"tmux set-window-option -u -t {quoted_target} "
+                    f"{TMUX_TERMINAL_ROLE_OPTION} >/dev/null 2>&1 || true; "
+                    f"tmux set-window-option -u -t {quoted_target} "
+                    f"{TMUX_MANAGED_RUN_OPTION} >/dev/null 2>&1 || true"
+                )
+            else:
+                restore_run = (
+                    f"tmux set-window-option -t {quoted_target} "
+                    f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(previous_run_id)}"
+                    if previous_run_id
+                    else f"tmux set-window-option -u -t {quoted_target} "
+                    f"{TMUX_MANAGED_RUN_OPTION}"
+                )
+                rollback = (
+                    f"tmux set-window-option -t {quoted_target} "
+                    f"{TMUX_TERMINAL_ROLE_OPTION} {shlex.quote(previous_role)}; "
+                    f"{restore_run}"
+                )
+            rollback_if_owned = f"if {identity_matches}; then {rollback}; fi"
+            command = (
+                f"tmux set-window-option -t {quoted_target} "
+                "remain-on-exit on; "
+                f"tmux set-window-option -t {quoted_target} "
+                f"{TMUX_TERMINAL_ROLE_OPTION} file_run; "
+                f"tmux set-window-option -t {quoted_target} "
+                f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(run_id)}; "
+                f"if {shlex.join(tokens)}; then :; else "
+                f"status=$?; {rollback_if_owned}; exit \"$status\"; fi"
+            )
+            self._exec_client(client, self._remote_posix_command(command))
+        finally:
+            sftp.close()
+            client.close()
+        terminals = self.ensure_workspace(workspace)
+        result = next(
+            (
+                item
+                for item in terminals
+                if item.get("role") == "file_run"
+                and item.get("managed_run_id") == run_id
+            ),
+            None,
+        )
+        if result is None:
+            raise SSHBackendError("Remote managed File Run Terminal is missing")
+        return result
+
+    def inspect_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        client, sftp = self._sftp(workspace)
+        try:
+            home = posixpath.normpath(sftp.normalize("."))
+            paths = self._file_run_metadata_paths(home, str(workspace["id"]), run_id)
+            completion_raw, completion_valid = self._read_sftp_json(
+                sftp, paths["completion"]
+            )
+            completion = (
+                self._valid_file_run_record(completion_raw, run_id)
+                if completion_valid
+                else None
+            )
+            if completion is not None and isinstance(completion.get("exit_code"), int):
+                return {
+                    "state": "stopped"
+                    if file_run_completion_was_stopped(completion)
+                    else "finished",
+                    "started_at": completion.get("started_at"),
+                    "ended_at": completion.get("ended_at"),
+                    "exit_code": int(completion["exit_code"]),
+                }
+            prepare_raw, prepare_valid = self._read_sftp_json(sftp, paths["prepare"])
+            prepare = (
+                self._valid_file_run_record(prepare_raw, run_id)
+                if prepare_valid
+                else None
+            )
+            if prepare is not None and prepare.get("state") == "failed":
+                return {
+                    "state": "failed",
+                    "ended_at": prepare.get("ended_at"),
+                    "error_code": prepare.get("error_code"),
+                }
+            windows = self._remote_file_run_windows(client, workspace)
+            if not windows:
+                return {"state": "lost", "error_code": "managed_terminal_missing"}
+            self.store.reconcile_terminals(str(workspace["id"]), windows)
+            slot = next((item for item in windows if item["role"] == "file_run"), None)
+            if slot is None or slot.get("managed_run_id") != run_id:
+                return {"state": "lost", "error_code": "managed_terminal_missing"}
+            pane = self._remote_file_run_pane(client, str(slot["tmux_window"]))
+            state_raw, state_valid = self._read_sftp_json(sftp, paths["state"])
+            state = (
+                self._valid_file_run_record(state_raw, run_id) if state_valid else None
+            )
+            if pane is not None and not pane["dead"]:
+                return {
+                    "state": "running"
+                    if state and state.get("state") == "running"
+                    else "preparing",
+                    "started_at": state.get("started_at") if state else None,
+                }
+            if self._sftp_exists(sftp, paths["force"]):
+                return {
+                    "state": "stopped",
+                    "started_at": state.get("started_at") if state else None,
+                    "exit_code": pane.get("exit_code") if pane else None,
+                    "error_code": "forced",
+                }
+            dead_at = pane.get("dead_at") if pane else None
+            if isinstance(dead_at, int) and time.time() - dead_at < 2:
+                return {
+                    "state": "running" if state else "preparing",
+                    "started_at": state.get("started_at") if state else None,
+                }
+            return {
+                "state": "lost",
+                "started_at": state.get("started_at") if state else None,
+                "error_code": "completion_missing",
+            }
+        finally:
+            sftp.close()
+            client.close()
+
+    def _control_remote_file_run(
+        self,
+        workspace: dict[str, Any],
+        *,
+        run_id: str,
+        force: bool,
+    ) -> bool:
+        client, sftp = self._sftp(workspace)
+        try:
+            home = posixpath.normpath(sftp.normalize("."))
+            paths = self._file_run_metadata_paths(home, str(workspace["id"]), run_id)
+            windows = self._remote_file_run_windows(client, workspace)
+            slot = next(
+                (
+                    item
+                    for item in windows
+                    if item.get("role") == "file_run"
+                    and item.get("managed_run_id") == run_id
+                ),
+                None,
+            )
+            if slot is None:
+                return False
+            requested_at = (
+                datetime.now(UTC).isoformat(timespec="microseconds") + "\n"
+            ).encode("utf-8")
+            self._sftp_atomic_write(sftp, paths["stop"], requested_at)
+            target = shlex.quote(str(slot["tmux_window"]))
+            verification = (
+                f"test \"$(tmux show-options -wv -t {target} "
+                f"{TMUX_TERMINAL_ROLE_OPTION})\" = file_run && "
+                f"test \"$(tmux show-options -wv -t {target} "
+                f"{TMUX_MANAGED_RUN_OPTION})\" = {shlex.quote(run_id)}"
+            )
+            if force:
+                action = (
+                    f"pid=$(tmux display-message -p -t {target} '#{{pane_pid}}'); "
+                    "test -n \"$pid\" && kill -KILL -\"$pid\" 2>/dev/null"
+                )
+            else:
+                action = f"tmux send-keys -t {target} C-c"
+            command = (
+                f"if {verification}; then "
+                f"if {action}; then printf 'sent\\n'; "
+                "else printf 'not-sent\\n'; fi; "
+                "else printf 'not-sent\\n'; fi"
+            )
+            output = self._exec_client(
+                client, self._remote_posix_command(command)
+            )
+            sent = output.strip() == "sent"
+            if sent and force:
+                self._sftp_atomic_write(sftp, paths["force"], requested_at)
+            return sent
+        finally:
+            sftp.close()
+            client.close()
+
+    def interrupt_file_run(
+        self, workspace: dict[str, Any], *, run_id: str
+    ) -> bool:
+        return self._control_remote_file_run(workspace, run_id=run_id, force=False)
+
+    def kill_file_run(self, workspace: dict[str, Any], *, run_id: str) -> bool:
+        return self._control_remote_file_run(workspace, run_id=run_id, force=True)
 
     def session_exists(self, workspace: dict[str, Any]) -> bool:
         computer = self._computer(workspace)
@@ -2994,6 +3469,8 @@ class SSHBackend:
         self, workspace: dict[str, Any], terminal: dict[str, Any], name: str
     ) -> dict[str, Any]:
         self.ensure_workspace(workspace)
+        if str(terminal.get("role") or "shell") != "shell":
+            raise SSHBackendError("Managed Terminals cannot be renamed")
         safe_name = normalize_terminal_name(name)
         command = (
             "tmux rename-window "
@@ -3010,6 +3487,8 @@ class SSHBackend:
         self, workspace: dict[str, Any], terminal: dict[str, Any]
     ) -> list[dict[str, Any]]:
         self.ensure_workspace(workspace)
+        if str(terminal.get("role") or "shell") != "shell":
+            raise SSHBackendError("Managed Terminals cannot be closed")
         command = f"tmux kill-window -t {shlex.quote(str(terminal['tmux_window']))}"
         self._exec(self._computer(workspace), command)
         self.store.delete_terminal(str(terminal["id"]))
@@ -3193,7 +3672,9 @@ class SSHBackend:
             if int(attr.st_size or 0) > max_bytes:
                 raise UnsupportedFileError("File exceeds the editable size limit")
             with sftp.open(remote, "rb") as handle:
-                raw = handle.read()
+                raw = handle.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise UnsupportedFileError("File exceeds the editable size limit")
             if b"\x00" in raw:
                 raise UnsupportedFileError("Binary files cannot be edited")
             try:
@@ -3206,6 +3687,49 @@ class SSHBackend:
                 content=content,
                 digest=file_digest(raw),
                 mtime_ns=int(attr.st_mtime or 0) * 1_000_000_000,
+            )
+        finally:
+            sftp.close()
+            client.close()
+
+    def inspect_runnable(
+        self,
+        workspace: dict[str, Any],
+        relative_path: str,
+        *,
+        expected_digest: str | None = None,
+        max_bytes: int,
+    ) -> RunnableFile:
+        client, sftp = self._sftp(workspace)
+        try:
+            remote, attr = self._resolve_real_remote_tree_path(
+                sftp,
+                self._remote_root(workspace),
+                relative_path,
+                expected_directory=False,
+            )
+            if not stat_module.S_ISREG(attr.st_mode):
+                raise UnsupportedFileError("Only regular files can be executed")
+            if int(attr.st_size or 0) > max_bytes:
+                raise UnsupportedFileError("File exceeds the editable size limit")
+            with sftp.open(remote, "rb") as handle:
+                raw = handle.read()
+            if b"\x00" in raw:
+                raise UnsupportedFileError("Binary files cannot be executed")
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise UnsupportedFileError(
+                    "Only UTF-8 text files can be executed"
+                ) from exc
+            digest = file_digest(raw)
+            if expected_digest is not None and digest != expected_digest:
+                raise FileConflictError("The file changed before execution")
+            return RunnableFile(
+                relative_path=self._relative_remote(workspace, remote),
+                digest=digest,
+                executable=bool(int(attr.st_mode or 0) & 0o111),
+                has_shebang=raw.startswith(b"#!"),
             )
         finally:
             sftp.close()

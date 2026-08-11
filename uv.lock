@@ -772,6 +772,7 @@ dependencies = [
     { name = "paramiko" },
     { name = "python-multipart" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -790,6 +791,7 @@ requires-dist = [
     { name = "paramiko", specifier = ">=3.5,<5" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
+    { name = "websockets", specifier = ">=15,<18" },
 ]
 
 [package.metadata.requires-dev]

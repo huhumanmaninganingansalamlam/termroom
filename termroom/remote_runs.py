@@ -24,6 +24,7 @@ from termroom.archive_safety import (
 )
 from termroom.db import StateStore, utc_now
 from termroom.files import FileEntry, FileService, TextPreview
+from termroom.node_remote_runs import NodeRemoteRunClient, NodeRemoteRunError
 from termroom.run_sources import (
     LocalWorkspaceSnapshotSource,
     WorkspaceManifest,
@@ -47,6 +48,8 @@ WAITING_UPLOAD_TTL = timedelta(hours=1)
 MAX_REMOTE_RUN_COMMAND_BYTES = 256 * 1024
 TERMINAL_STATES = frozenset({"finished", "stopped", "failed", "lost"})
 NONTERMINAL_STATES = frozenset({"preparing", "running"})
+REMOTE_RUN_OBSERVER_INTERVAL = 2.0
+REMOTE_RUN_OBSERVER_MAX_BACKOFF = 30.0
 
 
 class RemoteRunError(RuntimeError):
@@ -143,13 +146,14 @@ def _waiting_upload_expiry(now: datetime | None = None) -> str:
 
 
 class RemoteRunManager:
-    """Small SSH-only lifecycle manager for one Source snapshot and one command."""
+    """One Remote Run lifecycle with explicit SSH or Node target dispatch."""
 
     def __init__(
         self,
         store: StateStore,
         workspaces: WorkspaceManager,
         ssh: SSHBackend,
+        node_runs: NodeRemoteRunClient | None = None,
         *,
         state_dir: Path,
         max_archive_bytes: int,
@@ -157,6 +161,7 @@ class RemoteRunManager:
         self.store = store
         self.workspaces = workspaces
         self.ssh = ssh
+        self.node_runs = node_runs
         self.max_archive_bytes = max_archive_bytes
         self.archive_limits = ArchiveLimits(max_upload_bytes=max_archive_bytes)
         self.spool_root = (state_dir / "remote-run-spool").resolve()
@@ -167,6 +172,8 @@ class RemoteRunManager:
         self._locks_guard = threading.Lock()
         self._preparations: dict[str, _PreparationHandle] = {}
         self._startup_reconcile_task: asyncio.Task[None] | None = None
+        self._observer_task: asyncio.Task[None] | None = None
+        self._observer_wakeup = asyncio.Event()
         self._cleanup_task: asyncio.Task[int] | None = None
 
     def lock_for(self, run_id: str) -> threading.RLock:
@@ -194,6 +201,7 @@ class RemoteRunManager:
         return result
 
     async def create(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        self._bind_node_loop()
         normalized = self._normalize_create_payload(payload)
         existing = self.store.get_remote_run(str(normalized["id"]))
         if existing:
@@ -201,13 +209,14 @@ class RemoteRunManager:
             return self.get(str(existing["id"])), False
 
         computer = self._require_computer(str(normalized["target_computer_id"]))
+        backend = self._target_backend(computer)
         preflight = await asyncio.to_thread(
-            self.ssh.preflight_remote_run_target,
+            backend.preflight_remote_run_target,
             computer,
             run_base_dir=str(computer.get("run_base_dir") or "") or None,
             require_git=normalized["source_kind"] == "git",
         )
-        phase = "waiting_upload" if normalized["source_kind"] == "zip" else (
+        phase = "waiting_upload" if normalized["source_kind"] == "archive" else (
             "cloning" if normalized["source_kind"] == "git" else "scanning"
         )
         values = {
@@ -218,7 +227,7 @@ class RemoteRunManager:
             "created_at": utc_now(),
             "expires_at": (
                 _waiting_upload_expiry()
-                if normalized["source_kind"] == "zip"
+                if normalized["source_kind"] == "archive"
                 else None
             ),
         }
@@ -226,18 +235,27 @@ class RemoteRunManager:
         if not created:
             self._assert_idempotent(row, normalized)
             return self.get(str(row["id"])), False
-        if normalized["source_kind"] != "zip":
+        if normalized["source_kind"] != "archive":
             self.schedule(str(row["id"]))
         return self.get(str(row["id"])), True
 
     def _normalize_create_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         run_id = validate_remote_run_id(str(payload.get("id", "")))
-        source_kind = str(payload.get("source_kind", "")).strip()
-        if source_kind not in {"workspace", "git", "zip"}:
+        requested_source_kind = str(payload.get("source_kind", "")).strip()
+        source_kind = "archive" if requested_source_kind == "zip" else requested_source_kind
+        if source_kind not in {"workspace", "git", "archive"}:
             raise RemoteRunError(
-                "Remote Run Source must be Workspace, Git, or ZIP",
+                "Remote Run Source must be Workspace, Git, or Archive",
                 code="source_kind",
             )
+        archive_format: str | None = None
+        if source_kind == "archive":
+            archive_format = str(payload.get("archive_format") or "zip").strip().lower()
+            if archive_format != "zip":
+                raise RemoteRunError(
+                    "Only ZIP Archives are supported",
+                    code="archive_format",
+                )
         target_id = str(payload.get("target_computer_id", "")).strip()
         self._require_computer(target_id)
         command = str(payload.get("command", "")).rstrip()
@@ -280,6 +298,27 @@ class RemoteRunManager:
                 )
             try:
                 workspace = self.workspaces.require(workspace_id)
+                if workspace.get("transient") or workspace.get("is_remote_run"):
+                    raise RemoteRunError(
+                        "A transient Remote Run Workspace cannot be a Source",
+                        code="workspace_required",
+                    )
+                source_computer = workspace.get("computer") or {}
+                source_method = source_computer.get("connection_method")
+                if workspace.get("backend_kind") == "remote" and source_method == "node":
+                    if (
+                        self.node_runs is None
+                        or not self.node_runs.supports_remote_run_source(source_computer)
+                    ):
+                        raise RemoteRunError(
+                            "This Remote does not support Workspace Sources",
+                            code="capability_unsupported",
+                        )
+                elif workspace.get("backend_kind") == "remote" and source_method != "ssh":
+                    raise RemoteRunError(
+                        "This Workspace connection method is not supported yet",
+                        code="workspace_required",
+                    )
                 source_path = normalize_source_relative_path(
                     str(payload.get("source_path", ".")) or ".", allow_root=True
                 )
@@ -303,6 +342,7 @@ class RemoteRunManager:
         return {
             "id": run_id,
             "source_kind": source_kind,
+            "archive_format": archive_format,
             "source_workspace_id": workspace_id,
             "source_path": source_path,
             "source_label": source_label,
@@ -318,6 +358,7 @@ class RemoteRunManager:
     def _assert_idempotent(existing: Mapping[str, Any], requested: Mapping[str, Any]) -> None:
         immutable = (
             "source_kind",
+            "archive_format",
             "source_workspace_id",
             "source_path",
             "source_label",
@@ -333,6 +374,7 @@ class RemoteRunManager:
             )
 
     def schedule(self, run_id: str) -> bool:
+        self._bind_node_loop()
         safe_id = validate_remote_run_id(run_id)
         current = self._preparations.get(safe_id)
         if current and not current.task.done():
@@ -341,6 +383,7 @@ class RemoteRunManager:
         task = asyncio.create_task(self._prepare(safe_id, cancel))
         self._preparations[safe_id] = _PreparationHandle(task=task, cancel=cancel)
         task.add_done_callback(lambda completed, value=safe_id: self._task_done(value, completed))
+        self._observer_wakeup.set()
         return True
 
     def _task_done(self, run_id: str, task: asyncio.Task[None]) -> None:
@@ -379,7 +422,8 @@ class RemoteRunManager:
         source_path = str(run.get("source_path") or ".")
         options = self._source_options(run)
         includes = tuple(map(str, options.get("explicitly_included") or ()))
-        layout = self.ssh.create_remote_run_layout(
+        backend = self._target_backend(target)
+        layout = backend.create_remote_run_layout(
             target,
             str(run["id"]),
             run_base_dir=str(run["run_base"]),
@@ -387,7 +431,22 @@ class RemoteRunManager:
             cwd_rel=".",
         )
 
-        if workspace.get("backend_kind") == "ssh":
+        if (
+            workspace.get("backend_kind") == "remote"
+            and (workspace.get("computer") or {}).get("connection_method") == "node"
+        ):
+            if self.node_runs is None:
+                raise RemoteRunError(
+                    "Node Workspace Sources are unavailable",
+                    code="capability_unsupported",
+                )
+            with self.node_runs.remote_workspace_snapshot_source(
+                workspace,
+                source_path,
+                explicitly_included=includes,
+            ) as source:
+                self._materialize_workspace(run, target, source, cancel)
+        elif workspace.get("backend_kind") == "remote":
             exclusions = self._same_target_exclusions(workspace, source_path, run)
             with self.ssh.remote_workspace_snapshot_source(
                 workspace,
@@ -407,7 +466,7 @@ class RemoteRunManager:
             self._materialize_workspace(run, target, source, cancel)
 
         self._check_cancel(cancel)
-        self.ssh.commit_remote_run_snapshot(target, str(run["run_base"]), str(run["id"]))
+        backend.commit_remote_run_snapshot(target, str(run["run_base"]), str(run["id"]))
         self._write_source_metadata(
             run,
             target,
@@ -436,7 +495,8 @@ class RemoteRunManager:
             self._check_cancel(cancel)
             raise RemoteRunError("Remote Run preparation was superseded", code="state_conflict")
         self._check_cancel(cancel)
-        with self.ssh.remote_run_snapshot_sink(
+        backend = self._target_backend(target)
+        with backend.remote_run_snapshot_sink(
             target,
             str(run["run_base"]),
             str(run["id"]),
@@ -454,25 +514,37 @@ class RemoteRunManager:
         cancel: threading.Event,
     ) -> None:
         self._check_cancel(cancel)
-        preflight = self.ssh.preflight_remote_run_target(
+        backend = self._target_backend(target)
+        preflight = backend.preflight_remote_run_target(
             target,
             run_base_dir=str(run["run_base"]),
             require_git=True,
         )
-        layout = self.ssh.create_remote_run_layout(
+        layout = backend.create_remote_run_layout(
             target,
             str(run["id"]),
             run_base_dir=str(run["run_base"]),
             command=str(run["command"]),
             cwd_rel=".",
         )
-        metadata = str(layout["metadata"])
+        if self._is_node_target(target):
+            parameters = backend.remote_run_git_clone_parameters(
+                target, str(run["run_base"]), str(run["id"])
+            )
+        else:
+            metadata = str(layout["metadata"])
+            parameters = {
+                "git_path": str(preflight["tools"]["git"]),
+                "askpass_path": f"{metadata}/git-askpass",
+                "empty_home": f"{metadata}/git-home",
+                "destination": str(layout["work_staging"]),
+            }
         invocation = build_public_git_clone_invocation(
             str(run["source_url"]),
-            git_path=str(preflight["tools"]["git"]),
-            askpass_path=f"{metadata}/git-askpass",
-            empty_home=f"{metadata}/git-home",
-            destination=str(layout["work_staging"]),
+            git_path=str(parameters["git_path"]),
+            askpass_path=str(parameters["askpass_path"]),
+            empty_home=str(parameters["empty_home"]),
+            destination=str(parameters["destination"]),
         )
         self._write_source_metadata(run, target, cwd_rel=".")
         self._check_cancel(cancel)
@@ -491,7 +563,7 @@ class RemoteRunManager:
         started = self._start_with_reconciliation(
             run,
             target,
-            lambda: self.ssh.start_remote_git_run(
+            lambda: backend.start_remote_git_run(
                 target,
                 str(run["run_base"]),
                 str(run["id"]),
@@ -533,7 +605,8 @@ class RemoteRunManager:
             phase="copying",
             source_size=manifest.total_bytes,
         )
-        layout = self.ssh.create_remote_run_layout(
+        backend = self._target_backend(target)
+        layout = backend.create_remote_run_layout(
             target,
             str(run["id"]),
             run_base_dir=str(run["run_base"]),
@@ -541,7 +614,7 @@ class RemoteRunManager:
             cwd_rel=manifest.cwd_rel,
         )
         self._check_cancel(cancel)
-        with self.ssh.remote_run_snapshot_sink(
+        with backend.remote_run_snapshot_sink(
             target,
             str(run["run_base"]),
             str(run["id"]),
@@ -553,7 +626,7 @@ class RemoteRunManager:
                 limits=self.archive_limits,
             )
         self._check_cancel(cancel)
-        self.ssh.commit_remote_run_snapshot(target, str(run["run_base"]), str(run["id"]))
+        backend.commit_remote_run_snapshot(target, str(run["run_base"]), str(run["id"]))
         self._write_zip_manifest(run, target, manifest)
         self._write_source_metadata(run, target, cwd_rel=manifest.cwd_rel)
         self._start_materialized_run(run, target, layout, cancel)
@@ -582,7 +655,7 @@ class RemoteRunManager:
         self._start_with_reconciliation(
             run,
             target,
-            lambda: self.ssh.start_remote_run(
+            lambda: self._target_backend(target).start_remote_run(
                 target, str(run["run_base"]), str(run["id"])
             ),
         )
@@ -597,7 +670,7 @@ class RemoteRunManager:
 
         try:
             starter()
-        except SSHCommandStatusUnknown as exc:
+        except (SSHCommandStatusUnknown, NodeRemoteRunError) as exc:
             self._reconcile_start_exception(run, target, exc)
             return False
         self.store.transition_remote_run(
@@ -616,7 +689,7 @@ class RemoteRunManager:
     ) -> None:
         run_id = str(run["id"])
         try:
-            remote = self.ssh.reconcile_remote_run(
+            remote = self._target_backend(target).reconcile_remote_run(
                 target,
                 str(run["run_base"]),
                 run_id,
@@ -658,7 +731,7 @@ class RemoteRunManager:
         }
         if run.get("source_url"):
             value["url"] = str(run["source_url"])
-        self.ssh.write_remote_run_json(
+        self._target_backend(target).write_remote_run_json(
             target,
             str(run["run_base"]),
             str(run["id"]),
@@ -683,7 +756,7 @@ class RemoteRunManager:
             }
             for entry in manifest.entries
         ]
-        self.ssh.write_remote_run_json(
+        self._target_backend(target).write_remote_run_json(
             target,
             str(run["run_base"]),
             str(run["id"]),
@@ -706,7 +779,7 @@ class RemoteRunManager:
             }
             for entry in manifest.entries
         ]
-        self.ssh.write_remote_run_json(
+        self._target_backend(target).write_remote_run_json(
             target,
             str(run["run_base"]),
             str(run["id"]),
@@ -717,7 +790,7 @@ class RemoteRunManager:
     def _ensure_target_capacity(
         self, target: dict[str, Any], run: Mapping[str, Any], required: int
     ) -> None:
-        preflight = self.ssh.preflight_remote_run_target(
+        preflight = self._target_backend(target).preflight_remote_run_target(
             target,
             run_base_dir=str(run["run_base"]),
         )
@@ -801,8 +874,11 @@ class RemoteRunManager:
     ) -> dict[str, Any]:
         safe_id = validate_remote_run_id(run_id)
         run = self.get(safe_id)
-        if run["source_kind"] != "zip":
-            raise RemoteRunError("This Remote Run does not use a ZIP Source", code="source_kind")
+        if run["source_kind"] != "archive" or run.get("archive_format") != "zip":
+            raise RemoteRunError(
+                "This Remote Run does not use a ZIP Archive",
+                code="source_kind",
+            )
         options = self._source_options(run)
         expected_name = str(options.get("archive_name") or "")
         safe_name = Path(validate_zip_filename(filename)).name
@@ -908,8 +984,9 @@ class RemoteRunManager:
         with self.lock_for(safe_id):
             run = self.get(safe_id)
             target = self._require_run_target(run)
+            backend = self._target_backend(target)
             try:
-                remote = self.ssh.poll_remote_run(
+                remote = backend.poll_remote_run(
                     target,
                     str(run["run_base"]),
                     safe_id,
@@ -929,20 +1006,7 @@ class RemoteRunManager:
                         "eof": False,
                     },
                 }
-            if remote.get("layout_missing"):
-                if run["state"] == "running" and not remote.get("tmux_running"):
-                    self._apply_remote_status(
-                        run,
-                        {
-                            "state": "lost",
-                            "started_at": run.get("started_at"),
-                            "ended_at": utc_now(),
-                            "error_code": "layout_missing",
-                            "error_detail": "Remote Run files and managed tmux pane are missing",
-                        },
-                    )
-            elif not remote.get("layout_error"):
-                self._apply_remote_status(run, remote)
+            self._apply_remote_observation(run, remote)
             updated = self.get(safe_id)
             if (
                 updated["state"] in {"running", "finished", "stopped", "lost"}
@@ -955,7 +1019,7 @@ class RemoteRunManager:
                     if updated["state"] in {"running", "finished"}:
                         raise
                 updated = self.get(safe_id)
-            if updated["state"] == "running" and updated["source_kind"] == "zip":
+            if updated["state"] == "running" and updated["source_kind"] == "archive":
                 self._remove_spool(safe_id)
             return {
                 **updated,
@@ -964,6 +1028,65 @@ class RemoteRunManager:
                 **{key: value for key, value in remote.items() if key not in {"state"}},
                 "state": updated["state"],
             }
+
+    def reconcile(self, run_id: str) -> dict[str, Any]:
+        """Observe lifecycle metadata without reading any Remote Run log bytes."""
+
+        safe_id = validate_remote_run_id(run_id)
+        with self.lock_for(safe_id):
+            run = self.get(safe_id)
+            if run["state"] in TERMINAL_STATES:
+                return {
+                    **run,
+                    "connection": "online",
+                    "cleanup_pending": self._cleanup_pending(run),
+                }
+            target = self._require_run_target(run)
+            backend = self._target_backend(target)
+            try:
+                remote = backend.reconcile_remote_run(
+                    target,
+                    str(run["run_base"]),
+                    safe_id,
+                )
+            except SSHBackendError:
+                return {
+                    **run,
+                    "connection": "offline",
+                    "cleanup_pending": self._cleanup_pending(run),
+                }
+            self._apply_remote_observation(run, remote)
+            updated = self.get(safe_id)
+            if updated["state"] == "running" and updated["source_kind"] == "archive":
+                self._remove_spool(safe_id)
+            return {
+                **updated,
+                "connection": "online",
+                "cleanup_pending": self._cleanup_pending(updated),
+                **{key: value for key, value in remote.items() if key != "state"},
+                "state": updated["state"],
+            }
+
+    def _apply_remote_observation(
+        self,
+        run: Mapping[str, Any],
+        remote: Mapping[str, Any],
+    ) -> None:
+        if remote.get("layout_missing"):
+            if run["state"] == "running" and not remote.get("tmux_running"):
+                self._apply_remote_status(
+                    run,
+                    {
+                        "state": "lost",
+                        "started_at": run.get("started_at"),
+                        "ended_at": utc_now(),
+                        "error_code": "layout_missing",
+                        "error_detail": "Remote Run files and managed tmux pane are missing",
+                    },
+                )
+            return
+        if not remote.get("layout_error"):
+            self._apply_remote_status(run, remote)
 
     def _apply_remote_status(
         self, run: Mapping[str, Any], remote: Mapping[str, Any]
@@ -1050,8 +1173,9 @@ class RemoteRunManager:
             )
             return {"stopped": True, "needs_kill": False, "run": self.get(safe_id)}
         target = self._require_run_target(run)
+        backend = self._target_backend(target)
         try:
-            result = self.ssh.interrupt_remote_run(
+            result = backend.interrupt_remote_run(
                 target, str(run["run_base"]), safe_id
             )
         except RemoteRunLayoutError as exc:
@@ -1067,7 +1191,7 @@ class RemoteRunManager:
                 code="layout_unverifiable",
             ) from exc
         if result.get("completed"):
-            remote = self.ssh.reconcile_remote_run(
+            remote = backend.reconcile_remote_run(
                 target, str(run["run_base"]), safe_id
             )
             self._apply_remote_status(self.get(safe_id), remote)
@@ -1132,7 +1256,7 @@ class RemoteRunManager:
                 "cancellation_pending": True,
                 "run": self.get(safe_id),
             }
-        remote = self.ssh.reconcile_remote_run(
+        remote = backend.reconcile_remote_run(
             target, str(run["run_base"]), safe_id
         )
         self._apply_remote_status(self.get(safe_id), remote)
@@ -1159,8 +1283,9 @@ class RemoteRunManager:
             stop_requested_at=run.get("stop_requested_at") or now,
         )
         target = self._require_run_target(run)
+        backend = self._target_backend(target)
         try:
-            result = self.ssh.kill_remote_run(target, str(run["run_base"]), safe_id)
+            result = backend.kill_remote_run(target, str(run["run_base"]), safe_id)
         except RemoteRunLayoutError as exc:
             if live_handle and run["state"] == "preparing":
                 return self.get(safe_id)
@@ -1169,7 +1294,7 @@ class RemoteRunManager:
                 code="layout_unverifiable",
             ) from exc
         if result.get("completed"):
-            remote = self.ssh.reconcile_remote_run(
+            remote = backend.reconcile_remote_run(
                 target, str(run["run_base"]), safe_id
             )
             self._apply_remote_status(self.get(safe_id), remote)
@@ -1230,8 +1355,9 @@ class RemoteRunManager:
                 raise RemoteRunConflict("Remote Run is not deletable", code="state_conflict")
             run = self.get(safe_id)
             target = self._require_run_target(run)
+            backend = self._target_backend(target)
             try:
-                self.ssh.delete_remote_run_root(
+                backend.delete_remote_run_root(
                     target, str(run["run_base"]), safe_id
                 )
             except (OSError, SSHBackendError):
@@ -1264,10 +1390,12 @@ class RemoteRunManager:
         )
 
     async def preflight(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._bind_node_loop()
         normalized = self._normalize_create_payload(payload)
         target = self._require_computer(str(normalized["target_computer_id"]))
+        backend = self._target_backend(target)
         result = await asyncio.to_thread(
-            self.ssh.preflight_remote_run_target,
+            backend.preflight_remote_run_target,
             target,
             run_base_dir=str(target.get("run_base_dir") or "") or None,
             require_git=normalized["source_kind"] == "git",
@@ -1337,9 +1465,10 @@ class RemoteRunManager:
             with self.lock_for(safe_id):
                 run = self.get(safe_id)
                 target = self._require_run_target(run)
+                backend = self._target_backend(target)
                 offset = 0
                 while True:
-                    chunk = self.ssh.read_remote_run_log(
+                    chunk = backend.read_remote_run_log(
                         target,
                         str(run["run_base"]),
                         safe_id,
@@ -1411,8 +1540,63 @@ class RemoteRunManager:
             task.result()
 
     async def startup(self) -> None:
+        self._bind_node_loop()
         await asyncio.to_thread(self.cleanup_spools)
-        self._startup_reconcile_task = asyncio.create_task(self._reconcile_startup())
+        if not self._startup_reconcile_task or self._startup_reconcile_task.done():
+            self._startup_reconcile_task = asyncio.create_task(self._reconcile_startup())
+        if not self._observer_task or self._observer_task.done():
+            self._observer_task = asyncio.create_task(self._observe_active_runs())
+        self._observer_wakeup.set()
+
+    async def _observe_active_runs(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_attempt: dict[str, float] = {}
+        failures: dict[str, int] = {}
+        while True:
+            self._observer_wakeup.clear()
+            rows = await asyncio.to_thread(self.store.list_active_remote_runs)
+            active_ids = {str(row["id"]) for row in rows}
+            for run_id in set(next_attempt) - active_ids:
+                next_attempt.pop(run_id, None)
+                failures.pop(run_id, None)
+
+            now = loop.time()
+            for row in rows:
+                run_id = str(row["id"])
+                if next_attempt.get(run_id, 0.0) > now:
+                    continue
+                try:
+                    result = await asyncio.to_thread(self.reconcile, run_id)
+                except (KeyError, OSError, RemoteRunError, SSHBackendError, ValueError):
+                    connection = "offline"
+                else:
+                    connection = str(result.get("connection") or "online")
+                    if result.get("state") in TERMINAL_STATES:
+                        next_attempt.pop(run_id, None)
+                        failures.pop(run_id, None)
+                        continue
+                if connection == "offline":
+                    failure_count = failures.get(run_id, 0) + 1
+                    failures[run_id] = failure_count
+                    delay = min(
+                        REMOTE_RUN_OBSERVER_MAX_BACKOFF,
+                        REMOTE_RUN_OBSERVER_INTERVAL
+                        * (2 ** min(failure_count - 1, 4)),
+                    )
+                else:
+                    failures.pop(run_id, None)
+                    delay = REMOTE_RUN_OBSERVER_INTERVAL
+                next_attempt[run_id] = loop.time() + delay
+
+            if self._observer_wakeup.is_set():
+                continue
+            if not rows:
+                await self._observer_wakeup.wait()
+                continue
+            due = [next_attempt.get(str(row["id"]), loop.time()) for row in rows]
+            timeout = max(0.0, min(due) - loop.time())
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._observer_wakeup.wait(), timeout=timeout)
 
     async def _reconcile_startup(self) -> None:
         rows = self.store.list_recent_remote_runs(10_000)
@@ -1429,8 +1613,9 @@ class RemoteRunManager:
                 except (OSError, RemoteRunError, SSHBackendError):
                     try:
                         target = self._require_run_target(row)
+                        backend = self._target_backend(target)
                         layout_exists = await asyncio.to_thread(
-                            self.ssh.remote_run_layout_exists,
+                            backend.remote_run_layout_exists,
                             target,
                             str(row["run_base"]),
                             run_id,
@@ -1450,8 +1635,9 @@ class RemoteRunManager:
                 if result.get("connection") != "online":
                     try:
                         target = self._require_run_target(row)
+                        backend = self._target_backend(target)
                         layout_exists = await asyncio.to_thread(
-                            self.ssh.remote_run_layout_exists,
+                            backend.remote_run_layout_exists,
                             target,
                             str(row["run_base"]),
                             run_id,
@@ -1480,6 +1666,7 @@ class RemoteRunManager:
                     threading.Event(),
                 )
         await asyncio.to_thread(self.cleanup_expired)
+        self._observer_wakeup.set()
 
     async def shutdown(self) -> None:
         handles = list(self._preparations.values())
@@ -1492,7 +1679,11 @@ class RemoteRunManager:
             )
         maintenance = [
             task
-            for task in (self._startup_reconcile_task, self._cleanup_task)
+            for task in (
+                self._startup_reconcile_task,
+                self._observer_task,
+                self._cleanup_task,
+            )
             if task and not task.done()
         ]
         for task in maintenance:
@@ -1503,7 +1694,7 @@ class RemoteRunManager:
     def retry_preparation(self, run_id: str) -> dict[str, Any]:
         safe_id = validate_remote_run_id(run_id)
         run = self.get(safe_id)
-        if run["source_kind"] != "zip" or run["state"] != "failed":
+        if run["source_kind"] != "archive" or run["state"] != "failed":
             raise RemoteRunConflict(
                 "Only a failed ZIP preparation can be retried",
                 code="retry_not_allowed",
@@ -1513,7 +1704,9 @@ class RemoteRunManager:
             raise RemoteRunError("Verified ZIP spool has expired", code="zip_spool_expired")
         target = self._require_run_target(run)
         with contextlib.suppress(FileNotFoundError):
-            self.ssh.delete_remote_run_root(target, str(run["run_base"]), safe_id)
+            self._target_backend(target).delete_remote_run_root(
+                target, str(run["run_base"]), safe_id
+            )
         if not self.store.transition_remote_run(
             safe_id,
             expected_states={"failed"},
@@ -1589,7 +1782,7 @@ class RemoteRunManager:
         target = self._require_run_target(run)
         root = f"{str(run['run_base']).rstrip('/')}/{run['id']}/work"
         return {
-            "backend_kind": "ssh",
+            "backend_kind": "remote",
             "computer_id": str(target["id"]),
             "computer": target,
             "remote_path": root,
@@ -1617,7 +1810,8 @@ class RemoteRunManager:
             return self.workspaces.require(str(workspace_id))
         target = self._require_run_target(run)
         run_id = str(run["id"])
-        shell = self.ssh.ensure_remote_run_workspace_shell(
+        backend = self._target_backend(target)
+        shell = backend.ensure_remote_run_workspace_shell(
             target,
             str(run["run_base"]),
             run_id,
@@ -1628,21 +1822,41 @@ class RemoteRunManager:
             str(shell["session_name"]),
             str(shell["work_path"]),
         )
-        self.ssh.ensure_workspace(workspace)
+        if self._is_node_target(target):
+            terminals = shell.get("terminals")
+            if not isinstance(terminals, list) or not terminals:
+                raise RemoteRunError(
+                    "Node Remote Run Terminal list is invalid",
+                    code="terminal_invalid",
+                )
+            self.store.reconcile_terminals(str(workspace["id"]), terminals)
+        else:
+            self.ssh.ensure_workspace(workspace)
         return workspace
 
     def _require_computer(self, computer_id: str) -> dict[str, Any]:
         if not computer_id:
-            raise RemoteRunError("Choose an SSH target", code="target_required")
+            raise RemoteRunError("Choose a Remote", code="target_required")
         computer = self.store.get_computer(computer_id)
         if not computer:
             raise RemoteRunError(
-                f"Unknown SSH target: {computer_id}",
+                f"Unknown Remote: {computer_id}",
                 code="target_required",
             )
-        if computer.get("kind") != "ssh":
+        method = computer.get("connection_method")
+        if method == "node":
+            if (
+                computer.get("node_revoked_at") is not None
+                or self.node_runs is None
+                or "remote_run" not in self.node_runs.nodes.status(computer_id).capabilities
+            ):
+                raise RemoteRunError(
+                    "This Remote does not support Remote Run",
+                    code="capability_unsupported",
+                )
+        elif method != "ssh":
             raise RemoteRunError(
-                "Remote Run target must be an SSH computer",
+                "This Remote connection method is not supported yet",
                 code="target_required",
             )
         return computer
@@ -1652,3 +1866,25 @@ class RemoteRunManager:
         return target if isinstance(target, dict) else self._require_computer(
             str(run["target_computer_id"])
         )
+
+    @staticmethod
+    def _is_node_target(target: Mapping[str, Any]) -> bool:
+        return target.get("connection_method") == "node"
+
+    def _target_backend(self, target: Mapping[str, Any]) -> Any:
+        if not self._is_node_target(target):
+            return self.ssh
+        if self.node_runs is None:
+            raise RemoteRunError(
+                "Node Remote Run is unavailable", code="capability_unsupported"
+            )
+        return self.node_runs
+
+    def _bind_node_loop(self) -> None:
+        if self.node_runs is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.node_runs.bind_loop(loop)

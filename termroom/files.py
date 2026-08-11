@@ -11,7 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
-from termroom.security import PathBoundaryError, file_digest, is_within, resolve_inside
+from termroom.security import (
+    PathBoundaryError,
+    file_digest,
+    is_within,
+    resolve_inside,
+    resolve_no_symlink_inside,
+)
 
 
 class FileConflictError(RuntimeError):
@@ -29,6 +35,14 @@ class FileSnapshot:
     content: str
     digest: str
     mtime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class RunnableFile:
+    relative_path: str
+    digest: str
+    executable: bool
+    has_shebang: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +201,39 @@ class FileService:
             content=content,
             digest=file_digest(raw),
             mtime_ns=stat.st_mtime_ns,
+        )
+
+    def inspect_runnable(
+        self,
+        workspace_path: Path,
+        relative_path: str,
+        *,
+        expected_digest: str | None = None,
+    ) -> RunnableFile:
+        target = resolve_no_symlink_inside(workspace_path, relative_path)
+        info = target.stat(follow_symlinks=False)
+        if not target.is_file():
+            raise UnsupportedFileError("Only regular files can be executed")
+        if info.st_size > self.max_edit_bytes:
+            raise UnsupportedFileError("File exceeds the editable size limit")
+        with target.open("rb") as handle:
+            raw = handle.read(self.max_edit_bytes + 1)
+        if len(raw) > self.max_edit_bytes:
+            raise UnsupportedFileError("File exceeds the editable size limit")
+        if b"\x00" in raw:
+            raise UnsupportedFileError("Binary files cannot be executed")
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise UnsupportedFileError("Only UTF-8 text files can be executed") from exc
+        digest = file_digest(raw)
+        if expected_digest is not None and digest != expected_digest:
+            raise FileConflictError("The file changed before execution")
+        return RunnableFile(
+            relative_path=target.relative_to(workspace_path.resolve(strict=True)).as_posix(),
+            digest=digest,
+            executable=bool(info.st_mode & 0o111),
+            has_shebang=raw.startswith(b"#!"),
         )
 
     def stat(self, workspace_path: Path, relative_path: str) -> FileEntry:

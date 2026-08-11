@@ -42,6 +42,8 @@ ERROR_MESSAGE_KEYS = {
 }
 
 ERROR_CODE_KEYS = {
+    "archive_format": "remote_run.error.archive_format",
+    "capability_unsupported": "node.error.capability_unsupported",
     "command_required": "remote_run.error.command_required",
     "git_clone_failed": "remote_run.failed.git_copy",
     "git_missing": "remote_run.error.git_missing",
@@ -55,6 +57,8 @@ ERROR_CODE_KEYS = {
     "git_url_scheme": "remote_run.error.public_https_git",
     "git_url_userinfo": "remote_run.error.public_https_git",
     "git_url_whitespace": "remote_run.error.public_https_git",
+    "node_offline": "node.error.offline",
+    "node_revoked": "node.error.revoked",
     "source_contains_run_base": "remote_run.error.workspace_required",
     "source_path": "remote_run.error.workspace_required",
     "target_required": "remote_run.error.target_required",

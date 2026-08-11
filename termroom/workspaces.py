@@ -152,7 +152,7 @@ class WorkspaceManager:
         workspace = self.store.get_workspace(workspace_id)
         if not workspace:
             raise KeyError(f"Unknown workspace: {workspace_id}")
-        if workspace.get("backend_kind", "local") == "ssh":
+        if workspace.get("backend_kind", "local") == "remote":
             computer = self.store.get_computer(str(workspace.get("computer_id", "")))
             if not computer:
                 raise KeyError(f"Unknown computer for workspace: {workspace_id}")
@@ -217,13 +217,14 @@ class WorkspaceManager:
             self.store.touch_workspace(str(existing["id"]))
             return self.require(str(existing["id"]))
 
-        virtual_root = self.store.ensure_root_value(f"ssh://{computer_id}")
+        connection_method = str(computer.get("connection_method") or "ssh")
+        virtual_root = self.store.ensure_root_value(f"{connection_method}://{computer_id}")
         name = (display_name or PurePosixPath(normalized).name or normalized).strip()
         workspace = self.store.create_workspace(
             str(virtual_root["id"]),
             normalized,
             name[:120],
-            backend_kind="ssh",
+            backend_kind="remote",
             computer_id=computer_id,
             canonical_path=normalized,
         )
@@ -261,7 +262,7 @@ class WorkspaceManager:
                 ".termroom-server-terminal",
                 str(computer["name"]),
                 tmux_session=f"termroom-server-{computer_id[:12]}",
-                backend_kind="ssh",
+                backend_kind="remote",
                 computer_id=computer_id,
                 canonical_path=normalized_home,
                 workspace_kind="server_terminal",
@@ -368,7 +369,7 @@ class WorkspaceManager:
                 normalized_path,
                 display_name[:120] or "Remote Run",
                 tmux_session=safe_session,
-                backend_kind="ssh",
+                backend_kind="remote",
                 computer_id=computer_id,
                 canonical_path=normalized_path,
                 workspace_kind="remote_run",
@@ -412,7 +413,7 @@ class WorkspaceManager:
         remote_work_path: str,
     ) -> None:
         if (
-            workspace.get("backend_kind") != "ssh"
+            workspace.get("backend_kind") != "remote"
             or str(workspace.get("computer_id") or "") != computer_id
             or str(workspace.get("tmux_session") or "") != tmux_session
             or str(workspace.get("canonical_path") or "") != remote_work_path

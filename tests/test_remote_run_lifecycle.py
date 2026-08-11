@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
 from pathlib import Path
@@ -57,6 +58,7 @@ def _store_preparing_run(
         {
             "id": run_id,
             "source_kind": source_kind,
+            "archive_format": "zip" if source_kind == "archive" else None,
             "source_workspace_id": None,
             "source_path": "." if source_kind == "workspace" else None,
             "source_label": "source",
@@ -77,7 +79,7 @@ def _store_preparing_run(
 
 
 @pytest.mark.asyncio
-async def test_interrupted_zip_upload_keeps_same_run_retryable_with_expiry(
+async def test_interrupted_archive_upload_keeps_same_run_retryable_with_expiry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -86,7 +88,7 @@ async def test_interrupted_zip_upload_keeps_same_run_retryable_with_expiry(
     run, created = await app.state.remote_runs.create(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
             "archive_name": "source.zip",
             "target_computer_id": str(computer["id"]),
             "command": "python main.py",
@@ -115,7 +117,7 @@ async def test_interrupted_zip_upload_keeps_same_run_retryable_with_expiry(
 
 
 @pytest.mark.asyncio
-async def test_abandoned_zip_upload_is_removed_without_contacting_ssh(
+async def test_abandoned_archive_upload_is_removed_without_contacting_ssh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -124,7 +126,7 @@ async def test_abandoned_zip_upload_is_removed_without_contacting_ssh(
     await app.state.remote_runs.create(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
             "archive_name": "source.zip",
             "target_computer_id": str(computer["id"]),
             "command": "python main.py",
@@ -150,7 +152,7 @@ async def test_abandoned_zip_upload_is_removed_without_contacting_ssh(
 
 
 @pytest.mark.asyncio
-async def test_waiting_zip_upload_can_be_cancelled_without_remote_run_root(
+async def test_waiting_archive_upload_can_be_cancelled_without_remote_run_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -159,7 +161,7 @@ async def test_waiting_zip_upload_can_be_cancelled_without_remote_run_root(
     await app.state.remote_runs.create(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
             "archive_name": "source.zip",
             "target_computer_id": str(computer["id"]),
             "command": "python main.py",
@@ -1133,3 +1135,120 @@ def test_poll_does_not_finalize_existing_clone_without_start_uncertainty(
     assert stored["error_detail"] is None
     assert stored["ended_at"] is None
     assert stored["expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_background_observer_records_completion_without_browser_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, computer = _app_with_target(tmp_path, monkeypatch)
+    manager = app.state.remote_runs
+    run_id = _store_preparing_run(
+        app,
+        computer,
+        source_kind="workspace",
+        phase="starting",
+    )
+    assert app.state.store.transition_remote_run(
+        run_id,
+        expected_states={"preparing"},
+        state="running",
+        phase=None,
+        started_at="2026-08-09T00:00:05+00:00",
+    )
+
+    async def skip_startup_sweep() -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_reconcile_startup", skip_startup_sweep)
+    monkeypatch.setattr(
+        app.state.ssh,
+        "poll_remote_run",
+        lambda *_args, **_kwargs: pytest.fail("observer read Remote Run logs"),
+    )
+    reconcile_calls = 0
+
+    def completed(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        return {
+            "state": "finished",
+            "started_at": "2026-08-09T00:00:05+00:00",
+            "ended_at": "2026-08-09T00:00:09+00:00",
+            "exit_code": 0,
+            "tmux_exists": True,
+            "tmux_running": False,
+            "record_errors": [],
+        }
+
+    monkeypatch.setattr(app.state.ssh, "reconcile_remote_run", completed)
+    monkeypatch.setattr("termroom.remote_runs.REMOTE_RUN_OBSERVER_INTERVAL", 0.01)
+
+    await manager.startup()
+    try:
+        for _attempt in range(100):
+            if app.state.store.list_activity_events():
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await manager.shutdown()
+
+    stored = app.state.store.get_remote_run(run_id)
+    assert stored is not None
+    assert stored["state"] == "finished"
+    assert reconcile_calls == 1
+    events = app.state.store.list_activity_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "remote_run.completed"
+    assert events[0]["subject_id"] == run_id
+
+
+@pytest.mark.asyncio
+async def test_background_observer_keeps_offline_run_active_and_backs_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, computer = _app_with_target(tmp_path, monkeypatch)
+    manager = app.state.remote_runs
+    run_id = _store_preparing_run(
+        app,
+        computer,
+        source_kind="workspace",
+        phase="starting",
+    )
+    assert app.state.store.transition_remote_run(
+        run_id,
+        expected_states={"preparing"},
+        state="running",
+        phase=None,
+        started_at="2026-08-09T00:00:05+00:00",
+    )
+
+    async def skip_startup_sweep() -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_reconcile_startup", skip_startup_sweep)
+    reconcile_calls = 0
+
+    def offline(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        raise SSHBackendError("offline")
+
+    monkeypatch.setattr(app.state.ssh, "reconcile_remote_run", offline)
+    monkeypatch.setattr("termroom.remote_runs.REMOTE_RUN_OBSERVER_INTERVAL", 0.01)
+    monkeypatch.setattr("termroom.remote_runs.REMOTE_RUN_OBSERVER_MAX_BACKOFF", 0.04)
+
+    await manager.startup()
+    try:
+        await asyncio.sleep(0.075)
+    finally:
+        await manager.shutdown()
+
+    stored = app.state.store.get_remote_run(run_id)
+    assert stored is not None
+    assert stored["state"] == "running"
+    assert stored["ended_at"] is None
+    assert app.state.store.list_activity_events() == []
+    assert 2 <= reconcile_calls <= 5
