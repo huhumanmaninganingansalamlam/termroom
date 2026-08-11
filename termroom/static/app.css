@@ -2517,7 +2517,6 @@ details:not([open]) > :not(summary) {
 
   .editor-screen {
     overflow: hidden;
-    padding: 0;
   }
 
 }
