@@ -1280,6 +1280,10 @@ textarea {
   background: var(--surface);
 }
 
+button {
+  border: 1px solid var(--border);
+}
+
 button,
 .primary-button,
 .secondary-button {
