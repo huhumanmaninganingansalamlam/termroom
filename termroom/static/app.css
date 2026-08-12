@@ -5695,6 +5695,33 @@ details:not([open]) > :not(summary) {
   margin: 0 auto;
 }
 
+.computer-setup-shell > .panel.stack-form {
+  padding: 18px;
+}
+
+.computer-setup-shell > .panel.stack-form > * {
+  min-width: 0;
+}
+
+.computer-setup-shell > .panel.stack-form > h2,
+.computer-setup-shell > .panel.stack-form > p,
+.computer-setup-shell > .panel.stack-form > pre {
+  margin: 0;
+}
+
+.computer-setup-shell > .panel.stack-form pre {
+  max-width: 100%;
+  padding: 12px 14px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+}
+
+.computer-setup-shell > .panel.stack-form > form {
+  margin: 0;
+}
+
 .ssh-setup-section.panel,
 .ssh-fingerprint-panel.panel,
 .remote-workspace-card.panel {
@@ -6416,6 +6443,10 @@ details:not([open]) > :not(summary) {
   .computer-setup-heading p {
     font-size: 0.72rem;
     line-height: 1.5;
+  }
+
+  .computer-setup-shell > .panel.stack-form {
+    padding: 14px;
   }
 
   .ssh-setup-v2 {
