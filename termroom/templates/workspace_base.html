@@ -38,13 +38,7 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 7H3s3 0 3-7M9.5 19h5"/></svg>
         <strong class="activity-unread-badge" data-activity-unread hidden></strong>
       </a>
-      <label class="workspace-language-select workspace-language-desktop" aria-label="{{ t('app.language') }}">
-        <select data-language-select>
-          {% for code, label in languages.items() %}
-          <option value="{{ code }}" {% if code == locale %}selected{% endif %}>{{ code | upper }}</option>
-          {% endfor %}
-        </select>
-      </label>
+      {{ user_settings_menu('workspace-desktop') }}
     </span>
   </div>
   <div class="workspace-project-row">
@@ -85,18 +79,16 @@
       {% endif %}
       <a class="workspace-activity-link"
          href="/activity"
+         data-activity-link
+         data-summary-url="/api/activity/summary"
+         data-claim-url="/api/activity/notifications/claim"
+         data-csrf="{{ csrf_token }}"
          aria-label="{{ t('activity.heading') }}"
          title="{{ t('activity.heading') }}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 7H3s3 0 3-7M9.5 19h5"/></svg>
         <strong class="activity-unread-badge" data-activity-unread hidden></strong>
       </a>
-      <label class="workspace-language-select workspace-language-mobile" aria-label="{{ t('app.language') }}">
-        <select data-language-select>
-          {% for code, label in languages.items() %}
-          <option value="{{ code }}" {% if code == locale %}selected{% endif %}>{{ code | upper }}</option>
-          {% endfor %}
-        </select>
-      </label>
+      {{ user_settings_menu('workspace-mobile') }}
     </span>
   </div>
 </header>
@@ -152,11 +144,17 @@
 <main class="workspace-content {% block workspace_content_class %}{% endblock %}">
   {% block workspace_content %}{% endblock %}
 </main>
-<nav class="bottom-nav" aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}">
+<nav class="bottom-nav"
+     aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}"
+     data-workspace-terminal-activity
+     data-activity-url="/api/workspaces/{{ workspace.id }}/terminal-activity">
   <span class="workspace-nav-label">{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}</span>
-  <a class="{% if active_tab == 'terminal' %}active{% endif %}" href="/w/{{ workspace.id }}/terminal">
+  <a class="{% if active_tab == 'terminal' %}active{% endif %}" href="/w/{{ workspace.id }}/terminal" data-terminal-activity-nav>
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7l4 5-4 5M11 17h8"/></svg>
     <span>{{ t('common.terminal') }}</span>
+    <span class="terminal-unread-dot terminal-nav-unread" data-terminal-activity-nav-unread hidden>
+      <span class="sr-only">{{ t('terminal.activity.new_output') }}</span>
+    </span>
   </a>
   {% if server_terminal %}
   <a href="/open/{{ workspace.computer_id }}">

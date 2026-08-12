@@ -413,6 +413,8 @@ class NodeRuntime:
             return {"terminal": self._rename_terminal(payload)}
         if operation == "terminal.close":
             return {"terminals": self._close_terminal(payload)}
+        if operation == "terminal.activity":
+            return {"workspaces": self._terminal_activity(payload)}
         if operation == "terminal.scrollback":
             return {"output": self._capture_scrollback(payload)}
         if operation == "files.list":
@@ -940,6 +942,61 @@ class NodeRuntime:
         lines = max(100, min(int(payload.get("lines") or 2000), 10_000))
         return self._tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", window).stdout
 
+    def _terminal_activity(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Read activity for an explicit, bounded set of tmux sessions."""
+
+        raw_workspaces = payload.get("workspaces")
+        if not isinstance(raw_workspaces, list) or len(raw_workspaces) > 100:
+            raise NodeAgentError(
+                "Terminal activity request is invalid", code="terminal_activity_invalid"
+            )
+        requested: dict[str, set[str]] = {}
+        for raw in raw_workspaces:
+            if not isinstance(raw, Mapping):
+                raise NodeAgentError(
+                    "Terminal activity request is invalid",
+                    code="terminal_activity_invalid",
+                )
+            session = str(raw.get("tmux_session") or "")
+            if not NODE_SESSION_PATTERN.fullmatch(session) or session in requested:
+                raise NodeAgentError(
+                    "Terminal activity request is invalid",
+                    code="terminal_activity_invalid",
+                )
+            raw_windows = raw.get("windows")
+            if not isinstance(raw_windows, list) or len(raw_windows) > 100:
+                raise NodeAgentError(
+                    "Terminal activity request is invalid",
+                    code="terminal_activity_invalid",
+                )
+            windows = {str(window) for window in raw_windows}
+            if len(windows) != len(raw_windows) or any(
+                not NODE_WINDOW_PATTERN.fullmatch(window) for window in windows
+            ):
+                raise NodeAgentError(
+                    "Terminal activity request is invalid",
+                    code="terminal_activity_invalid",
+                )
+            requested[session] = windows
+        if not requested:
+            return []
+        result = self._tmux(
+            "list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT, check=False
+        )
+        if result.returncode:
+            raise NodeAgentError(
+                "Terminal activity is unavailable", code="terminal_activity_unavailable"
+            )
+        grouped = {session: [] for session in requested}
+        for record in parse_tmux_terminal_records(result.stdout):
+            session = str(record.get("tmux_session") or "")
+            if session in requested and str(record["tmux_window"]) in requested[session]:
+                grouped[session].append(record)
+        return [
+            {"tmux_session": session, "terminals": terminals}
+            for session, terminals in grouped.items()
+        ]
+
     async def _terminal_attach(
         self,
         payload: Mapping[str, Any],
@@ -958,9 +1015,13 @@ class NodeRuntime:
             if key.startswith("TERMROOM_") or key in {"TMUX", "TMUX_PANE"}:
                 environment.pop(key, None)
         environment["TERM"] = "xterm-256color"
+        command = ["tmux"]
+        test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
+        if test_socket:
+            command.extend(("-S", test_socket))
         process_pid, master_fd = await asyncio.to_thread(
             spawn_pty_process,
-            ["tmux", "attach-session", "-t", session],
+            [*command, "attach-session", "-t", session],
             cwd=str(root),
             environment=environment,
             rows=rows,
@@ -1744,8 +1805,12 @@ class NodeRuntime:
         for key in tuple(environment):
             if key.startswith("TERMROOM_"):
                 environment.pop(key, None)
+        command = ["tmux"]
+        test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
+        if test_socket:
+            command.extend(("-S", test_socket))
         result = subprocess.run(
-            ["tmux", *args],
+            [*command, *args],
             check=False,
             capture_output=True,
             text=True,

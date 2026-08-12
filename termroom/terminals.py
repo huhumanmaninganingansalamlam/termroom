@@ -41,22 +41,39 @@ MAX_TERMINAL_COLS = 1000
 TMUX_TERMINAL_ROLE_OPTION = "@termroom_terminal_role"
 TMUX_MANAGED_RUN_OPTION = "@termroom_managed_run_id"
 TMUX_TERMINAL_RECORD_FORMAT = (
-    "#{window_id}|#{window_name}|"
+    "#{session_name}|#{window_id}|#{window_activity}|#{window_name}|"
     f"#{{{TMUX_TERMINAL_ROLE_OPTION}}}|#{{{TMUX_MANAGED_RUN_OPTION}}}"
 )
 
 
-def parse_tmux_terminal_records(output: str) -> list[dict[str, str | None]]:
+def parse_tmux_terminal_records(output: str) -> list[dict[str, str | int | None]]:
     """Decode the printable tmux record format shared by Local and SSH."""
 
-    records: list[dict[str, str | None]] = []
+    records: list[dict[str, str | int | None]] = []
     for line in output.splitlines():
         if not line:
             continue
-        window_id, separator, remainder = line.partition("|")
+        first, separator, remainder = line.partition("|")
+        if first.startswith("@"):
+            # Compatibility for persisted fixtures and older Node peers. Live
+            # providers use the version with session and activity fields.
+            session_name: str | None = None
+            window_id = first
+            activity_at: int | None = None
+            window_separator = activity_separator = separator
+        else:
+            session_name = first
+            window_id, window_separator, remainder = remainder.partition("|")
+            activity_raw, activity_separator, remainder = remainder.partition("|")
+            if not activity_raw.isdigit():
+                raise ValueError("tmux exposed an invalid Terminal record")
+            activity_at = int(activity_raw)
         identity = remainder.rsplit("|", 2)
         if (
             not separator
+            or not window_separator
+            or not activity_separator
+            or session_name == ""
             or not window_id.startswith("@")
             or len(identity) != 3
         ):
@@ -65,6 +82,8 @@ def parse_tmux_terminal_records(output: str) -> list[dict[str, str | None]]:
         records.append(
             {
                 "tmux_window": window_id,
+                "tmux_session": session_name,
+                "activity_at": activity_at,
                 "name": name or "shell",
                 "role": role or "shell",
                 "managed_run_id": managed_run_id or None,
@@ -195,8 +214,12 @@ class TerminalManager:
     def _run_tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop("TERMROOM_PASSWORD", None)
+        command = ["tmux"]
+        test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
+        if test_socket:
+            command.extend(("-S", test_socket))
         return subprocess.run(
-            ["tmux", *args],
+            [*command, *args],
             check=check,
             capture_output=True,
             text=True,
@@ -274,7 +297,9 @@ class TerminalManager:
             str(workspace["id"]), self._list_tmux_window_records(session)
         )
 
-    def _list_tmux_window_records(self, session_name: str) -> list[dict[str, str | None]]:
+    def _list_tmux_window_records(
+        self, session_name: str
+    ) -> list[dict[str, str | int | None]]:
         result = self._run_tmux(
             "list-windows",
             "-t",
@@ -282,7 +307,44 @@ class TerminalManager:
             "-F",
             TMUX_TERMINAL_RECORD_FORMAT,
         )
-        return parse_tmux_terminal_records(result.stdout)
+        records = parse_tmux_terminal_records(result.stdout)
+        for record in records:
+            if record["tmux_session"] is None:
+                record["tmux_session"] = session_name
+        return records
+
+    def refresh_activity(
+        self, workspaces: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Refresh requested Local workspaces with one tmux server query."""
+
+        requested = {
+            str(workspace["tmux_session"]): workspace
+            for workspace in workspaces
+            if workspace.get("backend_kind", "local") == "local"
+        }
+        if not requested:
+            return {}
+        result = self._run_tmux(
+            "list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT, check=False
+        )
+        if result.returncode:
+            raise TerminalError(result.stderr.strip() or "Terminal activity refresh failed")
+        grouped: dict[str, list[dict[str, Any]]] = {
+            str(workspace["id"]): [] for workspace in requested.values()
+        }
+        for record in parse_tmux_terminal_records(result.stdout):
+            workspace = requested.get(str(record["tmux_session"]))
+            if workspace is None:
+                continue
+            grouped[str(workspace["id"])].append(record)
+        return self.store.observe_terminal_activity_batch(
+            {
+                workspace_id: records
+                for workspace_id, records in grouped.items()
+                if records
+            }
+        )
 
     def _list_tmux_windows(self, session_name: str) -> list[tuple[str, str]]:
         return [
@@ -771,16 +833,24 @@ class TerminalManager:
                 except OSError:
                     tail = decoder.feed(b"", final=True)
                     if tail:
+                        await asyncio.to_thread(
+                            self.store.touch_terminal_output, terminal_id
+                        )
                         await websocket.send_text(tail)
                     return
                 if not chunk:
                     tail = decoder.feed(b"", final=True)
                     if tail:
+                        await asyncio.to_thread(
+                            self.store.touch_terminal_output, terminal_id
+                        )
                         await websocket.send_text(tail)
                     return
                 decoded = decoder.feed(chunk)
-                await asyncio.to_thread(self.store.touch_terminal_output, terminal["id"])
                 if decoded:
+                    await asyncio.to_thread(
+                        self.store.touch_terminal_output, terminal_id
+                    )
                     await websocket.send_text(decoded)
 
         async def browser_to_input() -> None:
@@ -812,6 +882,19 @@ class TerminalManager:
                 kind = payload.get("kind")
                 if kind == "claim":
                     self.control.claim_view(terminal_id, client_id)
+                elif kind == "activity_ack":
+                    revision = payload.get("activity_at")
+                    if isinstance(revision, bool) or not isinstance(revision, int):
+                        continue
+                    try:
+                        await asyncio.to_thread(
+                            self.store.acknowledge_terminal_activity,
+                            terminal_id,
+                            device_id,
+                            revision,
+                        )
+                    except (KeyError, ValueError):
+                        continue
                 elif kind == "resize":
                     if not self.control.can_resize(terminal_id, client_id):
                         continue
@@ -863,9 +946,13 @@ class TerminalManager:
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TERMROOM_PASSWORD", None)
+        command = ["tmux"]
+        test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
+        if test_socket:
+            command.extend(("-S", test_socket))
         environment["TERM"] = "xterm-256color"
         process_pid, master_fd = spawn_pty_process(
-            ["tmux", "attach-session", "-t", workspace["tmux_session"]],
+            [*command, "attach-session", "-t", workspace["tmux_session"]],
             cwd=str(workspace["path"]),
             environment=environment,
         )

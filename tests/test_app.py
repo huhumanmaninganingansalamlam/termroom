@@ -17,6 +17,12 @@ from termroom.config import Settings
 from termroom.files import FileEntry, RecentFiles
 from termroom.ssh_backend import SSHBackendError
 
+_TERMINAL_ACTIVITY_EPOCH_SECONDS = 1_700_000_000
+
+
+def _terminal_activity_seconds(offset: int) -> int:
+    return _TERMINAL_ACTIVITY_EPOCH_SECONDS + offset
+
 
 async def _login(client: httpx.AsyncClient, password: str = "test-token") -> None:
     client.cookies.set("termroom_locale", "ko")
@@ -56,6 +62,85 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
         assert authenticated.headers["cache-control"] == "no-store"
         assert authenticated.headers["x-frame-options"] == "SAMEORIGIN"
         assert authenticated.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_apis_are_per_browser_scoped_and_race_safe(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    workspace_id = str(workspace["id"])
+    terminal = app.state.store.create_terminal(
+        workspace_id,
+        "shell",
+        "@1",
+        activity_at=_terminal_activity_seconds(10),
+    )
+    managed = app.state.store.create_terminal(
+        workspace_id,
+        "Run",
+        "@2",
+        role="file_run",
+        managed_run_id="run-managed",
+        activity_at=_terminal_activity_seconds(999),
+    )
+    terminal_id = str(terminal["id"])
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as first, httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as second:
+        await _login(first)
+        await _login(second)
+
+        initial = await first.get(
+            "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
+        )
+        assert initial.status_code == 200
+        assert initial.json()["unread_count"] == 0
+        assert [item["terminal_id"] for item in initial.json()["terminals"]] == [
+            terminal_id
+        ]
+        assert str(managed["id"]) not in initial.text
+
+        app.state.store.observe_terminal_activity(
+            workspace_id,
+            [{"tmux_window": "@1", "activity_at": _terminal_activity_seconds(20)}],
+        )
+        workspace_view = await first.get(
+            f"/api/workspaces/{workspace_id}/terminal-activity"
+        )
+        assert workspace_view.status_code == 200
+        assert workspace_view.json()["unread_count"] == 1
+        assert workspace_view.json()["latest_unread_terminal_id"] == terminal_id
+
+        second_baseline = await second.get(
+            "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
+        )
+        assert second_baseline.status_code == 200
+        assert second_baseline.json()["unread_count"] == 0
+
+        app.state.store.observe_terminal_activity(
+            workspace_id,
+            [{"tmux_window": "@1", "activity_at": _terminal_activity_seconds(30)}],
+        )
+        assert managed["id"] != terminal_id
+        missing_workspace = await first.get(
+            "/api/workspaces/missing/terminal-activity"
+        )
+        assert missing_workspace.status_code == 404
 
 
 @pytest.mark.asyncio

@@ -16,7 +16,9 @@
   <nav class="terminal-tabs" aria-label="{{ t('terminal.switch') }}">
     {% for item in terminals %}
     <a class="{% if item.id == terminal.id %}active{% endif %}"
-       href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}">{{ item.name }}</a>
+       href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}"
+       data-terminal-activity-tab="{{ item.id }}"
+       data-terminal-role="{{ item.role | default('shell') }}">{{ item.name }}{% if (item.role | default('shell')) == 'shell' %}<span class="terminal-unread-dot terminal-tab-unread" data-terminal-activity-tab-unread hidden><span class="sr-only">{{ t('terminal.activity.new_output') }}</span></span>{% endif %}</a>
     {% endfor %}
   </nav>
   <div class="terminal-top-actions">
@@ -117,7 +119,8 @@
      class="terminal-host"
      data-terminal-id="{{ terminal.id }}"
      data-workspace-id="{{ workspace.id }}"
-     data-device-id="{{ current_device_id }}"></div>
+     data-device-id="{{ current_device_id }}"
+     data-terminal-role="{{ terminal.role | default('shell') }}"></div>
 
 <div class="terminal-composer">
   <div class="quick-keys" aria-label="{{ t('terminal.more_keys') }}">
@@ -206,5 +209,5 @@
 {% endblock %}
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=36"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=39"></script>
 {% endblock %}

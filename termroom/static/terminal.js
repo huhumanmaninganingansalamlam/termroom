@@ -147,6 +147,13 @@
   let lastInputRevision = 0;
   let presenceInitialized = false;
   let otherInputTimer = null;
+  const shellTerminal = (host.dataset.terminalRole || "shell") === "shell";
+  let activityAckTimer = 0;
+  let pendingActivityAt = 0;
+  let acknowledgedActivityAt = 0;
+  let renderedActivityAt = 0;
+  let outputRenderSequence = 0;
+  let acknowledgedRenderSequence = 0;
   const mobileInput = window.matchMedia("(max-width: 1023px)");
   const coarsePrimaryPointer = window.matchMedia("(pointer: coarse)");
   const composePane = document.querySelector(".terminal-compose-pane");
@@ -216,7 +223,72 @@
   };
 
   const send = (payload) => {
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  };
+
+  const terminalAtBottom = () =>
+    term.buffer.active.viewportY >= term.buffer.active.baseY;
+  const terminalCanAcknowledge = () =>
+    shellTerminal
+    && document.visibilityState === "visible"
+    && document.hasFocus()
+    && terminalAtBottom();
+  const terminalActivityPayload = (result) => {
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    if (payload?.terminal && typeof payload.terminal === "object") return payload.terminal;
+    if (Array.isArray(payload?.terminals)) {
+      return payload.terminals.find(
+        (item) => String(item?.terminal_id ?? item?.id ?? "") === host.dataset.terminalId,
+      ) || payload.terminals[0] || {};
+    }
+    return payload;
+  };
+  const renderCurrentTerminalActivity = (result) => {
+    const payload = terminalActivityPayload(result);
+    const activityAt = Number(payload?.activity_at || 0);
+    const acknowledgedAt = Number(payload?.acknowledged_activity_at || 0);
+    if (Number.isSafeInteger(activityAt)) {
+      pendingActivityAt = Math.max(pendingActivityAt, activityAt);
+    }
+    if (Number.isSafeInteger(acknowledgedAt)) {
+      acknowledgedActivityAt = Math.max(acknowledgedActivityAt, acknowledgedAt);
+    }
+    if (pendingActivityAt <= acknowledgedActivityAt) {
+      acknowledgedRenderSequence = outputRenderSequence;
+    } else if (outputRenderSequence > acknowledgedRenderSequence) {
+      renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
+    }
+    document
+      .querySelectorAll(`[data-terminal-activity-tab="${CSS.escape(host.dataset.terminalId)}"] [data-terminal-activity-tab-unread]`)
+      .forEach((dot) => {
+        dot.hidden = pendingActivityAt <= acknowledgedActivityAt;
+      });
+    scheduleActivityAcknowledge();
+  };
+  const acknowledgeVisibleActivity = () => {
+    window.clearTimeout(activityAckTimer);
+    if (
+      !terminalCanAcknowledge()
+      || renderedActivityAt <= acknowledgedActivityAt
+    ) return;
+    const observedActivityAt = renderedActivityAt;
+    if (!send({ kind: "activity_ack", activity_at: observedActivityAt })) return;
+    acknowledgedActivityAt = observedActivityAt;
+    acknowledgedRenderSequence = outputRenderSequence;
+    renderCurrentTerminalActivity({
+      activity_at: pendingActivityAt,
+      acknowledged_activity_at: acknowledgedActivityAt,
+      unread: pendingActivityAt > acknowledgedActivityAt,
+    });
+    window.dispatchEvent(new CustomEvent("termroom:terminal-activity-changed"));
+  };
+  const scheduleActivityAcknowledge = () => {
+    window.clearTimeout(activityAckTimer);
+    if (terminalCanAcknowledge()) {
+      activityAckTimer = window.setTimeout(acknowledgeVisibleActivity, 180);
+    }
   };
 
   const resizeTerminal = (forceSend = false) => {
@@ -351,7 +423,16 @@
       updatePresence();
       if (!coarsePrimaryPointer.matches) term.focus();
     });
-    socket.addEventListener("message", (event) => term.write(event.data));
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      term.write(event.data, () => {
+        outputRenderSequence += 1;
+        if (pendingActivityAt > acknowledgedActivityAt) {
+          renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
+        }
+        scheduleActivityAcknowledge();
+      });
+    });
     socket.addEventListener("close", (event) => {
       const terminalCloseMessages = {
         4401: tr("terminal.status.auth_required"),
@@ -370,6 +451,11 @@
   };
 
   term.onData((data) => send({ kind: "input", data }));
+  term.onScroll(scheduleActivityAcknowledge);
+  window.addEventListener(
+    "termroom:terminal-activity-refreshed",
+    (event) => renderCurrentTerminalActivity(event.detail),
+  );
   new ResizeObserver(() => scheduleResize()).observe(host);
   window.visualViewport?.addEventListener("resize", () => {
     updateMobileKeyboardState();
@@ -384,8 +470,12 @@
       return;
     }
     claimVisibleTerminal();
+    scheduleActivityAcknowledge();
   });
-  window.addEventListener("focus", claimVisibleTerminal);
+  window.addEventListener("focus", () => {
+    claimVisibleTerminal();
+    scheduleActivityAcknowledge();
+  });
   window.addEventListener("orientationchange", () => {
     window.setTimeout(() => {
       mobileViewportBaseline = window.visualViewport?.height || window.innerHeight;

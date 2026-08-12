@@ -349,5 +349,5 @@ def test_activity_frontend_contract() -> None:
     assert 'notificationButton?.addEventListener("click"' in script
     assert 'tag: `termroom-${activityEvent.id}`' in script
     assert "/api/activity/notifications/claim" in base
-    assert "app.js') }}?v=50" in base
+    assert "app.js') }}?v=52" in base
     assert "data-activity-link" in workspace

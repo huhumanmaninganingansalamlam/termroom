@@ -141,7 +141,21 @@ def test_workspace_shell_contains_long_labels_and_exposes_full_values() -> None:
     assert 'class="workspace-sidebar-copy"' in template
     assert 'title="{{ workspace_sidebar_status }}"' in template
     assert 'title="{{ workspace_sidebar_detail }}"' in template
-    assert "path='app.css') }}?v=22" in base_template
+    assert "path='app.css') }}?v=24" in base_template
+
+
+def test_terminal_command_editor_keeps_input_and_run_button_in_one_row() -> None:
+    styles = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+
+    command_bar = re.search(r"\.command-bar\s*\{(?P<body>.*?)\}", styles, re.S)
+    assert command_bar
+    assert "display: grid" in command_bar.group("body")
+    assert "grid-template-columns: minmax(0, 1fr) 68px" in command_bar.group("body")
+    assert "align-items: stretch" in command_bar.group("body")
+
+    run_button = re.search(r"\.send-command\s*\{(?P<body>.*?)\}", styles, re.S)
+    assert run_button
+    assert "min-height: 0" in run_button.group("body")
 
 
 def test_dynamic_headings_and_notices_wrap_long_unbroken_values() -> None:

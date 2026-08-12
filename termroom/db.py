@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,10 @@ FILE_RUN_STATES = frozenset(
 )
 FILE_RUN_TERMINAL_STATES = frozenset({"finished", "stopped", "failed", "lost"})
 TERMINAL_ROLES = frozenset({"shell", "file_run", "remote_run"})
+SQLITE_MAX_INTEGER = (1 << 63) - 1
+TERMINAL_ACTIVITY_READ_RETENTION = timedelta(days=30)
+TERMINAL_ACTIVITY_CLOCK_SKEW_ALLOWANCE = timedelta(days=1)
+TERMINAL_ACTIVITY_READ_CLEANUP_INTERVAL_SECONDS = 60 * 60
 
 
 def _computers_table_sql(
@@ -122,6 +127,7 @@ def utc_now() -> str:
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._terminal_activity_cleanup_at = 0.0
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -173,7 +179,18 @@ class StateStore:
                     created_at TEXT NOT NULL,
                     last_opened_at TEXT NOT NULL,
                     last_output_at TEXT,
+                    activity_at INTEGER,
                     UNIQUE(workspace_id, tmux_window)
+                );
+
+                CREATE TABLE IF NOT EXISTS terminal_activity_reads (
+                    terminal_id TEXT NOT NULL
+                        REFERENCES terminals(id) ON DELETE CASCADE,
+                    device_id TEXT NOT NULL,
+                    acknowledged_activity_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(terminal_id, device_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS command_history (
@@ -272,9 +289,12 @@ class StateStore:
                     WHERE read_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_event_notification_claims_device
                     ON event_notification_claims(device_id, claimed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_terminal_activity_reads_updated_at
+                    ON terminal_activity_reads(updated_at);
                 """
             )
             self._ensure_column(db, "terminals", "last_output_at", "TEXT")
+            self._ensure_column(db, "terminals", "activity_at", "INTEGER")
             self._ensure_column(
                 db, "terminals", "role", "TEXT NOT NULL DEFAULT 'shell'"
             )
@@ -374,6 +394,7 @@ class StateStore:
                 WHERE workspace_id IS NOT NULL
                 """
             )
+
             db.execute(
                 """
                 UPDATE workspaces
@@ -765,6 +786,59 @@ class StateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def terminal_activity_workspaces(
+        self, workspace_ids: Iterable[str]
+    ) -> list[dict[str, Any]]:
+        """Load an exact persistent Workspace scope in a constant number of queries."""
+
+        unique_ids = list(dict.fromkeys(str(value) for value in workspace_ids))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT w.*
+                FROM workspaces AS w
+                WHERE w.id IN ({placeholders})
+                  AND w.workspace_kind = 'workspace'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM remote_runs AS rr WHERE rr.workspace_id = w.id
+                  )
+                """,
+                unique_ids,
+            ).fetchall()
+            workspaces = {str(row["id"]): dict(row) for row in rows}
+            computer_ids = list(
+                dict.fromkeys(
+                    str(item["computer_id"])
+                    for item in workspaces.values()
+                    if item.get("backend_kind") == "remote"
+                    and item.get("computer_id")
+                )
+            )
+            computers: dict[str, dict[str, Any]] = {}
+            if computer_ids:
+                computer_placeholders = ",".join("?" for _ in computer_ids)
+                computer_rows = db.execute(
+                    f"SELECT * FROM computers WHERE id IN ({computer_placeholders})",
+                    computer_ids,
+                ).fetchall()
+                computers = {str(row["id"]): dict(row) for row in computer_rows}
+
+        result: list[dict[str, Any]] = []
+        for workspace_id in unique_ids:
+            workspace = workspaces.get(workspace_id)
+            if workspace is None:
+                continue
+            if workspace.get("backend_kind") == "remote":
+                computer = computers.get(str(workspace.get("computer_id") or ""))
+                if computer is None:
+                    continue
+                workspace["computer"] = computer
+            result.append(workspace)
+        return result
+
     def list_workspaces_for_computer(self, computer_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
@@ -875,6 +949,22 @@ class StateStore:
             raise ValueError(f"Unsupported Terminal role: {role}")
         return role
 
+    @staticmethod
+    def _terminal_activity_revision(
+        value: Any,
+        *,
+        allow_none: bool = False,
+    ) -> int | None:
+        """Validate an exact provider revision without changing its unit."""
+
+        if value is None and allow_none:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("Terminal activity revision is invalid")
+        if value > SQLITE_MAX_INTEGER:
+            raise ValueError("Terminal activity revision is invalid")
+        return value
+
     def create_terminal(
         self,
         workspace_id: str,
@@ -883,8 +973,12 @@ class StateStore:
         *,
         role: str = "shell",
         managed_run_id: str | None = None,
+        activity_at: int | None = None,
     ) -> dict[str, Any]:
         safe_role = self._terminal_role(role)
+        safe_activity_at = self._terminal_activity_revision(
+            activity_at, allow_none=True
+        )
         safe_managed_run_id = str(managed_run_id) if managed_run_id else None
         if safe_role == "shell":
             safe_managed_run_id = None
@@ -895,8 +989,8 @@ class StateStore:
                 """
                 INSERT INTO terminals(
                     id, workspace_id, name, tmux_window, role, managed_run_id,
-                    created_at, last_opened_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, last_opened_at, activity_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     terminal_id,
@@ -907,6 +1001,7 @@ class StateStore:
                     safe_managed_run_id,
                     now,
                     now,
+                    safe_activity_at,
                 ),
             )
             row = db.execute("SELECT * FROM terminals WHERE id = ?", (terminal_id,)).fetchone()
@@ -932,7 +1027,7 @@ class StateStore:
     ) -> list[dict[str, Any]]:
         """Project live tmux windows into SQLite without churning stable row IDs."""
 
-        desired: list[dict[str, str | None]] = []
+        desired: list[dict[str, str | int | None]] = []
         seen_windows: set[str] = set()
         seen_managed_roles: set[str] = set()
         for raw in windows:
@@ -942,6 +1037,14 @@ class StateStore:
             seen_windows.add(tmux_window)
             role = self._terminal_role(raw.get("role"))
             managed_run_id = str(raw.get("managed_run_id") or "") or None
+            try:
+                activity_at = self._terminal_activity_revision(
+                    raw.get("activity_at"), allow_none=True
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "tmux exposed an invalid Terminal activity revision"
+                ) from exc
             if role == "shell":
                 managed_run_id = None
             elif role in seen_managed_roles:
@@ -954,6 +1057,7 @@ class StateStore:
                     "name": str(raw.get("name") or "shell"),
                     "role": role,
                     "managed_run_id": managed_run_id,
+                    "activity_at": activity_at,
                 }
             )
 
@@ -1048,8 +1152,8 @@ class StateStore:
                         """
                         INSERT INTO terminals(
                             id, workspace_id, name, tmux_window, role, managed_run_id,
-                            created_at, last_opened_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            created_at, last_opened_at, activity_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             terminal_id,
@@ -1060,13 +1164,19 @@ class StateStore:
                             item["managed_run_id"],
                             now,
                             now,
+                            item["activity_at"],
                         ),
                     )
                 else:
                     db.execute(
                         """
                         UPDATE terminals
-                        SET name = ?, tmux_window = ?, role = ?, managed_run_id = ?
+                        SET name = ?, tmux_window = ?, role = ?, managed_run_id = ?,
+                            activity_at = CASE
+                                WHEN ? IS NULL THEN activity_at
+                                WHEN activity_at IS NULL THEN ?
+                                ELSE MAX(activity_at, ?)
+                            END
                         WHERE id = ?
                         """,
                         (
@@ -1074,6 +1184,9 @@ class StateStore:
                             item["tmux_window"],
                             item["role"],
                             item["managed_run_id"],
+                            item["activity_at"],
+                            item["activity_at"],
+                            item["activity_at"],
                             str(row["id"]),
                         ),
                     )
@@ -1082,6 +1195,131 @@ class StateStore:
                 (workspace_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def observe_terminal_activity(
+        self,
+        workspace_id: str,
+        records: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Advance cached activity for known shell windows without reconciling inventory."""
+
+        return self.observe_terminal_activity_batch({str(workspace_id): records}).get(
+            str(workspace_id), []
+        )
+
+    def observe_terminal_activity_batch(
+        self,
+        records_by_workspace: Mapping[str, Iterable[Mapping[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Advance activity for many workspaces in one SQLite transaction."""
+
+        normalized: dict[str, dict[str, int]] = {}
+        for raw_workspace_id, records in records_by_workspace.items():
+            workspace_id = str(raw_workspace_id)
+            observed: dict[str, int] = {}
+            for record in records:
+                window = str(record.get("tmux_window") or "")
+                try:
+                    revision = self._terminal_activity_revision(
+                        record.get("activity_at")
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "tmux exposed an invalid Terminal activity record"
+                    ) from exc
+                if not window or window in observed or revision is None:
+                    raise ValueError("tmux exposed an invalid Terminal activity record")
+                observed[window] = revision
+            if observed:
+                normalized[workspace_id] = observed
+        if not normalized:
+            return {}
+        observations = [
+            (workspace_id, window, revision)
+            for workspace_id, observed in normalized.items()
+            for window, revision in observed.items()
+        ]
+        result: dict[str, list[dict[str, Any]]] = {
+            workspace_id: [] for workspace_id in normalized
+        }
+        with self.connect() as db:
+            db.execute(
+                """
+                CREATE TEMP TABLE observed_terminal_activity (
+                    workspace_id TEXT NOT NULL,
+                    tmux_window TEXT NOT NULL,
+                    activity_at INTEGER NOT NULL,
+                    PRIMARY KEY(workspace_id, tmux_window)
+                ) WITHOUT ROWID
+                """
+            )
+            db.executemany(
+                """
+                INSERT INTO observed_terminal_activity(
+                    workspace_id, tmux_window, activity_at
+                ) VALUES (?, ?, ?)
+                """,
+                observations,
+            )
+            db.execute(
+                """
+                UPDATE terminals
+                SET activity_at = MAX(
+                    COALESCE(terminals.activity_at, 0),
+                    (
+                        SELECT observed.activity_at
+                        FROM observed_terminal_activity AS observed
+                        WHERE observed.workspace_id = terminals.workspace_id
+                          AND observed.tmux_window = terminals.tmux_window
+                    )
+                )
+                WHERE terminals.role = 'shell'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM observed_terminal_activity AS observed
+                      WHERE observed.workspace_id = terminals.workspace_id
+                        AND observed.tmux_window = terminals.tmux_window
+                  )
+                """
+            )
+            rows = db.execute(
+                """
+                SELECT terminals.*
+                FROM terminals
+                JOIN observed_terminal_activity AS observed
+                  ON observed.workspace_id = terminals.workspace_id
+                 AND observed.tmux_window = terminals.tmux_window
+                WHERE terminals.role = 'shell'
+                ORDER BY terminals.workspace_id, terminals.created_at
+                """
+            ).fetchall()
+            for row in rows:
+                result[str(row["workspace_id"])].append(dict(row))
+        return result
+
+    def terminal_activity_targets(
+        self, workspace_ids: Iterable[str]
+    ) -> dict[str, list[str]]:
+        """Return known shell window ids for explicit workspaces in one query."""
+
+        unique_ids = list(dict.fromkeys(str(value) for value in workspace_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT workspace_id, tmux_window
+                FROM terminals
+                WHERE role = 'shell' AND workspace_id IN ({placeholders})
+                ORDER BY created_at
+                """,
+                unique_ids,
+            ).fetchall()
+        targets = {workspace_id: [] for workspace_id in unique_ids}
+        for row in rows:
+            targets[str(row["workspace_id"])].append(str(row["tmux_window"]))
+        return targets
 
     def reset_terminals(self, workspace_id: str) -> None:
         with self.connect() as db:
@@ -1095,11 +1333,201 @@ class StateStore:
             )
 
     def touch_terminal_output(self, terminal_id: str) -> None:
+        """Persist direct output without inventing an activity revision."""
+
         with self.connect() as db:
-            db.execute(
+            cursor = db.execute(
                 "UPDATE terminals SET last_output_at = ? WHERE id = ?",
                 (utc_now(), terminal_id),
             )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Unknown Terminal: {terminal_id}")
+
+    def _cleanup_terminal_activity_reads(self, db: sqlite3.Connection) -> None:
+        monotonic_now = time.monotonic()
+        if monotonic_now < self._terminal_activity_cleanup_at:
+            return
+        self._terminal_activity_cleanup_at = (
+            monotonic_now + TERMINAL_ACTIVITY_READ_CLEANUP_INTERVAL_SECONDS
+        )
+        cutoff = datetime.now(UTC) - (
+            TERMINAL_ACTIVITY_READ_RETENTION
+            + TERMINAL_ACTIVITY_CLOCK_SKEW_ALLOWANCE
+        )
+        db.execute(
+            "DELETE FROM terminal_activity_reads WHERE updated_at < ?",
+            (cutoff.isoformat(timespec="seconds"),),
+        )
+
+    def terminal_activity_summary(
+        self,
+        device_id: str,
+        *,
+        workspace_id: str | None = None,
+        workspace_ids: Iterable[str] | None = None,
+        terminal_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return cached shell activity, baselining a device on first observation."""
+
+        safe_device_id = str(device_id).strip()
+        if not safe_device_id:
+            raise ValueError("Terminal activity device identity is required")
+        conditions = ["terminals.role = 'shell'", "terminals.activity_at IS NOT NULL"]
+        parameters: list[object] = []
+        if workspace_id is not None:
+            conditions.append("terminals.workspace_id = ?")
+            parameters.append(str(workspace_id))
+        if workspace_ids is not None:
+            scoped_workspace_ids = list(
+                dict.fromkeys(str(value) for value in workspace_ids)
+            )
+            if not scoped_workspace_ids:
+                conditions.append("0")
+            else:
+                placeholders = ",".join("?" for _ in scoped_workspace_ids)
+                conditions.append(f"terminals.workspace_id IN ({placeholders})")
+                parameters.extend(scoped_workspace_ids)
+        if terminal_id is not None:
+            conditions.append("terminals.id = ?")
+            parameters.append(str(terminal_id))
+        where = " AND ".join(conditions)
+        now = utc_now()
+        with self.connect() as db:
+            self._cleanup_terminal_activity_reads(db)
+            db.execute(
+                f"""
+                INSERT INTO terminal_activity_reads(
+                    terminal_id, device_id, acknowledged_activity_at,
+                    created_at, updated_at
+                )
+                SELECT terminals.id, ?, terminals.activity_at, ?, ?
+                FROM terminals
+                WHERE {where}
+                ON CONFLICT(terminal_id, device_id) DO NOTHING
+                """,
+                (safe_device_id, now, now, *parameters),
+            )
+            rows = db.execute(
+                f"""
+                SELECT terminals.id AS terminal_id, terminals.workspace_id,
+                       terminals.activity_at, reads.acknowledged_activity_at
+                FROM terminals
+                JOIN terminal_activity_reads AS reads
+                  ON reads.terminal_id = terminals.id AND reads.device_id = ?
+                WHERE {where}
+                ORDER BY terminals.activity_at DESC, terminals.created_at DESC
+                """,
+                (safe_device_id, *parameters),
+            ).fetchall()
+            terminal_rows = [
+                {
+                    "terminal_id": str(row["terminal_id"]),
+                    "workspace_id": str(row["workspace_id"]),
+                    "activity_at": int(row["activity_at"]),
+                    "acknowledged_activity_at": int(row["acknowledged_activity_at"]),
+                    "unread": int(row["activity_at"])
+                    > int(row["acknowledged_activity_at"]),
+                }
+                for row in rows
+            ]
+
+        workspace_summaries: dict[str, dict[str, Any]] = {}
+        for row in terminal_rows:
+            current_workspace_id = str(row["workspace_id"])
+            summary = workspace_summaries.setdefault(
+                current_workspace_id,
+                {
+                    "workspace_id": current_workspace_id,
+                    "terminal_count": 0,
+                    "unread_terminal_count": 0,
+                    "unread_count": 0,
+                    "latest_unread_terminal_id": None,
+                },
+            )
+            summary["terminal_count"] += 1
+            if row["unread"]:
+                summary["unread_terminal_count"] += 1
+                summary["unread_count"] += 1
+                if summary["latest_unread_terminal_id"] is None:
+                    summary["latest_unread_terminal_id"] = row["terminal_id"]
+        workspace_rows = list(workspace_summaries.values())
+        unread_rows = [row for row in terminal_rows if row["unread"]]
+        return {
+            "terminals": terminal_rows,
+            "workspaces": workspace_rows,
+            "unread_count": len(unread_rows),
+            "latest_unread_terminal_id": (
+                unread_rows[0]["terminal_id"] if unread_rows else None
+            ),
+        }
+
+    def acknowledge_terminal_activity(
+        self,
+        terminal_id: str,
+        device_id: str,
+        observed_activity_at: int,
+    ) -> dict[str, Any]:
+        """Advance one device only to the exact cached revision it observed."""
+
+        normalized_observed_activity_at = self._terminal_activity_revision(
+            observed_activity_at
+        )
+        assert normalized_observed_activity_at is not None
+        safe_device_id = str(device_id).strip()
+        if not safe_device_id:
+            raise ValueError("Terminal activity device identity is required")
+        now = utc_now()
+        with self.connect() as db:
+            self._cleanup_terminal_activity_reads(db)
+            terminal = db.execute(
+                "SELECT id, workspace_id, role, activity_at FROM terminals WHERE id = ?",
+                (str(terminal_id),),
+            ).fetchone()
+            if terminal is None or str(terminal["role"]) != "shell":
+                raise KeyError(f"Unknown shell Terminal: {terminal_id}")
+            current = terminal["activity_at"]
+            if current is None:
+                raise KeyError(f"Terminal activity is unavailable: {terminal_id}")
+            current_revision = int(current)
+            if normalized_observed_activity_at > current_revision:
+                raise ValueError("Terminal activity revision is newer than the server cache")
+            db.execute(
+                """
+                INSERT INTO terminal_activity_reads(
+                    terminal_id, device_id, acknowledged_activity_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(terminal_id, device_id) DO UPDATE SET
+                    acknowledged_activity_at = MAX(
+                        terminal_activity_reads.acknowledged_activity_at,
+                        excluded.acknowledged_activity_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(terminal_id),
+                    safe_device_id,
+                    normalized_observed_activity_at,
+                    now,
+                    now,
+                ),
+            )
+            acknowledged = int(
+                db.execute(
+                    """
+                    SELECT acknowledged_activity_at FROM terminal_activity_reads
+                    WHERE terminal_id = ? AND device_id = ?
+                    """,
+                    (str(terminal_id), safe_device_id),
+                ).fetchone()["acknowledged_activity_at"]
+            )
+        return {
+            "terminal_id": str(terminal_id),
+            "workspace_id": str(terminal["workspace_id"]),
+            "activity_at": current_revision,
+            "acknowledged_activity_at": acknowledged,
+            "unread": current_revision > acknowledged,
+        }
 
     def rename_terminal(self, terminal_id: str, name: str) -> None:
         with self.connect() as db:

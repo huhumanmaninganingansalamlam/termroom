@@ -116,6 +116,19 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "workspace.ensure",
         "workspace.usage",
     }
+    terminal_operations = {
+        operation
+        for operation in NODE_REQUEST_OPERATIONS
+        if operation.startswith("terminal.")
+    }
+    assert terminal_operations == {
+        "terminal.activity",
+        "terminal.attach",
+        "terminal.close",
+        "terminal.create",
+        "terminal.rename",
+        "terminal.scrollback",
+    }
     file_run_operations = {
         operation
         for operation in NODE_REQUEST_OPERATIONS

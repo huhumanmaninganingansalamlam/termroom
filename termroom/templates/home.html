@@ -24,12 +24,18 @@
   </header>
 
   {% if recent %}
-  <div class="workspace-table" aria-label="{{ t('home.recent_workspaces') }}">
+  <div class="workspace-table"
+       aria-label="{{ t('home.recent_workspaces') }}"
+       data-terminal-activity-summary
+       data-summary-url="/api/terminal-activity/summary">
     <div class="workspace-table-head" aria-hidden="true">
       <span>{{ t('home.project') }}</span><span>{{ t('home.last_used') }}</span><span>{{ t('home.status') }}</span><span></span>
     </div>
     {% for workspace in recent %}
-    <a class="workspace-item" href="/w/{{ workspace.id }}">
+    <a class="workspace-item"
+       href="/w/{{ workspace.id }}"
+       data-terminal-activity-workspace="{{ workspace.id }}"
+       data-workspace-href="/w/{{ workspace.id }}">
       <span class="workspace-main">
         <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
         <span>
@@ -44,6 +50,12 @@
           {{ t(workspace.session_status_label) }}
         </span>
         <small>{{ t('common.terminal') }} {{ workspace.terminal_count }} · {{ workspace.connection_label or t('home.this_computer') }}</small>
+        <small class="workspace-terminal-unread" data-terminal-activity-unread hidden>
+          <span class="terminal-unread-dot" aria-hidden="true"></span>
+          <span>{{ t('terminal.activity.new_output') }}</span>
+          <span aria-hidden="true">·</span>
+          <span data-terminal-activity-count></span>
+        </small>
       </span>
       <span class="row-arrow" aria-hidden="true">→</span>
     </a>

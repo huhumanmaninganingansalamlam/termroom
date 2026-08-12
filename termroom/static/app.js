@@ -20,16 +20,6 @@
     }
   };
   const systemTheme = () => (themeMedia?.matches ? "light" : "dark");
-  const themeToggleTemplate = document.querySelector("#theme-toggle-template");
-  if (!document.querySelector("[data-theme-toggle]") && themeToggleTemplate) {
-    document
-      .querySelectorAll(".workspace-brand-actions, .workspace-mobile-actions")
-      .forEach((target) => {
-        const toggle = themeToggleTemplate.content.firstElementChild?.cloneNode(true);
-        if (toggle) target.prepend(toggle);
-      });
-  }
-
   const themeToggles = () => [...document.querySelectorAll("[data-theme-toggle]")];
   const updateThemeControls = (theme) => {
     const nextTheme = theme === "dark" ? "light" : "dark";
@@ -92,11 +82,47 @@
     set: (theme) => applyTheme(theme, { persist: true, source: "api" }),
   });
 
+  const userMenus = [...document.querySelectorAll("[data-user-menu]")];
+  const visibleUserMenu = (menu) => menu.getClientRects().length > 0;
+  const closeUserMenu = (menu, { restoreFocus = false } = {}) => {
+    if (!(menu instanceof HTMLDetailsElement) || !menu.open) return;
+    menu.open = false;
+    if (restoreFocus) menu.querySelector("summary")?.focus({ preventScroll: true });
+  };
+  userMenus.forEach((menu) => {
+    menu.addEventListener("toggle", () => {
+      if (!menu.open) return;
+      if (!visibleUserMenu(menu)) {
+        menu.open = false;
+        return;
+      }
+      userMenus.forEach((other) => {
+        if (other !== menu) closeUserMenu(other);
+      });
+    });
+  });
+  document.addEventListener("click", (event) => {
+    userMenus
+      .filter((menu) => menu.open && !menu.contains(event.target))
+      .forEach((menu) => closeUserMenu(menu));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const menu = userMenus.find((candidate) => candidate.open);
+    if (menu) closeUserMenu(menu, { restoreFocus: true });
+  });
+  window.addEventListener("resize", () => {
+    userMenus
+      .filter((menu) => menu.open && !visibleUserMenu(menu))
+      .forEach((menu) => closeUserMenu(menu));
+  });
+
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
 
-  const activityLink = document.querySelector("[data-activity-link]");
+  const activityLinks = [...document.querySelectorAll("[data-activity-link]")];
+  const activityLink = activityLinks[0];
   const activityBadges = [...document.querySelectorAll("[data-activity-unread]")];
   const notificationButton = document.querySelector("[data-notification-enable]");
   const updateUnread = (value) => {
@@ -119,10 +145,11 @@
       // Activity is durable on the Core. A later refresh can recover this badge.
     }
   };
+  const claimActivityLink = activityLinks.find((link) => link.dataset.claimUrl);
   const notificationSupported = (
     window.isSecureContext
     && "Notification" in window
-    && Boolean(activityLink?.dataset.claimUrl)
+    && Boolean(claimActivityLink?.dataset.claimUrl)
   );
   const syncNotificationButton = () => {
     if (!notificationButton) return;
@@ -147,13 +174,13 @@
   const claimActivityNotifications = async () => {
     if (!notificationSupported || Notification.permission !== "granted") return;
     try {
-      const response = await fetch(activityLink.dataset.claimUrl, {
+      const response = await fetch(claimActivityLink.dataset.claimUrl, {
         method: "POST",
         cache: "no-store",
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
-          "X-Termroom-CSRF": activityLink.dataset.csrf || "",
+          "X-Termroom-CSRF": claimActivityLink.dataset.csrf || "",
         },
         body: "{}",
       });
@@ -176,31 +203,168 @@
       // Notification delivery is optional; the Activity record remains available.
     }
   };
-  let activityNotificationTimer = 0;
-  const startActivityNotificationPolling = () => {
-    if (!notificationSupported || Notification.permission !== "granted") return;
-    claimActivityNotifications();
-    if (!activityNotificationTimer) {
-      activityNotificationTimer = window.setInterval(claimActivityNotifications, 5000);
+  let activityRefreshInFlight = false;
+  let lastActivityRefreshAt = 0;
+  const refreshActivityOnce = async ({ force = false } = {}) => {
+    if (document.hidden || activityRefreshInFlight) return;
+    const now = window.performance.now();
+    if (!force && now - lastActivityRefreshAt < 750) return;
+    activityRefreshInFlight = true;
+    try {
+      if (notificationSupported && Notification.permission === "granted") {
+        await claimActivityNotifications();
+      } else {
+        await refreshActivitySummary();
+      }
+    } finally {
+      lastActivityRefreshAt = window.performance.now();
+      activityRefreshInFlight = false;
     }
   };
   notificationButton?.addEventListener("click", async () => {
     if (!notificationSupported) return;
     const permission = await Notification.requestPermission();
     syncNotificationButton();
-    if (permission === "granted") startActivityNotificationPolling();
+    if (permission === "granted") await refreshActivityOnce({ force: true });
   });
   if (activityLink) {
-    refreshActivitySummary();
-    window.setInterval(refreshActivitySummary, 15000);
-    if (notificationSupported && Notification.permission === "granted") {
-      startActivityNotificationPolling();
-    }
+    refreshActivityOnce({ force: true });
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) refreshActivitySummary();
+      if (!document.hidden) refreshActivityOnce();
     });
+    window.addEventListener("focus", () => refreshActivityOnce());
   }
   syncNotificationButton();
+
+  const terminalActivitySummary = document.querySelector("[data-terminal-activity-summary]");
+  const workspaceTerminalActivity = document.querySelector("[data-workspace-terminal-activity]");
+  const terminalActivityEntries = (result, key) => {
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    const entries = payload?.[key];
+    if (Array.isArray(entries)) return entries;
+    if (entries && typeof entries === "object") return Object.values(entries);
+    return [];
+  };
+  const unreadTerminalCount = (entry) => {
+    const explicit = entry?.unread_terminal_count ?? entry?.unread_count;
+    if (explicit !== undefined && explicit !== null) {
+      return Math.max(0, Number(explicit) || 0);
+    }
+    return terminalActivityEntries(entry, "terminals").filter((item) => item?.unread).length;
+  };
+  const latestUnreadTerminalId = (entry) => {
+    const explicit = entry?.latest_unread_terminal_id ?? entry?.latest_terminal_id;
+    if (explicit) return String(explicit);
+    const unread = terminalActivityEntries(entry, "terminals").filter((item) => item?.unread);
+    unread.sort((left, right) => Number(right.activity_at || 0) - Number(left.activity_at || 0));
+    return unread[0]?.terminal_id || unread[0]?.id || "";
+  };
+  const renderHomeTerminalActivity = (result) => {
+    const entries = terminalActivityEntries(result, "workspaces");
+    const byWorkspace = new Map(
+      entries.map((entry) => [String(entry.workspace_id ?? entry.id ?? ""), entry]),
+    );
+    terminalActivitySummary
+      ?.querySelectorAll("[data-terminal-activity-workspace]")
+      .forEach((row) => {
+        const entry = byWorkspace.get(String(row.dataset.terminalActivityWorkspace || ""));
+        const count = unreadTerminalCount(entry);
+        const unread = row.querySelector("[data-terminal-activity-unread]");
+        const countNode = row.querySelector("[data-terminal-activity-count]");
+        if (unread) unread.hidden = count === 0;
+        if (countNode) {
+          countNode.textContent = tr(
+            count === 1
+              ? "terminal.activity.unread_terminal"
+              : "terminal.activity.unread_terminals",
+            { count },
+          );
+        }
+        const terminalId = latestUnreadTerminalId(entry);
+        row.href = count > 0 && terminalId
+          ? `/w/${encodeURIComponent(row.dataset.terminalActivityWorkspace)}/terminal?terminal=${encodeURIComponent(terminalId)}`
+          : row.dataset.workspaceHref;
+      });
+  };
+  const renderWorkspaceTerminalActivity = (result) => {
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    const count = unreadTerminalCount(payload);
+    document.querySelectorAll("[data-terminal-activity-nav-unread]").forEach((dot) => {
+      dot.hidden = count === 0;
+    });
+    const terminals = terminalActivityEntries(payload, "terminals");
+    const byTerminal = new Map(
+      terminals.map((entry) => [String(entry.terminal_id ?? entry.id ?? ""), entry]),
+    );
+    document.querySelectorAll("[data-terminal-activity-tab]").forEach((tab) => {
+      const dot = tab.querySelector("[data-terminal-activity-tab-unread]");
+      if (!dot || tab.dataset.terminalRole !== "shell") return;
+      dot.hidden = !Boolean(byTerminal.get(String(tab.dataset.terminalActivityTab))?.unread);
+    });
+  };
+  const syncWorkspaceTerminalUnreadFromTabs = () => {
+    const unread = [...document.querySelectorAll("[data-terminal-activity-tab-unread]")]
+      .some((dot) => !dot.hidden);
+    document.querySelectorAll("[data-terminal-activity-nav-unread]").forEach((dot) => {
+      dot.hidden = !unread;
+    });
+  };
+  let terminalActivityRefreshInFlight = false;
+  let lastTerminalActivityRefreshAt = 0;
+  const terminalActivityRequestUrl = (target) => {
+    const url = target?.dataset.summaryUrl || target?.dataset.activityUrl;
+    if (!url || !terminalActivitySummary) return url;
+    const workspaceIds = [
+      ...new Set(
+        [...terminalActivitySummary.querySelectorAll("[data-terminal-activity-workspace]")]
+          .map((row) => String(row.dataset.terminalActivityWorkspace || ""))
+          .filter(Boolean),
+      ),
+    ].slice(0, 20);
+    const searchParams = new URLSearchParams();
+    workspaceIds.forEach((workspaceId) => searchParams.append("workspace_id", workspaceId));
+    const query = searchParams.toString();
+    return query ? `${url}?${query}` : url;
+  };
+  const refreshTerminalActivity = async ({ force = false } = {}) => {
+    if (document.hidden || terminalActivityRefreshInFlight) return;
+    const now = window.performance.now();
+    if (!force && now - lastTerminalActivityRefreshAt < 750) return;
+    const target = terminalActivitySummary || workspaceTerminalActivity;
+    const url = terminalActivityRequestUrl(target);
+    if (!url) return;
+    terminalActivityRefreshInFlight = true;
+    try {
+      const response = await fetch(url, {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      const result = await response.json();
+      if (!response.ok || result?.ok === false) throw new Error("terminal activity unavailable");
+      if (terminalActivitySummary) renderHomeTerminalActivity(result);
+      if (workspaceTerminalActivity) renderWorkspaceTerminalActivity(result);
+      window.dispatchEvent(
+        new CustomEvent("termroom:terminal-activity-refreshed", { detail: result }),
+      );
+    } catch {
+      // Unread state is durable; leave the last rendered state until the next visit.
+    } finally {
+      lastTerminalActivityRefreshAt = window.performance.now();
+      terminalActivityRefreshInFlight = false;
+    }
+  };
+  if (terminalActivitySummary || workspaceTerminalActivity) {
+    refreshTerminalActivity({ force: true });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshTerminalActivity();
+    });
+    window.addEventListener("focus", () => refreshTerminalActivity());
+    window.addEventListener(
+      "termroom:terminal-activity-changed",
+      syncWorkspaceTerminalUnreadFromTabs,
+    );
+  }
 
   const workspaceUsageViews = [...document.querySelectorAll("[data-workspace-usage-view]")];
   if (workspaceUsageViews.length) {

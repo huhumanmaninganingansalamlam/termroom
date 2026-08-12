@@ -2992,6 +2992,51 @@ class SSHBackend:
             raise SSHBackendError("Remote tmux session did not expose any terminal windows")
         return self.store.reconcile_terminals(str(workspace["id"]), windows)
 
+    def refresh_activity(
+        self,
+        computer: dict[str, Any],
+        workspaces: list[dict[str, Any]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Refresh explicit SSH workspaces with one remote tmux query."""
+
+        requested = {
+            str(workspace["tmux_session"]): workspace
+            for workspace in workspaces
+            if str(workspace.get("computer_id") or "") == str(computer.get("id") or "")
+        }
+        if not requested:
+            return {}
+        sessions = " ".join(shlex.quote(session) for session in requested)
+        command = (
+            "command -v tmux >/dev/null 2>&1 || exit 45; "
+            f"for session in {sessions}; do "
+            "tmux has-session -t \"$session\" 2>/dev/null || continue; "
+            "tmux list-windows -t \"$session\" "
+            f"-F {shlex.quote(TMUX_TERMINAL_RECORD_FORMAT)}; "
+            "done"
+        )
+        output = self._exec(computer, self._remote_posix_command(command))
+        try:
+            records = parse_tmux_terminal_records(output)
+        except ValueError as exc:
+            raise SSHBackendError(
+                "Remote tmux exposed an invalid Terminal activity record"
+            ) from exc
+        grouped: dict[str, list[dict[str, Any]]] = {
+            str(workspace["id"]): [] for workspace in requested.values()
+        }
+        for record in records:
+            workspace = requested.get(str(record["tmux_session"]))
+            if workspace is not None:
+                grouped[str(workspace["id"])].append(record)
+        return self.store.observe_terminal_activity_batch(
+            {
+                workspace_id: workspace_records
+                for workspace_id, workspace_records in grouped.items()
+                if workspace_records
+            }
+        )
+
     def workspace_usage(self, workspace: dict[str, Any]) -> RawWorkspaceUsage:
         session = shlex.quote(str(workspace["tmux_session"]))
         command = (
@@ -3526,16 +3571,24 @@ class SSHBackend:
                 except OSError:
                     tail = decoder.feed(b"", final=True)
                     if tail:
+                        await asyncio.to_thread(
+                            self.store.touch_terminal_output, terminal_id
+                        )
                         await websocket.send_text(tail)
                     return
                 if not chunk:
                     tail = decoder.feed(b"", final=True)
                     if tail:
+                        await asyncio.to_thread(
+                            self.store.touch_terminal_output, terminal_id
+                        )
                         await websocket.send_text(tail)
                     return
-                await asyncio.to_thread(self.store.touch_terminal_output, str(terminal["id"]))
                 decoded = decoder.feed(chunk)
                 if decoded:
+                    await asyncio.to_thread(
+                        self.store.touch_terminal_output, terminal_id
+                    )
                     await websocket.send_text(decoded)
 
         async def browser_to_input() -> None:
@@ -3566,6 +3619,19 @@ class SSHBackend:
                 kind = payload.get("kind")
                 if kind == "claim":
                     self.control.claim_view(terminal_id, client_id)
+                elif kind == "activity_ack":
+                    revision = payload.get("activity_at")
+                    if isinstance(revision, bool) or not isinstance(revision, int):
+                        continue
+                    try:
+                        await asyncio.to_thread(
+                            self.store.acknowledge_terminal_activity,
+                            terminal_id,
+                            device_id,
+                            revision,
+                        )
+                    except (KeyError, ValueError):
+                        continue
                 elif kind == "resize":
                     if not self.control.can_resize(terminal_id, client_id):
                         continue

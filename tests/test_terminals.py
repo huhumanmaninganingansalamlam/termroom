@@ -12,6 +12,7 @@ import pytest
 
 from termroom.db import StateStore
 from termroom.terminals import (
+    TMUX_TERMINAL_RECORD_FORMAT,
     TerminalManager,
     TerminalOutputDecoder,
     normalize_terminal_name,
@@ -94,17 +95,90 @@ def test_managed_terminal_row_survives_tmux_window_id_drift(tmp_path: Path) -> N
 
 def test_tmux_terminal_records_preserve_printable_delimiters_in_names() -> None:
     records = parse_tmux_terminal_records(
-        "@7|worker|with|pipes|file_run|run-123\n"
+        "termroom-project|@7|1700000123|worker|with|pipes|file_run|run-123\n"
     )
 
     assert records == [
         {
             "tmux_window": "@7",
+            "tmux_session": "termroom-project",
             "name": "worker|with|pipes",
             "role": "file_run",
             "managed_run_id": "run-123",
+            "activity_at": 1700000123,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "record",
+    (
+        "termroom-project|@7||shell|shell|",
+        "termroom-project|@7|-1|shell|shell|",
+        "termroom-project|@7|not-a-revision|shell|shell|",
+    ),
+)
+def test_tmux_terminal_records_reject_invalid_activity_revisions(record: str) -> None:
+    with pytest.raises(ValueError, match="invalid Terminal record"):
+        parse_tmux_terminal_records(record)
+
+
+def test_legacy_tmux_terminal_records_remain_compatible_without_activity() -> None:
+    assert parse_tmux_terminal_records("@7|shell|shell|\n") == [
+        {
+            "tmux_window": "@7",
+            "tmux_session": None,
+            "activity_at": None,
+            "name": "shell",
+            "role": "shell",
+            "managed_run_id": None,
+        }
+    ]
+
+
+def test_terminal_activity_refresh_batches_local_sessions_without_running_tmux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    (root / "first").mkdir(parents=True)
+    (root / "second").mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace_manager = WorkspaceManager(RootManager(root), store)
+    first = workspace_manager.open("first")
+    second = workspace_manager.open("second")
+    first_terminal = store.create_terminal(str(first["id"]), "shell", "@1")
+    second_terminal = store.create_terminal(str(second["id"]), "logs", "@2")
+    manager = TerminalManager(store)
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def fake_tmux(
+        *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((args, check))
+        return subprocess.CompletedProcess(
+            ["tmux", *args],
+            0,
+            (
+                f"{first['tmux_session']}|@1|100|shell|shell|\n"
+                f"{second['tmux_session']}|@2|200|logs|shell|\n"
+                "unrelated-session|@9|999|ignore|shell|\n"
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(manager, "_run_tmux", fake_tmux)
+
+    refreshed = manager.refresh_activity([first, second])
+
+    assert calls == [
+        (("list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT), False)
+    ]
+    assert refreshed[str(first["id"])][0]["id"] == first_terminal["id"]
+    assert refreshed[str(first["id"])][0]["activity_at"] == 100
+    assert refreshed[str(second["id"])][0]["id"] == second_terminal["id"]
+    assert refreshed[str(second["id"])][0]["activity_at"] == 200
 
 
 def test_tmux_commands_do_not_inherit_termroom_or_legacy_password(

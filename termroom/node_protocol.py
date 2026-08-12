@@ -38,6 +38,7 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "terminal.create",
         "terminal.rename",
         "terminal.close",
+        "terminal.activity",
         "terminal.scrollback",
         "terminal.attach",
         "files.list",

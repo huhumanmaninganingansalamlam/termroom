@@ -13,10 +13,10 @@ import zipfile
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, urlencode, urlparse
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -67,7 +67,10 @@ from termroom.node_protocol import (
 )
 from termroom.node_remote_runs import NodeRemoteRunClient
 from termroom.pwa_icon import termroom_png_icon
-from termroom.remote_access import RemoteAccess, RemoteAccessError
+from termroom.remote_access import (
+    RemoteAccess,
+    RemoteAccessError,
+)
 from termroom.remote_runs import RemoteRunConflict, RemoteRunError, RemoteRunManager
 from termroom.run_sources import normalize_source_relative_path
 from termroom.runtime import runtime_stamp
@@ -156,6 +159,9 @@ def create_app(settings: Settings) -> FastAPI:
     active_terminal_websockets: dict[str, list[WebSocket]] = {}
     recent_file_snapshots: dict[str, dict[str, tuple[int, int]]] = {}
     recent_file_cache: dict[str, tuple[list[dict[str, Any]], RecentFiles]] = {}
+    terminal_activity_refreshes: dict[
+        tuple[str, str], tuple[frozenset[str], asyncio.Task[None]]
+    ] = {}
 
     app = FastAPI(title="Termroom", docs_url=None, redoc_url=None)
     app.state.settings = settings
@@ -814,6 +820,132 @@ def create_app(settings: Settings) -> FastAPI:
         return JSONResponse(
             {"ok": True, "unread_count": store.count_unread_events()}
         )
+
+    async def _refresh_terminal_activity_provider(
+        provider_key: tuple[str, str],
+        scoped_workspaces: list[dict[str, Any]],
+    ) -> None:
+        """Take one resilient snapshot from exactly one activity provider."""
+
+        try:
+            if provider_key[0] == "local":
+                await asyncio.to_thread(terminals.refresh_activity, scoped_workspaces)
+            else:
+                await remote.refresh_terminal_activity(scoped_workspaces)
+        except Exception:
+            # Activity is an opportunistic enhancement. Cached state remains
+            # usable when one Local or Remote provider is temporarily offline.
+            return
+
+    async def refresh_terminal_activity_provider(
+        provider_key: tuple[str, str],
+        scoped_workspaces: list[dict[str, Any]],
+    ) -> None:
+        """Serialize one provider and share any in-flight covered scope."""
+
+        requested = {
+            str(workspace["id"]): workspace for workspace in scoped_workspaces
+        }
+        while requested:
+            in_flight = terminal_activity_refreshes.get(provider_key)
+            if in_flight is not None:
+                covered, task = in_flight
+                await asyncio.shield(task)
+                requested = {
+                    workspace_id: workspace
+                    for workspace_id, workspace in requested.items()
+                    if workspace_id not in covered
+                }
+                continue
+
+            covered = frozenset(requested)
+            task = asyncio.create_task(
+                _refresh_terminal_activity_provider(
+                    provider_key, list(requested.values())
+                )
+            )
+            terminal_activity_refreshes[provider_key] = (covered, task)
+
+            def clear(
+                completed: asyncio.Task[None],
+                *,
+                key: tuple[str, str] = provider_key,
+            ) -> None:
+                current = terminal_activity_refreshes.get(key)
+                if current is not None and current[1] is completed:
+                    terminal_activity_refreshes.pop(key, None)
+
+            task.add_done_callback(clear)
+            await asyncio.shield(task)
+            return
+
+    async def refresh_terminal_activity_scope(
+        scoped_workspaces: list[dict[str, Any]],
+    ) -> None:
+        """Refresh Local once and each Remote computer once, concurrently."""
+
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for workspace in scoped_workspaces:
+            if workspace.get("backend_kind", "local") == "local":
+                provider_key = ("local", "local")
+            else:
+                computer = workspace.get("computer")
+                computer_id = workspace.get("computer_id")
+                if not computer_id and isinstance(computer, dict):
+                    computer_id = computer.get("id")
+                if not computer_id:
+                    continue
+                provider_key = ("remote", str(computer_id))
+            grouped.setdefault(provider_key, []).append(workspace)
+        await asyncio.gather(
+            *(
+                refresh_terminal_activity_provider(provider_key, workspaces_for_provider)
+                for provider_key, workspaces_for_provider in grouped.items()
+            )
+        )
+
+    def terminal_activity_payload(
+        request: Request,
+        *,
+        workspace_id: str | None = None,
+        workspace_ids: list[str] | None = None,
+        terminal_id: str | None = None,
+    ) -> dict[str, Any]:
+        summary = store.terminal_activity_summary(
+            str(request.state.session["id"]),
+            workspace_id=workspace_id,
+            workspace_ids=workspace_ids,
+            terminal_id=terminal_id,
+        )
+        return {"ok": True, **summary}
+
+    @app.get("/api/terminal-activity/summary", response_class=JSONResponse)
+    async def terminal_activity_summary(
+        request: Request,
+        workspace_id: Annotated[list[str] | None, Query()] = None,
+    ) -> dict[str, Any]:
+        requested_ids = list(dict.fromkeys(workspace_id or ()))
+        if len(requested_ids) > 20:
+            raise HTTPException(status_code=400, detail="Too many Workspaces requested")
+        scoped_workspaces = store.terminal_activity_workspaces(requested_ids)
+        if len(scoped_workspaces) != len(requested_ids):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        await refresh_terminal_activity_scope(scoped_workspaces)
+        return terminal_activity_payload(
+            request,
+            workspace_ids=requested_ids,
+        )
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/terminal-activity",
+        response_class=JSONResponse,
+    )
+    async def workspace_terminal_activity(
+        request: Request, workspace_id: str
+    ) -> dict[str, Any]:
+        workspace = _require_workspace(workspaces, workspace_id)
+        await refresh_terminal_activity_scope([workspace])
+        return terminal_activity_payload(request, workspace_id=workspace_id)
 
     @app.post(
         "/api/activity/notifications/claim",

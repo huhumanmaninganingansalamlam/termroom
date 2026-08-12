@@ -91,6 +91,7 @@ def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(tmp_path
                 f"/ws/terminal/{terminal['id']}",
                 headers={"origin": "http://testserver"},
             ) as websocket:
+                assert isinstance(websocket.receive_text(), str)
                 websocket.send_json(
                     {
                         "kind": "input",

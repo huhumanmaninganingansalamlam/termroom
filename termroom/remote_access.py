@@ -70,6 +70,8 @@ async def _cancel_bridge_tasks(tasks: Iterable[asyncio.Task[None]]) -> None:
 class RemoteAccess:
     """Explicit SSH-or-Node dispatch for the shared Remote product surface."""
 
+    TERMINAL_ACTIVITY_MAX_CONCURRENT_COMPUTERS = 4
+
     def __init__(
         self,
         store: StateStore,
@@ -81,6 +83,9 @@ class RemoteAccess:
         self.ssh = ssh
         self.nodes = nodes
         self.control = control
+        self._terminal_activity_concurrency = asyncio.Semaphore(
+            self.TERMINAL_ACTIVITY_MAX_CONCURRENT_COMPUTERS
+        )
 
     @staticmethod
     def is_node(value: Mapping[str, Any]) -> bool:
@@ -177,6 +182,118 @@ class RemoteAccess:
             return await asyncio.to_thread(self.ssh.ensure_workspace, workspace)
         result = await self._workspace_request(workspace, "workspace.ensure", {})
         return self._reconcile_terminals(workspace, result.get("terminals"))
+
+    async def refresh_terminal_activity(
+        self, workspaces: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Refresh Remote activity once per computer for explicit workspaces."""
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for workspace in workspaces:
+            computer = workspace.get("computer")
+            if not isinstance(computer, Mapping):
+                continue
+            grouped.setdefault(str(computer["id"]), []).append(workspace)
+        targets = self.store.terminal_activity_targets(
+            str(workspace["id"])
+            for computer_workspaces in grouped.values()
+            for workspace in computer_workspaces
+        )
+        async def refresh_computer(
+            computer_workspaces: list[dict[str, Any]],
+        ) -> dict[str, list[dict[str, Any]]]:
+            async with self._terminal_activity_concurrency:
+                computer = computer_workspaces[0]["computer"]
+                try:
+                    if not self.is_node(computer):
+                        return await asyncio.to_thread(
+                            self.ssh.refresh_activity, computer, computer_workspaces
+                        )
+                    request_workspaces: list[dict[str, Any]] = []
+                    by_session: dict[str, dict[str, Any]] = {}
+                    requested_windows: dict[str, set[str]] = {}
+                    for workspace in computer_workspaces:
+                        session = str(workspace["tmux_session"])
+                        windows = targets.get(str(workspace["id"]), [])
+                        if not windows:
+                            continue
+                        if session in by_session:
+                            raise RemoteAccessError(
+                                "Node Terminal activity batch is ambiguous"
+                            )
+                        by_session[session] = workspace
+                        requested_windows[session] = set(windows)
+                        request_workspaces.append(
+                            {
+                                "tmux_session": session,
+                                "windows": windows,
+                            }
+                        )
+                    if not request_workspaces:
+                        return {}
+                    result = await self._node_request(
+                        computer,
+                        "terminal.activity",
+                        {"workspaces": request_workspaces},
+                    )
+                    raw_workspaces = result.get("workspaces")
+                    if not isinstance(raw_workspaces, list) or len(
+                        raw_workspaces
+                    ) != len(request_workspaces):
+                        raise RemoteAccessError("Node returned invalid Terminal activity")
+                    parsed: dict[
+                        str, tuple[dict[str, Any], list[dict[str, Any]]]
+                    ] = {}
+                    for raw in raw_workspaces:
+                        if not isinstance(raw, Mapping):
+                            raise RemoteAccessError(
+                                "Node returned invalid Terminal activity"
+                            )
+                        session = str(raw.get("tmux_session") or "")
+                        workspace = by_session.get(session)
+                        terminals = raw.get("terminals")
+                        if (
+                            workspace is None
+                            or session in parsed
+                            or not isinstance(terminals, list)
+                            or len(terminals) > len(requested_windows[session])
+                        ):
+                            raise RemoteAccessError(
+                                "Node returned invalid Terminal activity"
+                            )
+                        records = [self._terminal_record(item) for item in terminals]
+                        returned_windows = [
+                            str(item["tmux_window"]) for item in records
+                        ]
+                        if len(set(returned_windows)) != len(
+                            returned_windows
+                        ) or not set(returned_windows).issubset(
+                            requested_windows[session]
+                        ):
+                            raise RemoteAccessError(
+                                "Node returned invalid Terminal activity"
+                            )
+                        parsed[session] = (workspace, records)
+                    if set(parsed) != set(by_session):
+                        raise RemoteAccessError(
+                            "Node returned incomplete Terminal activity"
+                        )
+                    return self.store.observe_terminal_activity_batch(
+                        {
+                            str(workspace["id"]): records
+                            for workspace, records in parsed.values()
+                        }
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    return {}
+
+        batches = await asyncio.gather(
+            *(refresh_computer(items) for items in grouped.values())
+        )
+        refreshed: dict[str, list[dict[str, Any]]] = {}
+        for batch in batches:
+            refreshed.update(batch)
+        return refreshed
 
     async def workspace_usage(
         self, workspace: dict[str, Any]
@@ -824,10 +941,15 @@ class RemoteAccess:
                 async for chunk in stream:
                     decoded = decoder.feed(chunk)
                     if decoded:
-                        self.store.touch_terminal_output(terminal_id)
+                        await asyncio.to_thread(
+                            self.store.touch_terminal_output, terminal_id
+                        )
                         await websocket.send_text(decoded)
                 tail = decoder.feed(b"", final=True)
                 if tail:
+                    await asyncio.to_thread(
+                        self.store.touch_terminal_output, terminal_id
+                    )
                     await websocket.send_text(tail)
 
             async def browser_to_input() -> None:
@@ -858,6 +980,19 @@ class RemoteAccess:
                     kind = payload.get("kind")
                     if kind == "claim":
                         self.control.claim_view(terminal_id, client_id)
+                    elif kind == "activity_ack":
+                        revision = payload.get("activity_at")
+                        if isinstance(revision, bool) or not isinstance(revision, int):
+                            continue
+                        try:
+                            await asyncio.to_thread(
+                                self.store.acknowledge_terminal_activity,
+                                terminal_id,
+                                device_id,
+                                revision,
+                            )
+                        except (KeyError, ValueError):
+                            continue
                     elif kind == "resize":
                         if self.control.can_resize(terminal_id, client_id):
                             size = terminal_size(payload)
@@ -978,13 +1113,20 @@ class RemoteAccess:
         return self.store.reconcile_terminals(str(workspace["id"]), records)
 
     @staticmethod
-    def _terminal_record(value: object) -> dict[str, str | None]:
+    def _terminal_record(value: object) -> dict[str, str | int | None]:
         if not isinstance(value, dict):
             raise RemoteAccessError("Node returned an invalid Terminal")
         window = str(value.get("tmux_window") or "")
         name = str(value.get("name") or "shell")[:255]
         role = str(value.get("role") or "shell")
         managed = str(value.get("managed_run_id") or "") or None
+        raw_activity_at = value.get("activity_at")
+        if raw_activity_at is not None and (
+            isinstance(raw_activity_at, bool)
+            or not isinstance(raw_activity_at, int)
+            or raw_activity_at < 0
+        ):
+            raise RemoteAccessError("Node returned invalid Terminal activity")
         if not window.startswith("@") or not window[1:].isdigit():
             raise RemoteAccessError("Node returned an invalid Terminal identity")
         if role == "shell":
@@ -1008,6 +1150,7 @@ class RemoteAccess:
             "name": name,
             "role": role,
             "managed_run_id": managed,
+            "activity_at": raw_activity_at,
         }
 
     @staticmethod

@@ -1359,8 +1359,12 @@ class NodeRemoteRunRuntime:
         for key in tuple(environment):
             if key.startswith("TERMROOM_"):
                 environment.pop(key, None)
+        command = ["tmux"]
+        test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
+        if test_socket:
+            command.extend(("-S", test_socket))
         result = subprocess.run(
-            ["tmux", *args],
+            [*command, *args],
             check=False,
             capture_output=True,
             text=True,
