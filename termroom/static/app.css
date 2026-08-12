@@ -2362,21 +2362,29 @@ details:not([open]) > :not(summary) {
     height: var(--topbar-height);
     align-items: center;
     justify-content: space-between;
-    padding: 0 16px;
+    padding: 0 8px;
     border-bottom: 1px solid var(--border-subtle);
   }
 
   .workspace-brand-actions {
     display: flex;
     min-width: 0;
+    flex-shrink: 0;
     align-items: center;
-    gap: 7px;
+    gap: 5px;
   }
 
   .workspace-brand {
-    gap: 8px;
+    min-width: 0;
+    gap: 6px;
     font-size: 0.82rem;
     font-weight: 680;
+  }
+
+  .workspace-brand > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .workspace-mode {
@@ -4092,7 +4100,7 @@ details:not([open]) > :not(summary) {
 .workspace-language-select select {
   width: 52px;
   min-height: 32px;
-  padding: 2px 18px 2px 6px;
+  padding: 2px 10px 2px 6px;
   border-color: var(--border);
   background: var(--bg-elevated);
   color: var(--text-secondary);
