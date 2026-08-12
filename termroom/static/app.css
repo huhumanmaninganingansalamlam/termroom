@@ -1727,6 +1727,13 @@ details:not([open]) > :not(summary) {
     min-width: 44px;
     min-height: 44px;
   }
+
+  .workspace-activity-link {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
 }
 
 @media (max-width: 420px) {
@@ -4101,7 +4108,7 @@ details:not([open]) > :not(summary) {
 
   .workspace-language-select select {
     width: 52px;
-    min-height: 36px;
+    min-height: 44px;
   }
 }
 
