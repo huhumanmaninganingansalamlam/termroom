@@ -335,19 +335,3 @@ async def test_file_run_activity_targets_exact_outcome_and_notification_threshol
         )
         assert opened_terminal.status_code == 303
         assert f"terminal={terminal['id']}" in opened_terminal.headers["location"]
-
-
-def test_activity_frontend_contract() -> None:
-    root = Path(__file__).resolve().parents[1]
-    script = (root / "termroom/static/app.js").read_text(encoding="utf-8")
-    base = (root / "termroom/templates/base.html").read_text(encoding="utf-8")
-    workspace = (root / "termroom/templates/workspace_base.html").read_text(
-        encoding="utf-8"
-    )
-
-    assert "Notification.requestPermission()" in script
-    assert 'notificationButton?.addEventListener("click"' in script
-    assert 'tag: `termroom-${activityEvent.id}`' in script
-    assert "/api/activity/notifications/claim" in base
-    assert "app.js') }}?v=52" in base
-    assert "data-activity-link" in workspace

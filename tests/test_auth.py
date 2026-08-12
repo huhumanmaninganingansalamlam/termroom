@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from termroom.app import create_app
-from termroom.auth import SESSION_MAX_AGE_SECONDS, AuthManager
+from termroom.auth import SESSION_MAX_AGE_SECONDS
 from termroom.config import Settings, default_config_dir
 
 
@@ -359,7 +359,8 @@ def test_settings_rejects_world_readable_termroom_password_file(tmp_path: Path) 
         Settings.create(root, state_dir=tmp_path / "state")
 
 
-def test_signed_browser_session_expires_server_side(
+@pytest.mark.asyncio
+async def test_signed_browser_session_expires_server_side(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
@@ -370,15 +371,21 @@ def test_signed_browser_session_expires_server_side(
         access_token="internal-secret",
         login_password="correct-password",
     )
-    manager = AuthManager(settings)
+    app = create_app(settings)
     issued_at = 1_800_000_000
     monkeypatch.setattr("termroom.auth._session_now", lambda: issued_at)
-    token = manager.login("correct-password", remote_key="browser")
-    assert token
-    assert manager._decode_session(token)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        login = await client.post(
+            "/login",
+            data={"password": "correct-password"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+        assert (await client.get("/")).status_code == 200
 
-    monkeypatch.setattr(
-        "termroom.auth._session_now",
-        lambda: issued_at + SESSION_MAX_AGE_SECONDS + 1,
-    )
-    assert manager._decode_session(token) is None
+        monkeypatch.setattr(
+            "termroom.auth._session_now",
+            lambda: issued_at + SESSION_MAX_AGE_SECONDS + 1,
+        )
+        assert (await client.get("/")).status_code == 401

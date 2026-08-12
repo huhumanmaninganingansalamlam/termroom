@@ -10,6 +10,7 @@ import re
 import secrets
 import signal
 import socket
+import ssl
 import stat as stat_module
 import struct
 import subprocess
@@ -129,6 +130,7 @@ class NodeConfig:
     allowed_roots: tuple[Path, ...]
     state_dir: Path | None = None
     run_root: Path | None = None
+    ca_file: Path | None = None
 
 
 @dataclass(slots=True)
@@ -204,21 +206,24 @@ def load_node_config(state_dir: Path) -> NodeConfig:
         raise NodeAgentError("Node configuration is invalid", code="config_invalid")
     roots = normalize_allowed_roots(value.get("allowed_roots", []))
     run_root = normalize_run_root(value.get("run_root"), state_dir=state_dir)
+    core_url = normalize_core_url(str(value.get("core_url") or ""))
     return NodeConfig(
-        core_url=normalize_core_url(str(value.get("core_url") or "")),
+        core_url=core_url,
         node_id=validate_node_id(str(value.get("node_id") or "")),
         name=str(value.get("name") or socket.gethostname())[:120],
         allowed_roots=roots,
         state_dir=state_dir.resolve(),
         run_root=run_root,
+        ca_file=normalize_ca_file(value.get("ca_file"), core_url=core_url),
     )
 
 
 def save_node_config(state_dir: Path, config: NodeConfig) -> None:
     ensure_private_directory(state_dir)
+    core_url = normalize_core_url(config.core_url)
     payload = json.dumps(
         {
-            "core_url": normalize_core_url(config.core_url),
+            "core_url": core_url,
             "node_id": validate_node_id(config.node_id),
             "name": config.name,
             "allowed_roots": [str(path) for path in config.allowed_roots],
@@ -227,6 +232,11 @@ def save_node_config(state_dir: Path, config: NodeConfig) -> None:
                     config.run_root,
                     state_dir=config.state_dir or state_dir,
                 )
+            ),
+            "ca_file": (
+                str(normalize_ca_file(config.ca_file, core_url=core_url))
+                if config.ca_file
+                else None
             ),
             "protocol_version": NODE_PROTOCOL_VERSION,
         },
@@ -270,6 +280,36 @@ def normalize_run_root(value: object, *, state_dir: Path) -> Path:
     return raw.resolve(strict=False)
 
 
+def normalize_ca_file(value: object, *, core_url: str) -> Path | None:
+    if value is None or str(value) == "":
+        return None
+    raw = Path(str(value)).expanduser()
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise NodeAgentError("Node CA file is unavailable", code="ca_file_invalid") from exc
+    if not resolved.is_file():
+        raise NodeAgentError(
+            "Node CA file must resolve to a file", code="ca_file_invalid"
+        )
+    if not core_url.startswith("https://"):
+        raise NodeAgentError(
+            "Node CA file requires an HTTPS Core URL", code="ca_file_requires_https"
+        )
+    return resolved
+
+
+def _node_ssl_context(ca_file: Path | None) -> ssl.SSLContext | None:
+    if ca_file is None:
+        return None
+    try:
+        return ssl.create_default_context(cafile=str(ca_file))
+    except (OSError, ssl.SSLError) as exc:
+        raise NodeAgentError(
+            "Node CA file is not a valid certificate bundle", code="ca_file_invalid"
+        ) from exc
+
+
 def pair_node(
     *,
     state_dir: Path,
@@ -278,10 +318,13 @@ def pair_node(
     allowed_roots: Sequence[str | Path],
     name: str | None = None,
     run_root: str | Path | None = None,
+    ca_file: str | Path | None = None,
     timeout_seconds: float = 600.0,
 ) -> NodeConfig:
     normalized_core = normalize_core_url(core_url)
     roots = normalize_allowed_roots(list(allowed_roots))
+    trusted_ca = normalize_ca_file(ca_file, core_url=normalized_core)
+    ssl_context = _node_ssl_context(trusted_ca)
     private_key = ensure_node_identity(state_dir)
     public_key = public_key_text(private_key.public_key())
     polling_secret = secrets.token_urlsafe(32)
@@ -296,6 +339,7 @@ def pair_node(
             "protocol_version": NODE_PROTOCOL_VERSION,
             "polling_secret": polling_secret,
         },
+        ssl_context=ssl_context,
     )
     enrollment_id = str(enrollment.get("enrollment_id") or "")
     if not enrollment_id:
@@ -306,6 +350,7 @@ def pair_node(
             normalized_core,
             "/api/node/enroll/status",
             {"enrollment_id": enrollment_id, "polling_secret": polling_secret},
+            ssl_context=ssl_context,
         )
         decision = str(status.get("status") or "")
         if decision == "approved":
@@ -316,6 +361,7 @@ def pair_node(
                 allowed_roots=roots,
                 state_dir=state_dir.resolve(),
                 run_root=normalize_run_root(run_root, state_dir=state_dir),
+                ca_file=trusted_ca,
             )
             save_node_config(state_dir, config)
             return config
@@ -2398,6 +2444,7 @@ class NodeAgent:
         self._socket: ClientConnection | None = None
         self._request_tasks: set[asyncio.Task[None]] = set()
         self._request_limit = asyncio.Semaphore(NODE_MAX_CONCURRENT_REQUESTS)
+        self._ssl_context = _node_ssl_context(config.ca_file)
 
     async def run_forever(self) -> None:
         delay = 1.0
@@ -2429,8 +2476,10 @@ class NodeAgent:
 
     async def run_once(self) -> None:
         url = control_websocket_url(self.config.core_url, self.config.node_id)
+        ssl_options = {"ssl": self._ssl_context} if self._ssl_context is not None else {}
         async with connect(
             url,
+            **ssl_options,
             max_size=MAX_NODE_MESSAGE_BYTES,
             open_timeout=10,
             ping_interval=20,
@@ -2699,7 +2748,13 @@ def _error_code(error: BaseException) -> str:
     return "operation_failed"
 
 
-def _json_post(core_url: str, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+def _json_post(
+    core_url: str,
+    path: str,
+    payload: Mapping[str, Any],
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> dict[str, Any]:
     request = urllib.request.Request(
         f"{core_url}{path}",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -2707,7 +2762,7 @@ def _json_post(core_url: str, path: str, payload: Mapping[str, Any]) -> dict[str
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=15, context=ssl_context) as response:
             raw = response.read(MAX_NODE_MESSAGE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         detail = exc.read(4096).decode("utf-8", errors="replace")

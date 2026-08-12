@@ -173,6 +173,9 @@ def isolate_test_tmux(
     monkeypatch.setenv("PYTEST_TMUX_SOCKET", str(socket_path))
     monkeypatch.setenv("PYTEST_TMUX_WRAPPER_DIR", str(wrapper_dir))
     if real_tmux:
+        default_socket = socket_root / f"tmux-{os.getuid()}" / "default"
+        default_socket.parent.mkdir(mode=0o700)
+        default_socket.symlink_to(socket_path)
         monkeypatch.setenv("PYTEST_REAL_TMUX", str(Path(real_tmux).resolve()))
         monkeypatch.setenv(
             "PATH",

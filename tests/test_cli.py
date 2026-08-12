@@ -32,6 +32,62 @@ def test_cli_reports_missing_tmux_without_traceback(
     assert "tmux is required for persistent Termroom terminals" in capsys.readouterr().err
 
 
+def test_serve_command_exposes_the_same_public_cli_as_the_default_entrypoint() -> None:
+    default = subprocess.run(
+        [sys.executable, "-m", "termroom.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    serve = subprocess.run(
+        [sys.executable, "-m", "termroom.cli", "serve", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert default.returncode == serve.returncode == 0
+    assert serve.stdout == default.stdout
+
+
+def test_node_pair_parser_accepts_custom_ca_file() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "termroom.cli", "node", "pair", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "--ca-file CA_FILE" in result.stdout
+
+
+def test_node_cli_reports_invalid_stored_ca_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    parser = cli._build_node_parser()
+    args = parser.parse_args(["--state-dir", str(tmp_path)])
+    identity = cli.ensure_node_identity(tmp_path)
+    monkeypatch.setattr(cli, "load_node_config", lambda _state_dir: object())
+    monkeypatch.setattr(cli, "load_node_identity", lambda _state_dir: identity)
+
+    def invalid_agent(_config, _private_key):  # type: ignore[no-untyped-def]
+        raise cli.NodeAgentError(
+            "Node CA file is not a valid certificate bundle",
+            code="ca_file_invalid",
+        )
+
+    monkeypatch.setattr(cli, "NodeAgent", invalid_agent)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._run_node(parser, args)
+
+    assert exit_info.value.code == 2
+    error = capsys.readouterr().err
+    assert "Node CA file is not a valid certificate bundle" in error
+    assert "Traceback" not in error
+
+
 def test_termroom_dot_reuses_running_core_and_registers_new_root(
     tmp_path: Path, capsys
 ) -> None:  # type: ignore[no-untyped-def]

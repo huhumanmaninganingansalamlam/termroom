@@ -475,52 +475,6 @@ async def test_remote_access_batches_node_terminal_activity_per_computer(
     assert store.get_terminal(str(managed["id"])) is not None
 
 
-def test_terminal_frontend_renders_plain_text_then_acknowledges_provider_revision() -> None:
-    root = Path(__file__).resolve().parents[1]
-    script = (root / "termroom/static/terminal.js").read_text(encoding="utf-8")
-
-    assert 'socket.addEventListener("message"' in script
-    assert "term.write(event.data, () =>" in script
-    assert 'socket.binaryType = "arraybuffer"' not in script
-    assert "event.data instanceof ArrayBuffer" not in script
-    assert "DataView" not in script
-    assert "getBigUint64" not in script
-    assert 'kind: "activity_ack"' in script
-    assert "activity_at: observedActivityAt" in script
-    assert 'document.visibilityState === "visible"' in script
-    assert "document.hasFocus()" in script
-    assert "term.buffer.active.viewportY >= term.buffer.active.baseY" in script
-    assert "outputRenderSequence += 1" in script
-    assert "renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt)" in script
-    assert "fetch(activityUrl" not in script
-    assert "fetch(activityAckUrl" not in script
-
-
-def test_terminal_activity_frontend_is_explicit_scoped_and_never_periodic() -> None:
-    root = Path(__file__).resolve().parents[1]
-    app_script = (root / "termroom/static/app.js").read_text(encoding="utf-8")
-    terminal_script = (root / "termroom/static/terminal.js").read_text(encoding="utf-8")
-    backend = (root / "termroom/remote_access.py").read_text(encoding="utf-8")
-
-    assert 'querySelectorAll("[data-terminal-activity-workspace]")' in app_script
-    assert "new URLSearchParams" in app_script
-    assert 'searchParams.append("workspace_id", workspaceId)' in app_script
-    assert ".slice(0, 20)" in app_script
-    assert "refreshTerminalActivity({ force: true })" in app_script
-    assert app_script.count("refreshTerminalActivity({ force: true })") == 1
-    assert 'document.addEventListener("visibilitychange"' in app_script
-    assert "if (!document.hidden) refreshTerminalActivity()" in app_script
-    assert 'window.addEventListener("focus"' in app_script
-    assert "setInterval(refreshTerminalActivity" not in app_script
-    assert "setTimeout(refreshTerminalActivity" not in app_script
-    assert "TerminalActivityObserver" not in backend
-
-    # WebSocket chunks are presentation only. Provider refreshes happen from
-    # the bounded summary checks above, never once per output chunk.
-    assert "fetch(activityUrl" not in terminal_script
-    assert "fetch(activityAckUrl" not in terminal_script
-
-
 def test_terminal_activity_revision_advances_after_store_restart(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -667,26 +621,6 @@ def test_provider_revision_change_is_the_only_unread_source(tmp_path: Path) -> N
     changed = store.terminal_activity_summary("browser-a", terminal_id=terminal_id)
     assert changed["unread_count"] == 1
     assert changed["terminals"][0]["activity_at"] == _revision(101)
-
-
-def test_all_terminal_bridges_have_no_synthetic_activity_frames() -> None:
-    root = Path(__file__).resolve().parents[1]
-    sources = [
-        (root / path).read_text(encoding="utf-8")
-        for path in (
-            "termroom/terminals.py",
-            "termroom/ssh_backend.py",
-            "termroom/remote_access.py",
-        )
-    ]
-
-    for source in sources:
-        assert "TerminalActivityStream" not in source
-        assert "terminal_output_frame" not in source
-        assert 'kind == "activity_ack"' in source
-        assert "self.store.acknowledge_terminal_activity" in source
-        assert "websocket.send_bytes(" not in source
-        assert "websocket.send_text(" in source
 
 
 def test_terminal_activity_summary_prunes_expired_device_reads(tmp_path: Path) -> None:

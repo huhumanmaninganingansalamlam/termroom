@@ -22,10 +22,13 @@ terminal-and-files interface.
 - Keep terminal work alive even when the browser is closed.
 - Browse, upload, download, or edit project files from the browser.
 - Move between several local projects from one interface.
-- Use SSH Linux servers in a workflow similar to local projects.
+- Use SSH Linux servers and outbound-only Termroom Nodes in the same Workspace flow.
+- Run the current Python, JavaScript, or Bash file without assembling its command by hand.
+- Send a Workspace snapshot, public HTTPS Git repository, or ZIP to another Remote and
+  recover its output and result files later.
 
 Termroom is not a cloud IDE. **The real terminal processes and files stay on your Linux
-computer or on an SSH server you control.** Termroom provides the browser interface.
+computer or on a Remote Linux computer you control.** Termroom provides the browser interface.
 
 ## Quick start
 
@@ -122,13 +125,22 @@ termroom .
 - Create files/folders, rename, and delete them.
 - Edit small text files directly in the browser.
 - Preview images/PDFs, JSON/CSV, and bounded portions of large text files.
-- Use the same Files UI for local and SSH projects.
+- Use the same Files UI for local, SSH, and Termroom Node projects.
+
+### Run the current file
+
+- Save and run the current Python 3, Node.js, Bash, or executable-shebang file from the
+  editor.
+- Use one managed interactive Terminal per Workspace, with exact exit status, stop, and
+  force-stop controls.
+- Keep the active run attached to the saved file and recover its outcome after reconnecting.
+- Termroom does not infer project commands, install runtimes, or create environments.
 
 ### Remote Run
 
-- Copy a Local/SSH Workspace folder, a public HTTPS Git repository, or one ZIP to a
-  registered SSH server's temporary space.
-- Run one command with that SSH user's installed tools and CPU/GPU/RAM.
+- Copy a Local, SSH, or compatible Node Workspace folder, a public HTTPS Git repository,
+  or one ZIP to a registered SSH or compatible Node Remote's temporary space.
+- Run one command with that Remote user's installed tools and CPU/GPU/RAM.
 - Keep the command alive in a dedicated remote `tmux` session when the browser disconnects.
 - Open the prepared folder through the normal Workspace Terminal and Files UI; there is no
   separate log dashboard or file viewer.
@@ -136,6 +148,15 @@ termroom .
   Workspace header.
 - Remote Run does not configure environments, provide a sandbox, schedule jobs, or write
   changes back to the Source.
+
+### Activity and Workspace usage
+
+- See File Run and Remote Run outcomes, Remote connection changes, unread state, and safe
+  browser notifications in one Activity view.
+- Open the exact Workspace, file, Remote Run, or Remote from an Activity item when it still
+  exists.
+- Check bounded estimates of a Workspace's CPU, memory, and process count without turning
+  Termroom into a monitoring dashboard.
 
 ### Recent
 
@@ -157,11 +178,12 @@ Computer
    └─ Recent
 ```
 
-A `Computer` is either this Linux machine or an SSH Linux server you registered.
+A `Computer` is either this Linux machine or a Remote Linux computer connected through SSH
+or Termroom Node.
 
 **Remote Run is a temporary Workspace shell, not a persistent project.** Its Source is copied
-to an SSH server, its Terminal and Files reuse the normal Workspace UI, and its managed folder
-is disposable. It does not appear in Recent Workspaces.
+to an SSH or compatible Node Remote, its Terminal and Files reuse the normal Workspace UI,
+and its managed folder is disposable. It does not appear in Recent Workspaces.
 
 ### Local projects
 
@@ -199,11 +221,39 @@ SFTP and then opened as an ordinary remote Workspace.
 
 The remote Linux host needs an SSH server, `/bin/bash`, and `tmux`.
 
+### Termroom Node
+
+Use Termroom Node when a Remote Linux computer can make outbound HTTPS/WSS connections but
+cannot expose an SSH server or inbound port.
+
+```text
+In the Core: Open Workspace → Connect computer → Connect with Node → Create pairing code
+On the Remote: termroom node pair --core https://core.example --code <code> \
+                 --allow-root /home/user/projects
+In the Core: verify and approve the Node fingerprint
+On the Remote: termroom node install-service
+```
+
+`--allow-root` is repeatable and stays under the Node user's local control. The Core cannot
+expand allowed roots or the Node's managed Remote Run root. `install-service` installs and
+starts a systemd user service; `termroom node status` reports both service and Core connection
+state, and `termroom node uninstall-service` removes only the service while preserving the
+Node identity and pairing configuration.
+
+If the Core uses a private HTTPS CA, add `--ca-file /path/to/core-ca.pem` to `node pair`.
+Termroom stores that verified path in the Node-local config and uses it for the control
+connection too; certificate verification cannot be disabled.
+
+Once paired, a compatible Node uses the same Remote picker and Workspace Terminal, Files,
+File Run, Remote Run, Activity, and recovery flows as SSH. Node requires `/bin/bash` and
+`tmux`, but no inbound SSH connection.
+
 ## Common commands
 
 ```bash
-termroom .                    # Open the current project
-termroom /path/to/project     # Open a specific project
+termroom serve .                    # Open the current project
+termroom serve /path/to/project     # Open a specific project
+termroom .                          # Backward-compatible shorthand
 termroom attach .             # Attach directly to this Workspace's tmux session
 termroom stop .               # Stop this Workspace's tmux session
 termroom stop --core          # Stop only the Termroom web Core
@@ -335,11 +385,13 @@ Browser / PWA
       ▼
 Termroom Core
   ├─ Local filesystem + local tmux
-  └─ SFTP + OpenSSH + remote tmux
+  ├─ SFTP + OpenSSH + remote tmux
+  └─ Termroom Node outbound WSS + remote filesystem/tmux
 ```
 
 Local terminals connect xterm.js in the browser to a real PTY over WebSocket. SSH
-Workspaces use the local OpenSSH client and SFTP. See
+Workspaces use the local OpenSSH client and SFTP. Node Workspaces use a paired,
+capability-gated Node connection with local allowed-root policy. See
 [`docs/architecture.md`](docs/architecture.md) for the data model and security boundaries.
 
 ## Development

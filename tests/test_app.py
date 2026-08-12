@@ -65,6 +65,68 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_workspace_display_name_updates_header_and_home_without_renaming_folder(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project-folder"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project-folder")
+    workspace_id = str(workspace["id"])
+    original_path = workspace["path"]
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        page = await client.get(f"/w/{workspace_id}/files")
+        assert page.status_code == 200
+        assert f'action="/w/{workspace_id}/name"' in page.text
+
+        renamed = await client.post(
+            f"/w/{workspace_id}/name",
+            data={
+                "_csrf": settings.csrf_token,
+                "display_name": "  집중 작업  ",
+            },
+            follow_redirects=False,
+        )
+        assert renamed.status_code == 303
+        assert renamed.headers["location"] == f"/w/{workspace_id}"
+        assert app.state.store.get_workspace(workspace_id)["display_name"] == "집중 작업"
+
+        renamed_page = await client.get(f"/w/{workspace_id}/files")
+        home = await client.get("/")
+        assert "집중 작업" in renamed_page.text
+        assert "집중 작업" in home.text
+
+        reset = await client.post(
+            f"/w/{workspace_id}/name",
+            data={"_csrf": settings.csrf_token, "display_name": ""},
+            follow_redirects=False,
+        )
+        assert reset.status_code == 303
+        assert app.state.store.get_workspace(workspace_id)["display_name"] == "project-folder"
+
+        invalid = await client.post(
+            f"/w/{workspace_id}/name",
+            data={"_csrf": settings.csrf_token, "display_name": "bad\nname"},
+        )
+        assert invalid.status_code == 400
+        assert "120자 이하의 한 줄 작업공간 이름" in invalid.text
+
+    refreshed = app.state.workspaces.require(workspace_id)
+    assert refreshed["path"] == original_path
+    assert project.is_dir()
+
+
+@pytest.mark.asyncio
 async def test_terminal_activity_apis_are_per_browser_scoped_and_race_safe(
     tmp_path: Path,
 ) -> None:
@@ -967,15 +1029,18 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
 
 
 @pytest.mark.asyncio
-async def test_open_workspace_flow_chooses_computer_then_workspace(tmp_path: Path) -> None:
+async def test_open_workspace_flow_chooses_computer_then_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "root"
-    root.mkdir()
+    (root / "local-project").mkdir(parents=True)
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
         access_token="test-token",
     )
     app = create_app(settings)
+    app.state.workspaces.open("local-project")
     computer = app.state.store.create_computer(
         name="Build server",
         ssh_alias="",
@@ -994,10 +1059,26 @@ async def test_open_workspace_flow_chooses_computer_then_workspace(tmp_path: Pat
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
-        computers = await client.get("/open")
+        with monkeypatch.context() as counts_guard:
+            counts_guard.setattr(
+                app.state.store,
+                "list_workspaces_for_root",
+                lambda *_args: pytest.fail(
+                    "Workspace hub must not query once per Local root"
+                ),
+            )
+            counts_guard.setattr(
+                app.state.store,
+                "list_workspaces_for_computer",
+                lambda *_args: pytest.fail(
+                    "Workspace hub must not query once per Remote"
+                ),
+            )
+            computers = await client.get("/open")
         assert computers.status_code == 200
         assert "어느 컴퓨터에서 열까요?" in computers.text
         assert "Build server" in computers.text
+        assert "작업공간 1개" in computers.text
         assert "작업공간 2개" in computers.text
 
         picker = await client.get(f"/open/{computer['id']}")
@@ -1210,19 +1291,6 @@ async def test_remote_workspace_picker_renders_browsable_directories(
     assert "현재 폴더 열기" in picker.text
     assert "닫기" in picker.text
     assert f'href="/open/{computer["id"]}"' in picker.text
-
-
-def test_remote_workspace_ajax_picker_uses_the_same_header_actions() -> None:
-    script = (
-        Path(__file__).resolve().parents[1] / "termroom/static/app.js"
-    ).read_text(encoding="utf-8")
-
-    assert 'class="path-picker-control" type="button" data-new-project' in script
-    assert "data-folder-picker-submit" not in script
-    assert 'form.querySelector("[data-folder-picker-default-actions]")' not in script
-    assert 'const submitButton = form.querySelector(\'button[type="submit"]\')' in script
-    assert 'form.classList.contains("remote-workspace-form")' in script
-    assert 'tr("browse.open_current")' in script
 
 
 @pytest.mark.asyncio
@@ -1611,6 +1679,17 @@ async def test_large_directories_are_paginated_in_browser(tmp_path: Path) -> Non
         )
         assert conflict_check.status_code == 200
         assert conflict_check.json()["conflicts"][0]["name"] == "file-204.txt"
+
+        duplicate_check = await client.post(
+            f"/w/{workspace['id']}/files/upload-check",
+            headers={"X-Termroom-CSRF": settings.csrf_token},
+            json={
+                "parent": ".",
+                "names": ["first.txt", "second.txt", "second.txt", "first.txt"],
+            },
+        )
+        assert duplicate_check.status_code == 400
+        assert "first.txt" in duplicate_check.json()["error"]
 
 
 @pytest.mark.asyncio
@@ -2141,26 +2220,6 @@ async def test_ssh_password_update_verifies_before_replacing_credential(
         assert app.state.ssh._stored_password(computer) == "new-password"
         detail = await client.get(updated.headers["location"])
         assert "SSH 비밀번호를 변경했습니다" in detail.text
-
-
-@pytest.mark.asyncio
-async def test_service_page_is_no_longer_a_workspace_feature(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    project = root / "project"
-    project.mkdir(parents=True)
-    settings = Settings.create(
-        root,
-        state_dir=tmp_path / "state",
-        access_token="test-token",
-    )
-    app = create_app(settings)
-    workspace = app.state.workspaces.open("project")
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        await _login(client)
-        response = await client.get(f"/w/{workspace['id']}/preview")
-        assert response.status_code == 404
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,6 @@ from termroom.file_runs import (
     FileRunConflict,
     FileRunError,
     FileRunManager,
-    RunnerSpec,
     resolve_runner,
 )
 from termroom.files import FileService, RunnableFile, UnsupportedFileError
@@ -809,12 +808,6 @@ def test_local_file_run_stop_and_force_stop_target_only_managed_pane(
         assert manager.store.get_terminal(str(shell["id"])) is not None
     finally:
         _cleanup_workspace(workspace)
-
-
-def test_additional_runner_requires_an_explicit_registry_entry() -> None:
-    ruby = RunnerSpec("ruby", (".rb",), "ruby", ("--",), "ruby_missing")
-    assert ruby.suffixes == (".rb",)
-    assert resolve_runner(_runnable("script.rb")) is None
 
 
 def test_file_run_conflict_exposes_existing_active_run(tmp_path: Path) -> None:

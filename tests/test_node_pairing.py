@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from termroom.app import create_app
 from termroom.config import Settings
 from termroom.db import StateStore
+from termroom.node_agent import NodeAgent, NodeAgentError, load_node_config, pair_node
 from termroom.node_protocol import (
     NODE_PROTOCOL_VERSION,
     generate_pairing_code,
@@ -30,6 +33,108 @@ def _new_store(tmp_path: Path) -> StateStore:
     store = StateStore(tmp_path / "state.sqlite3")
     store.initialize()
     return store
+
+
+@pytest.mark.asyncio
+async def test_node_pairing_persists_and_reuses_custom_ca_context(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    ca_file = tmp_path / "core-ca.pem"
+    ca_file.write_text("test bundle", encoding="utf-8")
+    trusted_context = ssl.create_default_context()
+    context_builds: list[str | None] = []
+    pairing_contexts: list[ssl.SSLContext | None] = []
+
+    def create_context(*, cafile=None):  # type: ignore[no-untyped-def]
+        context_builds.append(cafile)
+        return trusted_context
+
+    def post(_core, path, _payload, *, ssl_context=None):  # type: ignore[no-untyped-def]
+        pairing_contexts.append(ssl_context)
+        if path == "/api/node/enroll":
+            return {"enrollment_id": "enrollment"}
+        return {"status": "approved", "node_id": "a" * 32}
+
+    monkeypatch.setattr("termroom.node_agent.ssl.create_default_context", create_context)
+    monkeypatch.setattr("termroom.node_agent._json_post", post)
+    state_dir = tmp_path / "state"
+    config = pair_node(
+        state_dir=state_dir,
+        core_url="https://core.example",
+        code="one-time-code",
+        allowed_roots=[allowed],
+        ca_file=ca_file,
+    )
+
+    assert pairing_contexts == [trusted_context, trusted_context]
+    assert context_builds == [str(ca_file)]
+    assert config.ca_file == ca_file
+    assert load_node_config(state_dir).ca_file == ca_file
+
+    agent = NodeAgent(config, object())
+    assert agent._ssl_context is trusted_context
+    assert context_builds == [str(ca_file), str(ca_file)]
+
+    connection_options: dict[str, object] = {}
+
+    class _ConnectionProbe:
+        async def __aenter__(self):
+            raise RuntimeError("connection inspected")
+
+        async def __aexit__(self, *_args):  # type: ignore[no-untyped-def]
+            return False
+
+    def connect(_url, **options):  # type: ignore[no-untyped-def]
+        connection_options.update(options)
+        return _ConnectionProbe()
+
+    monkeypatch.setattr("termroom.node_agent.connect", connect)
+    with pytest.raises(RuntimeError, match="connection inspected"):
+        await agent.run_once()
+    assert connection_options["ssl"] is trusted_context
+
+
+def test_node_custom_ca_rejects_missing_or_invalid_bundle(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+
+    with pytest.raises(NodeAgentError) as missing:
+        pair_node(
+            state_dir=tmp_path / "state",
+            core_url="https://core.example",
+            code="code",
+            allowed_roots=[allowed],
+            ca_file=tmp_path / "missing.pem",
+        )
+    assert missing.value.code == "ca_file_invalid"
+
+    invalid = tmp_path / "invalid.pem"
+    invalid.write_text("not a certificate", encoding="utf-8")
+    with pytest.raises(NodeAgentError) as invalid_bundle:
+        pair_node(
+            state_dir=tmp_path / "other-state",
+            core_url="https://core.example",
+            code="code",
+            allowed_roots=[allowed],
+            ca_file=invalid,
+        )
+    assert invalid_bundle.value.code == "ca_file_invalid"
+
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_text("not read for HTTP validation", encoding="utf-8")
+    with pytest.raises(NodeAgentError) as insecure:
+        pair_node(
+            state_dir=tmp_path / "http-state",
+            core_url="http://127.0.0.1:8765",
+            code="code",
+            allowed_roots=[allowed],
+            ca_file=ca_file,
+        )
+    assert insecure.value.code == "ca_file_requires_https"
 
 
 def test_node_pairing_is_single_use_approved_and_revocable(tmp_path: Path) -> None:

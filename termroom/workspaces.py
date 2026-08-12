@@ -152,35 +152,54 @@ class WorkspaceManager:
         workspace = self.store.get_workspace(workspace_id)
         if not workspace:
             raise KeyError(f"Unknown workspace: {workspace_id}")
+        computer = None
         if workspace.get("backend_kind", "local") == "remote":
             computer = self.store.get_computer(str(workspace.get("computer_id", "")))
-            if not computer:
+            if computer is None:
                 raise KeyError(f"Unknown computer for workspace: {workspace_id}")
-            workspace["path"] = str(workspace["canonical_path"] or workspace["relative_path"])
-            workspace["remote_path"] = workspace["path"]
-            workspace["computer"] = computer
-            workspace["connection_label"] = computer["name"]
+        remote_run = self.store.get_remote_run_for_workspace(workspace_id)
+        return self._hydrate_workspace(
+            workspace,
+            computer=computer,
+            remote_run=remote_run,
+        )
+
+    def _hydrate_workspace(
+        self,
+        workspace: Mapping[str, Any],
+        *,
+        computer: Mapping[str, Any] | None,
+        remote_run: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        item = dict(workspace)
+        workspace_id = str(item["id"])
+        if item.get("backend_kind", "local") == "remote":
+            if computer is None:
+                raise KeyError(f"Unknown computer for workspace: {workspace_id}")
+            item["path"] = str(item["canonical_path"] or item["relative_path"])
+            item["remote_path"] = item["path"]
+            item["computer"] = dict(computer)
+            item["connection_label"] = computer["name"]
         else:
-            root_value = workspace.get("root_path")
+            root_value = item.get("root_path")
             root_path = (
                 Path(str(root_value)).expanduser().resolve(strict=True)
                 if root_value
                 else self.root_manager.root
             )
-            workspace["path"] = resolve_inside(root_path, workspace["relative_path"])
-            workspace["canonical_path"] = str(workspace["path"])
-            workspace["backend_kind"] = "local"
-            workspace["connection_label"] = ""
-        remote_run = self.store.get_remote_run_for_workspace(workspace_id)
-        workspace_kind = str(workspace.get("workspace_kind") or "workspace")
-        workspace["remote_run"] = remote_run
-        workspace["remote_run_id"] = str(remote_run["id"]) if remote_run else None
-        workspace["is_remote_run"] = remote_run is not None
-        workspace["is_server_terminal"] = workspace_kind == "server_terminal"
-        workspace["transient"] = remote_run is not None or workspace["is_server_terminal"]
-        if workspace["is_server_terminal"]:
-            workspace["display_name"] = str(workspace["computer"]["name"])
-        return workspace
+            item["path"] = resolve_inside(root_path, item["relative_path"])
+            item["canonical_path"] = str(item["path"])
+            item["backend_kind"] = "local"
+            item["connection_label"] = ""
+        workspace_kind = str(item.get("workspace_kind") or "workspace")
+        item["remote_run"] = dict(remote_run) if remote_run is not None else None
+        item["remote_run_id"] = str(remote_run["id"]) if remote_run else None
+        item["is_remote_run"] = remote_run is not None
+        item["is_server_terminal"] = workspace_kind == "server_terminal"
+        item["transient"] = remote_run is not None or item["is_server_terminal"]
+        if item["is_server_terminal"]:
+            item["display_name"] = str(item["computer"]["name"])
+        return item
 
     def list_recent(self) -> list[dict[str, Any]]:
         workspaces = self.store.list_recent_workspaces()
@@ -192,13 +211,60 @@ class WorkspaceManager:
         workspaces = self.store.list_recent_workspaces(limit=None)
         return self._hydrate_persistent_workspaces(workspaces)
 
+    def update_display_name(
+        self, workspace: Mapping[str, Any], display_name: str
+    ) -> None:
+        if workspace.get("transient"):
+            raise ValueError("Transient Workspace names are managed by their owner")
+
+        name = display_name.strip()
+        if not name:
+            path = workspace["path"]
+            name = (
+                PurePosixPath(str(path)).name
+                if workspace.get("backend_kind") == "remote"
+                else Path(path).name
+            )
+        if (
+            not name
+            or len(name) > 120
+            or any(
+                unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+                for character in name
+            )
+        ):
+            raise ValueError(
+                "Workspace display name must be a single line of 1 to 120 characters"
+            )
+        self.store.update_workspace_display_name(str(workspace["id"]), name)
+
     def _hydrate_persistent_workspaces(
         self, workspaces: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
+        has_remote = any(
+            workspace.get("backend_kind", "local") == "remote"
+            for workspace in workspaces
+        )
+        computer_by_id = (
+            {
+                str(computer["id"]): computer
+                for computer in self.store.list_computers()
+            }
+            if has_remote
+            else {}
+        )
         result: list[dict[str, Any]] = []
         for workspace in workspaces:
             try:
-                result.append(self.require(str(workspace["id"])))
+                result.append(
+                    self._hydrate_workspace(
+                        workspace,
+                        computer=computer_by_id.get(
+                            str(workspace.get("computer_id") or "")
+                        ),
+                        remote_run=None,
+                    )
+                )
             except (KeyError, OSError):
                 continue
         return result

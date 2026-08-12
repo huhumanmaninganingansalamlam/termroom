@@ -110,6 +110,10 @@ def _build_node_parser() -> argparse.ArgumentParser:
     pair_parser.add_argument("--core", required=True, help="Termroom Core base URL")
     pair_parser.add_argument("--code", required=True, help="One-time pairing code")
     pair_parser.add_argument(
+        "--ca-file",
+        help="PEM CA bundle for this Core's HTTPS certificate",
+    )
+    pair_parser.add_argument(
         "--allow-root",
         action="append",
         required=True,
@@ -165,6 +169,8 @@ def main(argv: list[str] | None = None) -> None:
             _require_tmux(node_parser)
         _run_node(node_parser, node_args)
         return
+    if argv and argv[0] == "serve":
+        argv = argv[1:]
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_user(parser, args.allow_root)
@@ -322,6 +328,7 @@ def _run_node(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
                 allowed_roots=args.allowed_roots,
                 name=args.name,
                 run_root=args.run_root,
+                ca_file=args.ca_file,
                 timeout_seconds=args.timeout,
             )
             print(f"Node paired: {config.name} ({config.node_id})", flush=True)
@@ -357,6 +364,7 @@ def _run_node(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
                     flush=True,
                 )
             return
+        agent = NodeAgent(config, private_key)
     except (OSError, ValueError, NodeAgentError, NodeServiceError) as exc:
         parser.error(str(exc))
 
@@ -372,7 +380,7 @@ def _run_node(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         with NodeProcessLock(state_dir, config.node_id):
             write_node_runtime_status(state_dir, config.node_id, "starting")
             try:
-                asyncio.run(_run_node_agent(NodeAgent(config, private_key)))
+                asyncio.run(_run_node_agent(agent))
             except KeyboardInterrupt:
                 return
             except NodePermanentError as exc:

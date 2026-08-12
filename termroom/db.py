@@ -655,6 +655,46 @@ class StateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def workspace_location_counts(self) -> tuple[dict[str, int], dict[str, int]]:
+        """Count user-visible Workspaces per Local root and computer in one query."""
+
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT 'root' AS location_kind, w.root_id AS location_id,
+                       COUNT(*) AS workspace_count
+                FROM workspaces AS w
+                JOIN roots AS r ON r.id = w.root_id
+                WHERE w.backend_kind = 'local'
+                  AND w.workspace_kind = 'workspace'
+                  AND r.path NOT LIKE 'ssh://%'
+                  AND r.path NOT LIKE 'node://%'
+                GROUP BY w.root_id
+
+                UNION ALL
+
+                SELECT 'computer' AS location_kind, c.id AS location_id,
+                       COUNT(*) AS workspace_count
+                FROM computers AS c
+                JOIN workspaces AS w ON w.computer_id = c.id
+                WHERE w.workspace_kind = 'workspace'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM remote_runs AS rr WHERE rr.workspace_id = w.id
+                  )
+                GROUP BY c.id
+                """
+            ).fetchall()
+
+        root_counts: dict[str, int] = {}
+        computer_counts: dict[str, int] = {}
+        for row in rows:
+            count = int(row["workspace_count"])
+            if row["location_kind"] == "root":
+                root_counts[str(row["location_id"])] = count
+            else:
+                computer_counts[str(row["location_id"])] = count
+        return root_counts, computer_counts
+
     def find_workspace(self, root_id: str, relative_path: str) -> dict[str, Any] | None:
         with self.connect() as db:
             row = db.execute(
@@ -924,6 +964,15 @@ class StateStore:
                     "UPDATE workspaces SET last_opened_at = ? WHERE id = ?",
                     (utc_now(), workspace_id),
                 )
+
+    def update_workspace_display_name(self, workspace_id: str, display_name: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE workspaces SET display_name = ? WHERE id = ?",
+                (display_name, workspace_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown Workspace: {workspace_id}")
 
     def delete_workspace(self, workspace_id: str) -> None:
         with self.connect() as db:

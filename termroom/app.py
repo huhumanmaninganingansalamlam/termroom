@@ -10,6 +10,7 @@ import secrets
 import tempfile
 import uuid
 import zipfile
+from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -1289,6 +1290,7 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> HTMLResponse:
         computers = store.list_computers()
         local_roots = store.list_local_roots()
+        root_workspace_counts, workspace_counts = store.workspace_location_counts()
         return templates.TemplateResponse(
             request=request,
             name="workspace_open.html",
@@ -1299,16 +1301,8 @@ def create_app(settings: Settings) -> FastAPI:
                 computers=computers,
                 computer_removed=computer_removed,
                 local_root_count=len(local_roots),
-                local_workspace_count=sum(
-                    len(store.list_workspaces_for_root(str(root["id"])))
-                    for root in local_roots
-                ),
-                workspace_counts={
-                    str(computer["id"]): len(
-                        store.list_workspaces_for_computer(str(computer["id"]))
-                    )
-                    for computer in computers
-                },
+                local_workspace_count=sum(root_workspace_counts.values()),
+                workspace_counts=workspace_counts,
                 node_statuses={
                     str(computer["id"]): remote.status(computer)
                     for computer in computers
@@ -1364,6 +1358,9 @@ def create_app(settings: Settings) -> FastAPI:
                 local_workspaces.append(workspaces.require(str(item["id"])))
             except (KeyError, OSError):
                 continue
+        root_workspace_counts, _computer_workspace_counts = (
+            store.workspace_location_counts()
+        )
         root_rows = []
         for item in local_roots:
             value = str(item["path"])
@@ -1371,9 +1368,7 @@ def create_app(settings: Settings) -> FastAPI:
                 {
                     **item,
                     "label": Path(value).name or value,
-                    "workspace_count": len(
-                        store.list_workspaces_for_root(str(item["id"]))
-                    ),
+                    "workspace_count": root_workspace_counts.get(str(item["id"]), 0),
                 }
             )
         location_picker = None
@@ -2475,6 +2470,24 @@ def create_app(settings: Settings) -> FastAPI:
             tab = "terminal"
         return RedirectResponse(f"/w/{workspace_id}/{tab}", status_code=303)
 
+    @app.post("/w/{workspace_id}/name")
+    async def update_workspace_display_name(
+        request: Request, workspace_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        workspace = _require_workspace(workspaces, workspace_id)
+        try:
+            workspaces.update_display_name(
+                workspace, str(form.get("display_name", ""))
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=translate(locale, "workspace.name.invalid"),
+            ) from exc
+        return RedirectResponse(f"/w/{workspace_id}", status_code=303)
+
     @app.get("/api/workspaces/{workspace_id}/usage", response_class=JSONResponse)
     async def workspace_usage_status(workspace_id: str) -> dict[str, Any]:
         workspace = _require_workspace(workspaces, workspace_id)
@@ -3124,8 +3137,9 @@ def create_app(settings: Settings) -> FastAPI:
             if not isinstance(raw_names, list) or len(raw_names) > 1000:
                 raise ValueError(translate(locale, "files.error.invalid_selection"))
             names = [str(name) for name in raw_names]
-            if len(names) != len(set(names)):
-                duplicate = next(name for name in names if names.count(name) > 1)
+            name_counts = Counter(names)
+            duplicate = next((name for name in names if name_counts[name] > 1), None)
+            if duplicate is not None:
                 raise ValueError(
                     translate(locale, "files.error.duplicate_upload", name=duplicate)
                 )

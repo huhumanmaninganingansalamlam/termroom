@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -335,6 +336,223 @@ def _node_prefix(state_dir: Path) -> list[str]:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         command.append("--allow-root-user")
     return command
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl is required")
+def test_real_node_pairing_and_control_connection_use_custom_ca(tmp_path: Path) -> None:
+    core_root = tmp_path / "core-root"
+    core_state = tmp_path / "core-state"
+    node_root = tmp_path / "node-root"
+    node_state = tmp_path / "node-state"
+    certificates = tmp_path / "certificates"
+    for path in (core_root, node_root, certificates):
+        path.mkdir()
+
+    ca_key = certificates / "ca.key"
+    ca_file = certificates / "ca.pem"
+    server_key = certificates / "server.key"
+    server_request = certificates / "server.csr"
+    server_certificate = certificates / "server.pem"
+    server_extensions = certificates / "server.ext"
+    server_extensions.write_text(
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\n"
+        "extendedKeyUsage=serverAuth\n"
+        "keyUsage=digitalSignature,keyEncipherment\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "1",
+            "-nodes",
+            "-keyout",
+            str(ca_key),
+            "-out",
+            str(ca_file),
+            "-subj",
+            "/CN=Termroom E2E CA",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-keyout",
+            str(server_key),
+            "-out",
+            str(server_request),
+            "-subj",
+            "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "x509",
+            "-req",
+            "-in",
+            str(server_request),
+            "-CA",
+            str(ca_file),
+            "-CAkey",
+            str(ca_key),
+            "-CAcreateserial",
+            "-out",
+            str(server_certificate),
+            "-days",
+            "1",
+            "-sha256",
+            "-extfile",
+            str(server_extensions),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    port = _free_port()
+    base_url = f"https://127.0.0.1:{port}"
+    environment = os.environ.copy()
+    environment["TERMROOM_PASSWORD"] = "custom-ca-e2e-password"
+    core_script = (
+        "import sys, uvicorn; "
+        "from termroom.app import create_app; "
+        "from termroom.config import Settings; "
+        "root, state, port, certificate, key = sys.argv[1:]; "
+        "settings = Settings.create(root, host='127.0.0.1', port=int(port), "
+        "state_dir=state, secure_cookie=True); "
+        "uvicorn.run(create_app(settings), host='127.0.0.1', port=int(port), "
+        "ssl_certfile=certificate, ssl_keyfile=key, log_level='info')"
+    )
+    core: subprocess.Popen[bytes] | None = None
+    pair: subprocess.Popen[bytes] | None = None
+    node: subprocess.Popen[bytes] | None = None
+    handles: list[Any] = []
+    trusted_context = ssl.create_default_context(cafile=str(ca_file))
+    client = httpx.Client(base_url=base_url, timeout=10, verify=trusted_context)
+
+    try:
+        core, handle = _start_process(
+            [
+                sys.executable,
+                "-c",
+                core_script,
+                str(core_root),
+                str(core_state),
+                str(port),
+                str(server_certificate),
+                str(server_key),
+            ],
+            environment,
+            tmp_path / "tls-core.log",
+        )
+        handles.append(handle)
+        _wait_until(
+            lambda: client.get("/health").status_code == 200,
+            description="TLS Core startup",
+        )
+        login = client.post("/login", data={"password": "custom-ca-e2e-password"})
+        assert login.status_code == 303
+        setup = client.get("/computers/new")
+        csrf_match = re.search(r'name="_csrf" value="([a-f0-9]{64})"', setup.text)
+        assert csrf_match is not None
+        csrf = csrf_match.group(1)
+
+        created = client.post("/computers/node/pair", data={"_csrf": csrf})
+        assert created.status_code == 201
+        code_match = re.search(r'class="node-pairing-code">([^<]+)<', created.text)
+        pairing_match = re.search(
+            r'name="pairing_id" value="([a-f0-9]{32})"', created.text
+        )
+        assert code_match is not None and pairing_match is not None
+        pair_command = [
+            *_node_prefix(node_state),
+            "pair",
+            "--core",
+            base_url,
+            "--code",
+            code_match.group(1),
+            "--allow-root",
+            str(node_root),
+            "--name",
+            "Custom CA E2E Node",
+            "--timeout",
+            "20",
+        ]
+
+        untrusted = subprocess.run(
+            pair_command,
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert untrusted.returncode == 2
+        assert "certificate verify failed" in (untrusted.stdout + untrusted.stderr).lower()
+        assert not (node_state / "node.json").exists()
+
+        pair, handle = _start_process(
+            [*pair_command, "--ca-file", str(ca_file)],
+            environment,
+            tmp_path / "tls-pair.log",
+        )
+        handles.append(handle)
+        review_url = f"/computers/node/pair?pairing_id={pairing_match.group(1)}"
+        review = _wait_until(
+            lambda: (
+                response
+                if (response := client.get(review_url)).status_code == 200
+                and "SHA256:" in response.text
+                else None
+            ),
+            description="custom-CA Node fingerprint submission",
+        )
+        enrollment_match = re.search(
+            r'/computers/node/pair/([a-f0-9]{32})/approve', review.text
+        )
+        assert enrollment_match is not None
+        approved = client.post(
+            f"/computers/node/pair/{enrollment_match.group(1)}/approve",
+            data={"_csrf": csrf},
+        )
+        assert approved.status_code == 303
+        node_id = approved.headers["location"].split("/")[2].split("?")[0]
+        assert pair.wait(timeout=10) == 0
+        stored = json.loads((node_state / "node.json").read_text(encoding="utf-8"))
+        assert stored["ca_file"] == str(ca_file.resolve())
+
+        node, handle = _start_process(
+            _node_prefix(node_state), environment, tmp_path / "tls-node.log"
+        )
+        handles.append(handle)
+        _wait_until(
+            lambda: _node_status_is(client, node_id, "Online"),
+            description="custom-CA Node WSS control connection",
+        )
+        assert node.poll() is None
+    finally:
+        client.close()
+        _stop_process(node)
+        _stop_process(pair)
+        _stop_process(core)
+        for handle in handles:
+            handle.close()
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")

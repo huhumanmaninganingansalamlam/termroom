@@ -1,5 +1,5 @@
 <!doctype html>
-{% macro user_settings_menu(placement='global') %}
+{% macro user_settings_menu(placement='global', workspace=none) %}
 <details class="user-menu user-menu-{{ placement }}" data-user-menu data-placement="{{ placement }}">
   <summary class="user-menu-trigger"
            aria-label="{{ t('open.settings') }}"
@@ -7,6 +7,21 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
   </summary>
   <div class="user-menu-popover">
+    {% if workspace and not workspace.transient %}
+    <form class="user-menu-workspace-name" method="post" action="/w/{{ workspace.id }}/name">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <label>
+        <span>{{ t('workspace.name.label') }}</span>
+        <input name="display_name"
+               value="{{ workspace.display_name }}"
+               maxlength="120"
+               autocomplete="off"
+               aria-label="{{ t('workspace.name.label') }}">
+      </label>
+      <small>{{ t('workspace.name.fallback') }}</small>
+      <button class="secondary-button" type="submit">{{ t('common.save') }}</button>
+    </form>
+    {% endif %}
     <button class="user-menu-action"
             type="button"
             data-theme-toggle

@@ -17,22 +17,27 @@ Browser / PWA
 │ Terminal ctrl  │
 │ File service   │
 │ SSH backend    │
-└──────┬─────┬───┘
-       │     │
- Local│     │SSH
-       ▼     ▼
- filesystem  SFTP
- tmux        remote tmux
+│ Node control   │
+└────┬─────┬─────┘
+     │     │
+Local│     │Remote
+     ▼     ├─ SSH → SFTP + remote tmux
+filesystem └─ Node outbound WSS → remote filesystem + tmux
+tmux
 ```
 
-SSH hosts require normal SSH, `/bin/bash`, and tmux.
+SSH Remotes require normal SSH, `/bin/bash`, and tmux. Node Remotes require the
+Termroom package, `/bin/bash`, and tmux, but no inbound port.
 
 ## Data model
 
 ### Computer
 
-The local machine is implicit. SSH computers are stored with connection metadata,
-authentication mode, and pinned host-key material.
+The local machine is implicit. Remote computers share one model with an internal
+`ssh` or `node` connection method, normalized connection state, capabilities, and
+last-seen data. SSH stores authentication and pinned host-key material. Node stores
+the approved public identity while the private key and filesystem policy stay local
+to the Node computer.
 
 ### Local root
 
@@ -48,7 +53,7 @@ remains available for advanced users.
 
 ### Workspace
 
-A Workspace belongs to one local root or one SSH computer and represents exactly
+A Workspace belongs to one Local root or one Remote computer and represents exactly
 one project directory. It owns a stable tmux session identifier and last-opened UI
 state.
 
@@ -61,14 +66,19 @@ not a new project system: validate one folder name, create the directory, then p
 the existing Workspace registration and tmux preparation path. If later Workspace preparation
 fails, Termroom keeps the created directory rather than rolling back possible user data.
 
+Node folder browse, project creation, Workspace registration, and Files operations are fixed
+typed operations that revalidate the Node-local `allowed_roots`. SSH and Node still render the
+same Workspace routes and UI.
+
 ### Remote Run
 
-A Remote Run targets one registered SSH computer. It copies one Workspace folder, public HTTPS
-Git repository, or ZIP into a Termroom-managed remote directory and executes one command there.
+A Remote Run targets one registered Remote with the `remote_run` capability. It copies one
+Local, SSH, or capable Node Workspace folder, public HTTPS Git repository, or ZIP into a
+Termroom-managed remote directory and executes one command there.
 
 ```text
 Remote Run
-├─ selected SSH Computer
+├─ selected SSH or Node Remote
 ├─ Workspace | public HTTPS Git | ZIP Source
 ├─ command
 ├─ temporary remote work directory
@@ -78,15 +88,31 @@ Remote Run
 └─ one transient Workspace using the existing Terminal and Files UI
 ```
 
-There is no local Run target, worker, queue, scheduler, environment builder, or generic job
+There is no Local Run target, worker, queue, scheduler, environment builder, or generic job
 engine. The transient Workspace is excluded from Recent Workspaces and is deleted with the Run.
-The browser polls Run status; remote tmux owns execution persistence when the browser or Core is
-gone.
+Remote tmux owns execution persistence when the browser or Core is gone. The Core observes
+active Local/SSH runs with bounded backoff; Node reports completion and reconciles active runs
+on heartbeat/reconnect.
 
 ### Terminal
 
 Terminals map to tmux windows. Browser WebSockets attach to PTYs connected to the
 same tmux window. tmux, not the browser, owns process persistence.
+
+### File Run
+
+A File Run belongs to one persistent Workspace and claims its single managed `file_run` slot.
+The versioned server-owned Runner Registry resolves Python 3, Node.js, Bash, or an executable
+shebang into structured argv. The browser cannot supply a runner or arbitrary command. The
+managed tmux window keeps interactive I/O and the current or previous output visible while the
+DB stores idempotency, source digest, exact argv, lifecycle state, exit code, and Event outcome.
+
+### Event and Activity
+
+Events are durable, deduplicated records created with File Run, Remote Run, and Remote connection
+state transitions. Activity lists them newest-first with per-browser read state and safe target
+links. Browser notifications use a device-and-Event claim so multiple tabs do not display the
+same Event repeatedly. Event payloads exclude commands, output, credentials, and private paths.
 
 ## Request layers
 
@@ -136,6 +162,23 @@ remote tmux
 remote shell / TUI
 ```
 
+### Node
+
+```text
+xterm.js / Files / managed Run UI
+↕ authenticated browser routes
+Termroom Core
+↕ outbound WSS control + bounded typed streams
+Termroom Node
+↕
+remote filesystem / PTY / tmux
+```
+
+Pairing uses a short-lived one-time code followed by explicit fingerprint approval. Node keeps
+its private key, `allowed_roots`, and `run_root` in owner-only local state. Requests carry an ID,
+operation type, deadline, and protocol version; fixed operations revalidate capability, identity,
+canonical path, and managed ownership on the Node before acting.
+
 The Core removes `TERMROOM_PASSWORD` from tmux and spawned SSH environments.
 
 Viewport resize is bounded and the most recently active browser controls terminal
@@ -144,8 +187,8 @@ rebuild Korean/Japanese/Chinese composition itself.
 
 ## File pipeline
 
-Local files use normal filesystem APIs; SSH files use SFTP. Both are adapted to the
-same browser contract:
+Local files use normal filesystem APIs, SSH files use SFTP, and Node files use fixed typed
+streaming operations. All are adapted to the same browser contract:
 
 - list/stat
 - bounded text read/edit
@@ -162,32 +205,32 @@ uses SFTP and refuses unsupported objects.
 Large previews are bounded to prevent the browser from freezing. Remote media can
 serve byte ranges where useful.
 
-Remote Run files reuse the existing SSH Workspace SFTP primitives after the Source has been
+Remote Run files reuse the existing SSH or Node Workspace primitives after the Source has been
 materialized. The remote temporary filesystem is the source of truth.
 
 ## Remote Run lifecycle
 
-Remote Runs target registered SSH computers only. A Source is one Local/SSH Workspace folder,
-a public anonymous HTTPS Git URL, or one verified ZIP. Each target stores the Run under
+Remote Runs target registered SSH or compatible Node Remotes. A Source is one Local, SSH, or
+compatible Node Workspace folder, a public anonymous HTTPS Git URL, or one verified ZIP. Each
+target stores the Run under
 `$HOME/.cache/termroom/runs/<run-id>/` by default, with `work/` for the copied Source and results
 and a hidden `.termroom/` directory for the marker, command, state, and logs.
 
 The command is written to metadata and executed by a fixed Bash runner. User text is never
-interpolated into a tmux command string. The Run is not a sandbox and uses the registered SSH
-user's permissions. Public Git clone arguments and environment are fixed and isolated; private
+interpolated into a tmux command string. The Run is not a sandbox and uses the registered
+Remote user's permissions. Public Git clone arguments and environment are fixed and isolated; private
 Git authentication is intentionally unsupported.
 
-Once `work/` is committed, the Run is linked one-to-one to a transient SSH Workspace row. Its
+Once `work/` is committed, the Run is linked one-to-one to a transient Remote Workspace row. Its
 fixed `termroom-run-<uuid>` session exposes the running command and an interactive shell window.
 All Terminal WebSocket, Files, preview, edit, upload, and download routes are the existing `/w/`
 Workspace routes. Transient rows are excluded from Recent Workspaces.
 
 Completed and stopped Runs expire after 24 hours. An uploaded ZIP that never starts is also
-bounded by spool retention. Deletion is
-allowed only when the path is under the managed Runs root and `.termroom/marker` matches the
-Run ID. SSH cleanup follows the same root-and-marker rule. No periodic cleanup worker exists;
-cleanup runs at Core startup and relevant list/browse operations, and users may delete a Run
-immediately.
+bounded by spool retention. Deletion is allowed only when the path is under the managed Runs root
+and `.termroom/marker` matches the Run ID. SSH and Node cleanup follow the same root-and-marker
+rule at the execution location. No periodic cleanup worker exists; cleanup runs at Core startup
+and relevant list/browse operations, and users may delete a Run immediately.
 
 ## Recent scan
 
@@ -207,6 +250,25 @@ Password mode stores encrypted credentials under the config directory. Managed-k
 mode creates one Ed25519 key and reuses it. Existing private-key paths remain an
 advanced option.
 
+## Node identity and service
+
+Node creates its own keypair and sends only its public identity for fingerprint approval. The
+Core rejects revoked or protocol-incompatible Nodes and never reuses the login password, browser
+session, or SSH credentials as Node identity. Non-loopback Pairing and control require verified
+HTTPS/WSS; there is no certificate-verification bypass.
+
+`termroom node` can run in the foreground or as one product-owned systemd user service. The
+service uses an absolute package entrypoint, a singleton process lock, the existing owner-only
+identity, and bounded reconnect with jitter. Installing or removing the service does not modify
+system lingering, elevate privileges, or discard Pairing state.
+
+## Workspace usage
+
+Workspace usage is a bounded estimate derived from tmux pane processes and observable
+descendants. CPU, memory, and process count are reference data, not precise
+accounting. Stale or failed samples are shown as unavailable with the last check time instead of
+being reused as current values.
+
 ## Persistent state
 
 New installs default to:
@@ -220,6 +282,10 @@ New installs default to:
 ├─ credentials/
 └─ ssh/
 ```
+
+A Node uses the same configurable base directory with owner-only `node.json`, private identity,
+runtime status, and lock files. Node-local allowed roots and managed run root are never stored as
+Core-editable policy.
 
 Password resolution is explicit argument → `TERMROOM_PASSWORD` environment →
 config-directory `.env` → project `.env` compatibility fallback. Any `.env`
@@ -243,8 +309,10 @@ The navigation model is:
 
 ```text
 Home
-├─ Open Workspace → Computer → Workspace → Terminal | Files | Recent
-└─ Remote Run → Source → SSH server → temporary Workspace → Terminal | Files | Recent
+├─ Open Workspace → Local or Remote → Workspace → Terminal | Files | Recent
+├─ Activity → exact Run, Workspace file, or Remote target
+└─ Remote Run → Source → capable SSH/Node Remote → temporary Workspace
+                → Terminal | Files | Recent
 ```
 
 Mobile uses a bottom tab bar for the three Workspace sections. Desktop uses a

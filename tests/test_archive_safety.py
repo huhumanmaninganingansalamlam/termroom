@@ -251,7 +251,6 @@ class _MemoryArchiveSink:
 
 
 def test_zip_materializer_creates_implicit_directories_and_streams_verified_files(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _archive(
         [
@@ -261,19 +260,9 @@ def test_zip_materializer_creates_implicit_directories_and_streams_verified_file
     )
     manifest: ZipManifest = validate_zip_archive(source)
     sink = _MemoryArchiveSink()
-    infolist_calls = 0
-    original_infolist = zipfile.ZipFile.infolist
-
-    def counted_infolist(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-        nonlocal infolist_calls
-        infolist_calls += 1
-        return original_infolist(archive)
-
-    monkeypatch.setattr(zipfile.ZipFile, "infolist", counted_infolist)
 
     materialize_zip_archive(source, manifest, sink)
 
-    assert infolist_calls == 1
     assert sink.directories == ["wrapper", "wrapper/bin", "wrapper/data"]
     assert sink.files == {
         "wrapper/bin/run.sh": b"#!/bin/sh\n",

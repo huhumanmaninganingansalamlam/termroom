@@ -949,9 +949,12 @@
     event.preventDefault();
     if (activeUploadRequest) return;
     const selectedFiles = [...uploadInput.files];
-    const duplicateName = selectedFiles.find(
-      (file, index) => selectedFiles.findIndex((candidate) => candidate.name === file.name) !== index,
-    );
+    const selectedNames = new Set();
+    const duplicateName = selectedFiles.find((file) => {
+      if (selectedNames.has(file.name)) return true;
+      selectedNames.add(file.name);
+      return false;
+    });
     const maxUploadBytes = Number(uploadForm.dataset.maxUploadBytes || 0);
     const oversized = maxUploadBytes > 0
       ? selectedFiles.find((file) => file.size > maxUploadBytes)

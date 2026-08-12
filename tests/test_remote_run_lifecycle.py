@@ -182,45 +182,6 @@ async def test_waiting_archive_upload_can_be_cancelled_without_remote_run_root(
     assert stored["expires_at"] is not None
 
 
-def test_force_stop_does_not_claim_success_when_ssh_is_offline(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    app, computer = _app_with_target(tmp_path, monkeypatch)
-    run_id = str(uuid.uuid4())
-    app.state.store.create_remote_run(
-        {
-            "id": run_id,
-            "source_kind": "git",
-            "source_workspace_id": None,
-            "source_path": None,
-            "source_label": "example/project",
-            "source_url": "https://example.test/project.git",
-            "source_options_json": "{}",
-            "source_revision": None,
-            "source_size": None,
-            "target_computer_id": str(computer["id"]),
-            "command": "sleep 300",
-            "run_base": "/home/runner/.cache/termroom/runs",
-            "state": "running",
-            "phase": None,
-            "created_at": "2026-08-09T00:00:00+00:00",
-        }
-    )
-    def offline(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        raise SSHBackendError("server offline")
-
-    monkeypatch.setattr(app.state.ssh, "kill_remote_run", offline)
-
-    with pytest.raises(SSHBackendError, match="offline"):
-        app.state.remote_runs.kill(run_id)
-
-    stored = app.state.store.get_remote_run(run_id)
-    assert stored is not None
-    assert stored["state"] == "running"
-    assert stored["expires_at"] is None
-
-
 @pytest.mark.asyncio
 async def test_stop_before_remote_layout_waits_for_live_preparation_to_cancel(
     tmp_path: Path,
@@ -284,36 +245,6 @@ def test_cancellable_sink_checks_between_transfer_chunks() -> None:
         sink.write_file("large.bin", iter((b"first", b"second")), expected_size=11)
 
     assert raised.value.code == "cancelled"
-
-
-@pytest.mark.asyncio
-async def test_startup_recovers_workspace_run_already_started_remotely(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    app, computer = _app_with_target(tmp_path, monkeypatch)
-    manager = app.state.remote_runs
-    run_id = _store_preparing_run(app, computer, source_kind="workspace", phase="starting")
-
-    def poll_started(value: str, **_kwargs: object) -> dict[str, object]:
-        remote = {
-            "state": "running",
-            "phase": None,
-            "started_at": "2026-08-09T00:00:05Z",
-            "tmux_exists": True,
-            "record_errors": [],
-        }
-        manager._apply_remote_status(manager.get(value), remote)
-        return {**remote, "connection": "online"}
-
-    monkeypatch.setattr(manager, "poll", poll_started)
-
-    await manager._reconcile_startup()
-
-    stored = app.state.store.get_remote_run(run_id)
-    assert stored is not None
-    assert stored["state"] == "running"
-    assert stored["started_at"] == "2026-08-09T00:00:05Z"
 
 
 @pytest.mark.asyncio

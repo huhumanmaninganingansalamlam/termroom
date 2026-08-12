@@ -20,9 +20,13 @@
 - 브라우저를 닫아도 터미널 작업을 끊지 않고 계속 유지하고 싶을 때
 - 프로젝트 파일을 브라우저에서 확인하거나 다운로드·업로드하고 싶을 때
 - 여러 로컬 프로젝트를 한 화면에서 오가고 싶을 때
-- SSH로 접속하는 Linux 서버도 로컬 프로젝트와 비슷한 방식으로 사용하고 싶을 때
+- SSH Linux 서버와 outbound 연결만 가능한 Termroom Node를 같은 Workspace 흐름으로
+  사용하고 싶을 때
+- 현재 Python, JavaScript 또는 Bash 파일을 실행 명령 조합 없이 바로 실행하고 싶을 때
+- Workspace snapshot, 공개 HTTPS Git 저장소 또는 ZIP을 다른 Remote에서 실행하고 나중에
+  출력과 결과 파일을 회수하고 싶을 때
 
-Termroom은 클라우드 IDE가 아닙니다. **내 Linux 컴퓨터 또는 내가 연결한 SSH 서버에서
+Termroom은 클라우드 IDE가 아닙니다. **내 Linux 컴퓨터 또는 내가 연결한 Remote Linux에서
 실제로 실행되는 터미널과 파일을 브라우저 UI로 연결**합니다.
 
 ## 빠른 시작
@@ -119,17 +123,32 @@ termroom .
 - 새 파일/폴더 만들기, 이름 변경, 삭제
 - 작은 텍스트 파일을 브라우저에서 바로 편집
 - 이미지/PDF, JSON/CSV, 큰 텍스트 일부 미리보기
-- 로컬 프로젝트와 SSH 프로젝트에서 같은 파일 UI 사용
+- Local, SSH, Termroom Node 프로젝트에서 같은 파일 UI 사용
+
+### 현재 파일 실행
+
+- 편집기에서 현재 Python 3, Node.js, Bash 또는 executable shebang 파일을 저장하고 실행
+- Workspace마다 관리형 interactive Terminal 하나를 사용하고 정확한 exit status, 중지,
+  강제 종료 제공
+- 실행 상태를 저장된 파일과 연결하고 재접속 뒤에도 결과 복구
+- project command를 추론하거나 runtime·환경을 자동 설치하지 않음
 
 ### 원격 실행
 
-- Local/SSH Workspace 폴더, 공개 HTTPS Git 저장소 또는 ZIP 하나를 등록한 SSH 서버의
-  임시 공간으로 복사
-- 해당 SSH 사용자의 설치된 도구와 CPU/GPU/RAM으로 명령 하나 실행
+- Local, SSH 또는 compatible Node Workspace 폴더, 공개 HTTPS Git 저장소, ZIP 하나를 등록한
+  SSH 또는 compatible Node Remote의 임시 공간으로 복사
+- 해당 Remote 사용자의 설치된 도구와 CPU/GPU/RAM으로 명령 하나 실행
 - 브라우저 연결이 끊겨도 원격 전용 `tmux` session에서 실행 유지
 - 준비가 끝나면 별도 로그 화면이 아니라 기존 Workspace Terminal·Files 화면을 그대로 사용
 - 완료 파일은 24시간 보관하고 임시 Workspace 상단에서 즉시 삭제 가능
 - 환경 자동 구성, sandbox, 작업 queue, scheduler, Source로 결과 덮어쓰기는 제공하지 않음
+
+### 활동과 Workspace 사용량
+
+- File Run·Remote Run 결과, Remote 연결 변화, 읽지 않은 상태와 안전한 browser 알림을 한
+  Activity 화면에서 확인
+- 대상이 남아 있으면 Activity에서 정확한 Workspace, file, Remote Run 또는 Remote로 이동
+- monitoring dashboard로 확장하지 않고 Workspace CPU·memory·process count의 제한된 추정값 확인
 
 ### 최근 작업
 
@@ -151,11 +170,11 @@ Computer
    └─ Recent
 ```
 
-`Computer`는 이 PC 또는 등록한 SSH Linux 서버입니다.
+`Computer`는 이 PC 또는 SSH나 Termroom Node로 연결한 Remote Linux입니다.
 
-**원격 실행은 지속 프로젝트가 아닌 임시 Workspace shell입니다.** Source를 SSH 서버로
-복사한 뒤 기존 Terminal·Files UI를 재사용하지만 관리 폴더는 휘발성이며 최근 Workspace
-목록에는 표시되지 않습니다.
+**원격 실행은 지속 프로젝트가 아닌 임시 Workspace shell입니다.** Source를 SSH 또는
+compatible Node Remote로 복사한 뒤 기존 Terminal·Files UI를 재사용하지만 관리 폴더는
+휘발성이며 최근 Workspace 목록에는 표시되지 않습니다.
 
 ### 로컬 프로젝트
 
@@ -191,11 +210,39 @@ SSH 주소 입력
 
 원격 Linux에는 SSH 서버, `/bin/bash`, `tmux`가 설치되어 있어야 합니다.
 
+### Termroom Node
+
+Remote Linux가 outbound HTTPS/WSS 연결은 할 수 있지만 SSH server나 inbound port를 열 수
+없다면 Termroom Node를 사용합니다.
+
+```text
+Core: Workspace 열기 → 컴퓨터 연결 → Node로 연결 → pairing code 생성
+Remote: termroom node pair --core https://core.example --code <code> \
+          --allow-root /home/user/projects
+Core: Node fingerprint 확인 후 승인
+Remote: termroom node install-service
+```
+
+`--allow-root`는 반복 지정할 수 있고 Node 사용자의 local control 아래에 남습니다. Core는
+allowed root나 Node의 관리형 Remote Run root를 넓힐 수 없습니다. `install-service`는
+systemd user service를 설치하고 즉시 시작합니다. `termroom node status`는 service와 Core
+연결 상태를 함께 표시하고, `termroom node uninstall-service`는 Node identity와 pairing
+설정을 보존한 채 service만 제거합니다.
+
+Core가 private HTTPS CA를 사용한다면 `node pair`에 `--ca-file /path/to/core-ca.pem`을
+추가합니다. 검증한 경로를 Node local config에 저장해 control connection에도 사용하며,
+certificate 검증을 끄는 옵션은 제공하지 않습니다.
+
+pairing이 끝난 compatible Node는 SSH와 같은 Remote picker, Workspace Terminal, Files,
+File Run, Remote Run, Activity와 recovery 흐름을 사용합니다. `/bin/bash`와 `tmux`는
+필요하지만 inbound SSH 연결은 필요하지 않습니다.
+
 ## 자주 쓰는 명령
 
 ```bash
-termroom .                    # 현재 프로젝트 열기
-termroom /path/to/project     # 지정한 프로젝트 열기
+termroom serve .                    # 현재 프로젝트 열기
+termroom serve /path/to/project     # 지정한 프로젝트 열기
+termroom .                          # 이전 버전 호환 단축형
 termroom attach .             # 현재 Workspace의 tmux에 직접 attach
 termroom stop .               # 현재 Workspace의 tmux session 종료
 termroom stop --core          # Termroom 웹 Core 종료
@@ -324,11 +371,13 @@ Browser / PWA
       ▼
 Termroom Core
   ├─ Local filesystem + local tmux
-  └─ SFTP + OpenSSH + remote tmux
+  ├─ SFTP + OpenSSH + remote tmux
+  └─ Termroom Node outbound WSS + remote filesystem/tmux
 ```
 
 로컬 터미널은 PTY/WebSocket을 통해 브라우저의 xterm.js와 연결되고, SSH Workspace는
-로컬 OpenSSH와 SFTP를 사용합니다. 자세한 데이터 모델과 보안 경계는
+로컬 OpenSSH와 SFTP를 사용합니다. Node Workspace는 local allowed-root policy를 가진
+pairing 및 capability 기반 Node 연결을 사용합니다. 자세한 데이터 모델과 보안 경계는
 [`docs/architecture.md`](docs/architecture.md)를 참고하세요.
 
 ## 개발

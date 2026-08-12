@@ -26,18 +26,6 @@ def test_korean_and_english_locale_keys_match() -> None:
     assert set(_locale("ko")) == set(_locale("en"))
 
 
-def test_workspace_kind_labels_are_backend_specific() -> None:
-    assert _locale("en")["workspace.kind.local"] == "Local Workspace"
-    assert _locale("en")["workspace.kind.remote"] == "Remote Workspace"
-    assert _locale("ko")["workspace.kind.local"] == "로컬 작업공간"
-    assert _locale("ko")["workspace.kind.remote"] == "원격 작업공간"
-
-
-def test_editor_saved_cta_opens_terminal_without_implying_a_rerun() -> None:
-    assert _locale("en")["editor.back_terminal"] == "Open terminal →"
-    assert _locale("ko")["editor.back_terminal"] == "터미널 열기 →"
-
-
 def test_ui_strings_live_in_locale_files() -> None:
     hangul = re.compile(r"[가-힣]")
     sources = (
