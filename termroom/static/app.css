@@ -3068,7 +3068,7 @@ details:not([open]) > :not(summary) {
 
 .terminal-command-trigger {
   display: inline-flex;
-  min-height: 44px;
+  min-height: 40px;
   flex: none;
   align-items: center;
   justify-content: center;
@@ -3079,6 +3079,12 @@ details:not([open]) > :not(summary) {
   color: var(--text-secondary);
   font-size: 0.7rem;
   font-weight: 650;
+}
+
+@media (max-width: 1023px) {
+  .terminal-command-trigger {
+    min-height: 44px;
+  }
 }
 
 .terminal-command-trigger svg {
