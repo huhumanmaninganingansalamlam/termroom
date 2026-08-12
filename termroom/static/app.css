@@ -1628,7 +1628,10 @@ details:not([open]) > :not(summary) {
 }
 
 .header-utility-button {
+  display: inline-flex;
   min-height: 34px;
+  align-items: center;
+  justify-content: center;
   gap: 7px;
   padding: 5px 9px;
   border-color: transparent;
@@ -1636,6 +1639,7 @@ details:not([open]) > :not(summary) {
   color: var(--text-tertiary);
   font-size: 0.68rem;
   font-weight: 560;
+  white-space: nowrap;
 }
 
 .header-utility-button:hover {
@@ -1748,7 +1752,7 @@ details:not([open]) > :not(summary) {
   }
 }
 
-@media (max-width: 420px) {
+@media (max-width: 600px) {
   .language-select select {
     width: 78px;
     min-height: 44px;
