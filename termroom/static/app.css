@@ -6653,7 +6653,11 @@ details:not([open]) > :not(summary) {
 
 .project-create-facts code,
 .project-final-path code {
-  overflow-wrap: anywhere;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
 }
 
 .project-final-path {
