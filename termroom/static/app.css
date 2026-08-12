@@ -1716,6 +1716,18 @@ details:not([open]) > :not(summary) {
   font-size: 0.65rem;
 }
 
+@media (min-width: 901px) {
+  .app-header .theme-toggle {
+    width: 34px;
+    min-width: 34px;
+    min-height: 34px;
+  }
+
+  .app-header .language-select select {
+    min-height: 34px;
+  }
+}
+
 @media (max-width: 900px) {
   .language-select select,
   .header-utility-button {
