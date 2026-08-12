@@ -6799,6 +6799,22 @@ details:not([open]) > :not(summary) {
   overflow: hidden;
 }
 
+.remote-run-empty {
+  display: grid;
+  gap: 7px;
+  padding: 22px;
+}
+
+.remote-run-empty > * {
+  min-width: 0;
+  margin: 0;
+}
+
+.remote-run-empty .primary-button {
+  justify-self: start;
+  margin-top: 4px;
+}
+
 .remote-run-form-section {
   display: grid;
   gap: 14px;
@@ -7010,6 +7026,10 @@ details:not([open]) > :not(summary) {
 }
 
 @media (max-width: 640px) {
+  .remote-run-empty {
+    padding: 16px;
+  }
+
   .remote-run-form-section {
     padding: 18px 15px;
   }
