@@ -17,8 +17,10 @@
     <code class="node-pairing-code">{{ code }}</code>
     <p>{{ t('node.pair.command_copy') }}</p>
     <pre><code>termroom node pair --core {{ core_url }} --code {{ code }} --allow-root /home/me/projects</code></pre>
-    <form method="get" action="/computers/node/pair">
+    <form method="post" action="/computers/node/pair/check">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="pairing_id" value="{{ pairing.id }}">
+      <input type="hidden" name="code" value="{{ code }}">
       <button class="secondary-button" type="submit">{{ t('node.pair.refresh') }}</button>
     </form>
   </section>

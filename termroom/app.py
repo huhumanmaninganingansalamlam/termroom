@@ -1732,6 +1732,29 @@ def create_app(settings: Settings) -> FastAPI:
             ),
         )
 
+    @app.post("/computers/node/pair/check", response_class=HTMLResponse)
+    async def check_node_pairing(request: Request) -> HTMLResponse:
+        form = await _verified_form(request, settings)
+        pairing_id = str(form.get("pairing_id", ""))
+        code = str(form.get("code", ""))
+        pairing = store.get_node_pairing(pairing_id)
+        if pairing is None:
+            raise HTTPException(status_code=404, detail="Node pairing not found")
+        if not secure_compare(str(pairing["code_hash"]), pairing_code_digest(code)):
+            raise HTTPException(status_code=409, detail="Node pairing code changed")
+        return templates.TemplateResponse(
+            request=request,
+            name="node_pair.html",
+            context=_context(
+                settings,
+                title=translate(locale_from_request(request), "node.pair.heading"),
+                pairing=pairing,
+                code=code if pairing.get("status") is None else None,
+                core_url=str(request.base_url).rstrip("/"),
+                error=None,
+            ),
+        )
+
     @app.post("/computers/node/pair", response_class=HTMLResponse)
     async def create_node_pairing(request: Request) -> HTMLResponse:
         await _verified_form(request, settings)
