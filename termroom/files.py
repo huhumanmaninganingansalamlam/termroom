@@ -73,6 +73,20 @@ class TextPreview:
     bytes_read: int = 0
 
 
+def editor_newline_style(content: str) -> str:
+    """Return the newline convention an HTML textarea must restore on save."""
+
+    without_crlf = content.replace("\r\n", "")
+    return "crlf" if "\r\n" in content and "\n" not in without_crlf else "lf"
+
+
+def normalize_editor_newlines(content: str, style: str) -> str:
+    """Undo the browser's form newline normalization at the editor boundary."""
+
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.replace("\n", "\r\n") if style == "crlf" else normalized
+
+
 def decode_utf8_preview(
     raw: bytes,
     *,

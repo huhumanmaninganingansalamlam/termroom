@@ -42,6 +42,8 @@ from termroom.files import (
     FileSnapshot,
     RecentFiles,
     UnsupportedFileError,
+    editor_newline_style,
+    normalize_editor_newlines,
 )
 from termroom.i18n import (
     LOCALE_COOKIE,
@@ -3154,6 +3156,7 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         values: dict[str, Any] = {
             "snapshot": snapshot,
+            "newline_style": editor_newline_style(snapshot.content),
             "saved": saved,
             "conflict": conflict,
             "save_error": save_error,
@@ -3207,7 +3210,9 @@ def create_app(settings: Settings) -> FastAPI:
             max_part_size=settings.max_edit_bytes * 3 + 1024,
         )
         locale = locale_from_request(request)
-        content = str(form.get("content", ""))
+        content = normalize_editor_newlines(
+            str(form.get("content", "")), str(form.get("newline", "lf"))
+        )
         expected_digest = str(form.get("digest", ""))
         expected_mtime_ns = int(str(form.get("mtime_ns", "0")))
         intent = str(form.get("intent", "save"))

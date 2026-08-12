@@ -5,6 +5,7 @@
   <input type="hidden" name="_csrf" value="{{ csrf_token }}">
   <input type="hidden" name="digest" value="{{ snapshot.digest }}">
   <input type="hidden" name="mtime_ns" value="{{ snapshot.mtime_ns }}">
+  <input type="hidden" name="newline" value="{{ newline_style }}">
   <input type="hidden" name="file_run_idempotency_key" value="{{ file_run_idempotency_key }}">
   <header class="editor-header">
     <a class="editor-back" href="/w/{{ workspace.id }}/files?path={{ (snapshot.relative_path.rsplit('/', 1)[0] if '/' in snapshot.relative_path else '.') | urlencode }}">←</a>
