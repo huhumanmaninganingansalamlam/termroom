@@ -809,7 +809,10 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         files_page = client.get(f"/w/{workspace_id}/files")
         assert files_page.status_code == 200
         assert "hello.txt" in files_page.text
-        assert f'/w/{workspace_id}/recent' not in files_page.text
+        recent_page = client.get(f"/w/{workspace_id}/recent")
+        assert recent_page.status_code == 200
+        assert "hello.txt" in recent_page.text
+        assert "shell" in recent_page.text
         assert "Run this location on another Remote" in files_page.text
         editor = client.get(f"/w/{workspace_id}/edit/hello.txt")
         digest = re.search(r'name="digest" value="([a-f0-9]{64})"', editor.text)

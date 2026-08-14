@@ -10,6 +10,13 @@
   </div>
 </header>
 
+{% if retry_run %}
+<section class="connection-notice" role="status">
+  <strong>{{ t('remote_run.retry_prefill_title') }}</strong>
+  <p>{{ t('remote_run.retry_prefill_copy') }}</p>
+</section>
+{% endif %}
+
 {% if not computers %}
 <section class="panel remote-run-empty">
   <strong>{{ t('remote_run.no_targets') }}</strong>
@@ -109,7 +116,7 @@
   <section class="remote-run-form-section">
     <label>
       <span>{{ t('remote_run.command') }} · {{ t('remote_run.command_multiline') }}</span>
-      <textarea name="command" rows="6" required placeholder="{{ t('remote_run.command_placeholder') }}" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+      <textarea name="command" rows="6" required placeholder="{{ t('remote_run.command_placeholder') }}" autocapitalize="off" autocorrect="off" spellcheck="false">{{ selected_command }}</textarea>
     </label>
     <p class="form-help">{{ t('remote_run.command_help') }}</p>
   </section>

@@ -22,9 +22,18 @@
         <input id="file-upload-input" type="file" name="files" multiple>
       </label>
     </form>
-    <details class="create-entry">
-      <summary class="secondary-button">{{ t('files.new') }}</summary>
-      <form method="post" action="/w/{{ workspace.id }}/files/create" class="create-popover">
+    <div class="create-entry" data-popover>
+      <button class="secondary-button"
+              type="button"
+              data-popover-trigger
+              aria-expanded="false"
+              aria-controls="file-create-popover">{{ t('files.new') }}</button>
+      <form id="file-create-popover"
+            method="post"
+            action="/w/{{ workspace.id }}/files/create"
+            class="create-popover"
+            data-popover-panel
+            hidden>
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <input type="hidden" name="parent" value="{{ path }}">
         <select name="kind" aria-label="{{ t('files.kind') }}">
@@ -34,7 +43,7 @@
         <input name="name" placeholder="{{ t('common.name') }}" required>
         <button class="primary-button" type="submit">{{ t('common.create') }}</button>
       </form>
-    </details>
+    </div>
   </div>
 </section>
 

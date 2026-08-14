@@ -222,11 +222,17 @@ def test_tmux_session_survives_detached_commands(tmp_path: Path) -> None:
             ],
             check=True,
         )
-        time.sleep(0.2)
+        deadline = time.monotonic() + 2
+        scrollback = ""
+        while time.monotonic() < deadline:
+            scrollback = manager.capture_scrollback(workspace, terminal)
+            if "TERMROOM_TMUX_TEST" in scrollback:
+                break
+            time.sleep(0.05)
 
         assert manager.session_exists(workspace["tmux_session"])
         assert workspace["tmux_session"] in manager.existing_sessions()
-        assert "TERMROOM_TMUX_TEST" in manager.capture_scrollback(workspace, terminal)
+        assert "TERMROOM_TMUX_TEST" in scrollback
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", workspace["tmux_session"]],

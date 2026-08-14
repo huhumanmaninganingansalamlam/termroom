@@ -1,8 +1,7 @@
 {% extends "base.html" %}
 {% set remote_run = workspace.remote_run | default(none) %}
 {% set server_terminal = workspace.is_server_terminal | default(false) %}
-{% set node_remote = workspace.backend_kind == 'remote' and workspace.computer.connection_method == 'node' %}
-{% set remote_run_state_key = ('remote_run.state.' ~ remote_run.state) if remote_run else '' %}
+{% set remote_run_state_key = ('remote_run.state.' ~ (remote_run_display_state or remote_run.state)) if remote_run else '' %}
 {% set remote_run_terminal = remote_run and remote_run.state in ('finished', 'stopped', 'failed', 'lost') %}
 {% if remote_run %}
   {% set workspace_kind_label = 'remote_run.workspace_mode' %}
@@ -133,6 +132,10 @@
     </form>
     {% endif %}
     {% else %}
+    {% if remote_run_display_state == 'failed' and remote_run_source_url and remote_run_retry_url %}
+    <a class="secondary-button" href="{{ remote_run_source_url }}">{{ t('remote_run.open_source') }}</a>
+    <a class="primary-button" href="{{ remote_run_retry_url }}">{{ t('remote_run.retry_setup') }}</a>
+    {% endif %}
     <form method="post" action="/remote-runs/{{ remote_run.id }}/delete">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <button class="danger-button" type="submit" data-confirm="{{ t('remote_run.delete_confirm') }}">{{ t('remote_run.delete_now') }}</button>
@@ -170,7 +173,7 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4z"/></svg>
     <span>{{ t('common.files') }}</span>
   </a>
-  {% if not node_remote %}
+  {% if recent_supported | default(true) %}
   <a class="{% if active_tab == 'recent' %}active{% endif %}" href="/w/{{ workspace.id }}/recent">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg>
     <span>{{ t('common.recent') }}</span>
@@ -193,5 +196,7 @@
   </span>
 </footer>
 {% block workspace_scripts %}{% endblock %}
-{% if remote_run %}<script src="{{ url_for('static', path='remote_run.js') }}?v=10" defer></script>{% endif %}
+{% if remote_run %}
+<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>
+{% endif %}
 {% endblock %}

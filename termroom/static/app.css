@@ -353,8 +353,8 @@ button,
   flex: none;
 }
 
-.add-location-menu > summary {
-  list-style: none;
+.add-location-menu > [data-popover-trigger] {
+  flex: none;
 }
 
 body.path-picker-modal-open {
@@ -1157,7 +1157,7 @@ body:has(.remote-workspace-form .remote-folder-browser:not([hidden])) {
     display: none;
   }
 
-  .open-location-compact > .add-location-menu > summary {
+  .open-location-compact > .add-location-menu > [data-popover-trigger] {
     min-height: 44px;
     white-space: nowrap;
   }
@@ -2904,20 +2904,6 @@ details:not([open]) > :not(summary) {
   position: relative;
 }
 
-.terminal-manage-menu > summary,
-.new-terminal-menu > summary,
-.more-keys > summary,
-.create-entry > summary {
-  list-style: none;
-}
-
-.terminal-manage-menu > summary::-webkit-details-marker,
-.new-terminal-menu > summary::-webkit-details-marker,
-.more-keys > summary::-webkit-details-marker,
-.create-entry > summary::-webkit-details-marker {
-  display: none;
-}
-
 .more-key-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(44px, 1fr));
@@ -3892,7 +3878,7 @@ details:not([open]) > :not(summary) {
     min-height: 44px;
   }
 
-  .terminal-top-actions .new-terminal-menu > summary {
+  .terminal-top-actions .new-terminal-menu > [data-popover-trigger] {
     width: 44px;
     height: 44px;
   }
@@ -5135,7 +5121,7 @@ details:not([open]) > :not(summary) {
   .file-primary-actions .upload-form,
   .file-primary-actions .upload-trigger,
   .file-primary-actions .create-entry,
-  .file-primary-actions .create-entry > summary {
+  .file-primary-actions .create-entry > [data-popover-trigger] {
     width: 100%;
   }
 

@@ -140,20 +140,107 @@ async def test_remote_open_page_has_git_archive_entry_and_only_its_reconnectable
             "/remote-runs/new",
             params={"target_computer_id": gpu["id"], "source_kind": "git"},
         )
-        home = await client.get("/")
 
     assert populated.status_code == 200
     assert "이 Remote의 실행 기록" in populated.text
     assert f'href="/remote-runs/{gpu_values["id"]}"' in populated.text
-    assert 'class="open-workspace-row"' in populated.text
     assert "vision/model" in populated.text
     assert "python inference.py" in populated.text
     assert f"/remote-runs/{other_values['id']}" not in populated.text
     assert 'name="source_kind" value="git" checked' in git_form.text
     assert f'<option value="{gpu["id"]}" selected>' in git_form.text
-    assert "로그인 없이 접근 가능한 공개 HTTPS clone URL만 지원" in git_form.text
-    assert "비공개 코드는 Workspace snapshot이나 Archive를 사용" in git_form.text
-    assert "최근 원격 실행" in home.text
-    assert f'href="/remote-runs/{gpu_values["id"]}"' in home.text
-    assert f'href="/remote-runs/{other_values["id"]}"' in home.text
-    assert "/remote-runs/new" not in home.text
+
+
+@pytest.mark.asyncio
+async def test_failed_workspace_remote_run_links_source_and_restores_retry_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    source_folder = root / "training" / "models"
+    source_folder.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    source_workspace = app.state.workspaces.open_local(root, "training")
+    computer = _computer(app, name="GPU QA", host="gpu.example.test")
+    command = "python train.py --resume\necho retry"
+    run_id = str(uuid.uuid4())
+    run, created = app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "workspace",
+            "source_workspace_id": str(source_workspace["id"]),
+            "source_path": "models",
+            "source_label": "training/models",
+            "source_url": None,
+            "source_options_json": '{"policy":1}',
+            "source_revision": None,
+            "source_size": None,
+            "target_computer_id": str(computer["id"]),
+            "command": command,
+            "run_base": "/home/runner/.cache/termroom/runs",
+            "workspace_id": None,
+            "state": "running",
+            "phase": None,
+            "created_at": "2026-08-13T00:00:00+00:00",
+        }
+    )
+    assert created is True
+    assert app.state.store.transition_remote_run(
+        run_id,
+        expected_states={"running"},
+        state="finished",
+        exit_code=7,
+        ended_at="2026-08-13T00:00:07+00:00",
+    )
+    run = app.state.store.get_remote_run(run_id)
+    assert run is not None
+    run_workspace = app.state.workspaces.open_remote_run(
+        run,
+        f"termroom-run-{run_id}",
+        f"/home/runner/.cache/termroom/runs/{run_id}/work",
+    )
+    terminal = app.state.store.create_terminal(
+        str(run_workspace["id"]),
+        "run",
+        "@run",
+        role="remote_run",
+        managed_run_id=run_id,
+    )
+    monkeypatch.setattr(app.state.ssh, "ensure_workspace", lambda _workspace: [terminal])
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        run_page = await client.get(f"/w/{run_workspace['id']}/terminal")
+        source = await client.get(f"/remote-runs/{run_id}/source", follow_redirects=False)
+        retry = await client.get("/remote-runs/new", params={"retry_run_id": run_id})
+
+    assert run_page.status_code == 200
+    assert f'href="/remote-runs/{run_id}/source"' in run_page.text
+    assert f'href="/remote-runs/new?retry_run_id={run_id}"' in run_page.text
+    assert "원본 열기" in run_page.text
+    assert "같은 설정으로 다시 실행" in run_page.text
+
+    assert source.status_code == 302
+    assert source.headers["location"] == (
+        f"/w/{source_workspace['id']}/files?path=models"
+    )
+
+    assert retry.status_code == 200
+    assert list(retry.url.params.keys()) == ["retry_run_id"]
+    assert retry.url.params["retry_run_id"] == run_id
+    assert command not in str(retry.url)
+    assert (
+        f'<input type="hidden" name="source_workspace_id" value="{source_workspace["id"]}">'
+        in retry.text
+    )
+    assert '<input type="hidden" name="source_path" value="models">' in retry.text
+    assert f'<option value="{computer["id"]}" selected>' in retry.text
+    assert command in retry.text
+    assert "이전 실행 설정을 복원했습니다" in retry.text

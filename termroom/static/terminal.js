@@ -160,7 +160,7 @@
   const composerRoot = document.querySelector(".terminal-composer");
   const openCommandEditor = document.querySelector("#open-command-editor");
   const closeCommandEditor = document.querySelector("#close-command-editor");
-  const moreKeys = document.querySelector("details.more-keys");
+  const moreKeys = document.querySelector(".more-keys[data-popover]");
   let composerOpen = false;
   let mobileViewportBaseline = window.visualViewport?.height || window.innerHeight;
   let mobileViewportBaselineWidth = window.visualViewport?.width || window.innerWidth;
@@ -509,7 +509,13 @@
   let ctrlArmed = false;
   const ctrlButton = document.querySelector("#ctrl-key");
   const closeMoreKeys = ({ focus = true } = {}) => {
-    if (moreKeys) moreKeys.open = false;
+    if (moreKeys) {
+      moreKeys.removeAttribute("open");
+      moreKeys.querySelector("[data-popover-trigger]")?.setAttribute("aria-expanded", "false");
+      moreKeys.querySelectorAll("[data-popover-panel]").forEach((panel) => {
+        panel.hidden = true;
+      });
+    }
     if (focus) term.focus();
   };
   ctrlButton?.addEventListener("click", () => {

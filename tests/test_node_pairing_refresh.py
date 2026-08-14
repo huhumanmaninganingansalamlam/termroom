@@ -26,7 +26,7 @@ def test_fingerprint_check_keeps_unconsumed_pairing_code(tmp_path: Path) -> None
             "/computers/node/pair", data={"_csrf": settings.csrf_token}
         )
         pairing = re.search(r'name="pairing_id" value="([a-f0-9]{32})"', created.text)
-        code = re.search(r'class="node-pairing-code">([^<]+)<', created.text)
+        code = re.search(r'name="code" value="([^"]+)"', created.text)
         assert pairing is not None
         assert code is not None
 
@@ -40,7 +40,6 @@ def test_fingerprint_check_keeps_unconsumed_pairing_code(tmp_path: Path) -> None
         )
 
     assert checked.status_code == 200
-    assert f'class="node-pairing-code">{code.group(1)}<' in checked.text
     assert f'name="pairing_id" value="{pairing.group(1)}"' in checked.text
     assert f'name="code" value="{code.group(1)}"' in checked.text
 
@@ -61,7 +60,7 @@ def test_fingerprint_check_rejects_a_code_from_another_pairing(tmp_path: Path) -
         first = client.post("/computers/node/pair", data={"_csrf": settings.csrf_token})
         second = client.post("/computers/node/pair", data={"_csrf": settings.csrf_token})
         pairing = re.search(r'name="pairing_id" value="([a-f0-9]{32})"', first.text)
-        other_code = re.search(r'class="node-pairing-code">([^<]+)<', second.text)
+        other_code = re.search(r'name="code" value="([^"]+)"', second.text)
         assert pairing is not None
         assert other_code is not None
 

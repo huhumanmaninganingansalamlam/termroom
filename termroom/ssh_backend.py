@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import fcntl
 import hashlib
@@ -18,15 +19,17 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import paramiko
 from fastapi import WebSocket, WebSocketDisconnect
+from paramiko.agent import AgentSSH
 from starlette.datastructures import UploadFile
 
 from termroom.db import StateStore
@@ -60,6 +63,7 @@ from termroom.terminals import (
     normalize_terminal_name,
     parse_tmux_terminal_records,
     terminal_size,
+    tmux_browser_view_session,
 )
 from termroom.workspace_usage import (
     WORKSPACE_USAGE_PANES_MARKER,
@@ -77,6 +81,8 @@ REMOTE_RUN_LOG_READ_LIMIT = 256 * 1024
 REMOTE_RUN_INITIAL_TAIL = 64 * 1024
 REMOTE_RUN_SESSION_PREFIX = "termroom-run-"
 REMOTE_RUN_DELETE_TIMEOUT_SECONDS = 10 * 60
+SSH_REUSE_IDLE_SECONDS = 30.0
+SSH_REUSE_MAX_IDLE_PER_TARGET = 2
 
 REMOTE_RUN_LOG_PIPE_SCRIPT = r"""#!/bin/bash
 set -u
@@ -607,12 +613,68 @@ class _ExpectedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
             raise SSHHostKeyChanged("SSH host key changed; reconnect only after verifying it")
 
 
+class _ConfiguredAgent(AgentSSH):
+    def __init__(self, path: str, allowed_keys: set[bytes] | None = None) -> None:
+        super().__init__()
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(path)
+            self._connect(connection)
+            if allowed_keys is not None:
+                self._keys = tuple(
+                    key for key in self._keys if key.asbytes() in allowed_keys
+                )
+        except Exception:
+            connection.close()
+            raise
+
+    def close(self) -> None:
+        self._close()
+
+
+class _SSHClientLease:
+    """Return a borrowed SSH client to the backend's bounded idle pool on close."""
+
+    def __init__(
+        self,
+        backend: SSHBackend,
+        key: tuple[Any, ...],
+        computer_id: str,
+        client: paramiko.SSHClient,
+    ) -> None:
+        self._backend = backend
+        self._key = key
+        self._computer_id = computer_id
+        self._client = client
+        self._closed = False
+        self._reusable = True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def invalidate(self) -> None:
+        self._reusable = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._backend._release_connection(
+            self._key,
+            self._computer_id,
+            self._client,
+            reusable=self._reusable,
+        )
+
+
 class SSHBackend:
     def __init__(
         self,
         store: StateStore,
         state_dir: Path,
         control: TerminalControl | None = None,
+        *,
+        reuse_connections: bool = False,
     ) -> None:
         self.store = store
         self.state_dir = state_dir
@@ -623,6 +685,13 @@ class SSHBackend:
         self.control = control or TerminalControl()
         self.secrets = SecretStore(state_dir)
         self.secrets.initialize()
+        self._reuse_connections = reuse_connections
+        self._ssh_pool_lock = threading.Lock()
+        self._ssh_idle: dict[
+            tuple[Any, ...], list[tuple[paramiko.SSHClient, float]]
+        ] = {}
+        self._ssh_pool_generation: dict[str, int] = {}
+        self._ssh_pool_closed = False
 
     @property
     def managed_key_path(self) -> Path:
@@ -682,11 +751,14 @@ class SSHBackend:
                 "Could not store the SSH password securely",
                 locale_key="ssh.backend.credential_save",
             ) from exc
+        self.close_connections(computer_id)
 
     def delete_password(self, computer_id: str) -> None:
         self.secrets.delete(computer_id)
+        self.close_connections(computer_id)
 
     def forget_host_key(self, computer_id: str) -> None:
+        self.close_connections(computer_id)
         alias = f"termroom-{computer_id}"
         if not self.known_hosts_path.exists():
             return
@@ -717,27 +789,212 @@ class SSHBackend:
         alias = value.strip()
         if not alias:
             raise ValueError("SSH host or config alias is required")
-        config = paramiko.SSHConfig()
-        for config_path in (self.ssh_dir / "config", Path.home() / ".ssh" / "config"):
-            if config_path.is_file():
-                with config_path.open(encoding="utf-8") as handle:
-                    config.parse(handle)
-        resolved = config.lookup(alias)
-        host = str(resolved.get("hostname") or alias)
-        port = int(resolved.get("port") or 22)
-        username = str(resolved.get("user") or os.environ.get("USER") or "")
-        identities = resolved.get("identityfile") or []
-        if isinstance(identities, str):
-            identities = [identities]
-        identity_file = str(identities[0]) if identities else ""
+        self._require_ssh_client()
+        environment = os.environ.copy()
+        environment.pop("TERMROOM_PASSWORD", None)
+        try:
+            result = subprocess.run(
+                ["ssh", "-G", "-T", "--", alias],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SSHBackendError("Could not read OpenSSH configuration") from exc
+        if result.returncode:
+            raise SSHBackendError(
+                result.stderr.strip() or "Could not read OpenSSH configuration"
+            )
+        resolved: dict[str, list[str]] = {}
+        for raw_line in result.stdout.splitlines():
+            key, separator, raw_value = raw_line.partition(" ")
+            if not separator:
+                continue
+            resolved.setdefault(key.casefold(), []).append(raw_value.strip())
+
+        def first(name: str, default: str = "") -> str:
+            values = resolved.get(name, [])
+            return values[0] if values else default
+
+        host = first("hostname", alias)
+        try:
+            port = int(first("port", "22"))
+        except ValueError as exc:
+            raise SSHBackendError("OpenSSH returned an invalid port") from exc
+        username = first("user", os.environ.get("USER") or "")
+        identities = tuple(
+            os.path.expanduser(path)
+            for path in resolved.get("identityfile", [])
+            if path and path.casefold() != "none"
+        )
+        proxycommand = first("proxycommand")
+        proxyjump = first("proxyjump")
+        identity_agent = first("identityagent")
+        identity_agent_disabled = identity_agent.casefold() == "none"
         return {
             "ssh_alias": alias,
             "host": host,
             "port": port,
             "username": username,
-            "identity_file": os.path.expanduser(identity_file) if identity_file else "",
-            "proxycommand": str(resolved.get("proxycommand") or ""),
+            "identity_file": identities[0] if identities else "",
+            "identity_files": identities,
+            "identity_agent": "" if identity_agent_disabled else identity_agent,
+            "identity_agent_disabled": identity_agent_disabled,
+            "identities_only": first("identitiesonly").casefold() == "yes",
+            "proxycommand": ""
+            if proxycommand.casefold() == "none"
+            else proxycommand,
+            "proxyjump": "" if proxyjump.casefold() == "none" else proxyjump,
+            "host_key_alias": first("hostkeyalias", host),
         }
+
+    @staticmethod
+    def _proxy_endpoint(host: str, port: int) -> str:
+        return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+
+    @staticmethod
+    def _parse_jump_destination(value: str) -> tuple[str, str, int | None]:
+        raw = value.strip()
+        if not raw:
+            raise SSHBackendError("OpenSSH ProxyJump target is empty")
+        user = ""
+        host_port = raw
+        if "@" in host_port:
+            user, host_port = host_port.rsplit("@", 1)
+        port: int | None = None
+        if host_port.startswith("["):
+            end = host_port.find("]")
+            if end <= 1:
+                raise SSHBackendError("OpenSSH ProxyJump target is invalid")
+            host = host_port[1:end]
+            suffix = host_port[end + 1 :]
+            if suffix:
+                if not suffix.startswith(":") or not suffix[1:].isdigit():
+                    raise SSHBackendError("OpenSSH ProxyJump port is invalid")
+                port = int(suffix[1:])
+        else:
+            host = host_port
+            if host_port.count(":") == 1:
+                candidate, separator, port_text = host_port.rpartition(":")
+                if separator and port_text.isdigit():
+                    host = candidate
+                    port = int(port_text)
+        if not host or (port is not None and not 1 <= port <= 65535):
+            raise SSHBackendError("OpenSSH ProxyJump target is invalid")
+        return user, host, port
+
+    @staticmethod
+    def _expand_proxy_command(command: str, target: Mapping[str, Any]) -> str:
+        host = str(target.get("host") or "")
+        port = str(int(target.get("port") or 22))
+        user = str(target.get("username") or "")
+        alias = str(target.get("ssh_alias") or host)
+        jump = str(target.get("proxyjump") or "")
+        local_fqdn = socket.getfqdn()
+        replacements = {
+            "%": "%",
+            "d": str(Path.home()),
+            "h": host,
+            "i": str(os.getuid()) if hasattr(os, "getuid") else "0",
+            "j": jump,
+            "k": str(target.get("host_key_alias") or host),
+            "L": socket.gethostname().split(".", 1)[0],
+            "l": local_fqdn,
+            "n": alias,
+            "p": port,
+            "r": user,
+        }
+        output: list[str] = []
+        index = 0
+        while index < len(command):
+            if command[index] != "%":
+                output.append(command[index])
+                index += 1
+                continue
+            if index + 1 >= len(command):
+                raise SSHBackendError("OpenSSH ProxyCommand ends with an invalid token")
+            token = command[index + 1]
+            if token not in replacements:
+                raise SSHBackendError(
+                    f"OpenSSH ProxyCommand token %{token} is not supported"
+                )
+            output.append(replacements[token])
+            index += 2
+        return "".join(output)
+
+    def _proxy_command_for_target(self, target: Mapping[str, Any]) -> str:
+        configured = str(target.get("proxycommand") or "").strip()
+        if configured:
+            return self._expand_proxy_command(configured, target)
+        jump = str(target.get("proxyjump") or "").strip()
+        if not jump:
+            return ""
+        jumps = [item.strip() for item in jump.split(",") if item.strip()]
+        if not jumps:
+            return ""
+        user, jump_host, jump_port = self._parse_jump_destination(jumps[-1])
+        argv = [
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "NumberOfPasswordPrompts=0",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ControlMaster=no",
+        ]
+        if len(jumps) > 1:
+            argv.extend(["-J", ",".join(jumps[:-1])])
+        if user:
+            argv.extend(["-l", user])
+        if jump_port is not None:
+            argv.extend(["-p", str(jump_port)])
+        argv.extend(
+            [
+                "-W",
+                self._proxy_endpoint(
+                    str(target.get("host") or ""), int(target.get("port") or 22)
+                ),
+                "--",
+                jump_host,
+            ]
+        )
+        return shlex.join(argv)
+
+    def _proxy_socket(self, target: Mapping[str, Any]) -> paramiko.ProxyCommand | None:
+        command = self._proxy_command_for_target(target)
+        return paramiko.ProxyCommand(command) if command else None
+
+    def probe_target_host_key(
+        self, target: Mapping[str, Any], *, timeout: float = 8.0
+    ) -> dict[str, str]:
+        host = str(target.get("host") or "")
+        port = int(target.get("port") or 22)
+        proxy = self._proxy_socket(target)
+        if proxy is None:
+            return self.probe_host_key(host, port, timeout=timeout)
+        transport = paramiko.Transport(proxy)
+        try:
+            transport.start_client(timeout=timeout)
+            key = transport.get_remote_server_key()
+            fingerprint = base64.b64encode(
+                hashlib.sha256(key.asbytes()).digest()
+            ).decode("ascii")
+            return {
+                "host_key_type": key.get_name(),
+                "host_key_data": key.get_base64(),
+                "host_fingerprint": "SHA256:" + fingerprint.rstrip("="),
+            }
+        except (OSError, paramiko.SSHException) as exc:
+            raise self.connection_error(exc, host, port) from exc
+        finally:
+            transport.close()
+            with contextlib.suppress(Exception):
+                proxy.close()
 
     @staticmethod
     def probe_host_key(host: str, port: int, *, timeout: float = 8.0) -> dict[str, str]:
@@ -781,7 +1038,9 @@ class SSHBackend:
         self, computer: dict[str, Any], password: str
     ) -> dict[str, str]:
         self._require_ssh_client()
-        client = self._connect_password(computer, password)
+        client = self._connect_password(
+            self._effective_connection_target(computer), password
+        )
         return self._connection_info(client)
 
     @staticmethod
@@ -836,6 +1095,7 @@ class SSHBackend:
         try:
             sftp = client.open_sftp()
         except (OSError, paramiko.SSHException) as exc:
+            self._invalidate_client(client)
             client.close()
             raise SSHBackendError(
                 "Could not open SFTP to resolve the SSH home directory",
@@ -882,6 +1142,7 @@ class SSHBackend:
         try:
             sftp = client.open_sftp()
         except Exception:
+            self._invalidate_client(client)
             client.close()
             raise
         try:
@@ -938,6 +1199,7 @@ class SSHBackend:
         try:
             sftp = client.open_sftp()
         except Exception:
+            self._invalidate_client(client)
             client.close()
             raise
         try:
@@ -1006,6 +1268,7 @@ class SSHBackend:
                 transport.set_keepalive(15)
             sftp = client.open_sftp()
         except Exception:
+            self._invalidate_client(client)
             client.close()
             raise
         try:
@@ -3561,7 +3824,10 @@ class SSHBackend:
         self.store.touch_terminal(str(terminal["id"]))
         terminal_id = str(terminal["id"])
         client_id = self.control.register(terminal_id)
-        process_pid, master_fd = self._spawn_ssh_tmux_client(workspace, terminal)
+        view_session = tmux_browser_view_session(client_id)
+        process_pid, master_fd = self._spawn_ssh_tmux_client(
+            workspace, terminal, view_session
+        )
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
@@ -4231,7 +4497,252 @@ class SSHBackend:
 
         return FileService().content_type(relative_path)
 
-    def _connect(self, computer: dict[str, Any]) -> paramiko.SSHClient:
+    def _effective_connection_target(
+        self, computer: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        target = dict(computer)
+        alias = str(computer.get("ssh_alias") or "").strip()
+        if alias:
+            configured = self.resolve_target(alias)
+            for key in (
+                "identity_files",
+                "identity_agent",
+                "identity_agent_disabled",
+                "identities_only",
+                "proxycommand",
+                "proxyjump",
+            ):
+                target[key] = configured.get(key)
+        else:
+            target.update(
+                identity_files=(),
+                identity_agent="",
+                identity_agent_disabled=False,
+                identities_only=False,
+                proxycommand="",
+                proxyjump="",
+            )
+        return target
+
+    def _connection_cache_key(self, computer: dict[str, Any]) -> tuple[Any, ...]:
+        computer_id = str(computer.get("id") or "")
+        identities = tuple(
+            os.path.expanduser(str(value))
+            for value in computer.get("identity_files", ())
+            if str(value)
+        )
+        explicit_identity = os.path.expanduser(
+            str(computer.get("identity_file") or "")
+        )
+        if explicit_identity:
+            identities = (explicit_identity,)
+        identity_revisions: list[tuple[str, int | None, int | None]] = []
+        for identity_value in identities:
+            mtime_ns: int | None = None
+            size: int | None = None
+            with contextlib.suppress(OSError):
+                identity_stat = Path(identity_value).stat()
+                mtime_ns = identity_stat.st_mtime_ns
+                size = identity_stat.st_size
+            identity_revisions.append((identity_value, mtime_ns, size))
+        with self._ssh_pool_lock:
+            generation = self._ssh_pool_generation.get(computer_id, 0)
+        return (
+            computer_id,
+            generation,
+            str(computer.get("auth_kind") or "key"),
+            str(computer.get("host") or ""),
+            int(computer.get("port") or 22),
+            str(computer.get("username") or ""),
+            tuple(identity_revisions),
+            str(computer.get("identity_agent") or ""),
+            bool(computer.get("identity_agent_disabled")),
+            bool(computer.get("identities_only")),
+            str(computer.get("host_key_type") or ""),
+            str(computer.get("host_key_data") or ""),
+            self._proxy_command_for_target(computer),
+        )
+
+    @staticmethod
+    def _connection_active(client: paramiko.SSHClient) -> bool:
+        transport = client.get_transport()
+        return bool(
+            transport is not None
+            and transport.is_active()
+            and transport.is_authenticated()
+        )
+
+    @staticmethod
+    def _close_clients(clients: Iterable[paramiko.SSHClient]) -> None:
+        for client in clients:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    @staticmethod
+    def _invalidate_client(client: paramiko.SSHClient) -> None:
+        invalidate = getattr(client, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
+
+    def _prune_idle_connections_locked(
+        self,
+        now: float,
+        *,
+        computer_id: str | None = None,
+        keep_key: tuple[Any, ...] | None = None,
+    ) -> list[paramiko.SSHClient]:
+        closing: list[paramiko.SSHClient] = []
+        for key in tuple(self._ssh_idle):
+            if computer_id is not None and str(key[0]) != computer_id:
+                continue
+            retained: list[tuple[paramiko.SSHClient, float]] = []
+            for client, idle_since in self._ssh_idle[key]:
+                if (
+                    (keep_key is not None and key != keep_key)
+                    or now - idle_since > SSH_REUSE_IDLE_SECONDS
+                    or not self._connection_active(client)
+                ):
+                    closing.append(client)
+                else:
+                    retained.append((client, idle_since))
+            if retained:
+                self._ssh_idle[key] = retained
+            else:
+                self._ssh_idle.pop(key, None)
+        return closing
+
+    def close_connections(self, computer_id: str | None = None) -> None:
+        with self._ssh_pool_lock:
+            if computer_id is None:
+                clients = [
+                    client
+                    for entries in self._ssh_idle.values()
+                    for client, _ in entries
+                ]
+                self._ssh_idle.clear()
+                for key in tuple(self._ssh_pool_generation):
+                    self._ssh_pool_generation[key] += 1
+            else:
+                self._ssh_pool_generation[computer_id] = (
+                    self._ssh_pool_generation.get(computer_id, 0) + 1
+                )
+                clients = []
+                for key in tuple(self._ssh_idle):
+                    if str(key[0]) == computer_id:
+                        clients.extend(client for client, _ in self._ssh_idle.pop(key))
+        self._close_clients(clients)
+
+    def close(self) -> None:
+        with self._ssh_pool_lock:
+            self._ssh_pool_closed = True
+            clients = [
+                client for entries in self._ssh_idle.values() for client, _ in entries
+            ]
+            self._ssh_idle.clear()
+        self._close_clients(clients)
+
+    def _release_connection(
+        self,
+        key: tuple[Any, ...],
+        computer_id: str,
+        client: paramiko.SSHClient,
+        *,
+        reusable: bool,
+    ) -> None:
+        if not reusable or not self._connection_active(client):
+            client.close()
+            return
+        close_client = False
+        with self._ssh_pool_lock:
+            generation = self._ssh_pool_generation.get(computer_id, 0)
+            entries = self._ssh_idle.setdefault(key, [])
+            if (
+                self._ssh_pool_closed
+                or int(key[1]) != generation
+                or len(entries) >= SSH_REUSE_MAX_IDLE_PER_TARGET
+            ):
+                close_client = True
+                if not entries:
+                    self._ssh_idle.pop(key, None)
+            else:
+                entries.append((client, time.monotonic()))
+        if close_client:
+            client.close()
+
+    def _connect(
+        self, computer: dict[str, Any]
+    ) -> paramiko.SSHClient | _SSHClientLease:
+        target = self._effective_connection_target(computer)
+        if not self._reuse_connections:
+            return self._connect_fresh(target)
+        key = self._connection_cache_key(target)
+        computer_id = str(target.get("id") or "")
+        reused: paramiko.SSHClient | None = None
+        with self._ssh_pool_lock:
+            if self._ssh_pool_closed:
+                raise SSHBackendError("SSH backend is closed")
+            closing = self._prune_idle_connections_locked(
+                time.monotonic(),
+                computer_id=computer_id,
+                keep_key=key,
+            )
+            entries = self._ssh_idle.get(key, [])
+            while entries:
+                candidate, _ = entries.pop()
+                if self._connection_active(candidate):
+                    reused = candidate
+                    break
+                closing.append(candidate)
+            if not entries:
+                self._ssh_idle.pop(key, None)
+        self._close_clients(closing)
+
+        if reused is not None:
+            self._record_connection(target)
+            return _SSHClientLease(self, key, computer_id, reused)
+
+        client = self._connect_fresh(target)
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(15)
+        return _SSHClientLease(self, key, computer_id, client)
+
+    def _configured_key_filenames(self, computer: Mapping[str, Any]) -> list[str]:
+        explicit = str(computer.get("identity_file") or "").strip()
+        if explicit:
+            return [self.validate_identity_file(explicit)]
+        result: list[str] = []
+        for raw_path in computer.get("identity_files", ()):
+            path = Path(str(raw_path)).expanduser()
+            if path.suffix == ".pub" or not path.is_file():
+                continue
+            result.append(self.validate_identity_file(str(path)))
+        return result
+
+    @staticmethod
+    def _configured_agent_key_blobs(computer: Mapping[str, Any]) -> set[bytes]:
+        raw_paths = [
+            str(value)
+            for value in computer.get("identity_files", ())
+            if str(value)
+        ]
+        explicit = str(computer.get("identity_file") or "").strip()
+        if explicit:
+            raw_paths.insert(0, explicit)
+        blobs: set[bytes] = set()
+        for raw_path in dict.fromkeys(raw_paths):
+            path = Path(raw_path).expanduser()
+            public_path = path if path.suffix == ".pub" else Path(str(path) + ".pub")
+            try:
+                fields = public_path.read_text(encoding="utf-8").strip().split()
+                if len(fields) < 2:
+                    continue
+                blobs.add(base64.b64decode(fields[1], validate=True))
+            except (OSError, UnicodeDecodeError, ValueError, binascii.Error):
+                continue
+        return blobs
+
+    def _connect_fresh(self, computer: dict[str, Any]) -> paramiko.SSHClient:
         if str(computer.get("auth_kind") or "key") == "password":
             try:
                 client = self._connect_password(computer, self._stored_password(computer))
@@ -4246,6 +4757,31 @@ class SSHBackend:
                 str(computer["host_key_type"]), str(computer["host_key_data"])
             )
         )
+        configured_agent = os.path.expandvars(
+            os.path.expanduser(str(computer.get("identity_agent") or ""))
+        )
+        process_agent = os.environ.get("SSH_AUTH_SOCK", "")
+        agent_matches_process = not configured_agent or configured_agent == process_agent
+        custom_agent: _ConfiguredAgent | None = None
+        identities_only = bool(computer.get("identities_only"))
+        allowed_agent_keys = (
+            self._configured_agent_key_blobs(computer) if identities_only else None
+        )
+        agent_allowed = not bool(computer.get("identity_agent_disabled")) and (
+            not identities_only or bool(allowed_agent_keys)
+        )
+        agent_path = configured_agent or process_agent
+        if agent_allowed and agent_path and (not agent_matches_process or identities_only):
+            try:
+                custom_agent = _ConfiguredAgent(agent_path, allowed_agent_keys)
+            except (OSError, paramiko.SSHException) as exc:
+                error = SSHBackendError(
+                    "Could not connect to the SSH agent configured for this alias"
+                )
+                self._record_connection(computer, error=error)
+                client.close()
+                raise error from exc
+            client._agent = custom_agent
         connect_kwargs: dict[str, Any] = {
             "hostname": str(computer["host"]),
             "port": int(computer["port"]),
@@ -4253,15 +4789,17 @@ class SSHBackend:
             "timeout": 10,
             "banner_timeout": 10,
             "auth_timeout": 15,
-            "allow_agent": True,
-            "look_for_keys": True,
+            "allow_agent": agent_allowed
+            and (agent_matches_process or custom_agent is not None),
+            "look_for_keys": not bool(computer.get("ssh_alias"))
+            and not identities_only,
         }
-        identity = str(computer.get("identity_file") or "")
-        if identity:
-            connect_kwargs["key_filename"] = self.validate_identity_file(identity)
-        proxy = self._proxy_command(str(computer.get("ssh_alias") or ""))
-        if proxy:
-            connect_kwargs["sock"] = paramiko.ProxyCommand(proxy)
+        identities = self._configured_key_filenames(computer)
+        if identities:
+            connect_kwargs["key_filename"] = identities
+        proxy = self._proxy_socket(computer)
+        if proxy is not None:
+            connect_kwargs["sock"] = proxy
         try:
             client.connect(**connect_kwargs)
         except SSHHostKeyChanged as exc:
@@ -4283,6 +4821,10 @@ class SSHBackend:
             self._record_connection(computer, error=error)
             client.close()
             raise error from exc
+        finally:
+            if custom_agent is not None:
+                custom_agent.close()
+                client._agent = None
         self._record_connection(computer)
         return client
 
@@ -4295,12 +4837,14 @@ class SSHBackend:
                 str(computer["host_key_type"]), str(computer["host_key_data"])
             )
         )
+        proxy = self._proxy_socket(computer)
         try:
             client.connect(
                 hostname=str(computer["host"]),
                 port=int(computer["port"]),
                 username=str(computer["username"]),
                 password=password,
+                sock=proxy,
                 timeout=10,
                 banner_timeout=10,
                 auth_timeout=15,
@@ -4309,12 +4853,18 @@ class SSHBackend:
             )
         except paramiko.AuthenticationException as exc:
             client.close()
+            if proxy is not None:
+                with contextlib.suppress(Exception):
+                    proxy.close()
             raise SSHBackendError(
                 "SSH password authentication failed",
                 locale_key="ssh.backend.password_auth",
             ) from exc
         except (OSError, paramiko.SSHException) as exc:
             client.close()
+            if proxy is not None:
+                with contextlib.suppress(Exception):
+                    proxy.close()
             raise self.connection_error(
                 exc, str(computer["host"]), int(computer["port"])
             ) from exc
@@ -4405,6 +4955,7 @@ class SSHBackend:
         try:
             return client, client.open_sftp()
         except Exception:
+            self._invalidate_client(client)
             client.close()
             raise
 
@@ -4429,6 +4980,7 @@ class SSHBackend:
             error = stderr.read().decode("utf-8", errors="replace")
             status = stdout.channel.recv_exit_status()
         except (EOFError, OSError, paramiko.SSHException) as exc:
+            SSHBackend._invalidate_client(client)
             raise SSHCommandStatusUnknown(
                 "SSH command completion status is unknown"
             ) from exc
@@ -4520,24 +5072,11 @@ class SSHBackend:
         value = relative.as_posix()
         return "." if value == "." else value
 
-    def _proxy_command(self, alias: str) -> str:
-        if not alias:
-            return ""
-        config = paramiko.SSHConfig()
-        found = False
-        for config_path in (self.ssh_dir / "config", Path.home() / ".ssh" / "config"):
-            if not config_path.is_file():
-                continue
-            with config_path.open(encoding="utf-8") as handle:
-                config.parse(handle)
-            found = True
-        if not found:
-            return ""
-        value = config.lookup(alias).get("proxycommand")
-        return str(value or "")
-
     def _spawn_ssh_tmux_client(
-        self, workspace: dict[str, Any], terminal: dict[str, Any]
+        self,
+        workspace: dict[str, Any],
+        terminal: dict[str, Any],
+        view_session: str,
     ) -> tuple[int, int]:
         computer = self._computer(workspace)
         self.remember_host_key(computer)
@@ -4552,11 +5091,16 @@ class SSHBackend:
             environment["TERMROOM_SSH_CREDENTIAL_ID"] = str(computer["id"])
             environment.setdefault("DISPLAY", "termroom")
         argv = self._ssh_argv(computer)
+        quoted_view = shlex.quote(view_session)
+        quoted_workspace_session = shlex.quote(str(workspace["tmux_session"]))
+        quoted_window = shlex.quote(f"{view_session}:{terminal['tmux_window']}")
+        cleanup = f"tmux kill-session -t {quoted_view} >/dev/null 2>&1 || true"
         remote_command = (
-            "exec tmux attach-session -t "
-            + shlex.quote(str(workspace["tmux_session"]))
-            + " \\; select-window -t "
-            + shlex.quote(str(terminal["tmux_window"]))
+            f"{cleanup}; "
+            f"tmux new-session -d -s {quoted_view} -t {quoted_workspace_session} && "
+            f"tmux select-window -t {quoted_window} && "
+            f"trap {shlex.quote(cleanup)} EXIT HUP INT TERM; "
+            f"tmux attach-session -t {quoted_view}"
         )
         process_pid, master_fd = spawn_pty_process(
             [*argv, remote_command], environment=environment
@@ -4578,6 +5122,12 @@ class SSHBackend:
             f"HostKeyAlias=termroom-{computer['id']}",
             "-o",
             "ControlMaster=no",
+            "-o",
+            "HostName=" + str(computer["host"]),
+            "-p",
+            str(computer["port"]),
+            "-l",
+            str(computer["username"]),
         ]
         if str(computer.get("auth_kind") or "key") == "password":
             argv.extend(
@@ -4592,8 +5142,6 @@ class SSHBackend:
             )
         else:
             argv.extend(["-o", "BatchMode=yes"])
-        if not computer.get("ssh_alias"):
-            argv.extend(["-p", str(computer["port"]), "-l", str(computer["username"])])
         identity = str(computer.get("identity_file") or "")
         if identity:
             argv.extend(["-i", os.path.expanduser(identity)])

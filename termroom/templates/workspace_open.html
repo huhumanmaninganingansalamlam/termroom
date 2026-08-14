@@ -82,12 +82,24 @@
     <span><strong>{{ roots[0].label }}</strong><small>{{ roots[0].path }}</small></span>
     <span>{{ t('open.workspace_count', count=roots[0].workspace_count) }}</span>
   </span>
-  <details class="add-location-menu" {% if browse_location %}open{% endif %}
-           data-popover-close-url="{{ location_close_url }}"
-           data-popover-clear-query="{{ 1 if browse_location else 0 }}">
-    <summary class="secondary-button">{{ t('open.add_location') }}</summary>
-    <span class="add-location-backdrop" data-close-popover aria-hidden="true"></span>
-    <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}"
+  <div class="add-location-menu" data-popover {% if browse_location %}open{% endif %}
+       data-popover-close-url="{{ location_close_url }}"
+       data-popover-clear-query="{{ 1 if browse_location else 0 }}">
+    <button class="secondary-button"
+            type="button"
+            data-popover-trigger
+            aria-expanded="{{ 'true' if browse_location else 'false' }}"
+            aria-controls="add-location-dialog">{{ t('open.add_location') }}</button>
+    <span class="add-location-backdrop" data-popover-panel data-close-popover aria-hidden="true" {% if not browse_location %}hidden{% endif %}></span>
+    <form id="add-location-dialog"
+          method="post"
+          action="/open/local/locations"
+          class="add-location-form"
+          role="dialog"
+          aria-modal="true"
+          aria-label="{{ t('open.add_location') }}"
+          data-popover-panel
+          {% if not browse_location %}hidden{% endif %}
           data-folder-picker data-folder-picker-url="/api/local/browse-directories">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <header class="floating-form-heading">
@@ -135,18 +147,30 @@
         <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('open.add_location') }}">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
       </div>
     </form>
-  </details>
+  </div>
 </section>
 {% else %}
 <section class="open-location-panel panel">
   <header class="open-section-heading">
     <div><h2>{{ t('open.locations') }}</h2><p>{{ t('open.locations_copy') }}</p></div>
-    <details class="add-location-menu" {% if browse_location %}open{% endif %}
-             data-popover-close-url="{{ location_close_url }}"
-             data-popover-clear-query="{{ 1 if browse_location else 0 }}">
-      <summary class="secondary-button">{{ t('open.add_location') }}</summary>
-      <span class="add-location-backdrop" data-close-popover aria-hidden="true"></span>
-      <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}"
+    <div class="add-location-menu" data-popover {% if browse_location %}open{% endif %}
+         data-popover-close-url="{{ location_close_url }}"
+         data-popover-clear-query="{{ 1 if browse_location else 0 }}">
+      <button class="secondary-button"
+              type="button"
+              data-popover-trigger
+              aria-expanded="{{ 'true' if browse_location else 'false' }}"
+              aria-controls="add-location-dialog">{{ t('open.add_location') }}</button>
+      <span class="add-location-backdrop" data-popover-panel data-close-popover aria-hidden="true" {% if not browse_location %}hidden{% endif %}></span>
+      <form id="add-location-dialog"
+            method="post"
+            action="/open/local/locations"
+            class="add-location-form"
+            role="dialog"
+            aria-modal="true"
+            aria-label="{{ t('open.add_location') }}"
+            data-popover-panel
+            {% if not browse_location %}hidden{% endif %}
             data-folder-picker data-folder-picker-url="/api/local/browse-directories">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <header class="floating-form-heading">
@@ -191,7 +215,7 @@
           <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('open.add_location') }}">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
         </div>
       </form>
-    </details>
+    </div>
   </header>
   <div class="open-location-list">
     {% for item in roots %}

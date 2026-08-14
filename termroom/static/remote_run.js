@@ -232,9 +232,7 @@
         }
         workspaceRun.dataset.state = result.state;
         stateChip?.classList.toggle("running", result.state === "running");
-        if (stateLabel) {
-          stateLabel.textContent = tr(`remote_run.state.${result.state}`);
-        }
+        if (stateLabel) stateLabel.textContent = result.state_label || tr(`remote_run.state.${result.state}`);
       } catch (_error) {
         // A dropped SSH connection does not change the Run state. Keep polling;
         // the existing terminal reconnect UI remains the visible connection signal.

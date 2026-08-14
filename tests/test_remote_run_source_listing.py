@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -23,9 +22,7 @@ def _node_computer(app, name: str, capabilities: tuple[str, ...]):  # type: igno
     code = generate_pairing_code()
     app.state.store.create_node_pairing_code(
         code_hash=pairing_code_digest(code),
-        expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat(
-            timespec="seconds"
-        ),
+        expires_at="2999-01-01T00:00:00+00:00",
     )
     public_key = public_key_text(generate_private_key().public_key())
     enrollment = app.state.store.submit_node_enrollment(

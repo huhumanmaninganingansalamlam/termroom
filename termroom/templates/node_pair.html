@@ -10,6 +10,12 @@
   </header>
 
   {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+  {% if node_pairing_issue_key %}
+  <section class="connection-notice" role="status" aria-live="polite" aria-labelledby="node-pair-reachability-title">
+    <strong id="node-pair-reachability-title">{{ t('node.pair.reachability_title') }}</strong>
+    <p>{{ t(node_pairing_issue_key, core_url=core_url) }}</p>
+  </section>
+  {% endif %}
 
   {% if code %}
   <section class="panel stack-form">
@@ -52,7 +58,7 @@
   <form method="post" action="/computers/node/pair" class="panel stack-form">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <p>{{ t('node.pair.start_copy') }}</p>
-    <button class="primary-button" type="submit">{{ t('node.pair.create_code') }}</button>
+    <button class="primary-button" type="submit" {% if not node_pairing_ready %}disabled aria-disabled="true"{% endif %}>{{ t('node.pair.create_code') }}</button>
   </form>
   {% endif %}
 </section>

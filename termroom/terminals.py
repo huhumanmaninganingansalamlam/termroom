@@ -40,10 +40,23 @@ MIN_TERMINAL_COLS = 20
 MAX_TERMINAL_COLS = 1000
 TMUX_TERMINAL_ROLE_OPTION = "@termroom_terminal_role"
 TMUX_MANAGED_RUN_OPTION = "@termroom_managed_run_id"
+TMUX_BROWSER_VIEW_PREFIX = "termroom-view-"
 TMUX_TERMINAL_RECORD_FORMAT = (
     "#{session_name}|#{window_id}|#{window_activity}|#{window_name}|"
     f"#{{{TMUX_TERMINAL_ROLE_OPTION}}}|#{{{TMUX_MANAGED_RUN_OPTION}}}"
 )
+
+
+def tmux_browser_view_session(client_id: str) -> str:
+    """Return the internal tmux session used by one browser terminal view."""
+
+    try:
+        parsed = uuid.UUID(hex=str(client_id))
+    except (ValueError, AttributeError) as exc:
+        raise TerminalError("Browser Terminal view identity is invalid") from exc
+    if parsed.hex != client_id:
+        raise TerminalError("Browser Terminal view identity is invalid")
+    return f"{TMUX_BROWSER_VIEW_PREFIX}{client_id}"
 
 
 def parse_tmux_terminal_records(output: str) -> list[dict[str, str | int | None]]:
@@ -816,19 +829,18 @@ class TerminalManager:
     ) -> None:
         self.ensure_workspace(workspace)
         self.store.touch_terminal(terminal["id"])
-        self._run_tmux("select-window", "-t", terminal["tmux_window"])
         terminal_id = str(terminal["id"])
         client_id = self.control.register(terminal_id)
-
-        # The helper process creates a real controlling terminal after a
-        # posix_spawn. This preserves resize semantics without calling forkpty
-        # from the multi-threaded web server.
-        process_pid, master_fd = self._spawn_tmux_client(workspace)
+        view_session = tmux_browser_view_session(client_id)
+        process_pid: int | None = None
+        master_fd: int | None = None
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
             while True:
                 try:
+                    if master_fd is None:
+                        return
                     chunk = await asyncio.to_thread(os.read, master_fd, 65536)
                 except OSError:
                     tail = decoder.feed(b"", final=True)
@@ -863,6 +875,8 @@ class TerminalManager:
                     if len(payload_bytes) > MAX_TERMINAL_MESSAGE_BYTES:
                         await websocket.close(code=1009, reason="Terminal input is too large")
                         return
+                    if master_fd is None:
+                        return
                     self.control.mark_input(terminal_id, client_id, device_id)
                     os.write(master_fd, payload_bytes)
                     continue
@@ -873,6 +887,8 @@ class TerminalManager:
                 try:
                     payload = json.loads(raw)
                 except json.JSONDecodeError:
+                    if master_fd is None:
+                        return
                     self.control.mark_input(terminal_id, client_id, device_id)
                     os.write(master_fd, raw.encode())
                     continue
@@ -899,13 +915,15 @@ class TerminalManager:
                     if not self.control.can_resize(terminal_id, client_id):
                         continue
                     size = terminal_size(payload)
-                    if size is None:
+                    if size is None or master_fd is None or process_pid is None:
                         continue
                     rows, cols = size
                     self._set_window_size(master_fd, rows=rows, cols=cols)
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process_pid, signal.SIGWINCH)
                 elif kind == "command":
+                    if master_fd is None:
+                        return
                     self.control.mark_input(terminal_id, client_id, device_id)
                     command = str(payload.get("data", ""))
                     await asyncio.to_thread(
@@ -913,12 +931,21 @@ class TerminalManager:
                     )
                     os.write(master_fd, command.encode() + b"\r")
                 elif kind == "input":
+                    if master_fd is None:
+                        return
                     self.control.mark_input(terminal_id, client_id, device_id)
                     os.write(master_fd, str(payload.get("data", "")).encode())
 
-        output_task = asyncio.create_task(output_to_browser())
-        input_task = asyncio.create_task(browser_to_input())
+        output_task: asyncio.Task[None] | None = None
+        input_task: asyncio.Task[None] | None = None
         try:
+            self._prepare_browser_view(workspace, terminal, view_session)
+            # The helper process creates a real controlling terminal after a
+            # posix_spawn. This preserves resize semantics without calling forkpty
+            # from the multi-threaded web server.
+            process_pid, master_fd = self._spawn_tmux_client(workspace, view_session)
+            output_task = asyncio.create_task(output_to_browser())
+            input_task = asyncio.create_task(browser_to_input())
             done, pending = await asyncio.wait(
                 {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -930,19 +957,54 @@ class TerminalManager:
         finally:
             self.control.unregister(terminal_id, client_id)
             for task in (output_task, input_task):
-                if not task.done():
+                if task is not None and not task.done():
                     task.cancel()
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process_pid, signal.SIGTERM)
-            exited = await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
-            if not exited:
+            if process_pid is not None:
                 with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process_pid, signal.SIGKILL)
-                await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
-            with contextlib.suppress(OSError):
-                os.close(master_fd)
+                    os.killpg(process_pid, signal.SIGTERM)
+                exited = await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
+                if not exited:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process_pid, signal.SIGKILL)
+                    await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
+            if master_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(master_fd)
+            self._run_tmux("kill-session", "-t", view_session, check=False)
 
-    def _spawn_tmux_client(self, workspace: dict[str, Any]) -> tuple[int, int]:
+    def _prepare_browser_view(
+        self,
+        workspace: dict[str, Any],
+        terminal: dict[str, Any],
+        view_session: str,
+    ) -> None:
+        self._run_tmux("kill-session", "-t", view_session, check=False)
+        created = self._run_tmux(
+            "new-session",
+            "-d",
+            "-s",
+            view_session,
+            "-t",
+            str(workspace["tmux_session"]),
+            check=False,
+        )
+        if created.returncode:
+            raise TerminalError(created.stderr.strip() or "Browser Terminal view could not start")
+        selected = self._run_tmux(
+            "select-window",
+            "-t",
+            f"{view_session}:{terminal['tmux_window']}",
+            check=False,
+        )
+        if selected.returncode:
+            self._run_tmux("kill-session", "-t", view_session, check=False)
+            raise TerminalError(
+                selected.stderr.strip() or "Browser Terminal window could not be selected"
+            )
+
+    def _spawn_tmux_client(
+        self, workspace: dict[str, Any], view_session: str | None = None
+    ) -> tuple[int, int]:
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TERMROOM_PASSWORD", None)
@@ -951,8 +1013,9 @@ class TerminalManager:
         if test_socket:
             command.extend(("-S", test_socket))
         environment["TERM"] = "xterm-256color"
+        target_session = view_session or str(workspace["tmux_session"])
         process_pid, master_fd = spawn_pty_process(
-            [*command, "attach-session", "-t", workspace["tmux_session"]],
+            [*command, "attach-session", "-t", target_session],
             cwd=str(workspace["path"]),
             environment=environment,
         )

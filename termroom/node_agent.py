@@ -43,6 +43,7 @@ from termroom.node_protocol import (
     NODE_PROTOCOL_VERSION,
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
     NODE_REMOTE_RUN_SOURCE_VERSION,
+    NODE_REQUIRED_CAPABILITIES,
     NODE_WORKSPACE_USAGE_VERSION,
     NodeProtocolError,
     control_websocket_url,
@@ -92,6 +93,7 @@ from termroom.terminals import (
     file_run_completion_was_stopped,
     normalize_terminal_name,
     parse_tmux_terminal_records,
+    tmux_browser_view_session,
 )
 from termroom.workspace_usage import (
     WorkspaceUsageCollectionError,
@@ -469,6 +471,14 @@ class NodeRuntime:
             return {
                 "directory": self._relative(root, directory),
                 "entries": [asdict(entry) for entry in entries],
+            }
+        if operation == "files.recent":
+            root = self._workspace_path(payload)
+            recent = self.files.recent_files(root, limit=int(payload.get("limit") or 50))
+            return {
+                "entries": [asdict(entry) for entry in recent.entries],
+                "scanned_files": recent.scanned_files,
+                "truncated": recent.truncated,
             }
         if operation == "files.stat":
             root = self._workspace_path(payload)
@@ -1055,7 +1065,14 @@ class NodeRuntime:
         stream_id = validate_request_id(str(payload.get("stream_id") or ""))
         rows = max(4, min(int(payload.get("rows") or 24), 500))
         cols = max(20, min(int(payload.get("cols") or 80), 1000))
-        self._tmux("select-window", "-t", window)
+        view_session = tmux_browser_view_session(stream_id)
+        self._tmux("kill-session", "-t", view_session, check=False)
+        self._tmux("new-session", "-d", "-s", view_session, "-t", session)
+        try:
+            self._tmux("select-window", "-t", f"{view_session}:{window}")
+        except Exception:
+            self._tmux("kill-session", "-t", view_session, check=False)
+            raise
         environment = os.environ.copy()
         for key in tuple(environment):
             if key.startswith("TERMROOM_") or key in {"TMUX", "TMUX_PANE"}:
@@ -1065,15 +1082,28 @@ class NodeRuntime:
         test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
         if test_socket:
             command.extend(("-S", test_socket))
-        process_pid, master_fd = await asyncio.to_thread(
-            spawn_pty_process,
-            [*command, "attach-session", "-t", session],
-            cwd=str(root),
-            environment=environment,
-            rows=rows,
-            cols=cols,
+        try:
+            process_pid, master_fd = await asyncio.to_thread(
+                spawn_pty_process,
+                [*command, "attach-session", "-t", view_session],
+                cwd=str(root),
+                environment=environment,
+                rows=rows,
+                cols=cols,
+            )
+        except Exception:
+            self._tmux("kill-session", "-t", view_session, check=False)
+            raise
+        stream = TerminalAgentStream(
+            stream_id,
+            process_pid,
+            master_fd,
+            send,
+            self.streams,
+            cleanup=lambda: self._tmux(
+                "kill-session", "-t", view_session, check=False
+            ),
         )
-        stream = TerminalAgentStream(stream_id, process_pid, master_fd, send, self.streams)
         self.streams[stream_id] = stream
         return OperationResult({"stream_id": stream_id}, start=stream.start)
 
@@ -2123,12 +2153,14 @@ class TerminalAgentStream:
         master_fd: int,
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
         registry: dict[str, AgentStream],
+        cleanup: Callable[[], object] | None = None,
     ) -> None:
         self.stream_id = stream_id
         self.process_pid = process_pid
         self.master_fd = master_fd
         self.send = send
         self.registry = registry
+        self.cleanup = cleanup
         self.closed = False
 
     async def start(self) -> None:
@@ -2173,6 +2205,9 @@ class TerminalAgentStream:
         await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0)
         with contextlib.suppress(OSError):
             os.close(self.master_fd)
+        if self.cleanup is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.cleanup)
 
 
 class TextDownloadAgentStream:
@@ -2552,6 +2587,15 @@ class NodeAgent:
         if challenge.get("type") != "auth.challenge":
             raise NodeProtocolError("Core did not send a challenge", code="auth_invalid")
         nonce = str(challenge.get("nonce") or "")
+        offered_capabilities = challenge.get("capabilities")
+        if offered_capabilities is None:
+            capabilities = NODE_REQUIRED_CAPABILITIES
+        elif not isinstance(offered_capabilities, list) or any(
+            not isinstance(item, str) for item in offered_capabilities
+        ):
+            raise NodeProtocolError("Core capabilities are invalid", code="capabilities_invalid")
+        else:
+            capabilities = NODE_CAPABILITIES.intersection(offered_capabilities)
         await websocket.send(
             encode_message(
                 {
@@ -2559,7 +2603,7 @@ class NodeAgent:
                     "node_id": self.config.node_id,
                     "signature": sign_challenge(self.private_key, self.config.node_id, nonce),
                     "protocol_version": NODE_PROTOCOL_VERSION,
-                    "capabilities": sorted(NODE_CAPABILITIES),
+                    "capabilities": sorted(capabilities),
                 }
             )
         )

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import csv
 import io
+import ipaddress
 import json
 import os
 import secrets
@@ -131,7 +132,12 @@ def create_app(settings: Settings) -> FastAPI:
     files = FileService(settings.max_edit_bytes)
     terminal_control = TerminalControl()
     terminals = TerminalManager(store, terminal_control)
-    ssh = SSHBackend(store, settings.state_dir, terminal_control)
+    ssh = SSHBackend(
+        store,
+        settings.state_dir,
+        terminal_control,
+        reuse_connections=True,
+    )
     node_core = NodeCore(store)
     node_remote_runs = NodeRemoteRunClient(node_core)
     node_pairing_limiter = NodePairingRateLimiter()
@@ -185,6 +191,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.router.add_event_handler("startup", file_runs.startup)
     app.router.add_event_handler("shutdown", file_runs.shutdown)
     app.router.add_event_handler("shutdown", remote_runs.shutdown)
+    app.router.add_event_handler("shutdown", ssh.close)
     app.router.add_event_handler("shutdown", node_core.shutdown)
 
     @app.middleware("http")
@@ -720,9 +727,11 @@ def create_app(settings: Settings) -> FastAPI:
             target = run.get("target") or {}
             run["target_label"] = str(target.get("name") or "")
             run["created_label"] = _relative_time(str(run["created_at"]), locale)
+            display_state = _run_display_state(run.get("state"), run.get("exit_code"))
+            run["display_state"] = display_state
             run["state_label"] = translate(
                 locale,
-                f"remote_run.state.{run['state']}",
+                f"remote_run.state.{display_state}",
             )
         return templates.TemplateResponse(
             request=request,
@@ -975,8 +984,24 @@ def create_app(settings: Settings) -> FastAPI:
         source_workspace_id: str | None = None,
         source_path: str = ".",
         target_computer_id: str | None = None,
+        retry_run_id: str | None = None,
     ) -> HTMLResponse:
         remote_runs.schedule_cleanup()
+        retry_run = None
+        if retry_run_id:
+            retry_run = store.get_remote_run(retry_run_id)
+            if (
+                retry_run is None
+                or str(retry_run.get("source_kind") or "") != "workspace"
+                or not retry_run.get("source_workspace_id")
+            ):
+                raise HTTPException(status_code=404, detail="Retryable Remote Run not found")
+            if str(retry_run.get("state") or "") in {"preparing", "running"}:
+                raise HTTPException(status_code=409, detail="Remote Run is still active")
+            source_kind = "workspace"
+            source_workspace_id = str(retry_run["source_workspace_id"])
+            source_path = str(retry_run.get("source_path") or ".")
+            target_computer_id = str(retry_run.get("target_computer_id") or "")
         computers = [
             computer
             for computer in store.list_computers()
@@ -995,6 +1020,11 @@ def create_app(settings: Settings) -> FastAPI:
             str(workspace["id"]): workspace for workspace in source_workspaces
         }
         source_workspace = source_workspace_by_id.get(source_workspace_id or "")
+        if retry_run is not None and source_workspace is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Remote Run source Workspace is no longer available",
+            )
         normalized_source_path = "."
         if source_workspace is not None:
             with contextlib.suppress(ValueError):
@@ -1042,10 +1072,43 @@ def create_app(settings: Settings) -> FastAPI:
                 selected_source_path=normalized_source_path,
                 source_path_display=source_path_display,
                 selected_target_id=selected_target_id,
+                selected_command=str(retry_run.get("command") or "")
+                if retry_run is not None
+                else "",
+                retry_run=retry_run,
                 change_source_url=change_source_url,
                 return_url=return_url,
                 max_archive_bytes=settings.max_upload_bytes,
             ),
+        )
+
+    @app.get("/remote-runs/{run_id}/source")
+    async def open_remote_run_source(run_id: str) -> RedirectResponse:
+        run = store.get_remote_run(run_id)
+        if (
+            run is None
+            or str(run.get("source_kind") or "") != "workspace"
+            or not run.get("source_workspace_id")
+        ):
+            raise HTTPException(status_code=404, detail="Remote Run source not found")
+        try:
+            source_workspace = workspaces.require(str(run["source_workspace_id"]))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Source Workspace not found") from exc
+        if source_workspace.get("transient"):
+            raise HTTPException(status_code=404, detail="Source Workspace not found")
+        try:
+            source_path = normalize_source_relative_path(
+                str(run.get("source_path") or "."), allow_root=True
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Remote Run source not found") from exc
+        return RedirectResponse(
+            _url_with_query(
+                f"/w/{source_workspace['id']}/files",
+                path=source_path,
+            ),
+            status_code=302,
         )
 
     @app.post("/api/remote-runs", response_class=JSONResponse)
@@ -1631,9 +1694,11 @@ def create_app(settings: Settings) -> FastAPI:
         computer_runs = store.list_remote_runs_for_computer(computer_id)
         for run in computer_runs:
             run["created_label"] = _relative_time(str(run["created_at"]), locale)
+            display_state = _run_display_state(run.get("state"), run.get("exit_code"))
+            run["display_state"] = display_state
             run["state_label"] = translate(
                 locale,
-                f"remote_run.state.{run['state']}",
+                f"remote_run.state.{display_state}",
             )
         remote_picker = None
         browse_error = None
@@ -1854,7 +1919,7 @@ def create_app(settings: Settings) -> FastAPI:
                 title=translate(locale_from_request(request), "node.pair.heading"),
                 pairing=pairing,
                 code=None,
-                core_url=str(request.base_url).rstrip("/"),
+                **_node_pairing_reachability(request),
                 error=None,
             ),
         )
@@ -1877,7 +1942,7 @@ def create_app(settings: Settings) -> FastAPI:
                 title=translate(locale_from_request(request), "node.pair.heading"),
                 pairing=pairing,
                 code=code if pairing.get("status") is None else None,
-                core_url=str(request.base_url).rstrip("/"),
+                **_node_pairing_reachability(request),
                 error=None,
             ),
         )
@@ -1900,7 +1965,7 @@ def create_app(settings: Settings) -> FastAPI:
                 title=translate(locale_from_request(request), "node.pair.heading"),
                 pairing=pairing,
                 code=code,
-                core_url=str(request.base_url).rstrip("/"),
+                **_node_pairing_reachability(request),
                 error=None,
             ),
             status_code=201,
@@ -2053,10 +2118,8 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             target = ssh.resolve_target(values["target"])
             _apply_ssh_overrides(target, values, locale=locale)
-            if target.get("proxycommand"):
-                raise ValueError(translate(locale, "ssh.error.proxy_unsupported"))
             host_key = await asyncio.to_thread(
-                ssh.probe_host_key, str(target["host"]), int(target["port"])
+                ssh.probe_target_host_key, target
             )
         except (OSError, ValueError, SSHBackendError) as exc:
             return JSONResponse(
@@ -2083,11 +2146,7 @@ def create_app(settings: Settings) -> FastAPI:
                 raise ValueError(translate(locale, "ssh.error.host_key_required"))
             target = ssh.resolve_target(values["target"])
             _apply_ssh_overrides(target, values, locale=locale)
-            if target.get("proxycommand"):
-                raise ValueError(translate(locale, "ssh.error.proxy_unsupported"))
-            probed = await asyncio.to_thread(
-                ssh.probe_host_key, str(target["host"]), int(target["port"])
-            )
+            probed = await asyncio.to_thread(ssh.probe_target_host_key, target)
             expected_fingerprint = str(form.get("host_fingerprint", ""))
             expected_key_type = str(form.get("host_key_type", ""))
             expected_key_data = str(form.get("host_key_data", ""))
@@ -2099,13 +2158,13 @@ def create_app(settings: Settings) -> FastAPI:
                 raise ValueError(translate(locale, "ssh.error.host_key_changed"))
 
             auth_mode = values["auth_mode"]
-            identity_file = str(target.get("identity_file") or "")
+            identity_file = ""
             temporary = {
                 "id": "",
                 "host": str(target["host"]),
                 "port": int(target["port"]),
                 "username": str(target["username"]),
-                "ssh_alias": "",
+                "ssh_alias": str(target.get("ssh_alias") or ""),
                 "identity_file": identity_file,
                 "host_key_type": probed["host_key_type"],
                 "host_key_data": probed["host_key_data"],
@@ -2122,8 +2181,8 @@ def create_app(settings: Settings) -> FastAPI:
                 managed_key = await asyncio.to_thread(ssh.ensure_managed_key)
                 identity_file = managed_key["private_key"]
             elif auth_mode == "existing":
-                if not identity_file:
-                    raise ValueError(translate(locale, "ssh.error.existing_key_required"))
+                if values.get("identity_file"):
+                    identity_file = str(target.get("identity_file") or "")
             else:
                 raise ValueError(translate(locale, "ssh.error.auth_unsupported"))
 
@@ -2132,7 +2191,7 @@ def create_app(settings: Settings) -> FastAPI:
                 await asyncio.to_thread(ssh.test_connection, temporary)
             computer = store.create_computer(
                 name=values["name"] or values["target"],
-                ssh_alias=str(target.get("ssh_alias") or "") if auth_mode == "existing" else "",
+                ssh_alias=str(target.get("ssh_alias") or ""),
                 host=str(target["host"]),
                 port=int(target["port"]),
                 username=str(target["username"]),
@@ -2555,6 +2614,7 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="terminal",
+                recent_supported=remote.supports_capability(workspace, "recent"),
                 terminals=terminal_list,
                 terminal=selected,
                 commands=store.list_commands(workspace_id),
@@ -2654,6 +2714,7 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="terminal",
+                recent_supported=remote.supports_capability(workspace, "recent"),
                 terminal=terminal,
                 output=output,
                 **_workspace_status(store, terminals, workspace),
@@ -2713,6 +2774,7 @@ def create_app(settings: Settings) -> FastAPI:
             settings,
             workspace,
             active_tab="files",
+            recent_supported=remote.supports_capability(workspace, "recent"),
             path=relative,
             entries=entries,
             breadcrumbs=_breadcrumbs(relative),
@@ -2815,6 +2877,7 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="files",
+                recent_supported=remote.supports_capability(workspace, "recent"),
                 entry=entry,
                 file_path=file_path,
                 content_type=content_type,
@@ -3291,20 +3354,25 @@ def create_app(settings: Settings) -> FastAPI:
                     and str(selected["relative_path"]) == snapshot.relative_path
                 ):
                     latest = selected
+
+        def file_run_view(run: Mapping[str, Any] | None) -> dict[str, Any] | None:
+            if run is None:
+                return None
+            view = _file_run_status_payload(store, run, locale=locale)
+            source_digest = str(run.get("source_digest") or "")
+            view["source_changed"] = bool(
+                source_digest
+                and str(run.get("relative_path") or "") == snapshot.relative_path
+                and source_digest != snapshot.digest
+            )
+            return view
+
         return {
             "file_run_supported": runner is not None,
             "file_run_runner_id": runner.id if runner is not None else None,
             "file_run_idempotency_key": idempotency_key or str(uuid.uuid4()),
-            "active_file_run": _file_run_status_payload(
-                store, active, locale=locale
-            )
-            if active is not None
-            else None,
-            "latest_file_run": _file_run_status_payload(
-                store, latest, locale=locale
-            )
-            if latest is not None
-            else None,
+            "active_file_run": file_run_view(active),
+            "latest_file_run": file_run_view(latest),
         }
 
     async def render_editor(
@@ -3349,6 +3417,7 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="files",
+                recent_supported=remote.supports_capability(workspace, "recent"),
                 **values,
             ),
             status_code=status_code,
@@ -3726,8 +3795,8 @@ def create_app(settings: Settings) -> FastAPI:
     async def recent_page(request: Request, workspace_id: str) -> HTMLResponse:
         locale = locale_from_request(request)
         workspace = _require_workspace(workspaces, workspace_id)
-        if remote.is_node(workspace):
-            raise HTTPException(status_code=404, detail="Workspace activity is not supported")
+        if not remote.supports_capability(workspace, "recent"):
+            raise HTTPException(status_code=404, detail="Recent is not supported")
         refresh_errors: list[str] = []
         try:
             recent_scan = await recent_workspace_files(workspace)
@@ -3755,7 +3824,7 @@ def create_app(settings: Settings) -> FastAPI:
                 [dict(item) for item in recent_file_rows],
                 recent_scan,
             )
-        except (OSError, SSHBackendError) as exc:
+        except (OSError, RemoteAccessError, SSHBackendError) as exc:
             if not is_remote(workspace):
                 raise
             refresh_errors.append(_localized_exception(locale, exc))
@@ -3772,7 +3841,7 @@ def create_app(settings: Settings) -> FastAPI:
 
         try:
             terminal_list = await ensure_terminal_list(workspace)
-        except (OSError, SSHBackendError) as exc:
+        except (OSError, RemoteAccessError, SSHBackendError) as exc:
             if not is_remote(workspace):
                 raise
             refresh_errors.append(_localized_exception(locale, exc))
@@ -3792,6 +3861,7 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="recent",
+                recent_supported=remote.supports_capability(workspace, "recent"),
                 recent_files=recent_file_rows,
                 recent_scan=recent_scan,
                 terminals=terminal_list,
@@ -3907,6 +3977,26 @@ def _access_scope(settings: Settings) -> tuple[str, str]:
     return f"{settings.host}:{settings.port}", "network"
 
 
+def _node_pairing_reachability(request: Request) -> dict[str, str | bool | None]:
+    core_url = str(request.base_url).rstrip("/")
+    parsed = urlparse(core_url)
+    hostname = str(parsed.hostname or "").casefold()
+    loopback = hostname == "localhost" or hostname.endswith(".localhost")
+    if hostname and not loopback:
+        with contextlib.suppress(ValueError):
+            loopback = ipaddress.ip_address(hostname).is_loopback
+    issue_key: str | None = None
+    if loopback or not hostname:
+        issue_key = "node.pair.reachability_local"
+    elif parsed.scheme.casefold() != "https":
+        issue_key = "node.pair.reachability_https"
+    return {
+        "core_url": core_url,
+        "node_pairing_ready": issue_key is None,
+        "node_pairing_issue_key": issue_key,
+    }
+
+
 def _workspace_context(
     settings: Settings,
     workspace: Mapping[str, Any],
@@ -3914,11 +4004,33 @@ def _workspace_context(
     active_tab: str,
     **values: Any,
 ) -> dict[str, Any]:
+    remote_run = workspace.get("remote_run")
+    remote_run_display_state = (
+        _run_display_state(remote_run.get("state"), remote_run.get("exit_code"))
+        if isinstance(remote_run, Mapping)
+        else None
+    )
+    remote_run_workspace_source = bool(
+        isinstance(remote_run, Mapping)
+        and str(remote_run.get("source_kind") or "") == "workspace"
+        and remote_run.get("source_workspace_id")
+    )
     return _context(
         settings,
         title=workspace["display_name"],
         workspace=workspace,
         active_tab=active_tab,
+        remote_run_display_state=remote_run_display_state,
+        remote_run_source_url=(
+            f"/remote-runs/{remote_run['id']}/source"
+            if remote_run_workspace_source
+            else None
+        ),
+        remote_run_retry_url=(
+            _url_with_query("/remote-runs/new", retry_run_id=str(remote_run["id"]))
+            if remote_run_workspace_source
+            else None
+        ),
         **values,
     )
 
@@ -3953,13 +4065,29 @@ def _workspace_status(
     }
 
 
+def _run_display_state(state: object, exit_code: object) -> str:
+    normalized = str(state or "preparing")
+    if (
+        normalized == "finished"
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+    ):
+        return "failed"
+    return normalized
+
+
 def _remote_run_status_payload(
     run: Mapping[str, Any], *, locale: str
 ) -> dict[str, Any]:
     workspace_id = str(run.get("workspace_id") or "")
+    state = str(run.get("state", "preparing"))
+    display_state = _run_display_state(state, run.get("exit_code"))
     return {
         "id": str(run.get("id", "")),
-        "state": str(run.get("state", "preparing")),
+        "state": state,
+        "display_state": display_state,
+        "state_label": translate(locale, f"remote_run.state.{display_state}"),
         "phase": run.get("phase"),
         "exit_code": run.get("exit_code"),
         "created_at": run.get("created_at"),
@@ -4068,6 +4196,7 @@ def _file_run_status_payload(
     locale: str,
 ) -> dict[str, Any]:
     state = str(run.get("state") or "preparing")
+    display_state = _run_display_state(state, run.get("exit_code"))
     duration_seconds = _file_run_duration_seconds(run)
     terminal_url = _file_run_terminal_url(store, run)
     return {
@@ -4076,7 +4205,8 @@ def _file_run_status_payload(
         "relative_path": str(run.get("relative_path") or ""),
         "runner_id": str(run.get("runner_id") or ""),
         "state": state,
-        "state_label": translate(locale, f"file_run.state.{state}"),
+        "display_state": display_state,
+        "state_label": translate(locale, f"file_run.state.{display_state}"),
         "exit_code": run.get("exit_code"),
         "created_at": run.get("created_at"),
         "started_at": run.get("started_at"),
@@ -4611,9 +4741,11 @@ def _apply_ssh_overrides(
         target["port"] = port
     if values.get("auth_mode") == "existing" and values.get("identity_file"):
         try:
-            target["identity_file"] = SSHBackend.validate_identity_file(values["identity_file"])
+            identity_file = SSHBackend.validate_identity_file(values["identity_file"])
         except SSHBackendError as exc:
             raise ValueError(str(exc)) from exc
+        target["identity_file"] = identity_file
+        target["identity_files"] = (identity_file,)
     if not str(target.get("username") or "").strip():
         raise ValueError(translate(locale, "ssh.error.username_required"))
 

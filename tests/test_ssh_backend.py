@@ -28,7 +28,7 @@ from termroom.file_runs import FILE_RUN_TERMINAL_STATES, FileRunManager
 from termroom.files import FileService, UnsupportedFileError
 from termroom.remote_runs import RemoteRunManager
 from termroom.ssh_backend import SSHBackend, SSHBackendError, SSHHostKeyChanged
-from termroom.terminals import TerminalManager
+from termroom.terminals import TerminalManager, tmux_browser_view_session
 from termroom.workspaces import ProjectPathExists, RootManager, WorkspaceManager
 
 
@@ -39,7 +39,9 @@ def _free_port() -> int:
 
 
 @contextlib.contextmanager
-def _test_sshd(tmp_path: Path) -> Iterator[dict[str, object]]:
+def _test_sshd(
+    tmp_path: Path, *, log_level: str = "ERROR"
+) -> Iterator[dict[str, object]]:
     qa = tmp_path / "sshd"
     qa.mkdir()
     remote_tmux_root = qa / "tmux"
@@ -76,7 +78,7 @@ def _test_sshd(tmp_path: Path) -> Iterator[dict[str, object]]:
                 "PermitRootLogin no",
                 f"AllowUsers {username}",
                 f"SetEnv TMUX_TMPDIR={remote_tmux_root}",
-                "LogLevel ERROR",
+                f"LogLevel {log_level}",
                 "Subsystem sftp internal-sftp",
                 "",
             ]
@@ -108,6 +110,7 @@ def _test_sshd(tmp_path: Path) -> Iterator[dict[str, object]]:
             "username": username,
             "client_key": client_key,
             "authorized_keys": authorized_keys,
+            "log_path": qa / "sshd.log",
         }
     finally:
         process.terminate()
@@ -141,6 +144,198 @@ def test_termroom_managed_key_survives_backend_restart(tmp_path: Path) -> None:
     assert private_key.with_suffix(".pub").stat().st_mode & 0o022 == 0
 
 
+def test_resolve_target_uses_openssh_effective_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                "hostname 10.0.0.8\n"
+                "user ubuntu\n"
+                "port 2222\n"
+                "identitiesonly yes\n"
+                "identityfile ~/.ssh/id_gpu\n"
+                "identityfile ~/.ssh/id_fallback\n"
+                "identityagent /tmp/agent.sock\n"
+                "proxyjump bastion-a,bastion-b\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("termroom.ssh_backend.subprocess.run", fake_run)
+    target = backend.resolve_target("gpu")
+
+    assert seen == [["ssh", "-G", "-T", "--", "gpu"]]
+    assert target["host"] == "10.0.0.8"
+    assert target["username"] == "ubuntu"
+    assert target["port"] == 2222
+    assert target["identity_files"] == (
+        str(Path("~/.ssh/id_gpu").expanduser()),
+        str(Path("~/.ssh/id_fallback").expanduser()),
+    )
+    assert target["identities_only"] is True
+    assert target["identity_agent"] == "/tmp/agent.sock"
+    assert target["proxyjump"] == "bastion-a,bastion-b"
+
+
+def test_proxy_command_host_key_probe_verifies_final_target(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+
+    with _test_sshd(tmp_path) as server:
+        direct = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        proxied = backend.probe_target_host_key(
+            {
+                "ssh_alias": "proxied",
+                "host": "127.0.0.1",
+                "port": int(server["port"]),
+                "username": str(server["username"]),
+                "proxycommand": "nc %h %p",
+                "proxyjump": "",
+            }
+        )
+
+    assert proxied == direct
+
+
+def test_ssh_backend_uses_alias_specific_agent_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+
+    with _test_sshd(tmp_path) as server:
+        agent_socket = Path("/tmp") / f"termroom-agent-{uuid.uuid4().hex[:12]}"
+        agent = subprocess.Popen(
+            ["ssh-agent", "-D", "-a", str(agent_socket)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not agent_socket.exists():
+                if agent.poll() is not None:
+                    raise RuntimeError("test ssh-agent did not start")
+                time.sleep(0.02)
+            if not agent_socket.exists():
+                raise RuntimeError("test ssh-agent socket was not created")
+            agent_env = os.environ.copy()
+            agent_env["SSH_AUTH_SOCK"] = str(agent_socket)
+            subprocess.run(
+                ["ssh-add", str(server["client_key"])],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=agent_env,
+            )
+
+            backend = SSHBackend(store, state_dir)
+            probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+            computer = store.create_computer(
+                name="Agent QA",
+                ssh_alias="agent-qa",
+                host="127.0.0.1",
+                port=int(server["port"]),
+                username=str(server["username"]),
+                identity_file="",
+                host_key_type=probe["host_key_type"],
+                host_key_data=probe["host_key_data"],
+                host_fingerprint=probe["host_fingerprint"],
+            )
+            monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "wrong-agent"))
+            monkeypatch.setattr(
+                backend,
+                "resolve_target",
+                lambda _alias: {
+                    "identity_files": (str(server["client_key"]) + ".pub",),
+                    "identity_agent": str(agent_socket),
+                    "identity_agent_disabled": False,
+                    "identities_only": True,
+                    "proxycommand": "",
+                    "proxyjump": "",
+                },
+            )
+
+            assert backend.test_connection(computer)["tmux"].startswith("tmux ")
+        finally:
+            agent.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                agent.wait(timeout=2)
+            if agent.poll() is None:
+                agent.kill()
+                agent.wait(timeout=2)
+            with contextlib.suppress(FileNotFoundError):
+                agent_socket.unlink()
+
+
+def test_ssh_backend_reuses_idle_authenticated_transport(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+
+    with _test_sshd(tmp_path, log_level="INFO") as server:
+        backend = SSHBackend(store, state_dir, reuse_connections=True)
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Reuse QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        backend.remember_host_key(computer)
+
+        assert backend.test_connection(computer)["tmux"].startswith("tmux ")
+        assert backend.home_directory(computer).startswith("/")
+        assert backend.list_browse_directories(computer, str(tmp_path))["current"] == str(tmp_path)
+
+        log_path = Path(server["log_path"])
+        auth_marker = "Accepted " + "publickey for"
+        deadline = time.monotonic() + 2
+        accepted = 0
+        while time.monotonic() < deadline:
+            accepted = log_path.read_text(encoding="utf-8", errors="replace").count(
+                auth_marker
+            )
+            if accepted >= 1:
+                break
+            time.sleep(0.02)
+        assert accepted == 1
+
+        backend.close_connections(str(computer["id"]))
+        assert backend.test_connection(computer)["tmux"].startswith("tmux ")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            accepted = log_path.read_text(encoding="utf-8", errors="replace").count(
+                auth_marker
+            )
+            if accepted >= 2:
+                break
+            time.sleep(0.02)
+        assert accepted == 2
+        backend.close()
+
+
 def test_password_ssh_attach_uses_encrypted_askpass_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -151,7 +346,7 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
     backend = SSHBackend(store, state_dir)
     computer = store.create_computer(
         name="Password QA",
-        ssh_alias="",
+        ssh_alias="prod-alias",
         host="example.invalid",
         port=22,
         username="user",
@@ -166,8 +361,10 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_ssh = fake_bin / "ssh"
+    args_log = tmp_path / "ssh-args"
     fake_ssh.write_text(
         "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" > {shlex.quote(str(args_log))}\n"
         "value=\"$($SSH_ASKPASS 'Password:')\"\n"
         "if [ \"$value\" != 'stored-password' ]; then exit 91; fi\n"
         "printf 'ASKPASS_OK\\n'\n",
@@ -183,7 +380,11 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
         "remote_path": "/tmp",
     }
     terminal = {"tmux_window": "@1"}
-    process_pid, master_fd = backend._spawn_ssh_tmux_client(workspace, terminal)
+    process_pid, master_fd = backend._spawn_ssh_tmux_client(
+        workspace,
+        terminal,
+        tmux_browser_view_session(uuid.uuid4().hex),
+    )
     try:
         deadline = time.monotonic() + 2
         output = b""
@@ -199,6 +400,11 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
                 break
         assert b"ASKPASS_OK" in output
         assert b"stored-password" not in output
+        args = args_log.read_text(encoding="utf-8").splitlines()
+        assert "HostName=example.invalid" in args
+        assert "22" in args
+        assert "user" in args
+        assert args[-2] == "prod-alias"
     finally:
         backend._wait_for_pid(process_pid, 1)
         os.close(master_fd)
@@ -289,7 +495,7 @@ async def test_password_setup_route_persists_encrypted_credential(
         "host_key_data": "AAAATEST",
         "host_fingerprint": "SHA256:test",
     }
-    monkeypatch.setattr(app.state.ssh, "probe_host_key", lambda host, port: host_key)
+    monkeypatch.setattr(app.state.ssh, "probe_target_host_key", lambda target: host_key)
     seen_passwords: list[str] = []
 
     def fake_password_test(computer: dict[str, object], password: str) -> dict[str, str]:
@@ -327,6 +533,7 @@ async def test_password_setup_route_persists_encrypted_credential(
     assert len(computers) == 1
     computer = computers[0]
     assert computer["auth_kind"] == "password"
+    assert computer["ssh_alias"] == "example.test"
     assert computer["identity_file"] == ""
     assert seen_passwords == [secret]
     encrypted = state_dir / "credentials" / str(computer["id"])
@@ -547,9 +754,24 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             assert "result.csv" in recent_paths
             assert "ignored.tmp" not in recent_paths
 
-            process_pid, master_fd = backend._spawn_ssh_tmux_client(workspace, terminal)
+            browser_terminal = backend.create_terminal(workspace, "browser-view")
+            view_session = tmux_browser_view_session(uuid.uuid4().hex)
+            process_pid, master_fd = backend._spawn_ssh_tmux_client(
+                workspace,
+                browser_terminal,
+                view_session,
+            )
             try:
                 time.sleep(0.4)
+                assert backend._exec(
+                    computer,
+                    f"tmux display-message -p -t {shlex.quote(str(workspace['tmux_session']))} "
+                    "'#{window_id}'",
+                ).strip() == str(terminal["tmux_window"])
+                assert backend._exec(
+                    computer,
+                    f"tmux display-message -p -t {shlex.quote(view_session)} '#{{window_id}}'",
+                ).strip() == str(browser_terminal["tmux_window"])
                 backend._set_window_size(master_fd, rows=41, cols=123)
                 os.killpg(process_pid, signal.SIGWINCH)
                 deadline = time.monotonic() + 2
@@ -557,7 +779,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 while time.monotonic() < deadline:
                     output = backend._exec(
                         computer,
-                        f"tmux list-clients -t {workspace['tmux_session']} "
+                        f"tmux list-clients -t {shlex.quote(view_session)} "
                         "-F '#{client_width}x#{client_height}'",
                     )
                     sizes = output.strip().splitlines()
@@ -570,6 +792,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                     os.killpg(process_pid, signal.SIGTERM)
                 backend._wait_for_pid(process_pid, 1)
                 os.close(master_fd)
+                backend.close_terminal(workspace, browser_terminal)
 
             settings = Settings.create(
                 local_root,

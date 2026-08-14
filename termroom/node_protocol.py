@@ -24,7 +24,7 @@ NODE_WORKSPACE_USAGE_VERSION = 1
 NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW = 8
 NODE_REQUIRED_CAPABILITIES = frozenset({"workspace", "terminal", "files"})
 NODE_OPTIONAL_CAPABILITIES = frozenset(
-    {"file_run", "remote_run", "remote_run_source", "workspace_usage"}
+    {"file_run", "recent", "remote_run", "remote_run_source", "workspace_usage"}
 )
 NODE_CAPABILITIES = NODE_REQUIRED_CAPABILITIES | NODE_OPTIONAL_CAPABILITIES
 NODE_REQUEST_OPERATIONS = frozenset(
@@ -42,6 +42,7 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "terminal.scrollback",
         "terminal.attach",
         "files.list",
+        "files.recent",
         "files.stat",
         "files.read_text.open",
         "files.read_preview",

@@ -84,6 +84,12 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
         "files.list", {"workspace_path": str(workspace), "path": "."}
     )
     assert [entry["name"] for entry in listed["entries"]] == ["hello.txt"]
+    recent = runtime._handle_sync(
+        "files.recent", {"workspace_path": str(workspace), "limit": 5}
+    )
+    assert [entry["relative_path"] for entry in recent["entries"]] == ["hello.txt"]
+    assert recent["scanned_files"] == 1
+    assert recent["truncated"] is False
     sent: list[dict[str, Any]] = []
 
     async def send(message: Any) -> None:

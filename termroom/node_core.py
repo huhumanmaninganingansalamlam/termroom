@@ -16,6 +16,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from termroom.db import StateStore
 from termroom.node_protocol import (
     MAX_NODE_STREAM_CHUNK_BYTES,
+    NODE_CAPABILITIES,
     NODE_REQUIRED_CAPABILITIES,
     NodeProtocolError,
     decode_message,
@@ -410,7 +411,15 @@ class NodeCore:
         ):
             raise KeyError(f"Unknown or revoked Node: {node_id}")
         nonce = secrets.token_urlsafe(32)
-        await websocket.send_text(encode_message({"type": "auth.challenge", "nonce": nonce}))
+        await websocket.send_text(
+            encode_message(
+                {
+                    "type": "auth.challenge",
+                    "nonce": nonce,
+                    "capabilities": sorted(NODE_CAPABILITIES),
+                }
+            )
+        )
         message = await asyncio.wait_for(self._receive(websocket), NODE_AUTH_TIMEOUT_SECONDS)
         if message.get("type") != "auth.response" or message.get("node_id") != node_id:
             raise NodeProtocolError("Node authentication response is invalid", code="auth_invalid")

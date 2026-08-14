@@ -733,9 +733,28 @@ class RemoteAccess:
         self, workspace: dict[str, Any], *, limit: int = 50
     ) -> RecentFiles:
         if self.is_node(workspace):
-            raise RemoteAccessError(
-                "Workspace activity is not available for Node yet",
-                code="capability_unsupported",
+            if not self.supports_capability(workspace, "recent"):
+                raise RemoteAccessError(
+                    "Recent is not available for this Node",
+                    code="capability_unsupported",
+                )
+            result = await self._workspace_request(
+                workspace,
+                "files.recent",
+                {"limit": limit},
+            )
+            scanned_files = result.get("scanned_files")
+            if isinstance(scanned_files, bool) or not isinstance(scanned_files, int):
+                raise RemoteAccessError("Node returned an invalid Recent scan count")
+            if scanned_files < 0 or scanned_files > 100_000:
+                raise RemoteAccessError("Node returned an invalid Recent scan count")
+            truncated = result.get("truncated")
+            if not isinstance(truncated, bool):
+                raise RemoteAccessError("Node returned an invalid Recent scan state")
+            return RecentFiles(
+                entries=self._file_entries(result.get("entries")),
+                scanned_files=scanned_files,
+                truncated=truncated,
             )
         if limit == 50:
             return await asyncio.to_thread(self.ssh.recent_files, workspace)

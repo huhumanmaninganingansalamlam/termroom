@@ -18,7 +18,7 @@ from termroom.config import Settings
         (b"", "after\r\nline\r\n", "lf", b"after\nline\n"),
     ],
 )
-async def test_editor_save_restores_original_newline_style(
+async def test_editor_round_trips_original_newline_style(
     tmp_path: Path,
     original: bytes,
     submitted: str,
@@ -41,6 +41,9 @@ async def test_editor_save_restores_original_newline_style(
             "/login", data={"password": "test-token"}, follow_redirects=False
         )
         assert login.status_code == 303
+        editor = await client.get(f"/w/{workspace['id']}/edit/note.txt")
+        assert editor.status_code == 200
+        assert f'name="newline" value="{style}"' in editor.text
         response = await client.post(
             f"/w/{workspace['id']}/edit/note.txt",
             data={
@@ -55,22 +58,3 @@ async def test_editor_save_restores_original_newline_style(
 
     assert response.status_code == 303
     assert target.read_bytes() == expected
-
-
-@pytest.mark.asyncio
-async def test_editor_renders_detected_newline_style(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    project = root / "project"
-    project.mkdir(parents=True)
-    (project / "windows.txt").write_bytes(b"one\r\ntwo\r\n")
-    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
-    app = create_app(settings)
-    workspace = app.state.workspaces.open("project")
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        await client.post("/login", data={"password": "test-token"})
-        response = await client.get(f"/w/{workspace['id']}/edit/windows.txt")
-
-    assert response.status_code == 200
-    assert 'name="newline" value="crlf"' in response.text

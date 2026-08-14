@@ -12,7 +12,7 @@ from urllib.parse import quote
 import httpx
 import pytest
 
-from termroom.app import MAX_INLINE_IMAGE_BYTES, _content_disposition, create_app
+from termroom.app import MAX_INLINE_IMAGE_BYTES, create_app
 from termroom.config import Settings
 from termroom.files import FileEntry, RecentFiles
 from termroom.ssh_backend import SSHBackendError
@@ -317,8 +317,7 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
 
         terminal_page = await client.get(response.headers["location"])
         assert terminal_page.status_code == 200
-        assert '<span class="workspace-mode">이 컴퓨터 · 로컬 작업공간</span>' in terminal_page.text
-        assert "<small>로컬 작업공간</small>" in terminal_page.text
+        assert "로컬 작업공간" in terminal_page.text
         assert f'/api/workspaces/{workspace_id}/usage' in terminal_page.text
         assert "작업공간 사용량" in terminal_page.text
 
@@ -474,8 +473,7 @@ async def test_remote_run_empty_state_connects_a_remote_directly(
         response = await client.get("/remote-runs/new")
 
     assert response.status_code == 200
-    assert "등록한 Remote가 없습니다" in response.text
-    assert '<a class="primary-button" href="/computers/new">컴퓨터 연결</a>' in response.text
+    assert 'href="/computers/new"' in response.text
 
 
 @pytest.mark.asyncio
@@ -720,13 +718,9 @@ async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
 
         terminal_page = await client.get(detail.headers["location"])
         assert terminal_page.status_code == 200
-        assert (
-            '<span class="workspace-mode">GPU QA · 원격 실행 작업공간</span>'
-            in terminal_page.text
-        )
-        assert "<small>원격 실행 작업공간</small>" in terminal_page.text
+        assert "GPU QA" in terminal_page.text
+        assert "원격 실행 작업공간" in terminal_page.text
         assert "로컬 전용" not in terminal_page.text
-        assert 'aria-label="컴퓨터 · Termroom"' not in terminal_page.text
         assert "source.zip" in terminal_page.text
         assert f"/w/{workspace['id']}/files" in terminal_page.text
         assert "python main.py" in terminal_page.text
@@ -890,6 +884,8 @@ async def test_file_upload_view_download_and_recent_flow(tmp_path: Path) -> None
     root = tmp_path / "root"
     project = root / "project"
     project.mkdir(parents=True)
+    header_filename = 'line\rbreak"\\.txt'
+    (project / header_filename).write_bytes(b"safe header\n")
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
@@ -922,6 +918,16 @@ async def test_file_upload_view_download_and_recent_flow(tmp_path: Path) -> None
         assert download.status_code == 200
         assert download.content == b"name,value\nalpha,1\n"
         assert "attachment" in download.headers["content-disposition"]
+
+        special_download = await client.get(
+            f"/w/{workspace['id']}/download/{quote(header_filename, safe='')}"
+        )
+        assert special_download.status_code == 200
+        assert special_download.content == b"safe header\n"
+        disposition = special_download.headers["content-disposition"]
+        assert "\r" not in disposition
+        assert "\n" not in disposition
+        assert "%0D" in disposition
 
         recent = await client.get(f"/w/{workspace['id']}/recent")
         assert recent.status_code == 200
@@ -1016,7 +1022,6 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
         assert partial.status_code == 200
         assert "report-final.csv" in partial.text
         assert "notes.txt" not in partial.text
-        assert '<section class="workspace-file-list">' in partial.text
         assert "<!doctype html>" not in partial.text
 
         archive = await client.get(f"/w/{workspace['id']}/archive/reports")
@@ -1202,7 +1207,6 @@ async def test_local_location_picker_can_browse_absolute_directories(tmp_path: P
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
     assert "현재 폴더 열기" in picker.text
-    assert 'class="secondary-button folder-picker-button"' in picker.text
     assert "취소" in picker.text
     assert 'data-close-popover' in picker.text
     assert 'data-folder-picker-url="/api/local/browse-directories"' in picker.text
@@ -1273,14 +1277,10 @@ async def test_remote_workspace_picker_renders_browsable_directories(
     assert {entry["name"] for entry in api_data["entries"]} == {"projects", "work"}
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
-    assert 'class="secondary-button folder-picker-button"' in picker.text
-    assert 'class="remote-workspace-path-section"' in picker.text
-    assert 'class="remote-workspace-submit-row"' in picker.text
-    assert 'class="path-picker-control path-picker-close-control"' in picker.text
     assert "이 위치에 새 프로젝트" in picker.text
     assert "data-folder-picker-submit" not in picker.text
     assert "data-folder-picker-default-actions" not in picker.text
-    assert 'class="path-picker-control" type="button" data-new-project' in picker.text
+    assert "data-new-project" in picker.text
     browse_url = f'/api/computers/{computer["id"]}/browse-directories'
     assert f'data-folder-picker-url="{browse_url}"' in picker.text
     assert "data-folder-picker-open" in picker.text
@@ -1535,15 +1535,6 @@ async def test_streaming_upload_endpoint_writes_and_protects_existing_file(tmp_p
         )
         assert csrf_failure.status_code == 403
         assert not (project / "blocked.txt").exists()
-
-
-def test_content_disposition_sanitizes_ascii_control_characters() -> None:
-    value = _content_disposition('line\r\nbreak"\\.txt', "attachment")
-
-    assert "\r" not in value
-    assert "\n" not in value
-    assert 'filename="line__break__.txt"' in value
-    assert "filename*=UTF-8''line%0D%0Abreak%22%5C.txt" in value
 
 
 @pytest.mark.asyncio
@@ -2102,14 +2093,9 @@ async def test_remote_terminal_page_stays_available_while_ssh_is_down(
     assert "shell" in response.text
     assert str(terminal["id"]) in response.text
     assert "SSH 연결이 거부되었습니다" in response.text
-    assert (
-        '<span class="workspace-mode">QA server · 원격 작업공간</span>'
-        in response.text
-    )
-    assert "<small>원격 작업공간</small>" in response.text
+    assert "QA server" in response.text
+    assert "원격 작업공간" in response.text
     assert "로컬 전용" not in response.text
-    assert 'aria-label="컴퓨터 · Termroom"' not in response.text
-    assert 'class="status-dot is-active"' not in response.text
 
 
 @pytest.mark.asyncio
@@ -2433,6 +2419,54 @@ async def test_remove_ssh_computer_keeps_credentials_when_remote_run_exists(
 
 
 @pytest.mark.asyncio
+async def test_ssh_probe_accepts_openssh_proxy_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    target = {
+        "ssh_alias": "gpu",
+        "host": "10.0.0.8",
+        "port": 22,
+        "username": "runner",
+        "identity_file": "",
+        "proxycommand": "nc %h %p",
+        "proxyjump": "",
+    }
+    monkeypatch.setattr(app.state.ssh, "resolve_target", lambda value: dict(target))
+    seen: list[dict[str, object]] = []
+
+    def probe(resolved: dict[str, object]) -> dict[str, str]:
+        seen.append(dict(resolved))
+        return {
+            "host_key_type": "ssh-ed25519",
+            "host_key_data": "AAAATESTKEY",
+            "host_fingerprint": "SHA256:test",
+        }
+
+    monkeypatch.setattr(app.state.ssh, "probe_target_host_key", probe)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            "/computers/probe",
+            data={
+                "_csrf": settings.csrf_token,
+                "target": "gpu",
+                "username": "",
+                "port": "",
+                "auth_mode": "existing",
+            },
+        )
+
+    assert response.status_code == 200
+    assert seen and seen[0]["proxycommand"] == "nc %h %p"
+    assert response.json()["host"] == "10.0.0.8"
+
+
+@pytest.mark.asyncio
 async def test_failed_ssh_computer_registration_rolls_back_local_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2467,7 +2501,7 @@ async def test_failed_ssh_computer_registration_rolls_back_local_records(
         "host_key_data": "AAAATESTKEY",
         "host_fingerprint": "SHA256:test",
     }
-    monkeypatch.setattr(ssh, "probe_host_key", lambda host, port: host_key)
+    monkeypatch.setattr(ssh, "probe_target_host_key", lambda target: host_key)
     monkeypatch.setattr(
         ssh,
         "test_connection",
@@ -2664,7 +2698,7 @@ async def test_internal_config_is_not_addressable_through_file_routes(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_pwa_shell_is_public_but_does_not_cache_workspace_pages(tmp_path: Path) -> None:
+async def test_pwa_public_contract_does_not_cache_workspace_pages(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -2678,6 +2712,10 @@ async def test_pwa_shell_is_public_but_does_not_cache_workspace_pages(tmp_path: 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         worker = await client.get("/sw.js")
         manifest = await client.get("/static/manifest.webmanifest")
+        icons = {
+            size: await client.get(f"/icons/termroom-{size}.png") for size in (192, 512)
+        }
+        missing_icon = await client.get("/icons/termroom-256.png")
         unauthorized_home = await client.get("/")
 
         assert worker.status_code == 200
@@ -2685,4 +2723,23 @@ async def test_pwa_shell_is_public_but_does_not_cache_workspace_pages(tmp_path: 
         assert worker.headers["cache-control"] == "no-cache"
         assert "caches.open" not in worker.text
         assert manifest.status_code == 200
+        manifest_payload = manifest.json()
+        assert manifest_payload["name"] == "Termroom"
+        assert manifest_payload["short_name"] == "Termroom"
+        png_icons = {
+            (icon["sizes"], icon["type"], icon["purpose"])
+            for icon in manifest_payload["icons"]
+            if icon["src"].endswith(".png")
+        }
+        assert ("192x192", "image/png", "any") in png_icons
+        assert ("512x512", "image/png", "any maskable") in png_icons
+        for size, icon in icons.items():
+            assert icon.status_code == 200
+            assert icon.headers["content-type"] == "image/png"
+            assert icon.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert int.from_bytes(icon.content[16:20], "big") == size
+            assert int.from_bytes(icon.content[20:24], "big") == size
+            assert icon.content[24] == 8
+            assert icon.content[25] == 2
+        assert missing_icon.status_code == 404
         assert unauthorized_home.status_code == 401

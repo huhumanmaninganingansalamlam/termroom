@@ -581,7 +581,9 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
     )
     monkeypatch.setattr(
-        manager, "_spawn_tmux_client", lambda _workspace: (2_147_483_647, read_fd)
+        manager,
+        "_spawn_tmux_client",
+        lambda _workspace, _view_session: (2_147_483_647, read_fd),
     )
     monkeypatch.setattr(manager, "_wait_for_pid", lambda *args, **kwargs: True)
 

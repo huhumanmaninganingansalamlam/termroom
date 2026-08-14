@@ -516,7 +516,9 @@
         "failed",
         "lost",
       );
-      if (result.state) panel.classList.add(result.state);
+      if (result.display_state || result.state) {
+        panel.classList.add(result.display_state || result.state);
+      }
       if (stateNode && result.state_label) stateNode.textContent = result.state_label;
       if (durationNode) {
         durationNode.textContent = result.duration_seconds === null
@@ -1023,78 +1025,100 @@
   });
 
   const popoverSelector =
-    "details.new-terminal-menu, details.more-keys, details.terminal-manage-menu, details.create-entry, details.add-location-menu";
-  const popoverDetails = [...document.querySelectorAll(popoverSelector)];
-  const locationPopovers = [...document.querySelectorAll("details.add-location-menu")];
+    ".new-terminal-menu[data-popover], .more-keys[data-popover], .terminal-manage-menu[data-popover], .create-entry[data-popover], .add-location-menu[data-popover]";
+  const popovers = [...document.querySelectorAll(popoverSelector)];
+  const locationPopovers = [...document.querySelectorAll(".add-location-menu[data-popover]")];
+  const popoverOpen = (popover) => popover?.hasAttribute("open") === true;
+  const syncPopover = (popover, open) => {
+    if (!popover) return;
+    popover.toggleAttribute("open", open);
+    popover.querySelector("[data-popover-trigger]")?.setAttribute(
+      "aria-expanded",
+      open ? "true" : "false",
+    );
+    popover.querySelectorAll("[data-popover-panel]").forEach((panel) => {
+      panel.hidden = !open;
+    });
+  };
 
   const syncLocationModalState = () => {
     document.body.classList.toggle(
       "path-picker-modal-open",
-      locationPopovers.some((details) => details.open),
+      locationPopovers.some(popoverOpen),
     );
   };
 
-  const closePopover = (details, { restoreFocus = false } = {}) => {
-    if (!(details instanceof HTMLDetailsElement)) return false;
-    if (!details.open) return false;
-    details.open = false;
-    if (details.dataset.popoverClearQuery === "1" && details.dataset.popoverCloseUrl) {
-      window.history.replaceState(null, "", details.dataset.popoverCloseUrl);
-      details.dataset.popoverClearQuery = "0";
+  const closePopover = (popover, { restoreFocus = false } = {}) => {
+    if (!popoverOpen(popover)) return false;
+    syncPopover(popover, false);
+    if (popover.dataset.popoverClearQuery === "1" && popover.dataset.popoverCloseUrl) {
+      window.history.replaceState(null, "", popover.dataset.popoverCloseUrl);
+      popover.dataset.popoverClearQuery = "0";
     }
     if (restoreFocus) {
-      details.querySelector("summary")?.focus({ preventScroll: true });
+      popover.querySelector("[data-popover-trigger]")?.focus({ preventScroll: true });
     }
     return true;
   };
 
-  locationPopovers.forEach((details) => {
+  const openPopover = (popover) => {
+    popovers.forEach((other) => {
+      if (other !== popover) closePopover(other);
+    });
+    syncPopover(popover, true);
+  };
+
+  popovers.forEach((popover) => syncPopover(popover, popoverOpen(popover)));
+  locationPopovers.forEach((popover) => {
     const focusFirstField = () => {
-      const input = details.querySelector(".add-location-form input:not([type='hidden'])");
+      const input = popover.querySelector(".add-location-form input:not([type='hidden'])");
       window.setTimeout(() => input?.focus({ preventScroll: true }), 0);
     };
-    details.addEventListener("toggle", () => {
-      syncLocationModalState();
-      if (details.open) focusFirstField();
-    });
-    if (details.open) focusFirstField();
+    popover._termroomFocusFirstField = focusFirstField;
+    if (popoverOpen(popover)) focusFirstField();
   });
   syncLocationModalState();
 
   document.addEventListener("click", (event) => {
     const closeButton = event.target.closest("[data-close-popover]");
     if (closeButton) {
-      closePopover(closeButton.closest("details"), { restoreFocus: true });
+      closePopover(closeButton.closest(popoverSelector), { restoreFocus: true });
+      syncLocationModalState();
       return;
     }
 
     const popover = event.target.closest(popoverSelector);
     if (popover) {
-      const summary = event.target.closest("summary");
-      if (summary && summary.parentElement === popover && !popover.open) {
-        popoverDetails.forEach((other) => {
-          if (other !== popover) closePopover(other);
-        });
+      const trigger = event.target.closest("[data-popover-trigger]");
+      if (trigger && trigger.parentElement === popover) {
+        if (popoverOpen(popover)) {
+          closePopover(popover);
+        } else {
+          openPopover(popover);
+          popover._termroomFocusFirstField?.();
+        }
+        syncLocationModalState();
       }
       return;
     }
-    popoverDetails.filter((details) => details.open).forEach(closePopover);
+    popovers.filter(popoverOpen).forEach(closePopover);
+    syncLocationModalState();
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      const openPopovers = popoverDetails.filter((details) => details.open);
+      const openPopovers = popovers.filter(popoverOpen);
       const activePopover = event.target.closest(popoverSelector);
       const focusPopover = openPopovers.includes(activePopover)
         ? activePopover
         : openPopovers.at(-1);
-      openPopovers.forEach((details) =>
-        closePopover(details, { restoreFocus: details === focusPopover }),
+      openPopovers.forEach((popover) =>
+        closePopover(popover, { restoreFocus: popover === focusPopover }),
       );
       syncLocationModalState();
       return;
     }
     if (event.key !== "Tab") return;
-    const modal = locationPopovers.find((details) => details.open);
+    const modal = locationPopovers.find(popoverOpen);
     if (!modal) return;
     const focusable = [
       ...modal.querySelectorAll(

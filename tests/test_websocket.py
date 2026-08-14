@@ -105,15 +105,17 @@ def test_terminal_websocket_closes_when_signed_session_expires(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("termroom.auth.SESSION_MAX_AGE_SECONDS", 1)
+    issued_at = 1_800_000_000
+    monkeypatch.setattr("termroom.auth._session_now", lambda: issued_at)
     app, workspace, terminal = _app(tmp_path)
     try:
         with TestClient(app, base_url="http://testserver") as client:
             client.post("/login", data={"password": "correct-password"})
+            monkeypatch.setattr("termroom.auth._session_now", lambda: issued_at + 1)
             with client.websocket_connect(
                 f"/ws/terminal/{terminal['id']}",
                 headers={"origin": "http://testserver"},
             ) as websocket:
-                time.sleep(1.2)
                 closed = False
                 for _ in range(20):
                     try:

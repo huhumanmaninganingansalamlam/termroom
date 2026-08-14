@@ -90,6 +90,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
     assert {"workspace", "terminal", "files"} == NODE_REQUIRED_CAPABILITIES
     assert {
         "file_run",
+        "recent",
         "remote_run",
         "remote_run_source",
         "workspace_usage",
@@ -99,6 +100,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "terminal",
         "files",
         "file_run",
+        "recent",
         "remote_run",
         "remote_run_source",
         "workspace_usage",

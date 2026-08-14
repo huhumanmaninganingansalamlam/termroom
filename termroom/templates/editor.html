@@ -75,7 +75,7 @@
 </form>
 {% set shown_file_run = active_file_run or latest_file_run %}
 {% if shown_file_run %}
-<aside class="file-run-bar {{ shown_file_run.state }}"
+<aside class="file-run-bar {{ shown_file_run.display_state }}"
        data-file-run
        data-state="{{ shown_file_run.state }}"
        data-status-url="{{ shown_file_run.status_url }}"
@@ -94,6 +94,9 @@
     </small>
     {% if active_file_run and active_file_run.relative_path != snapshot.relative_path %}
     <small>{{ t('file_run.other_file_running') }}</small>
+    {% endif %}
+    {% if shown_file_run.source_changed %}
+    <small data-file-run-stale>{{ t('file_run.source_changed_since_run') }}</small>
     {% endif %}
     <small class="file-run-error" data-file-run-error {% if not shown_file_run.error_detail %}hidden{% endif %}>{{ shown_file_run.error_detail or '' }}</small>
   </span>

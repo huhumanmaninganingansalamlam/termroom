@@ -32,11 +32,21 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
       <span class="terminal-tool-label">{{ t('terminal.output') }}</span>
     </a>
-    <details class="new-terminal-menu terminal-manage-menu" name="terminal-popover">
-      <summary class="terminal-tool-button" aria-label="{{ t('terminal.manage') }}">
+    <div class="new-terminal-menu terminal-manage-menu" data-popover>
+      <button class="terminal-tool-button"
+              type="button"
+              data-popover-trigger
+              aria-expanded="false"
+              aria-controls="terminal-manage-popover"
+              aria-label="{{ t('terminal.manage') }}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>
-      </summary>
-      <form method="post" action="/w/{{ workspace.id }}/terminals/{{ terminal.id }}" class="terminal-manage-form">
+      </button>
+      <form id="terminal-manage-popover"
+            method="post"
+            action="/w/{{ workspace.id }}/terminals/{{ terminal.id }}"
+            class="terminal-manage-form"
+            data-popover-panel
+            hidden>
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <section class="terminal-display-settings" aria-labelledby="terminal-display-settings-title">
           <span class="terminal-display-heading">
@@ -64,22 +74,31 @@
                   data-confirm="{{ t('terminal.close_confirm') }}">{{ t('terminal.close') }}</button>
         {% endif %}
       </form>
-    </details>
-    <details class="new-terminal-menu" name="terminal-popover">
-      <summary class="terminal-tool-button terminal-new-button" aria-label="{{ t('terminal.new') }}">
+    </div>
+    <div class="new-terminal-menu" data-popover>
+      <button class="terminal-tool-button terminal-new-button"
+              type="button"
+              data-popover-trigger
+              aria-expanded="false"
+              aria-controls="terminal-new-popover"
+              aria-label="{{ t('terminal.new') }}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-      </summary>
-      <form method="post" action="/w/{{ workspace.id }}/terminals">
+      </button>
+      <form id="terminal-new-popover"
+            method="post"
+            action="/w/{{ workspace.id }}/terminals"
+            data-popover-panel
+            hidden>
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <input name="name" value="shell" maxlength="32" aria-label="{{ t('terminal.name') }}">
         <button type="submit">{{ t('common.create') }}</button>
       </form>
-    </details>
+    </div>
   </div>
 </div>
 {% if error %}<p class="terminal-error-banner" role="alert">{{ error }}</p>{% endif %}
 {% if file_run %}
-<aside class="file-run-bar file-run-terminal-bar {{ file_run.state }}"
+<aside class="file-run-bar file-run-terminal-bar {{ file_run.display_state }}"
        data-file-run
        data-state="{{ file_run.state }}"
        data-status-url="{{ file_run.status_url }}"
@@ -132,9 +151,14 @@
       <button class="terminal-keycap terminal-keycap-symbol" type="button" data-terminal-action="arrow-down">↓</button>
       <button class="terminal-keycap" type="button" data-terminal-key="\u0003">C-c</button>
     </div>
-    <details class="more-keys" name="terminal-popover">
-      <summary class="terminal-keycap terminal-keycap-symbol" aria-label="{{ t('terminal.more_keys') }}">•••</summary>
-      <div class="more-keys-panel">
+    <div class="more-keys" data-popover>
+      <button class="terminal-keycap terminal-keycap-symbol"
+              type="button"
+              data-popover-trigger
+              aria-expanded="false"
+              aria-controls="terminal-more-keys-popover"
+              aria-label="{{ t('terminal.more_keys') }}">•••</button>
+      <div id="terminal-more-keys-popover" class="more-keys-panel" data-popover-panel hidden>
         <header class="more-keys-heading">
           <strong>{{ t('terminal.more_keys') }}</strong>
           <button id="close-more-keys"
@@ -158,7 +182,7 @@
           <button type="button" id="paste-terminal">{{ t('terminal.paste') }}</button>
         </div>
       </div>
-    </details>
+    </div>
     <button id="open-command-editor" class="terminal-command-trigger" type="button" aria-label="{{ t('terminal.command_edit') }}">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
       <span>{{ t('terminal.command_edit') }}</span>
@@ -209,5 +233,5 @@
 {% endblock %}
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=39"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=40"></script>
 {% endblock %}
