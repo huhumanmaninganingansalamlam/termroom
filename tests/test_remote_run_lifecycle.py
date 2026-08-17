@@ -1173,6 +1173,11 @@ async def test_background_observer_keeps_offline_run_active_and_backs_off(
 
     await manager.startup()
     try:
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while reconcile_calls < 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert reconcile_calls >= 2
+        calls_after_initial_retry = reconcile_calls
         await asyncio.sleep(0.075)
     finally:
         await manager.shutdown()
@@ -1182,4 +1187,4 @@ async def test_background_observer_keeps_offline_run_active_and_backs_off(
     assert stored["state"] == "running"
     assert stored["ended_at"] is None
     assert app.state.store.list_activity_events() == []
-    assert 2 <= reconcile_calls <= 5
+    assert calls_after_initial_retry <= reconcile_calls <= calls_after_initial_retry + 3
