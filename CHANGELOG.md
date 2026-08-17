@@ -2,6 +2,12 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.2] - 2026-08-17
+
+### Fixed
+
+- Render HTTPS asset URLs correctly behind standard reverse proxies such as SWAG without trusting forwarded client IPs.
+
 ## [0.3.1] - 2026-08-17
 
 ### Fixed
