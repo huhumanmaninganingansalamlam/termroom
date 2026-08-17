@@ -4604,7 +4604,7 @@ class SSHBackend:
         command = (
             f"cd {shlex.quote(root)} && "
             "timeout 2s find . -xdev -mindepth 1 "
-            f"\\( -type d \\( {prune} \\) -prune \\) -o "
+            f"\\( -type d \\( ! -readable -o {prune} \\) -prune \\) -o "
             "\\( -type f -printf '%T@\\t%s\\t%p\\n' \\)"
         )
         client = self._connect(self._computer(workspace))
