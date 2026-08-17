@@ -83,6 +83,38 @@ def test_docker_entrypoint_preserves_explicit_node_pair_command(tmp_path: Path) 
     )
 
 
+def test_docker_entrypoint_enables_secure_cookie_for_https_proxy(tmp_path: Path) -> None:
+    environment = _fake_entrypoint_environment(tmp_path, mode="core")
+    environment["TERMROOM_SECURE_COOKIE"] = "true"
+
+    result = subprocess.run(
+        ["/bin/sh", str(ENTRYPOINT), "/workspaces", "--foreground"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "termroom /workspaces --foreground --secure-cookie"
+
+
+def test_docker_entrypoint_rejects_invalid_secure_cookie_setting(tmp_path: Path) -> None:
+    environment = _fake_entrypoint_environment(tmp_path, mode="core")
+    environment["TERMROOM_SECURE_COOKIE"] = "sometimes"
+
+    result = subprocess.run(
+        ["/bin/sh", str(ENTRYPOINT), "/workspaces"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "TERMROOM_SECURE_COOKIE must be true or false."
+
+
 def test_docker_entrypoint_rejects_unknown_mode(tmp_path: Path) -> None:
     result = subprocess.run(
         ["/bin/sh", str(ENTRYPOINT), "/workspaces"],

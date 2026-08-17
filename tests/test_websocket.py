@@ -70,6 +70,14 @@ def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Pa
             ) as websocket:
                 websocket.send_json({"kind": "resize", "rows": 41, "cols": 123})
                 websocket.send_text("[]")
+            with client.websocket_connect(
+                f"/ws/terminal/{terminal['id']}",
+                headers={
+                    "host": "termroom.example",
+                    "origin": "https://termroom.example",
+                },
+            ) as websocket:
+                websocket.send_json({"kind": "resize", "rows": 42, "cols": 124})
     finally:
         _cleanup(app, workspace)
 

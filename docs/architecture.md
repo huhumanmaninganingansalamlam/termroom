@@ -324,8 +324,10 @@ advanced option.
 
 Node creates its own keypair and sends only its public identity for fingerprint approval. The
 Core rejects revoked or protocol-incompatible Nodes and never reuses the login password, browser
-session, or SSH credentials as Node identity. Non-loopback Pairing and control require verified
-HTTPS/WSS; there is no certificate-verification bypass.
+session, or SSH credentials as Node identity. Pairing and control support HTTP/WS when the
+operator has selected an encrypted private network such as Tailscale, while HTTPS/WSS remains
+the safe choice on networks where transport confidentiality is not otherwise provided. Private
+CA paths are verified for HTTPS and there is no certificate-verification bypass.
 
 `termroom node` can run in the foreground or as one product-owned systemd user service. The
 service uses an absolute package entrypoint, a singleton process lock, the existing owner-only

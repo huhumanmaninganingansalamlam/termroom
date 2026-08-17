@@ -56,17 +56,19 @@ def test_pairing_code_is_high_entropy_normalized_and_hashed() -> None:
     assert exc_info.value.code == "pairing_invalid"
 
 
-def test_core_url_requires_tls_except_loopback() -> None:
+def test_core_url_accepts_operator_selected_http_or_https() -> None:
     assert normalize_core_url("http://127.0.0.1:8765/") == "http://127.0.0.1:8765"
     assert normalize_core_url("http://[::1]:8765") == "http://[::1]:8765"
+    assert normalize_core_url("http://100.64.0.10:8765/") == "http://100.64.0.10:8765"
+    assert (
+        control_websocket_url("http://100.64.0.10:8765", "a" * 32)
+        == f"ws://100.64.0.10:8765/api/node/control?node_id={'a' * 32}"
+    )
     assert normalize_core_url("https://termroom.example.com/") == "https://termroom.example.com"
     assert (
         control_websocket_url("https://termroom.example.com", "a" * 32)
         == f"wss://termroom.example.com/api/node/control?node_id={'a' * 32}"
     )
-    with pytest.raises(NodeProtocolError) as exc_info:
-        normalize_core_url("http://termroom.example.com")
-    assert exc_info.value.code == "core_tls_required"
     with pytest.raises(NodeProtocolError):
         normalize_core_url("https://user:secret@termroom.example.com/path")
 

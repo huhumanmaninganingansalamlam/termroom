@@ -245,7 +245,7 @@ The remote Linux host needs an SSH server, `/bin/bash`, and `tmux`.
 
 ### Termroom Node
 
-Use Termroom Node when a Remote Linux computer can make outbound HTTPS/WSS connections but
+Use Termroom Node when a Remote Linux computer can make outbound HTTP(S)/WS(S) connections but
 cannot expose an SSH server or inbound port.
 
 ```text
@@ -265,6 +265,11 @@ Node identity and pairing configuration.
 If the Core uses a private HTTPS CA, add `--ca-file /path/to/core-ca.pem` to `node pair`.
 Termroom stores that verified path in the Node-local config and uses it for the control
 connection too; certificate verification cannot be disabled.
+
+The Core URL may use plain HTTP when Core and Node communicate through an operator-controlled,
+encrypted private network such as Tailscale. Use HTTPS on an ordinary LAN or any network where
+transport confidentiality is not otherwise provided. The selected HTTP or HTTPS scheme also
+selects WS or WSS for the persistent control connection.
 
 Once paired, a compatible Node uses the same Remote picker and Workspace Terminal, Files,
 Workspace Run, File Run, Remote Run, result-recovery, and reconnect flows as SSH. Node
@@ -299,7 +304,7 @@ docker compose run --rm termroom-node \
   node --config-dir /config/node pair \
   --core https://termroom.example \
   --code <10-minute-one-time-code> \
-  --allow-root /workspace \
+  --allow-root /workspaces \
   --name build-node
 ```
 
@@ -318,8 +323,8 @@ between Core and Node.
 Do not run `termroom node install-service` in Docker. Compose's `restart: unless-stopped`
 manages the Node process. Terminals and commands run inside the Node container rather than
 directly on the host. Build a Node-specific image from the official image when the Workspace
-needs Git, Node.js, compilers, CUDA, or other additional tools. The Core URL must be an HTTPS
-address reachable from inside the container.
+needs Git, Node.js, compilers, CUDA, or other additional tools. The Core URL must be reachable
+from inside the container; HTTP is supported on an encrypted private network such as Tailscale.
 
 ## Common commands
 
@@ -458,7 +463,18 @@ uses:
 
 - `termroom-config:/config` for persistent DB, SSH-key, and credential state
 - `${TERMROOM_WORKSPACES_HOST_PATH}:/workspaces` for the selected host project folder
-- `127.0.0.1:8765:8765` as the default host publish in Core mode only
+- `${TERMROOM_BIND_HOST}:8765:8765` as the Core publish, defaulting to loopback
+
+For direct Core-to-Node communication inside a tailnet, set `TERMROOM_BIND_HOST` to the Core
+host's specific Tailscale IP and pair the Node with `http://<tailscale-ip>:8765`. This does not
+open a Node port. Keep the default loopback bind when using Tailscale Serve or an HTTPS reverse
+proxy. Avoid `0.0.0.0` unless host firewall rules already limit who can reach the port.
+
+For an HTTPS reverse proxy, leave `TERMROOM_BIND_HOST=127.0.0.1` and set
+`TERMROOM_SECURE_COOKIE=true`. Caddy, Nginx, and similar proxies must preserve the original Host
+header and proxy WebSocket upgrades; their standard reverse-proxy configuration normally does
+both. Native HTTP remains behind the proxy while the browser and HTTPS/WSS Nodes use the proxy
+URL.
 
 For an SSH/Node-only Core, keep `TERMROOM_MODE=core` and set
 `TERMROOM_ALLOW_LOCAL_WORKSPACES=false`. That Core policy is separate from
