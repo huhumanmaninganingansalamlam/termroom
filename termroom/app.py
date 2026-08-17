@@ -721,6 +721,14 @@ def create_app(settings: Settings) -> FastAPI:
         request.state.session = session
         return await call_next(request)
 
+    @app.middleware("http")
+    async def restore_https_proxy_scheme(request: Request, call_next):  # type: ignore[no-untyped-def]
+        if settings.secure_cookie:
+            forwarded_proto = request.headers.get("x-forwarded-proto", "")
+            if forwarded_proto.partition(",")[0].strip().lower() == "https":
+                request.scope["scheme"] = "https"
+        return await call_next(request)
+
     @app.exception_handler(PathBoundaryError)
     async def path_error(request: Request, exc: PathBoundaryError) -> HTMLResponse:
         return _error_page(

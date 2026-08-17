@@ -123,13 +123,13 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 60); do
             if curl --fail --silent --show-error \
               "https://pypi.org/pypi/termroom/${VERSION}/json" >/dev/null; then
               exit 0
             fi
-            echo "Waiting for termroom ${VERSION} on PyPI (${attempt}/20)..."
-            sleep 3
+            echo "Waiting for termroom ${VERSION} on PyPI (${attempt}/60)..."
+            sleep 5
           done
           echo "termroom ${VERSION} did not become available on PyPI in time" >&2
           exit 1
