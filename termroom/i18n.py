@@ -61,6 +61,8 @@ ERROR_CODE_KEYS = {
     "node_revoked": "node.error.revoked",
     "source_contains_run_base": "remote_run.error.workspace_required",
     "source_path": "remote_run.error.workspace_required",
+    "source_special_file": "remote_run.error.source_special_file",
+    "source_symlink_outside": "remote_run.error.source_symlink_outside",
     "target_required": "remote_run.error.target_required",
     "workspace_required": "remote_run.error.workspace_required",
     "zip_extension": "remote_run.error.zip_only",

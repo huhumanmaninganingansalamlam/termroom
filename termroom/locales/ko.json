@@ -431,6 +431,8 @@
   "remote_run.error.upload_network": "ZIP 업로드 중 연결이 끊겼습니다. 파일을 다시 선택해 처음부터 올리세요.",
   "remote_run.error.upload_aborted": "ZIP 업로드를 취소했습니다. 파일을 다시 선택해 처음부터 올리세요.",
   "remote_run.error.prepare_failed": "원격 작업공간을 준비하지 못했습니다.",
+  "remote_run.error.source_symlink_outside": "선택한 폴더에 폴더 밖을 가리키는 symlink가 있어 snapshot을 만들지 않았습니다. symlink를 제외하거나 실행할 하위 폴더를 선택하세요.",
+  "remote_run.error.source_special_file": "선택한 폴더에 socket이나 device 같은 special file이 있어 snapshot을 만들지 않았습니다. 해당 항목을 제외하거나 실행할 하위 폴더를 선택하세요.",
   "remote_run.workspace_mode": "원격 실행 작업공간",
   "remote_run.managed_terminal_locked": "실행을 관리하는 Run 터미널은 이름을 바꾸거나 닫을 수 없습니다.",
   "remote_run.result_download": "결과 ZIP 다운로드",
