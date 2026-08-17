@@ -431,6 +431,8 @@
   "remote_run.error.upload_network": "The connection was lost while uploading the ZIP. Select it again to upload from the beginning.",
   "remote_run.error.upload_aborted": "The ZIP upload was cancelled. Select it again to upload from the beginning.",
   "remote_run.error.prepare_failed": "The remote Workspace could not be prepared.",
+  "remote_run.error.source_symlink_outside": "The selected folder contains a symlink that points outside it, so no snapshot was created. Exclude the symlink or select a runnable subfolder.",
+  "remote_run.error.source_special_file": "The selected folder contains a special file such as a socket or device, so no snapshot was created. Exclude it or select a runnable subfolder.",
   "remote_run.workspace_mode": "Temporary remote Workspace",
   "remote_run.managed_terminal_locked": "The managed Run terminal cannot be renamed or closed.",
   "remote_run.result_download": "Download result ZIP",
