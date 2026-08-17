@@ -71,6 +71,40 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secure_cookie", "expected_scheme"),
+    [(True, "https"), (False, "http")],
+)
+async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
+    tmp_path: Path, secure_cookie: bool, expected_scheme: str
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        secure_cookie=secure_cookie,
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://termroom",
+        headers={
+            "Host": "termroom.example.com",
+            "X-Forwarded-Proto": "https",
+        },
+    ) as client:
+        response = await client.get("/")
+
+    assert response.status_code == 401
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=41'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=61'
+    assert f'href="{css_url}"' in response.text
+    assert f'src="{script_url}"' in response.text
+
+
+@pytest.mark.asyncio
 async def test_workspace_display_name_updates_header_and_home_without_renaming_folder(
     tmp_path: Path,
 ) -> None:
