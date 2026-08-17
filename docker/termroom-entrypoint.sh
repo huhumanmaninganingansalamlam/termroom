@@ -4,6 +4,7 @@ set -eu
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 TERMROOM_MODE="${TERMROOM_MODE:-core}"
+TERMROOM_SECURE_COOKIE="${TERMROOM_SECURE_COOKIE:-false}"
 
 case "$TERMROOM_MODE" in
   core|node)
@@ -50,6 +51,20 @@ umask 077
 
 if [ "$TERMROOM_MODE" = "node" ] && [ "${1:-}" != "node" ]; then
   set -- node --config-dir "${TERMROOM_NODE_CONFIG_DIR:-/config/node}"
+fi
+
+if [ "$TERMROOM_MODE" = "core" ]; then
+  case "$TERMROOM_SECURE_COOKIE" in
+    1|true|TRUE|yes|YES|on|ON)
+      set -- "$@" --secure-cookie
+      ;;
+    0|false|FALSE|no|NO|off|OFF|'')
+      ;;
+    *)
+      echo "TERMROOM_SECURE_COOKIE must be true or false." >&2
+      exit 2
+      ;;
+  esac
 fi
 
 exec gosu termroom termroom "$@"

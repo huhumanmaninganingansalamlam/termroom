@@ -232,7 +232,7 @@ SSH 주소 입력
 
 ### Termroom Node
 
-Remote Linux가 outbound HTTPS/WSS 연결은 할 수 있지만 SSH server나 inbound port를 열 수
+Remote Linux가 outbound HTTP(S)/WS(S) 연결은 할 수 있지만 SSH server나 inbound port를 열 수
 없다면 Termroom Node를 사용합니다.
 
 ```text
@@ -252,6 +252,11 @@ systemd user service를 설치하고 즉시 시작합니다. `termroom node stat
 Core가 private HTTPS CA를 사용한다면 `node pair`에 `--ca-file /path/to/core-ca.pem`을
 추가합니다. 검증한 경로를 Node local config에 저장해 control connection에도 사용하며,
 certificate 검증을 끄는 옵션은 제공하지 않습니다.
+
+Core와 Node가 Tailscale 같은 운영자 관리 암호화 사설망에서 통신한다면 Core URL에 plain
+HTTP를 사용할 수 있습니다. 일반 LAN이나 전송 기밀성이 따로 보장되지 않는 네트워크에서는
+HTTPS를 사용하세요. 선택한 HTTP 또는 HTTPS scheme은 상시 control 연결의 WS 또는 WSS에도
+그대로 적용됩니다.
 
 pairing이 끝난 compatible Node는 SSH와 같은 Remote picker, Workspace Terminal, Files,
 Workspace Run, File Run, Remote Run, 결과 회수와 재접속 흐름을 사용합니다. `/bin/bash`와
@@ -285,7 +290,7 @@ docker compose run --rm termroom-node \
   node --config-dir /config/node pair \
   --core https://termroom.example \
   --code <10분-일회용-code> \
-  --allow-root /workspace \
+  --allow-root /workspaces \
   --name build-node
 ```
 
@@ -305,7 +310,7 @@ Docker에서는 `termroom node install-service`를 사용하지 않습니다. Co
 `restart: unless-stopped`가 Node process를 관리합니다. 터미널과 명령은 host가 아니라
 Node container 안에서 실행되므로 Git, Node.js, compiler, CUDA 등 추가 도구가 필요하면
 공식 이미지를 기반으로 Node 전용 이미지를 만들어 설치해야 합니다. Core URL은 container
-내부에서 접근 가능한 HTTPS 주소여야 합니다.
+내부에서 접근 가능해야 하며, Tailscale 같은 암호화 사설망에서는 HTTP도 지원합니다.
 
 ## 자주 쓰는 명령
 
@@ -439,7 +444,17 @@ Node service를 선택합니다. 기본 Compose는 다음을 사용합니다.
 
 - `termroom-config:/config` — DB, SSH 키, credential 등 영속 설정
 - `${TERMROOM_WORKSPACES_HOST_PATH}:/workspaces` — 선택한 host 프로젝트 폴더
-- Core 모드에서만 `127.0.0.1:8765:8765` — 기본 host publish
+- Core 모드에서 `${TERMROOM_BIND_HOST}:8765:8765` — 기본값은 loopback
+
+tailnet 안에서 Core와 Node를 직접 연결하려면 `TERMROOM_BIND_HOST`를 Core host의 특정
+Tailscale IP로 설정하고 Node를 `http://<tailscale-ip>:8765`에 pairing합니다. Node 쪽에
+포트가 열리지는 않습니다. Tailscale Serve나 HTTPS reverse proxy를 쓰면 기본 loopback을
+유지하세요. host firewall이 접근 범위를 제한하지 않는다면 `0.0.0.0`은 사용하지 마세요.
+
+HTTPS reverse proxy를 사용한다면 `TERMROOM_BIND_HOST=127.0.0.1`을 유지하고
+`TERMROOM_SECURE_COOKIE=true`로 설정합니다. Caddy·Nginx 같은 proxy는 원래 Host header와
+WebSocket upgrade를 전달해야 하며 일반적인 reverse proxy 기본 설정은 둘 다 처리합니다.
+Termroom의 native HTTP는 proxy 뒤에 남고 browser와 HTTPS/WSS Node는 proxy URL을 사용합니다.
 
 Core를 SSH/Node-only로 운영할 때는 `TERMROOM_MODE=core`를 유지하면서
 `TERMROOM_ALLOW_LOCAL_WORKSPACES=false`를 설정합니다. 이것은 Docker Node process를 선택하는

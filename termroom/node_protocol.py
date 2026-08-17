@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import ipaddress
 import json
 import math
 import re
@@ -307,8 +306,6 @@ def normalize_core_url(value: str) -> str:
         )
     if parsed.path not in {"", "/"}:
         raise NodeProtocolError("Core URL must not contain a path", code="core_url_invalid")
-    if parsed.scheme == "http" and not _loopback_host(parsed.hostname):
-        raise NodeProtocolError("A non-loopback Core URL must use HTTPS", code="core_tls_required")
     host = parsed.hostname
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
@@ -324,12 +321,3 @@ def control_websocket_url(core_url: str, node_id: str) -> str:
     parsed = urlsplit(normalized)
     scheme = "wss" if parsed.scheme == "https" else "ws"
     return urlunsplit((scheme, parsed.netloc, "/api/node/control", f"node_id={node_id}", ""))
-
-
-def _loopback_host(hostname: str) -> bool:
-    if hostname.casefold() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(hostname).is_loopback
-    except ValueError:
-        return False
