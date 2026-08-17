@@ -3,6 +3,16 @@ set -eu
 
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
+TERMROOM_MODE="${TERMROOM_MODE:-core}"
+
+case "$TERMROOM_MODE" in
+  core|node)
+    ;;
+  *)
+    echo "TERMROOM_MODE must be either core or node." >&2
+    exit 2
+    ;;
+esac
 
 case "$PUID" in
   ''|*[!0-9]*)
@@ -37,4 +47,9 @@ chmod 700 /config /config/home /config/ssh /config/credentials
 
 export HOME=/config/home
 umask 077
+
+if [ "$TERMROOM_MODE" = "node" ] && [ "${1:-}" != "node" ]; then
+  set -- node --config-dir "${TERMROOM_NODE_CONFIG_DIR:-/config/node}"
+fi
+
 exec gosu termroom termroom "$@"

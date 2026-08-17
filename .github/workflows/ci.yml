@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, test, and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Install Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server tmux
+
+      - name: Install project dependencies
+        run: uv sync --all-groups --frozen
+
+      - name: Lint Python
+        run: uv run --frozen ruff check termroom tests
+
+      - name: Run tests
+        run: env -u TMUX -u TMUX_PANE uv run --frozen pytest
+
+      - name: Check all browser JavaScript syntax
+        shell: bash
+        run: |
+          mapfile -d '' scripts < <(find termroom/static -type f -name '*.js' -print0 | sort -z)
+          test "${#scripts[@]}" -gt 0
+          for script in "${scripts[@]}"; do
+            node --check "$script"
+          done
+
+      - name: Validate Docker Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose config
+          test "$(docker compose config --services)" = "termroom"
+          TERMROOM_MODE=node COMPOSE_PROFILES=node docker compose config
+          test "$(TERMROOM_MODE=node COMPOSE_PROFILES=node docker compose config --services)" = "termroom-node"
+
+      - name: Build distributions
+        run: uv build
+
+  systemd-user-e2e:
+    name: Real systemd user-service E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Install systemd E2E dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
+      - name: Install project dependencies
+        run: uv sync --all-groups --frozen
+
+      - name: Start the ephemeral runner user manager
+        shell: bash
+        run: |
+          runner_uid=$(id -u)
+          runner_name=$(id -un)
+          sudo loginctl enable-linger "$runner_name"
+          sudo systemctl start "user@${runner_uid}.service"
+          runtime_dir="/run/user/${runner_uid}"
+          test -S "${runtime_dir}/bus"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus" >> "$GITHUB_ENV"
+
+      - name: Verify isolated systemd prerequisites
+        shell: bash
+        run: |
+          systemctl --user show-environment >/dev/null
+          load_state=$(systemctl --user show termroom-node.service --property=LoadState --value)
+          test "$load_state" = "not-found"
+          systemctl --user unset-environment TMUX_TMPDIR
+
+      - name: Run real install, restart, reconnect, revoke, and uninstall E2E
+        shell: bash
+        env:
+          TERMROOM_SYSTEMD_USER_E2E: "1"
+          TMUX_TMPDIR: ${{ runner.temp }}/termroom-systemd-tmux
+          SYSTEMD_E2E_REPORT: ${{ runner.temp }}/systemd-user-e2e.xml
+        run: |
+          install -d -m 700 "$TMUX_TMPDIR"
+          env -u TMUX -u TMUX_PANE uv run --frozen pytest \
+            tests/test_node_e2e.py::test_real_node_systemd_service_preserves_identity_tmux_and_reconnects \
+            -vv --junitxml="$SYSTEMD_E2E_REPORT"
+          uv run --frozen python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(os.environ["SYSTEMD_E2E_REPORT"]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+          if tests != 1 or skipped:
+              raise SystemExit(f"systemd E2E must run exactly once without skips: tests={tests}, skipped={skipped}")
+          PY
+          load_state=$(systemctl --user show termroom-node.service --property=LoadState --value)
+          test "$load_state" = "not-found"
+          ! systemctl --user show-environment | grep -q '^TMUX_TMPDIR='

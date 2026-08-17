@@ -11,45 +11,7 @@ permissions:
 jobs:
   test:
     name: Test release candidate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-
-      - name: Install Linux test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes openssh-server tmux
-
-      - name: Install project dependencies
-        run: uv sync --all-groups --frozen
-
-      - name: Lint Python
-        run: uv run --frozen ruff check termroom tests
-
-      - name: Run tests
-        run: uv run --frozen pytest
-
-      - name: Check browser JavaScript syntax
-        run: |
-          node --check termroom/static/app.js
-          node --check termroom/static/terminal.js
-
-      - name: Validate Docker Compose configuration
-        run: |
-          cp .env.example .env
-          docker compose config
+    uses: ./.github/workflows/ci.yml
 
   build:
     name: Build release artifacts
@@ -106,6 +68,7 @@ jobs:
           name: python-package-distributions
           path: dist/
           if-no-files-found: error
+          overwrite: true
 
   publish:
     name: Publish to PyPI
@@ -128,6 +91,8 @@ jobs:
 
       - name: Publish distribution to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   container:
     name: Publish container to GHCR
