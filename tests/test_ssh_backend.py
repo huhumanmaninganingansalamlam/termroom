@@ -920,11 +920,19 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                     max_bytes=1024 * 1024,
                 )
             assert (project / "raced.txt").read_text(encoding="utf-8") == "created elsewhere\n"
-            recent_paths = [
-                entry.relative_path for entry in backend.recent_files(workspace).entries
-            ]
+            unreadable = project / "unreadable"
+            unreadable.mkdir()
+            (unreadable / "private.txt").write_text("private\n", encoding="utf-8")
+            unreadable.chmod(0)
+            try:
+                recent_paths = [
+                    entry.relative_path for entry in backend.recent_files(workspace).entries
+                ]
+            finally:
+                unreadable.chmod(0o700)
             assert "result.csv" in recent_paths
             assert "ignored.tmp" not in recent_paths
+            assert "unreadable/private.txt" not in recent_paths
 
             browser_terminal = backend.create_terminal(workspace, "browser-view")
             view_session = tmux_browser_view_session(uuid.uuid4().hex)
