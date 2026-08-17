@@ -2,22 +2,30 @@
 {% block body_class %}computer-page{% endblock %}
 {% block content %}
 <section class="computer-detail-shell">
-  <header class="computer-detail-heading">
+  <header class="computer-detail-heading" data-remote-connection-view>
     <div>
       <a class="text-back-link" href="/open/{{ computer.id }}">← {{ t('common.workspace') }}</a>
-      <p class="eyebrow">{{ t('ssh.detail.eyebrow') }}</p>
+      <p class="eyebrow">{% if computer.connection_method == 'node' %}Termroom Node{% else %}{{ t('ssh.detail.eyebrow') }}{% endif %}</p>
       <h1>{{ computer.name }}</h1>
-      <p><code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code></p>
+      <p class="remote-connection-summary">
+        <span class="state-chip remote {{ remote_status.state }}" data-remote-connection-status><span class="status-dot" aria-hidden="true"></span><span data-remote-connection-label>{{ remote_status.label }}</span></span>
+        {% if remote_status.last_success_label %}<small data-remote-last-success>{{ t('remote.last_success', time=remote_status.last_success_label) }}</small>{% endif %}
+        {% if computer.connection_method == 'ssh' %}<code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code>{% endif %}
+      </p>
     </div>
-    <form method="post" action="/computers/{{ computer.id }}/test">
+    {% if computer.connection_method == 'ssh' %}
+    <form method="post" action="/computers/{{ computer.id }}/test" data-remote-connection-check data-remote-connecting-label="{{ t('remote.status.connecting') }}">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <button class="secondary-button" type="submit">{{ t('ssh.detail.retest') }}</button>
     </form>
+    {% else %}
+    <a class="secondary-button" href="/computers/{{ computer.id }}" data-remote-connection-check data-remote-connecting-label="{{ t('remote.status.connecting') }}">{{ t('remote.check_again') }}</a>
+    {% endif %}
   </header>
 
   {% if error %}
   <div class="connection-notice error">
-    <strong>{{ t('ssh.detail.needs_check') }}</strong>
+    <strong>{% if computer.connection_method == 'node' %}{{ t('node.detail.needs_check') }}{% else %}{{ t('ssh.detail.needs_check') }}{% endif %}</strong>
     <p>{{ error }}</p>
   </div>
   {% elif checked %}
@@ -27,8 +35,8 @@
   </div>
   {% elif connected %}
   <div class="connection-notice success">
-    <strong>{{ t('ssh.detail.connected') }}</strong>
-    <p>{{ t('ssh.detail.connected_copy') }}</p>
+    <strong>{% if computer.connection_method == 'node' %}{{ t('node.detail.paired') }}{% else %}{{ t('ssh.detail.connected') }}{% endif %}</strong>
+    <p>{% if computer.connection_method == 'node' %}{{ t('node.detail.paired_copy') }}{% else %}{{ t('ssh.detail.connected_copy') }}{% endif %}</p>
   </div>
   {% endif %}
   {% if password_updated %}
@@ -51,7 +59,7 @@
   <section class="computer-run-base panel">
     <div>
       <h2>{{ t('ssh.detail.connection_name') }}</h2>
-      <p>{{ t('ssh.detail.connection_name_copy') }}</p>
+      <p>{% if computer.connection_method == 'node' %}{{ t('node.detail.connection_name_copy') }}{% else %}{{ t('ssh.detail.connection_name_copy') }}{% endif %}</p>
     </div>
     <form method="post" action="/computers/{{ computer.id }}/name">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -64,11 +72,18 @@
   </section>
 
   <section class="computer-facts">
+    {% if computer.connection_method == 'node' %}
+    <span><small>{{ t('node.detail.fingerprint') }}</small><code>{{ computer.node_fingerprint }}</code></span>
+    <span><small>{{ t('node.detail.protocol') }}</small><strong>v{{ computer.node_protocol_version }}</strong></span>
+    <span><small>{{ t('ssh.detail.requirements') }}</small><strong>Termroom Node + tmux</strong></span>
+    {% else %}
     <span><small>{{ t('ssh.detail.host_key') }}</small><code>{{ computer.host_fingerprint }}</code></span>
     <span><small>{{ t('ssh.detail.auth') }}</small><strong>{% if computer.auth_kind == 'password' %}{{ t('ssh.detail.auth_password') }}{% elif computer.identity_file == managed_key_path %}{{ t('ssh.detail.auth_public_key') }}{% elif computer.identity_file %}{{ t('ssh.detail.auth_existing') }}{% else %}{{ t('ssh.detail.auth_config') }}{% endif %}</strong></span>
     <span><small>{{ t('ssh.detail.requirements') }}</small><strong>SSH + tmux</strong></span>
+    {% endif %}
   </section>
 
+  {% if computer.connection_method != 'node' %}
   <section class="computer-workspace-return panel">
     <div>
       <strong>{{ t('server_terminal.title') }}</strong>
@@ -79,12 +94,14 @@
       <button class="primary-button" type="submit">{{ t('server_terminal.open') }}</button>
     </form>
   </section>
+  {% endif %}
 
   <div class="computer-workspace-return panel">
-    <div><strong>{{ t('open.workspaces_live_elsewhere') }}</strong><p>{{ t('open.workspaces_live_elsewhere_copy') }}</p></div>
+    <div><strong>{{ t('open.workspaces_live_elsewhere') }}</strong><p>{% if computer.connection_method == 'node' %}{{ t('node.detail.workspaces_copy') }}{% else %}{{ t('open.workspaces_live_elsewhere_copy') }}{% endif %}</p></div>
     <a class="primary-button" href="/open/{{ computer.id }}">{{ t('home.open_workspace') }}</a>
   </div>
 
+  {% if computer.connection_method != 'node' %}
   <section class="computer-run-base panel">
     <div>
       <h2>{{ t('ssh.detail.run_base') }}</h2>
@@ -99,6 +116,7 @@
       <button class="secondary-button" type="submit">{{ t('ssh.detail.run_base_save') }}</button>
     </form>
   </section>
+  {% endif %}
 
   {% if computer.auth_kind == 'password' %}
   <details class="computer-password-update panel">
@@ -115,10 +133,24 @@
   </details>
   {% endif %}
 
+  {% if computer.connection_method == 'node' and not computer.node_revoked_at %}
+  <section class="computer-danger-zone panel">
+    <div>
+      <h2>{{ t('node.detail.revoke') }}</h2>
+      <p>{{ t('node.detail.revoke_copy') }}</p>
+    </div>
+    <form method="post" action="/computers/{{ computer.id }}/revoke"
+          data-confirm="{{ t('node.detail.revoke_confirm', name=computer.name) }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="danger-button" type="submit">{{ t('node.detail.revoke_button') }}</button>
+    </form>
+  </section>
+  {% endif %}
+
   <section class="computer-danger-zone panel">
     <div>
       <h2>{{ t('ssh.detail.remove') }}</h2>
-      <p>{{ t('ssh.detail.remove_copy') }}</p>
+      <p>{% if computer.connection_method == 'node' %}{{ t('node.detail.remove_copy') }}{% else %}{{ t('ssh.detail.remove_copy') }}{% endif %}</p>
     </div>
     <form method="post"
           action="/computers/{{ computer.id }}/delete"

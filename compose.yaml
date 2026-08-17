@@ -1,38 +1,35 @@
 services:
   termroom:
+    profiles:
+      - core
     image: ghcr.io/huhumanmaninganingansalamlam/termroom:${TERMROOM_IMAGE_TAG:-latest}
-    build:
-      context: .
-      args:
-        TERMROOM_VERSION: "${TERMROOM_VERSION:-}"
+    build: .
     restart: unless-stopped
     env_file:
       - .env
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
+      TERMROOM_MODE: core
     ports:
-      # Host loopback only. Use Tailscale Serve, a VPN, or an HTTPS reverse
-      # proxy when another device needs access.
       - "127.0.0.1:8765:8765"
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=2).read()"
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     volumes:
       - termroom-config:/config
-      # Replace this bind mount with the local folders this Core may expose.
-      - ./workspaces:/workspaces
-      # Advanced existing-key mode only. The normal public-key mode keeps its
-      # generated key inside /config/ssh. If needed, mount one existing key
-      # into /config/ssh and select that path in the advanced setup UI.
-      # - ~/.ssh/id_ed25519:/config/ssh/existing_id_ed25519:ro
+      - "${TERMROOM_WORKSPACES_HOST_PATH:-./workspaces}:/workspaces"
+
+  termroom-node:
+    profiles:
+      - node
+    image: ghcr.io/huhumanmaninganingansalamlam/termroom:${TERMROOM_IMAGE_TAG:-latest}
+    build: .
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TERMROOM_MODE: node
+    volumes:
+      - termroom-config:/config
+      - "${TERMROOM_WORKSPACES_HOST_PATH:-./workspaces}:/workspaces"
 
 volumes:
   termroom-config:

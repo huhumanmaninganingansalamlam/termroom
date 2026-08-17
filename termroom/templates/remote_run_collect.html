@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block body_class %}remote-run-collect-page{% endblock %}
+{% block content %}
+<section class="remote-run-collect-shell">
+  <header class="open-page-heading">
+    <div>
+      <a class="text-back-link" href="/remote-runs/{{ run.id }}">← {{ t('remote_run.collect.back') }}</a>
+      <p class="eyebrow">{{ t('remote_run.collect.eyebrow') }}</p>
+      <h1>{{ t('remote_run.collect.heading') }}</h1>
+      <p class="page-copy">{{ t('remote_run.collect.copy', source=run.source_label) }}</p>
+    </div>
+    <a class="secondary-button" href="/remote-runs/{{ run.id }}/result.zip" download>{{ t('remote_run.result_download') }}</a>
+  </header>
+
+  {% if action_error %}<p class="notice error" role="alert">{{ action_error }}</p>{% endif %}
+  {% if collection_result %}
+  <p class="notice success" role="status">{{ t(
+    'remote_run.collect.success',
+    applied=collection_result['applied'],
+    conflict=collection_result['conflict'],
+    already_result=collection_result['already_result'],
+    skipped=collection_result['skipped'],
+    failed=collection_result['failed']
+  ) }}</p>
+  {% endif %}
+
+  {% if plan %}
+  <section class="panel remote-run-collect-summary" aria-label="{{ t('remote_run.collect.summary') }}">
+    <span><strong>{{ plan['summary']['ready'] }}</strong><small>{{ t('remote_run.collect.status.ready') }}</small></span>
+    <span><strong>{{ plan['summary']['conflict'] }}</strong><small>{{ t('remote_run.collect.status.conflict') }}</small></span>
+    <span><strong>{{ plan['summary']['already_result'] }}</strong><small>{{ t('remote_run.collect.status.already_result') }}</small></span>
+    <span><strong>{{ plan['summary']['skipped'] }}</strong><small>{{ t('remote_run.collect.status.skipped') }}</small></span>
+  </section>
+
+  <section class="panel remote-run-collect-panel">
+    <header class="open-section-heading">
+      <div><h2>{{ t('remote_run.collect.review_heading') }}</h2><p>{{ t('remote_run.collect.review_copy') }}</p></div>
+    </header>
+    <div class="remote-run-collect-list">
+      {% for item in plan['items'] %}
+      <article class="remote-run-collect-row {{ item.status }}">
+        <code title="{{ item.path }}">{{ item.path }}</code>
+        <span class="remote-run-collect-tags">
+          <span class="state-chip">{{ item.change_label }}</span>
+          <span class="state-chip {{ item.status }}">{{ item.status_label }}</span>
+        </span>
+        <small>{{ item.reason_label }}</small>
+      </article>
+      {% else %}
+      <p class="empty-state quiet-empty">{{ t('remote_run.collect.empty') }}</p>
+      {% endfor %}
+    </div>
+    {% if plan.get('items_truncated') %}
+    <p class="notice" role="status">{{ t('remote_run.collect.truncated_plan', count=plan['omitted_items']) }}</p>
+    {% endif %}
+  </section>
+
+  <footer class="remote-run-collect-actions">
+    <a class="secondary-button" href="/remote-runs/{{ run.id }}">{{ t('remote_run.collect.cancel') }}</a>
+    {% if plan['summary']['ready'] and plan.get('apply_allowed', true) %}
+    <form method="post" action="/remote-runs/{{ run.id }}/collect">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="revision" value="{{ plan['revision'] }}">
+      <button class="primary-button" type="submit">{{ t('remote_run.collect.apply', count=plan['summary']['ready']) }}</button>
+    </form>
+    {% endif %}
+  </footer>
+  {% endif %}
+
+  {% if report %}
+  <section class="panel remote-run-collect-summary" aria-label="{{ t('remote_run.collect.result_heading') }}">
+    <span><strong>{{ report['summary']['applied'] }}</strong><small>{{ t('remote_run.collect.outcome.applied') }}</small></span>
+    <span><strong>{{ report['summary']['conflict'] }}</strong><small>{{ t('remote_run.collect.outcome.conflict') }}</small></span>
+    <span><strong>{{ report['summary']['already_result'] }}</strong><small>{{ t('remote_run.collect.outcome.already_result') }}</small></span>
+    <span><strong>{{ report['summary']['skipped'] }}</strong><small>{{ t('remote_run.collect.outcome.skipped') }}</small></span>
+    <span><strong>{{ report['summary']['failed'] }}</strong><small>{{ t('remote_run.collect.outcome.failed') }}</small></span>
+  </section>
+  <section class="panel remote-run-collect-panel">
+    <header class="open-section-heading">
+      <div><h2>{{ t('remote_run.collect.result_heading') }}</h2><p>{{ t('remote_run.collect.result_copy') }}</p></div>
+    </header>
+    <div class="remote-run-collect-list">
+      {% for item in report['items'] %}
+      <article class="remote-run-collect-row {{ item.outcome }}">
+        <code title="{{ item.path }}">{{ item.path }}</code>
+        <span class="remote-run-collect-tags">
+          <span class="state-chip">{{ item.change_label }}</span>
+          <span class="state-chip {{ item.outcome }}">{{ item.outcome_label }}</span>
+        </span>
+        <small>{{ item.reason_label }}</small>
+      </article>
+      {% endfor %}
+    </div>
+    {% if report.get('items_truncated') %}
+    <p class="notice" role="status">{{ t('remote_run.collect.truncated_report', count=report['omitted_items']) }}</p>
+    {% endif %}
+  </section>
+  <footer class="remote-run-collect-actions">
+    <a class="secondary-button" href="/remote-runs/{{ run.id }}/collect">{{ t('remote_run.collect.review_again') }}</a>
+    <a class="primary-button" href="/remote-runs/{{ run.id }}">{{ t('remote_run.collect.done') }}</a>
+  </footer>
+  {% endif %}
+</section>
+{% endblock %}

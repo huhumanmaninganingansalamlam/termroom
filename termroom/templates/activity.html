@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block body_class %}activity-page{% endblock %}
+{% block content %}
+<header class="activity-heading">
+  <div>
+    <p class="eyebrow">Termroom</p>
+    <h1>{{ t('activity.heading') }}</h1>
+    <p class="page-copy">{{ t('activity.copy') }}</p>
+  </div>
+  <div class="activity-heading-actions">
+    <button class="secondary-button"
+            type="button"
+            data-notification-enable>
+      {{ t('activity.notifications_enable') }}
+    </button>
+    {% if unread_count %}
+    <form method="post" action="/activity/read-all">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="secondary-button" type="submit">{{ t('activity.read_all') }}</button>
+    </form>
+    {% endif %}
+  </div>
+</header>
+
+{% if unavailable %}
+<p class="notice" role="status">{{ t('activity.target_unavailable_copy') }}</p>
+{% endif %}
+
+{% if events %}
+<section class="activity-list" aria-label="{{ t('activity.heading') }}">
+  {% for event in events %}
+  <article class="activity-row {{ event.status_class }}{% if event.unread %} unread{% endif %}">
+    <span class="activity-state" aria-hidden="true"></span>
+    <span class="activity-copy">
+      <span class="activity-title-line">
+        <strong>{{ event.title }}</strong>
+        {% if event.unread %}<span class="activity-new">{{ t('activity.new') }}</span>{% endif %}
+      </span>
+      <span>{{ event.summary }}</span>
+      <small>{{ event.occurred_label }}</small>
+    </span>
+    <span class="activity-actions">
+      {% if event.subject_exists %}
+      <form method="post" action="/activity/{{ event.id }}/open">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button class="quiet-action" type="submit">{{ t('activity.open') }}</button>
+      </form>
+      {% if event.terminal_url %}
+      <form method="post" action="/activity/{{ event.id }}/open">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="destination" value="terminal">
+        <button class="quiet-action" type="submit">{{ t('common.terminal') }}</button>
+      </form>
+      {% endif %}
+      {% else %}
+      <span class="activity-unavailable">{{ t('activity.target_unavailable') }}</span>
+      {% endif %}
+      {% if event.unread %}
+      <form method="post" action="/activity/{{ event.id }}/read">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button class="quiet-action" type="submit">{{ t('activity.mark_read') }}</button>
+      </form>
+      {% endif %}
+    </span>
+  </article>
+  {% endfor %}
+</section>
+{% else %}
+<section class="empty-state activity-empty">
+  <span class="empty-icon" aria-hidden="true"></span>
+  <strong>{{ t('activity.empty') }}</strong>
+  <p>{{ t('activity.empty_copy') }}</p>
+</section>
+{% endif %}
+{% endblock %}

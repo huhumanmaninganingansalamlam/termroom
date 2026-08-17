@@ -10,8 +10,44 @@ VENDOR_DIR = PACKAGE_ROOT / "static" / "vendor"
 XTERM_VERSION = "6.0.0"
 XTERM_VERSION_FILE = VENDOR_DIR / "xterm.version"
 TERMINAL_FONT_VERSION = "3.5.0"
-TERMINAL_FONT_FILENAME = f"d2koding-ligature-nerd-font-mono-{TERMINAL_FONT_VERSION}.woff2"
-TERMINAL_FONT_SHA256 = "6d491d86d652cf6886afe1a37c50877a7bbf91c9369f529049d0d27cd77131be"
+TERMINAL_FONT_ASSETS = {
+    "core_hangul": {
+        "filename": (
+            f"d2koding-ligature-nerd-font-mono-{TERMINAL_FONT_VERSION}-core-hangul.woff2"
+        ),
+        "sha256": "b9fae6a182cc440dcf69c7a8b3a8b2ad60284fa2ed67e8e41c2f26bead83ede9",
+        "size": 567_584,
+        "unicode_range": "U+0000-4DFF,U+AC00-DFFF,U+FB00-FFFF",
+    },
+    "cjk": {
+        "filename": f"d2koding-ligature-nerd-font-mono-{TERMINAL_FONT_VERSION}-cjk.woff2",
+        "sha256": "0d1b8923dc714312107b8282b1e2f1d79645e48f26e0a12d38dac886028c9783",
+        "size": 801_848,
+        "unicode_range": "U+4E00-ABFF,U+F900-FAFF",
+    },
+    "nerd_bmp": {
+        "filename": (
+            f"d2koding-ligature-nerd-font-mono-{TERMINAL_FONT_VERSION}-nerd-bmp.woff2"
+        ),
+        "sha256": "64c9508468b380ac4e31f65ce5fc548e14939670ae1833870596f276661122dd",
+        "size": 497_412,
+        "unicode_range": (
+            "U+E000-E00A,U+E0A0-E0A3,U+E0B0-E0C8,U+E0CA,U+E0CC-E0D2,"
+            "U+E0D4,U+E0D6-E0D7,U+E200-E2A9,U+E300-E3E3,U+E5FA-E6BB,"
+            "U+E700-E8EF,U+EA60-EA88,U+EA8A-EA8C,U+EA8F-EAC7,U+EAC9,"
+            "U+EACC-EB09,U+EB0B-EB4E,U+EB50-EC5E,U+EC60-EC84,U+ED00-EFCF,"
+            "U+F000-F385,U+F400-F533"
+        ),
+    },
+    "nerd_supp": {
+        "filename": (
+            f"d2koding-ligature-nerd-font-mono-{TERMINAL_FONT_VERSION}-nerd-supp.woff2"
+        ),
+        "sha256": "25fa39d5040346d76385e04aa5977b15b1bc72b3af27bff429f27e341fc03f0d",
+        "size": 397_908,
+        "unicode_range": "U+F0001-F1AF0",
+    },
+}
 TERMINAL_FONT_SOURCE_ARCHIVE_URL = (
     "https://github.com/ryanoasis/nerd-fonts/releases/download/"
     f"v{TERMINAL_FONT_VERSION}/D2Coding.tar.xz"

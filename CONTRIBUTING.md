@@ -1,8 +1,8 @@
 # Contributing to Termroom
 
 Thanks for helping improve Termroom. Keep changes aligned with its narrow product
-contract: a self-hosted workspace for persistent terminals, files, and quick
-resume across local and SSH Linux computers.
+contract: a self-hosted workspace for persistent terminals, files, managed runs,
+and quick resume across Local, SSH, and Termroom Node Linux computers.
 
 ## Setup
 
@@ -21,6 +21,7 @@ uv run termroom .
 uv run --frozen ruff check termroom tests
 uv run --frozen pytest
 node --check termroom/static/app.js
+node --check termroom/static/remote_run.js
 node --check termroom/static/terminal.js
 ```
 
@@ -31,7 +32,7 @@ Prefer changes that improve at least one of these:
 1. faster return to a project;
 2. easier observation/interruption/resume of running work;
 3. easier recovery of result files;
-4. a consistent local/SSH mental model.
+4. a consistent Local/SSH/Node mental model.
 
 Avoid turning Termroom into a full IDE, server administration dashboard, built-in
 AI agent, public relay, or remote desktop.
@@ -47,8 +48,8 @@ Home → Open workspace → Computer → Workspace
 
 Check at least 390px, 768px, and 1440px widths. Look for horizontal overflow,
 truncated primary actions, touch targets below 44px on mobile, keyboard overlap,
-focus states, empty/error/loading states, and accidental divergence between local
-and SSH screens.
+focus states, empty/error/loading states, and accidental divergence between Local,
+SSH, and Node screens.
 
 Top-level navigation is for changing workspace sections. Actions for the current
 view belong in that view's toolbar. Avoid duplicating the same action in several
@@ -58,7 +59,7 @@ unrelated surfaces.
 
 Preserve workspace boundary checks, symlink protections, internal config hiding,
 upload race protection, and bounded previews. Multi-select operations must work
-for both local and SSH backends or clearly fail before making partial changes.
+for Local, SSH, and Node backends or clearly fail before making partial changes.
 
 ## Terminal
 
@@ -70,7 +71,23 @@ xterm IME/composition and bracketed-paste paths.
 
 Keep host-key pinning and credential storage intact. The normal managed-key path
 should reuse one Ed25519 key. Existing-key mode is advanced functionality. Remote
-Linux must not require a Termroom-specific agent.
+Linux connected through SSH must not require a Termroom-specific agent.
+
+## Node
+
+Node is the outbound-only connection method for a Remote Linux computer, not a
+separate product. Preserve one-time Pairing, fingerprint approval, Node-local
+allowed roots and run root, owner-only identity state, capability gating, bounded
+streaming, request idempotency, and reconnect behavior. Do not add a generic hidden
+shell or let the Core expand Node-local filesystem policy.
+
+## Managed runs and Activity
+
+File Run uses the server-owned Runner Registry and one exact managed slot per
+Workspace. Remote Run uses an explicit Bash command in a managed transient Workspace.
+Do not infer runtimes or project commands, auto-install environments, or treat a
+connection loss as proof of completion. State transitions and Activity Events must
+remain idempotent across polling, multiple browser tabs, and Core/Remote reconnects.
 
 ## Localization
 

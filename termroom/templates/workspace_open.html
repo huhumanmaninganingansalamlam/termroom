@@ -15,6 +15,7 @@
 {% if computer_removed %}<p class="notice success">{{ t('home.computer_removed') }}</p>{% endif %}
 
 <section class="open-computer-grid" aria-label="{{ t('open.choose_computer') }}">
+  {% if allow_local_workspaces %}
   <a class="open-computer-card" href="/open/local">
     <span class="computer-icon" aria-hidden="true"></span>
     <span class="open-computer-main">
@@ -24,15 +25,25 @@
     <span class="open-computer-meta">{{ t('open.workspace_count', count=local_workspace_count) }}</span>
     <span class="row-arrow" aria-hidden="true">→</span>
   </a>
+  {% endif %}
   {% for computer in computers %}
+  {% set remote_status = remote_statuses.get(computer.id) %}
   <a class="open-computer-card" href="/open/{{ computer.id }}">
     <span class="computer-icon remote" aria-hidden="true"></span>
     <span class="open-computer-main">
       <strong title="{{ computer.name }}">{{ computer.name }}</strong>
+      {% if computer.connection_method == 'ssh' %}
       <small title="{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}">{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</small>
+      {% else %}
+      <small>Termroom Node</small>
+      {% endif %}
     </span>
-    <span class="open-computer-meta {% if computer.last_error %}has-error{% endif %}">
-      {% if computer.last_error %}{{ t('home.needs_check') }}{% else %}{{ t('open.workspace_count', count=workspace_counts.get(computer.id, 0)) }}{% endif %}
+    <span class="open-computer-meta remote-connection-meta">
+      <span class="state-chip remote {{ remote_status.state }}">
+        <span class="status-dot" aria-hidden="true"></span>
+        {{ remote_status.label }}
+      </span>
+      <small>{% if remote_status.last_success_label %}{{ t('remote.last_success', time=remote_status.last_success_label) }}{% else %}{{ t('open.workspace_count', count=workspace_counts.get(computer.id, 0)) }}{% endif %}</small>
     </span>
     <span class="row-arrow" aria-hidden="true">→</span>
   </a>
@@ -77,12 +88,24 @@
     <span><strong>{{ roots[0].label }}</strong><small>{{ roots[0].path }}</small></span>
     <span>{{ t('open.workspace_count', count=roots[0].workspace_count) }}</span>
   </span>
-  <details class="add-location-menu" {% if browse_location %}open{% endif %}
-           data-popover-close-url="{{ location_close_url }}"
-           data-popover-clear-query="{{ 1 if browse_location else 0 }}">
-    <summary class="secondary-button">{{ t('open.add_location') }}</summary>
-    <span class="add-location-backdrop" data-close-popover aria-hidden="true"></span>
-    <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}"
+  <div class="add-location-menu" data-popover {% if browse_location %}open{% endif %}
+       data-popover-close-url="{{ location_close_url }}"
+       data-popover-clear-query="{{ 1 if browse_location else 0 }}">
+    <button class="secondary-button"
+            type="button"
+            data-popover-trigger
+            aria-expanded="{{ 'true' if browse_location else 'false' }}"
+            aria-controls="add-location-dialog">{{ t('open.add_location') }}</button>
+    <span class="add-location-backdrop" data-popover-panel data-close-popover aria-hidden="true" {% if not browse_location %}hidden{% endif %}></span>
+    <form id="add-location-dialog"
+          method="post"
+          action="/open/local/locations"
+          class="add-location-form"
+          role="dialog"
+          aria-modal="true"
+          aria-label="{{ t('open.add_location') }}"
+          data-popover-panel
+          {% if not browse_location %}hidden{% endif %}
           data-folder-picker data-folder-picker-url="/api/local/browse-directories">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <header class="floating-form-heading">
@@ -130,18 +153,30 @@
         <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('open.add_location') }}">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
       </div>
     </form>
-  </details>
+  </div>
 </section>
 {% else %}
 <section class="open-location-panel panel">
   <header class="open-section-heading">
     <div><h2>{{ t('open.locations') }}</h2><p>{{ t('open.locations_copy') }}</p></div>
-    <details class="add-location-menu" {% if browse_location %}open{% endif %}
-             data-popover-close-url="{{ location_close_url }}"
-             data-popover-clear-query="{{ 1 if browse_location else 0 }}">
-      <summary class="secondary-button">{{ t('open.add_location') }}</summary>
-      <span class="add-location-backdrop" data-close-popover aria-hidden="true"></span>
-      <form method="post" action="/open/local/locations" class="add-location-form" role="dialog" aria-modal="true" aria-label="{{ t('open.add_location') }}"
+    <div class="add-location-menu" data-popover {% if browse_location %}open{% endif %}
+         data-popover-close-url="{{ location_close_url }}"
+         data-popover-clear-query="{{ 1 if browse_location else 0 }}">
+      <button class="secondary-button"
+              type="button"
+              data-popover-trigger
+              aria-expanded="{{ 'true' if browse_location else 'false' }}"
+              aria-controls="add-location-dialog">{{ t('open.add_location') }}</button>
+      <span class="add-location-backdrop" data-popover-panel data-close-popover aria-hidden="true" {% if not browse_location %}hidden{% endif %}></span>
+      <form id="add-location-dialog"
+            method="post"
+            action="/open/local/locations"
+            class="add-location-form"
+            role="dialog"
+            aria-modal="true"
+            aria-label="{{ t('open.add_location') }}"
+            data-popover-panel
+            {% if not browse_location %}hidden{% endif %}
             data-folder-picker data-folder-picker-url="/api/local/browse-directories">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <header class="floating-form-heading">
@@ -186,7 +221,7 @@
           <button class="primary-button" type="submit" data-folder-picker-default-label="{{ t('open.add_location') }}">{% if browse_location and location_picker %}{{ t('open.use_current_folder') }}{% else %}{{ t('open.add_location') }}{% endif %}</button>
         </div>
       </form>
-    </details>
+    </div>
   </header>
   <div class="open-location-list">
     {% for item in roots %}
@@ -313,14 +348,29 @@
 </dialog>
 
 {% elif mode == 'remote' %}
-<header class="open-page-heading remote-open-heading">
+<header class="open-page-heading remote-open-heading" data-remote-connection-view>
   <div>
     <a class="text-back-link" href="/open">← {{ t('open.computers') }}</a>
-    <p class="eyebrow">{{ t('ssh.detail.eyebrow') }}</p>
+    <p class="eyebrow">{{ t('common.remote') }}</p>
     <h1>{{ computer.name }}</h1>
-    <p class="page-copy"><code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code></p>
+    <p class="page-copy remote-connection-summary">
+      <span class="state-chip remote {{ remote_status.state }}" data-remote-connection-status><span class="status-dot" aria-hidden="true"></span><span data-remote-connection-label>{{ remote_status.label }}</span></span>
+      {% if remote_status.last_success_label %}<small data-remote-last-success>{{ t('remote.last_success', time=remote_status.last_success_label) }}</small>{% endif %}
+      {% if computer.connection_method == 'ssh' %}<code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code>{% endif %}
+    </p>
   </div>
-  <a class="secondary-button" href="/computers/{{ computer.id }}">{{ t('open.connection_settings') }}</a>
+  <span class="project-result-actions">
+    {% if computer.connection_method == 'ssh' %}
+    <form method="post" action="/computers/{{ computer.id }}/test" data-remote-connection-check data-remote-connecting-label="{{ t('remote.status.connecting') }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="return_to" value="/open/{{ computer.id }}">
+      <button class="secondary-button" type="submit">{{ t('remote.check_again') }}</button>
+    </form>
+    {% else %}
+    <a class="secondary-button" href="/open/{{ computer.id }}" data-remote-connection-check data-remote-connecting-label="{{ t('remote.status.connecting') }}">{{ t('remote.check_again') }}</a>
+    {% endif %}
+    <a class="secondary-button" href="/computers/{{ computer.id }}">{{ t('open.connection_settings') }}</a>
+  </span>
 </header>
 
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
@@ -342,21 +392,40 @@
 </section>
 {% endif %}
 {% if connected %}<p class="notice success">{{ t('ssh.detail.connected_copy') }}</p>{% endif %}
+<p class="sr-only"
+   role="status"
+   aria-live="polite"
+   aria-atomic="true"
+   data-workspace-open-announcer></p>
 
 <section class="open-workspace-panel panel">
   <header class="open-section-heading">
     <div><h2>{{ t('open.registered') }}</h2><p>{{ t('open.remote_registered_copy') }}</p></div>
+    {% if can_remote_run %}
     <span class="project-result-actions" aria-label="{{ t('remote_run.server_entry_heading') }}">
       <a class="secondary-button" href="/remote-runs/new?target_computer_id={{ computer.id | urlencode }}&source_kind=git">{{ t('remote_run.run_public_git') }}</a>
-      <a class="secondary-button" href="/remote-runs/new?target_computer_id={{ computer.id | urlencode }}&source_kind=zip">{{ t('remote_run.run_zip') }}</a>
+      <a class="secondary-button" href="/remote-runs/new?target_computer_id={{ computer.id | urlencode }}&source_kind=archive">{{ t('remote_run.run_archive') }}</a>
     </span>
+    {% endif %}
   </header>
   {% if remote_workspaces %}
   <div class="open-workspace-list">
     {% for workspace in remote_workspaces %}
-    <a class="open-workspace-row" href="/w/{{ workspace.id }}">
+    <a class="open-workspace-row"
+       href="/w/{{ workspace.id }}"
+       data-workspace-open-pending
+       data-workspace-opening-label="{{ t('terminal.status.connecting') }}">
       <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
-      <span><strong>{{ workspace.display_name }}</strong><small>{{ workspace.canonical_path }}</small></span>
+      <span>
+        <strong>{{ workspace.display_name }}</strong>
+        <small data-workspace-open-idle>{{ workspace.canonical_path }}</small>
+        <span class="state-chip remote"
+              data-workspace-open-status
+              hidden>
+          <span class="status-dot" aria-hidden="true"></span>
+          <span data-workspace-open-status-label>{{ t('terminal.status.connecting') }}</span>
+        </span>
+      </span>
       <span class="row-arrow" aria-hidden="true">→</span>
     </a>
     {% endfor %}
@@ -488,5 +557,5 @@
 {% endif %}
 {% endblock %}
 {% block scripts %}
-{% if mode == 'remote' and remote_runs %}<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>{% endif %}
+{% if mode == 'remote' and remote_runs %}<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>{% endif %}
 {% endblock %}

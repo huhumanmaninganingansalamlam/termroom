@@ -6,6 +6,8 @@ import struct
 import zlib
 from functools import lru_cache
 
+PWA_ICON_VERSION = "1"
+
 
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
     checksum = binascii.crc32(kind + payload) & 0xFFFFFFFF
@@ -34,8 +36,8 @@ def _distance_to_segment(
 
 @lru_cache(maxsize=4)
 def termroom_png_icon(size: int) -> bytes:
-    if size not in {192, 512}:
-        raise ValueError("Termroom PWA icon size must be 192 or 512")
+    if size not in {180, 192, 512}:
+        raise ValueError("Termroom PWA icon size must be 180, 192, or 512")
 
     scale = size / 512.0
     stroke_radius = 21.0 * scale

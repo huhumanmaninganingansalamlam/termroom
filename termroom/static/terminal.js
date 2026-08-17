@@ -16,8 +16,10 @@
   const MIN_TERMINAL_FONT_SIZE = 12;
   const MAX_TERMINAL_FONT_SIZE = 20;
   const BUNDLED_TERMINAL_FONT_FAMILY = '"Termroom D2Koding Nerd Mono"';
-  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C\uE0B0\uF013\u{F0001}";
-  const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 5000;
+  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C";
+  // Let fast cached/local loads avoid a font swap without holding terminal input
+  // behind a slow first-visit font download.
+  const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400;
   const BUNDLED_TERMINAL_FONT_DESCRIPTOR =
     `normal 400 ${DEFAULT_TERMINAL_FONT_SIZE}px ${BUNDLED_TERMINAL_FONT_FAMILY}`;
   const clampTerminalFontSize = (value) =>
@@ -80,27 +82,34 @@
       : systemFamily;
   };
 
-  const loadBundledTerminalFont = async () => {
-    if (typeof document.fonts?.load !== "function") return false;
-    const loadFace = document.fonts
+  const beginBundledTerminalFontLoad = () => {
+    if (typeof document.fonts?.load !== "function") {
+      const unavailable = Promise.resolve(false);
+      return { initial: unavailable, completed: unavailable };
+    }
+    const completed = document.fonts
       .load(BUNDLED_TERMINAL_FONT_DESCRIPTOR, BUNDLED_TERMINAL_FONT_PROBE)
       .then((faces) => faces.length > 0)
       .catch(() => false);
-    let timeoutId;
-    const timeout = new Promise((resolve) => {
-      timeoutId = window.setTimeout(
-        () => resolve(false),
-        BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS,
-      );
-    });
-    const loaded = await Promise.race([loadFace, timeout]);
-    window.clearTimeout(timeoutId);
-    return loaded;
+    const initial = (async () => {
+      let timeoutId;
+      const timeout = new Promise((resolve) => {
+        timeoutId = window.setTimeout(
+          () => resolve(false),
+          BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS,
+        );
+      });
+      const loaded = await Promise.race([completed, timeout]);
+      window.clearTimeout(timeoutId);
+      return loaded;
+    })();
+    return { initial, completed };
   };
 
   const status = document.querySelector("#terminal-status");
   const statusLabel = status.querySelector(".terminal-status-label");
-  const bundledTerminalFontLoaded = await loadBundledTerminalFont();
+  const bundledTerminalFontLoad = beginBundledTerminalFontLoad();
+  let bundledTerminalFontLoaded = await bundledTerminalFontLoad.initial;
   host.dataset.terminalFont = bundledTerminalFontLoaded ? "bundled" : "system-fallback";
   const term = new window.Terminal({
     cursorBlink: true,
@@ -113,10 +122,27 @@
     theme: terminalTheme(),
   });
   term.open(host);
+  const refreshTerminalFont = () => {
+    term.clearTextureAtlas?.();
+    term.refresh(0, Math.max(0, term.rows - 1));
+  };
+  document.fonts?.addEventListener?.("loadingdone", () => {
+    refreshTerminalFont();
+    scheduleResize(true);
+  });
+  void bundledTerminalFontLoad.completed.then((loaded) => {
+    if (!loaded || bundledTerminalFontLoaded) return;
+    bundledTerminalFontLoaded = true;
+    host.dataset.terminalFont = "bundled";
+    term.options.fontFamily = terminalFontFamily(true);
+    refreshTerminalFont();
+    scheduleResize(true);
+  });
   window.addEventListener("themechange", () => {
     term.options.theme = terminalTheme();
     term.options.fontFamily = terminalFontFamily(bundledTerminalFontLoaded);
     term.refresh(0, Math.max(0, term.rows - 1));
+    scheduleResize(true);
   });
 
   // xterm owns the actual IME/composition lifecycle. Do not mirror the hidden
@@ -147,13 +173,20 @@
   let lastInputRevision = 0;
   let presenceInitialized = false;
   let otherInputTimer = null;
+  const shellTerminal = (host.dataset.terminalRole || "shell") === "shell";
+  let activityAckTimer = 0;
+  let pendingActivityAt = 0;
+  let acknowledgedActivityAt = 0;
+  let renderedActivityAt = 0;
+  let outputRenderSequence = 0;
+  let acknowledgedRenderSequence = 0;
   const mobileInput = window.matchMedia("(max-width: 1023px)");
   const coarsePrimaryPointer = window.matchMedia("(pointer: coarse)");
   const composePane = document.querySelector(".terminal-compose-pane");
   const composerRoot = document.querySelector(".terminal-composer");
   const openCommandEditor = document.querySelector("#open-command-editor");
   const closeCommandEditor = document.querySelector("#close-command-editor");
-  const moreKeys = document.querySelector("details.more-keys");
+  const moreKeys = document.querySelector(".more-keys[data-popover]");
   let composerOpen = false;
   let mobileViewportBaseline = window.visualViewport?.height || window.innerHeight;
   let mobileViewportBaselineWidth = window.visualViewport?.width || window.innerWidth;
@@ -216,7 +249,72 @@
   };
 
   const send = (payload) => {
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  };
+
+  const terminalAtBottom = () =>
+    term.buffer.active.viewportY >= term.buffer.active.baseY;
+  const terminalCanAcknowledge = () =>
+    shellTerminal
+    && document.visibilityState === "visible"
+    && document.hasFocus()
+    && terminalAtBottom();
+  const terminalActivityPayload = (result) => {
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    if (payload?.terminal && typeof payload.terminal === "object") return payload.terminal;
+    if (Array.isArray(payload?.terminals)) {
+      return payload.terminals.find(
+        (item) => String(item?.terminal_id ?? item?.id ?? "") === host.dataset.terminalId,
+      ) || payload.terminals[0] || {};
+    }
+    return payload;
+  };
+  const renderCurrentTerminalActivity = (result) => {
+    const payload = terminalActivityPayload(result);
+    const activityAt = Number(payload?.activity_at || 0);
+    const acknowledgedAt = Number(payload?.acknowledged_activity_at || 0);
+    if (Number.isSafeInteger(activityAt)) {
+      pendingActivityAt = Math.max(pendingActivityAt, activityAt);
+    }
+    if (Number.isSafeInteger(acknowledgedAt)) {
+      acknowledgedActivityAt = Math.max(acknowledgedActivityAt, acknowledgedAt);
+    }
+    if (pendingActivityAt <= acknowledgedActivityAt) {
+      acknowledgedRenderSequence = outputRenderSequence;
+    } else if (outputRenderSequence > acknowledgedRenderSequence) {
+      renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
+    }
+    document
+      .querySelectorAll(`[data-terminal-activity-tab="${CSS.escape(host.dataset.terminalId)}"] [data-terminal-activity-tab-unread]`)
+      .forEach((dot) => {
+        dot.hidden = pendingActivityAt <= acknowledgedActivityAt;
+      });
+    scheduleActivityAcknowledge();
+  };
+  const acknowledgeVisibleActivity = () => {
+    window.clearTimeout(activityAckTimer);
+    if (
+      !terminalCanAcknowledge()
+      || renderedActivityAt <= acknowledgedActivityAt
+    ) return;
+    const observedActivityAt = renderedActivityAt;
+    if (!send({ kind: "activity_ack", activity_at: observedActivityAt })) return;
+    acknowledgedActivityAt = observedActivityAt;
+    acknowledgedRenderSequence = outputRenderSequence;
+    renderCurrentTerminalActivity({
+      activity_at: pendingActivityAt,
+      acknowledged_activity_at: acknowledgedActivityAt,
+      unread: pendingActivityAt > acknowledgedActivityAt,
+    });
+    window.dispatchEvent(new CustomEvent("termroom:terminal-activity-changed"));
+  };
+  const scheduleActivityAcknowledge = () => {
+    window.clearTimeout(activityAckTimer);
+    if (terminalCanAcknowledge()) {
+      activityAckTimer = window.setTimeout(acknowledgeVisibleActivity, 180);
+    }
   };
 
   const resizeTerminal = (forceSend = false) => {
@@ -261,25 +359,24 @@
       try {
         window.localStorage.setItem(TERMINAL_FONT_SIZE_KEY, String(size));
       } catch {
-        // Storage is optional; the live terminal still updates immediately.
+        // Storage is optional; the local font size still applies.
       }
     }
-    term.refresh(0, Math.max(0, term.rows - 1));
-    window.setTimeout(() => scheduleResize(true), 0);
+    scheduleResize(true);
   };
   updateFontSizeControls(initialTerminalFontSize);
   fontSizeDecrease?.addEventListener("click", () =>
-    applyTerminalFontSize(term.options.fontSize - 1),
+    applyTerminalFontSize(Number(term.options.fontSize) - 1),
   );
   fontSizeIncrease?.addEventListener("click", () =>
-    applyTerminalFontSize(term.options.fontSize + 1),
+    applyTerminalFontSize(Number(term.options.fontSize) + 1),
   );
   fontSizeReset?.addEventListener("click", () =>
     applyTerminalFontSize(DEFAULT_TERMINAL_FONT_SIZE),
   );
   window.addEventListener("storage", (event) => {
-    if (event.key === TERMINAL_FONT_SIZE_KEY && event.newValue) {
-      applyTerminalFontSize(event.newValue, { persist: false });
+    if (event.key === TERMINAL_FONT_SIZE_KEY) {
+      applyTerminalFontSize(event.newValue || DEFAULT_TERMINAL_FONT_SIZE, { persist: false });
     }
   });
 
@@ -294,7 +391,7 @@
         term.focus();
       }
     }
-    window.setTimeout(() => scheduleResize(true), 0);
+    window.setTimeout(() => scheduleResize(), 0);
   };
 
   const updateMobileKeyboardState = () => {
@@ -320,7 +417,7 @@
       !widthChanged &&
       (layoutGap > keyboardThreshold || mobileViewportBaseline - height > keyboardThreshold);
     document.body.classList.toggle("terminal-keyboard-open", keyboardOpen);
-    window.setTimeout(() => scheduleResize(true), 0);
+    window.setTimeout(() => scheduleResize(), 0);
   };
 
   openCommandEditor?.addEventListener("click", () => setComposerOpen(true));
@@ -332,26 +429,31 @@
   });
   setComposerOpen(false, { focus: false });
 
-  const claimVisibleTerminal = () => {
-    if (document.visibilityState !== "visible") return;
-    send({ kind: "claim" });
-    scheduleResize(true);
-  };
-
   const connect = () => {
     window.clearTimeout(reconnectTimer);
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    socket = new WebSocket(`${scheme}://${location.host}/ws/terminal/${host.dataset.terminalId}`);
+    socket = new WebSocket(
+      `${scheme}://${location.host}/ws/terminal/${host.dataset.terminalId}`,
+    );
     setStatus(tr("terminal.status.connecting"));
 
     socket.addEventListener("open", () => {
       reconnectDelay = 500;
       setStatus(tr("terminal.status.connected"), true);
-      claimVisibleTerminal();
+      scheduleResize(true);
       updatePresence();
       if (!coarsePrimaryPointer.matches) term.focus();
     });
-    socket.addEventListener("message", (event) => term.write(event.data));
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      term.write(event.data, () => {
+        outputRenderSequence += 1;
+        if (pendingActivityAt > acknowledgedActivityAt) {
+          renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
+        }
+        scheduleActivityAcknowledge();
+      });
+    });
     socket.addEventListener("close", (event) => {
       const terminalCloseMessages = {
         4401: tr("terminal.status.auth_required"),
@@ -369,7 +471,34 @@
     socket.addEventListener("error", () => socket.close());
   };
 
-  term.onData((data) => send({ kind: "input", data }));
+  let nextTerminalDataIsUserInput = false;
+  const onUserInput = term._core?.coreService?.onUserInput;
+  const hasUserInputSignal = typeof onUserInput === "function";
+  if (hasUserInputSignal) {
+    onUserInput(() => {
+      nextTerminalDataIsUserInput = true;
+    });
+  }
+  term.onData((data) => {
+    const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;
+    nextTerminalDataIsUserInput = false;
+    send({
+      kind: "input",
+      data,
+      rows: term.rows,
+      cols: term.cols,
+      user_input: userInput,
+    });
+  });
+  term.onBinary((data) => {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    socket.send(Uint8Array.from(data, (character) => character.charCodeAt(0)));
+  });
+  term.onScroll(scheduleActivityAcknowledge);
+  window.addEventListener(
+    "termroom:terminal-activity-refreshed",
+    (event) => renderCurrentTerminalActivity(event.detail),
+  );
   new ResizeObserver(() => scheduleResize()).observe(host);
   window.visualViewport?.addEventListener("resize", () => {
     updateMobileKeyboardState();
@@ -383,9 +512,11 @@
       connect();
       return;
     }
-    claimVisibleTerminal();
+    scheduleActivityAcknowledge();
   });
-  window.addEventListener("focus", claimVisibleTerminal);
+  window.addEventListener("focus", () => {
+    scheduleActivityAcknowledge();
+  });
   window.addEventListener("orientationchange", () => {
     window.setTimeout(() => {
       mobileViewportBaseline = window.visualViewport?.height || window.innerHeight;
@@ -419,7 +550,13 @@
   let ctrlArmed = false;
   const ctrlButton = document.querySelector("#ctrl-key");
   const closeMoreKeys = ({ focus = true } = {}) => {
-    if (moreKeys) moreKeys.open = false;
+    if (moreKeys) {
+      moreKeys.removeAttribute("open");
+      moreKeys.querySelector("[data-popover-trigger]")?.setAttribute("aria-expanded", "false");
+      moreKeys.querySelectorAll("[data-popover-panel]").forEach((panel) => {
+        panel.hidden = true;
+      });
+    }
     if (focus) term.focus();
   };
   ctrlButton?.addEventListener("click", () => {
@@ -497,7 +634,12 @@
     event.preventDefault();
     if (composerComposing) return;
     if (!commandInput.value.trim()) return;
-    send({ kind: "command", data: commandInput.value });
+    send({
+      kind: "command",
+      data: commandInput.value,
+      rows: term.rows,
+      cols: term.cols,
+    });
     commandInput.value = "";
     updateCommandComposer();
     commandInput.blur();

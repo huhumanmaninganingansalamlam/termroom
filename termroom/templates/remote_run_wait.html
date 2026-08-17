@@ -10,13 +10,14 @@
   <p class="eyebrow">{{ t('remote_run.eyebrow') }}</p>
   <h1>{{ run.source_label }} <span aria-hidden="true">→</span> {{ target_label }}</h1>
   {% if run.state in ('preparing', 'running') %}
-  <div class="remote-run-wait-status" role="status">
+  <div class="remote-run-wait-status" role="status" aria-live="polite">
     <span class="status-dot is-active" aria-hidden="true"></span>
     <strong data-run-state>{% if run.state == 'running' %}{{ t('remote_run.state.running') }}{% else %}{{ t(run_phase_key) }}{% endif %}</strong>
-  </div>
-  <div class="connection-notice error" role="status" aria-live="polite" data-run-connection hidden>
-    <strong>{{ t('remote_run.connection_lost', computer=target_label) }}</strong>
-    <p>{{ t('remote_run.connection_lost_copy') }}</p>
+    <span class="state-chip remote-run-connection-state"
+          data-run-connection{% if run.connection != 'offline' %} hidden{% endif %}>
+      <span class="status-dot" aria-hidden="true"></span>
+      {{ t('remote_run.connection_rechecking') }}
+    </span>
   </div>
   <p>{{ t('remote_run.workspace_ready_copy') }}</p>
   {% else %}
@@ -42,6 +43,12 @@
     </form>
     {% endif %}
     {% else %}
+    {% if remote_run_results_available %}
+    <a class="primary-button" href="/remote-runs/{{ run.id }}/result.zip" download>{{ t('remote_run.result_download') }}</a>
+    {% if remote_run_collect_available %}
+    <a class="secondary-button" href="/remote-runs/{{ run.id }}/collect">{{ t('remote_run.collect.open') }}</a>
+    {% endif %}
+    {% endif %}
     <a class="secondary-button" href="/remote-runs/new">{{ t('remote_run.try_again') }}</a>
     <form method="post" action="/remote-runs/{{ run.id }}/delete">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -52,5 +59,5 @@
 </section>
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>
+<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>
 {% endblock %}

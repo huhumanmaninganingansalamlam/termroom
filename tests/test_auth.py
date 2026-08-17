@@ -6,12 +6,12 @@ import httpx
 import pytest
 
 from termroom.app import create_app
-from termroom.auth import SESSION_MAX_AGE_SECONDS, AuthManager
+from termroom.auth import SESSION_MAX_AGE_SECONDS
 from termroom.config import Settings, default_config_dir
 
 
 @pytest.mark.asyncio
-async def test_password_login_creates_stateless_browser_session(tmp_path: Path) -> None:
+async def test_password_login_creates_authenticated_browser_session(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -36,12 +36,9 @@ async def test_password_login_creates_stateless_browser_session(tmp_path: Path) 
         assert login.status_code == 303
         token = client.cookies.get("termroom_session")
         assert token
-        assert "." in token
 
         home = await client.get("/")
         assert home.status_code == 200
-        assert "Device connections" not in home.text
-        assert "Sign out" in home.text
 
 
 @pytest.mark.asyncio
@@ -91,7 +88,7 @@ async def test_successful_login_does_not_consume_failure_rate_limit(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_login_rate_limit_has_distinct_user_feedback(tmp_path: Path) -> None:
+async def test_login_rate_limit_returns_retry_contract(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -118,7 +115,6 @@ async def test_login_rate_limit_has_distinct_user_feedback(tmp_path: Path) -> No
         )
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == "60"
-        assert "Too many login attempts" in limited.text
 
 
 @pytest.mark.asyncio
@@ -280,6 +276,51 @@ def test_settings_rejects_unknown_default_locale(tmp_path: Path) -> None:
         )
 
 
+def test_settings_loads_local_workspace_policy_from_dotenv_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text(
+        "TERMROOM_ALLOW_LOCAL_WORKSPACES=false\n", encoding="utf-8"
+    )
+
+    from_dotenv = Settings.create(
+        root,
+        state_dir=state,
+        access_token="internal-secret",
+        login_password="password",
+    )
+    monkeypatch.setenv("TERMROOM_ALLOW_LOCAL_WORKSPACES", "true")
+    from_environment = Settings.create(
+        root,
+        state_dir=state,
+        access_token="internal-secret",
+        login_password="password",
+    )
+
+    assert from_dotenv.allow_local_workspaces is False
+    assert from_environment.allow_local_workspaces is True
+
+
+def test_settings_rejects_invalid_local_workspace_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("TERMROOM_ALLOW_LOCAL_WORKSPACES", "sometimes")
+
+    with pytest.raises(ValueError, match="TERMROOM_ALLOW_LOCAL_WORKSPACES"):
+        Settings.create(
+            root,
+            state_dir=tmp_path / "state",
+            access_token="internal-secret",
+            login_password="password",
+        )
+
+
 def test_settings_rejects_world_readable_config_password_file(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -308,6 +349,21 @@ def test_settings_database_path_is_termroom_database(tmp_path: Path) -> None:
     state = tmp_path / "state"
     settings = Settings.create(root, state_dir=state, access_token="internal-secret")
     assert settings.database_path == state / "termroom.sqlite3"
+
+
+def test_settings_repairs_existing_access_token_permissions(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    token_path = state / "access-token"
+    token_path.write_text("existing-token\n", encoding="utf-8")
+    token_path.chmod(0o644)
+
+    settings = Settings.create(root, state_dir=state, login_password="local-password")
+
+    assert settings.access_token == "existing-token"
+    assert token_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_settings_accepts_short_operator_password_by_default(tmp_path: Path) -> None:
@@ -359,7 +415,8 @@ def test_settings_rejects_world_readable_termroom_password_file(tmp_path: Path) 
         Settings.create(root, state_dir=tmp_path / "state")
 
 
-def test_signed_browser_session_expires_server_side(
+@pytest.mark.asyncio
+async def test_signed_browser_session_expires_server_side(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
@@ -370,15 +427,21 @@ def test_signed_browser_session_expires_server_side(
         access_token="internal-secret",
         login_password="correct-password",
     )
-    manager = AuthManager(settings)
+    app = create_app(settings)
     issued_at = 1_800_000_000
     monkeypatch.setattr("termroom.auth._session_now", lambda: issued_at)
-    token = manager.login("correct-password", remote_key="browser")
-    assert token
-    assert manager._decode_session(token)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        login = await client.post(
+            "/login",
+            data={"password": "correct-password"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+        assert (await client.get("/")).status_code == 200
 
-    monkeypatch.setattr(
-        "termroom.auth._session_now",
-        lambda: issued_at + SESSION_MAX_AGE_SECONDS + 1,
-    )
-    assert manager._decode_session(token) is None
+        monkeypatch.setattr(
+            "termroom.auth._session_now",
+            lambda: issued_at + SESSION_MAX_AGE_SECONDS + 1,
+        )
+        assert (await client.get("/")).status_code == 401

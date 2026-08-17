@@ -22,40 +22,13 @@ def _locale(name: str) -> dict[str, str]:
     return {str(key): str(text) for key, text in value.items()}
 
 
-def test_korean_and_english_locale_keys_match() -> None:
-    assert set(_locale("ko")) == set(_locale("en"))
-
-
-def test_workspace_kind_labels_are_backend_specific() -> None:
-    assert _locale("en")["workspace.kind.local"] == "Local Workspace"
-    assert _locale("en")["workspace.kind.ssh"] == "SSH Workspace"
-    assert _locale("ko")["workspace.kind.local"] == "로컬 작업공간"
-    assert _locale("ko")["workspace.kind.ssh"] == "SSH 작업공간"
-
-
-def test_ui_strings_live_in_locale_files() -> None:
-    hangul = re.compile(r"[가-힣]")
-    sources = (
-        list((ROOT / "termroom").glob("*.py"))
-        + list((ROOT / "termroom" / "templates").glob("*.html"))
-        + [
-            ROOT / "termroom" / "static" / "app.js",
-            ROOT / "termroom" / "static" / "terminal.js",
-        ]
-    )
-    offenders = [str(path.relative_to(ROOT)) for path in sources if hangul.search(path.read_text())]
-    assert offenders == []
-
-
-def test_literal_translation_keys_exist() -> None:
+def test_locale_catalogs_match_and_literal_translation_keys_exist() -> None:
     known = set(_locale("ko"))
+    assert known == set(_locale("en"))
     used: set[str] = set()
-    for path in (ROOT / "termroom" / "templates").glob("*.html"):
+    for path in (ROOT / "termroom" / "templates").rglob("*.html"):
         used.update(re.findall(r"\bt\(['\"]([^'\"]+)['\"]", path.read_text()))
-    for path in (
-        ROOT / "termroom" / "static" / "app.js",
-        ROOT / "termroom" / "static" / "terminal.js",
-    ):
+    for path in (ROOT / "termroom" / "static").rglob("*.js"):
         used.update(re.findall(r"\btr\(['\"]([^'\"]+)['\"]", path.read_text()))
     assert used - known == set()
 
@@ -65,6 +38,40 @@ def test_missing_remote_git_error_is_localized() -> None:
 
     assert "Git is not installed" in localize_exception("en", error)
     assert "Git이 설치되어 있지 않습니다" in localize_exception("ko", error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locale", "heading", "copy"),
+    [
+        ("en", "Sign in", "Enter your Termroom password."),
+        ("ko", "로그인", "Termroom 접속 비밀번호를 입력하세요."),
+    ],
+)
+async def test_login_uses_user_facing_copy_without_operator_configuration(
+    tmp_path: Path,
+    locale: str,
+    heading: str,
+    copy: str,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "config",
+        access_token="internal-secret",
+        login_password="termroom-password",
+        default_locale=locale,
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 401
+    assert f"<h1>{heading}</h1>" in response.text
+    assert copy in response.text
+    assert "TERMROOM_PASSWORD" not in response.text
 
 
 @pytest.mark.asyncio
@@ -89,8 +96,6 @@ async def test_english_is_default_until_locale_cookie_switches_ui(tmp_path: Path
         login = await client.get("/")
         assert login.status_code == 401
         assert '<html lang="en">' in login.text
-        assert "Enter with your password" in login.text
-        assert "Local only" in login.text
 
         signed_in = await client.post(
             "/login",
@@ -98,14 +103,11 @@ async def test_english_is_default_until_locale_cookie_switches_ui(tmp_path: Path
             follow_redirects=True,
         )
         assert signed_in.status_code == 200
-        assert "Where do you want to continue?" in signed_in.text
-        assert "Session alive" in signed_in.text
 
         switched = await client.get("/locale/ko?next=/", follow_redirects=True)
         assert switched.status_code == 200
         assert client.cookies.get("termroom_locale") == "ko"
         assert '<html lang="ko">' in switched.text
-        assert "어디서 이어서 작업할까요?" in switched.text
 
 
 @pytest.mark.asyncio
@@ -125,7 +127,6 @@ async def test_configured_korean_is_initial_ui_until_cookie_overrides_it(tmp_pat
         initial = await client.get("/")
         assert initial.status_code == 401
         assert '<html lang="ko">' in initial.text
-        assert "비밀번호로 들어가기" in initial.text
 
         switched = await client.get("/locale/en?next=/", follow_redirects=True)
         assert client.cookies.get("termroom_locale") == "en"

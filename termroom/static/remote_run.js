@@ -40,7 +40,7 @@
     const submit = form.querySelector("button[type='submit']");
     const progressBox = form.querySelector("#remote-run-upload-progress");
     const progress = progressBox?.querySelector("progress");
-    let pendingZipRun = null;
+    let pendingArchiveRun = null;
 
     const selectedKind = () => sourceInputs.find((input) => input.checked)?.value || "workspace";
     const updatePanels = () => {
@@ -118,8 +118,8 @@
       }
       const fingerprint = JSON.stringify(payload);
       const runId = (
-        sourceKind === "zip" && pendingZipRun?.fingerprint === fingerprint
-          ? pendingZipRun.id
+        sourceKind === "archive" && pendingArchiveRun?.fingerprint === fingerprint
+          ? pendingArchiveRun.id
           : createUuid()
       );
       if (!runId) {
@@ -143,8 +143,8 @@
         if (!response.ok || result.ok === false) {
           throw new Error(result.error || tr("remote_run.error.start_failed"));
         }
-        if (sourceKind === "zip") {
-          pendingZipRun = { id: runId, fingerprint };
+        if (sourceKind === "archive") {
+          pendingArchiveRun = { id: runId, fingerprint };
           if (!archive) throw new Error(tr("remote_run.error.zip_required"));
           if (progressBox) progressBox.hidden = false;
           await uploadArchive(runId, archive);
@@ -232,9 +232,7 @@
         }
         workspaceRun.dataset.state = result.state;
         stateChip?.classList.toggle("running", result.state === "running");
-        if (stateLabel) {
-          stateLabel.textContent = tr(`remote_run.state.${result.state}`);
-        }
+        if (stateLabel) stateLabel.textContent = result.state_label || tr(`remote_run.state.${result.state}`);
       } catch (_error) {
         // A dropped SSH connection does not change the Run state. Keep polling;
         // the existing terminal reconnect UI remains the visible connection signal.

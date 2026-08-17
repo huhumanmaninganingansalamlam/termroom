@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block body_class %}computer-setup-page{% endblock %}
+{% block content %}
+<section class="computer-setup-shell">
+  <a class="text-back-link" href="/computers/new">← {{ t('node.pair.back') }}</a>
+  <header class="computer-setup-heading">
+    <p class="eyebrow">{{ t('node.pair.eyebrow') }}</p>
+    <h1>{{ t('node.pair.heading') }}</h1>
+    <p>{{ t('node.pair.copy') }}</p>
+  </header>
+
+  {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+  {% if node_pairing_issue_key %}
+  <section class="connection-notice" role="status" aria-live="polite" aria-labelledby="node-pair-reachability-title">
+    <strong id="node-pair-reachability-title">{{ t('node.pair.reachability_title') }}</strong>
+    <p>{{ t(node_pairing_issue_key, core_url=core_url) }}</p>
+  </section>
+  {% endif %}
+
+  {% if code %}
+  <section class="panel stack-form">
+    <h2>{{ t('node.pair.code_title') }}</h2>
+    <code class="node-pairing-code">{{ code }}</code>
+    <p>{{ t('node.pair.command_copy') }}</p>
+    <pre><code>termroom node pair --core {{ core_url }} --code {{ code }} --allow-root /home/me/projects</code></pre>
+    <form method="post" action="/computers/node/pair/check">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="pairing_id" value="{{ pairing.id }}">
+      <input type="hidden" name="code" value="{{ code }}">
+      <button class="secondary-button" type="submit">{{ t('node.pair.refresh') }}</button>
+    </form>
+  </section>
+  {% elif pairing and pairing.status == 'pending' %}
+  <section class="panel stack-form">
+    <h2>{{ t('node.pair.verify_title') }}</h2>
+    <p><strong>{{ pairing.node_name }}</strong></p>
+    <code>{{ pairing.fingerprint }}</code>
+    <p>{{ t('node.pair.verify_copy') }}</p>
+    <div class="dialog-actions">
+      <form method="post" action="/computers/node/pair/{{ pairing.enrollment_id }}/reject">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button class="secondary-button" type="submit">{{ t('node.pair.reject') }}</button>
+      </form>
+      <form method="post" action="/computers/node/pair/{{ pairing.enrollment_id }}/approve">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button class="primary-button" type="submit">{{ t('node.pair.approve') }}</button>
+      </form>
+    </div>
+  </section>
+  {% elif pairing and pairing.status == 'approved' %}
+  <section class="connection-notice success">
+    <strong>{{ t('node.pair.approved') }}</strong>
+    <a class="primary-button" href="/computers/{{ pairing.computer_id }}">{{ t('node.pair.open') }}</a>
+  </section>
+  {% elif pairing and pairing.status == 'rejected' %}
+  <p class="notice error">{{ t('node.pair.rejected') }}</p>
+  {% else %}
+  <form method="post" action="/computers/node/pair" class="panel stack-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <p>{{ t('node.pair.start_copy') }}</p>
+    <button class="primary-button" type="submit" {% if not node_pairing_ready %}disabled aria-disabled="true"{% endif %}>{{ t('node.pair.create_code') }}</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

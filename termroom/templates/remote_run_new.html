@@ -10,6 +10,13 @@
   </div>
 </header>
 
+{% if retry_run %}
+<section class="connection-notice" role="status">
+  <strong>{{ t('remote_run.retry_prefill_title') }}</strong>
+  <p>{{ t('remote_run.retry_prefill_copy') }}</p>
+</section>
+{% endif %}
+
 {% if not computers %}
 <section class="panel remote-run-empty">
   <strong>{{ t('remote_run.no_targets') }}</strong>
@@ -51,7 +58,7 @@
     <div class="remote-run-source-tabs" role="group" aria-label="{{ t('remote_run.source_heading') }}">
       <label><input type="radio" name="source_kind" value="workspace" {% if selected_source_kind == 'workspace' %}checked{% endif %}> <span>{{ t('remote_run.source.workspace') }}</span></label>
       <label><input type="radio" name="source_kind" value="git" {% if selected_source_kind == 'git' %}checked{% endif %}> <span>{{ t('remote_run.source.git') }}</span></label>
-      <label><input type="radio" name="source_kind" value="zip" {% if selected_source_kind == 'zip' %}checked{% endif %}> <span>{{ t('remote_run.source.zip') }}</span></label>
+      <label><input type="radio" name="source_kind" value="archive" {% if selected_source_kind == 'archive' %}checked{% endif %}> <span>{{ t('remote_run.source.archive') }}</span></label>
     </div>
 
     <div data-source-panel="workspace" {% if selected_source_kind != 'workspace' %}hidden{% endif %}>
@@ -84,7 +91,7 @@
       <p class="form-help">{{ t('remote_run.git_private_alternative') }}</p>
     </div>
 
-    <div data-source-panel="zip" {% if selected_source_kind != 'zip' %}hidden{% endif %}>
+    <div data-source-panel="archive" {% if selected_source_kind != 'archive' %}hidden{% endif %}>
       <label class="remote-run-zip-input">
         <span>{{ t('remote_run.zip_choose') }}</span>
         <input name="archive" type="file" accept=".zip,application/zip">
@@ -100,7 +107,7 @@
       <select name="target_computer_id" required>
         <option value="">{{ t('remote_run.target_placeholder') }}</option>
         {% for computer in computers %}
-        <option value="{{ computer.id }}" {% if computer.id == selected_target_id %}selected{% endif %}>{{ computer.name }} · {{ computer.username }}@{{ computer.host }}</option>
+        <option value="{{ computer.id }}" {% if computer.id == selected_target_id %}selected{% endif %}>{{ computer.name }}{% if computer.host %} · {{ computer.username }}@{{ computer.host }}{% endif %}</option>
         {% endfor %}
       </select>
     </label>
@@ -109,7 +116,7 @@
   <section class="remote-run-form-section">
     <label>
       <span>{{ t('remote_run.command') }} · {{ t('remote_run.command_multiline') }}</span>
-      <textarea name="command" rows="6" required placeholder="{{ t('remote_run.command_placeholder') }}" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+      <textarea name="command" rows="6" required placeholder="{{ t('remote_run.command_placeholder') }}" autocapitalize="off" autocorrect="off" spellcheck="false">{{ selected_command }}</textarea>
     </label>
     <p class="form-help">{{ t('remote_run.command_help') }}</p>
   </section>
@@ -130,5 +137,5 @@
 {% endif %}
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>
+<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>
 {% endblock %}

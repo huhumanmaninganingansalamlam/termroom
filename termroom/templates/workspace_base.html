@@ -1,21 +1,94 @@
 {% extends "base.html" %}
 {% set remote_run = workspace.remote_run | default(none) %}
 {% set server_terminal = workspace.is_server_terminal | default(false) %}
-{% set remote_run_state_key = ('remote_run.state.' ~ remote_run.state) if remote_run else '' %}
+{% set remote_run_state_key = ('remote_run.state.' ~ (remote_run_display_state or remote_run.state)) if remote_run else '' %}
 {% set remote_run_terminal = remote_run and remote_run.state in ('finished', 'stopped', 'failed', 'lost') %}
 {% if remote_run %}
   {% set workspace_kind_label = 'remote_run.workspace_mode' %}
 {% elif server_terminal %}
   {% set workspace_kind_label = 'server_terminal.mode' %}
-{% elif workspace.backend_kind == 'ssh' %}
-  {% set workspace_kind_label = 'workspace.kind.ssh' %}
+{% elif workspace.backend_kind == 'remote' %}
+  {% set workspace_kind_label = 'workspace.kind.remote' %}
 {% else %}
   {% set workspace_kind_label = 'workspace.kind.local' %}
 {% endif %}
 {% set workspace_sidebar_status = t('server_terminal.mode') if server_terminal else t(session_status_label) %}
 {% set workspace_sidebar_detail = t('common.terminal') ~ ' ' ~ terminal_count %}
+{% macro workspace_run_menu(placement) %}
+{% if workspace_commands_visible %}
+<details class="workspace-run-menu workspace-run-menu-{{ placement }}" data-workspace-run-menu>
+  <summary aria-label="{{ t('workspace.run.open') }}" title="{{ t('workspace.run.open') }}">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 10 7-10 7Z"/></svg>
+    <span>{{ t('workspace.run.open') }}</span>
+  </summary>
+  <section class="workspace-run-popover">
+    <header>
+      <div class="workspace-run-heading">
+        <strong>{{ t('workspace.run.heading') }}</strong>
+        <small>{{ t('workspace.run.copy') }}</small>
+      </div>
+      <button class="workspace-run-close"
+              type="button"
+              data-workspace-run-close
+              aria-label="{{ t('common.close') }}"
+              title="{{ t('common.close') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m7 7 10 10M17 7 7 17"/>
+        </svg>
+      </button>
+    </header>
+    {% if workspace_commands_supported %}
+    <div class="workspace-run-command-list">
+      {% for item in workspace_commands %}
+      <form method="post"
+            action="/w/{{ workspace.id }}/run-commands/{{ item.slot }}"
+            data-workspace-command-run
+            data-workspace-command-starting-label="{{ t('workspace.run.starting') }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="launch_id" value="{{ item.launch_id }}">
+        <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
+        <button type="submit" title="{{ item.command }}">
+          <code>{{ item.command }}</code>
+          <span data-workspace-command-label>{{ t('workspace.run.command') }}</span>
+        </button>
+      </form>
+      {% else %}
+      <p class="workspace-run-empty">{{ t('workspace.run.empty') }}</p>
+      {% endfor %}
+    </div>
+    <details class="workspace-run-config">
+      <summary>{{ t('workspace.run.configure') }}</summary>
+      <form method="post" action="/w/{{ workspace.id }}/run-commands">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <p>{{ t('workspace.run.configure_copy') }}</p>
+        {% for index in range(3) %}
+        <label>
+          <span>{{ t('workspace.run.slot', number=index + 1) }}</span>
+          <input name="commands"
+                 value="{{ workspace_commands[index].command if workspace_commands | length > index else '' }}"
+                 maxlength="4096"
+                 autocomplete="off"
+                 spellcheck="false"
+                 placeholder="{{ t('workspace.run.placeholder') }}">
+        </label>
+        {% endfor %}
+        <button class="primary-button" type="submit">{{ t('workspace.run.save') }}</button>
+      </form>
+    </details>
+    {% else %}
+    <p class="workspace-run-empty">{{ t('workspace.run.unsupported_node') }}</p>
+    {% endif %}
+  </section>
+</details>
+{% endif %}
+{% endmacro %}
 {% block body_class %}workspace-page{% endblock %}
 {% block body %}
+<p class="sr-only"
+   role="status"
+   aria-live="polite"
+   aria-atomic="true"
+   data-workspace-command-announcer></p>
 <header class="workspace-header">
   <div class="workspace-brand-row">
     <a class="workspace-brand" href="/" aria-label="{{ t('app.home') }}">
@@ -26,13 +99,18 @@
     </a>
     <span class="workspace-brand-actions">
       <span class="workspace-mode">{{ workspace.connection_label or t('home.this_computer') }} · {{ t(workspace_kind_label) }}</span>
-      <label class="workspace-language-select workspace-language-desktop" aria-label="{{ t('app.language') }}">
-        <select data-language-select>
-          {% for code, label in languages.items() %}
-          <option value="{{ code }}" {% if code == locale %}selected{% endif %}>{{ code | upper }}</option>
-          {% endfor %}
-        </select>
-      </label>
+      <a class="workspace-activity-link"
+         href="/activity"
+         data-activity-link
+         data-summary-url="/api/activity/summary"
+         data-claim-url="/api/activity/notifications/claim"
+         data-csrf="{{ csrf_token }}"
+         aria-label="{{ t('activity.heading') }}"
+         title="{{ t('activity.heading') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 7H3s3 0 3-7M9.5 19h5"/></svg>
+        <strong class="activity-unread-badge" data-activity-unread hidden></strong>
+      </a>
+      {{ user_settings_menu('workspace-desktop', workspace) }}
     </span>
   </div>
   <div class="workspace-project-row">
@@ -48,13 +126,41 @@
         <strong>{{ workspace.connection_label or t('home.this_computer') }}</strong>
         <small>{{ t(workspace_kind_label) }}</small>
       </span>
-      <label class="workspace-language-select workspace-language-mobile" aria-label="{{ t('app.language') }}">
-        <select data-language-select>
-          {% for code, label in languages.items() %}
-          <option value="{{ code }}" {% if code == locale %}selected{% endif %}>{{ code | upper }}</option>
-          {% endfor %}
-        </select>
-      </label>
+      {% if not workspace.transient %}
+      <details class="workspace-usage-menu"
+               data-workspace-usage-view
+               data-usage-url="/api/workspaces/{{ workspace.id }}/usage">
+        <summary aria-label="{{ t('workspace.usage.heading') }}"
+                 title="{{ t('workspace.usage.heading') }}">
+          <span>{{ t('workspace.usage.cpu') }}</span>
+          <strong data-workspace-usage-cpu>—</strong>
+        </summary>
+        <section class="workspace-usage-popover">
+          <header>
+            <strong>{{ t('workspace.usage.heading') }}</strong>
+            <small>{{ t('workspace.usage.estimated') }}</small>
+          </header>
+          <dl>
+            <div><dt>{{ t('workspace.usage.cpu') }}</dt><dd data-workspace-usage-cpu>—</dd></div>
+            <div><dt>{{ t('workspace.usage.memory') }}</dt><dd data-workspace-usage-memory>—</dd></div>
+            <div><dt>{{ t('workspace.usage.processes') }}</dt><dd data-workspace-usage-processes>—</dd></div>
+          </dl>
+          <p data-workspace-usage-meta>{{ t('workspace.usage.loading') }}</p>
+        </section>
+      </details>
+      {% endif %}
+      <a class="workspace-activity-link"
+         href="/activity"
+         data-activity-link
+         data-summary-url="/api/activity/summary"
+         data-claim-url="/api/activity/notifications/claim"
+         data-csrf="{{ csrf_token }}"
+         aria-label="{{ t('activity.heading') }}"
+         title="{{ t('activity.heading') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 7H3s3 0 3-7M9.5 19h5"/></svg>
+        <strong class="activity-unread-badge" data-activity-unread hidden></strong>
+      </a>
+      {{ user_settings_menu('workspace-mobile', workspace) }}
     </span>
   </div>
 </header>
@@ -99,6 +205,14 @@
     </form>
     {% endif %}
     {% else %}
+    <a class="primary-button" href="/remote-runs/{{ remote_run.id }}/result.zip" download>{{ t('remote_run.result_download') }}</a>
+    {% if remote_run_source_url %}
+    <a class="secondary-button" href="/remote-runs/{{ remote_run.id }}/collect">{{ t('remote_run.collect.open') }}</a>
+    {% endif %}
+    {% if remote_run_display_state == 'failed' and remote_run_source_url and remote_run_retry_url %}
+    <a class="secondary-button" href="{{ remote_run_source_url }}">{{ t('remote_run.open_source') }}</a>
+    <a class="secondary-button" href="{{ remote_run_retry_url }}">{{ t('remote_run.retry_setup') }}</a>
+    {% endif %}
     <form method="post" action="/remote-runs/{{ remote_run.id }}/delete">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <button class="danger-button" type="submit" data-confirm="{{ t('remote_run.delete_confirm') }}">{{ t('remote_run.delete_now') }}</button>
@@ -110,11 +224,17 @@
 <main class="workspace-content {% block workspace_content_class %}{% endblock %}">
   {% block workspace_content %}{% endblock %}
 </main>
-<nav class="bottom-nav" aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}">
+<nav class="bottom-nav"
+     aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}"
+     data-workspace-terminal-activity
+     data-activity-url="/api/workspaces/{{ workspace.id }}/terminal-activity">
   <span class="workspace-nav-label">{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}</span>
-  <a class="{% if active_tab == 'terminal' %}active{% endif %}" href="/w/{{ workspace.id }}/terminal">
+  <a class="{% if active_tab == 'terminal' %}active{% endif %}" href="/w/{{ workspace.id }}/terminal" data-terminal-activity-nav>
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7l4 5-4 5M11 17h8"/></svg>
     <span>{{ t('common.terminal') }}</span>
+    <span class="terminal-unread-dot terminal-nav-unread" data-terminal-activity-nav-unread hidden>
+      <span class="sr-only">{{ t('terminal.activity.new_output') }}</span>
+    </span>
   </a>
   {% if server_terminal %}
   <a href="/open/{{ workspace.computer_id }}">
@@ -130,19 +250,52 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4z"/></svg>
     <span>{{ t('common.files') }}</span>
   </a>
+  {% if recent_supported | default(true) %}
   <a class="{% if active_tab == 'recent' %}active{% endif %}" href="/w/{{ workspace.id }}/recent">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg>
     <span>{{ t('common.recent') }}</span>
   </a>
   {% endif %}
+  {% endif %}
+  {{ workspace_run_menu('navigation') }}
 </nav>
-<footer class="workspace-sidebar-footer" aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}">
-  <span class="status-dot {% if session_active %}is-active{% endif %}"></span>
+{% if workspace.transient %}
+<footer class="workspace-sidebar-footer"
+        aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}">
+  <span class="status-dot {% if session_active %}is-active{% endif %}"{% if not workspace.transient %} data-workspace-usage-dot{% endif %}></span>
   <span class="workspace-sidebar-copy">
     <strong title="{{ workspace_sidebar_status }}">{{ workspace_sidebar_status }}</strong>
     <small title="{{ workspace_sidebar_detail }}">{{ workspace_sidebar_detail }}</small>
   </span>
 </footer>
+{% else %}
+<details class="workspace-sidebar-footer workspace-usage-menu workspace-sidebar-usage-menu"
+         data-workspace-usage-view
+         data-usage-url="/api/workspaces/{{ workspace.id }}/usage">
+  <summary aria-label="{{ t('workspace.usage.heading') }}"
+           title="{{ t('workspace.usage.heading') }}">
+    <span class="status-dot {% if session_active %}is-active{% endif %}" data-workspace-usage-dot></span>
+    <span class="workspace-sidebar-copy">
+      <strong data-workspace-usage-summary>{{ t('workspace.usage.heading') }}</strong>
+      <small data-workspace-usage-meta>{{ t('workspace.usage.estimated') }}</small>
+    </span>
+  </summary>
+  <section class="workspace-usage-popover">
+    <header>
+      <strong>{{ t('workspace.usage.heading') }}</strong>
+      <small>{{ t('workspace.usage.estimated') }}</small>
+    </header>
+    <dl>
+      <div><dt>{{ t('workspace.usage.cpu') }}</dt><dd data-workspace-usage-cpu>—</dd></div>
+      <div><dt>{{ t('workspace.usage.memory') }}</dt><dd data-workspace-usage-memory>—</dd></div>
+      <div><dt>{{ t('workspace.usage.processes') }}</dt><dd data-workspace-usage-processes>—</dd></div>
+    </dl>
+    <p data-workspace-usage-meta>{{ t('workspace.usage.loading') }}</p>
+  </section>
+</details>
+{% endif %}
 {% block workspace_scripts %}{% endblock %}
-{% if remote_run %}<script src="{{ url_for('static', path='remote_run.js') }}?v=9" defer></script>{% endif %}
+{% if remote_run %}
+<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>
+{% endif %}
 {% endblock %}

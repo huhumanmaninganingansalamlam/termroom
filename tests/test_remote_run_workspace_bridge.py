@@ -90,7 +90,7 @@ def test_remote_run_workspace_is_idempotent_linked_and_hidden_from_workspace_lis
     )
 
     assert reopened["id"] == workspace["id"]
-    assert workspace["backend_kind"] == "ssh"
+    assert workspace["backend_kind"] == "remote"
     assert workspace["computer_id"] == computer["id"]
     assert workspace["tmux_session"] == f"termroom-run-{RUN_ID}"
     assert workspace["canonical_path"] == _work_path()
@@ -128,7 +128,7 @@ def test_remote_run_workspace_can_recover_create_then_attach_crash_window(
         _work_path(),
         "example/project",
         tmux_session=f"termroom-run-{RUN_ID}",
-        backend_kind="ssh",
+        backend_kind="remote",
         computer_id=str(computer["id"]),
         canonical_path=_work_path(),
     )
@@ -203,7 +203,7 @@ def test_store_attach_enforces_one_target_run_and_workspace_relationship(
     )
     wrong_workspace = manager.open_remote(str(other_target["id"]), "/srv/project")
 
-    with pytest.raises(ValueError, match="target computer"):
+    with pytest.raises(ValueError, match="target Remote"):
         store.attach_remote_run_workspace(RUN_ID, str(wrong_workspace["id"]))
 
     attached = manager.open_remote_run(first, f"termroom-run-{RUN_ID}", _work_path())

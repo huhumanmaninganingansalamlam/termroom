@@ -71,6 +71,60 @@ def test_workspace_manager_can_open_multiple_local_roots(tmp_path: Path) -> None
     assert second_root in roots
 
 
+def test_workspace_location_counts_excludes_internal_workspaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    local = WorkspaceManager(RootManager(local_root), store)
+    local_workspace = local.open(".")
+    computer = store.create_computer(
+        name="Build server",
+        ssh_alias="",
+        host="build.example",
+        port=22,
+        username="dev",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    first_remote = local.open_remote(str(computer["id"]), "/srv/one", "one")
+    second_remote = local.open_remote(str(computer["id"]), "/srv/two", "two")
+    virtual_root = store.ensure_root_value(f"ssh://{computer['id']}")
+    store.create_workspace(
+        str(virtual_root["id"]),
+        ".termroom-server-terminal",
+        "Build server",
+        backend_kind="remote",
+        computer_id=str(computer["id"]),
+        canonical_path="/home/dev",
+        workspace_kind="server_terminal",
+    )
+
+    root_counts, computer_counts = store.workspace_location_counts()
+
+    assert root_counts == {str(local_workspace["root_id"]): 1}
+    assert computer_counts == {str(computer["id"]): 2}
+
+    monkeypatch.setattr(
+        local,
+        "require",
+        lambda *_args: pytest.fail("Persistent Workspace lists must batch hydration"),
+    )
+    listed = {str(item["id"]): item for item in local.list_all()}
+    assert set(listed) == {
+        str(first_remote["id"]),
+        str(second_remote["id"]),
+        str(local_workspace["id"]),
+    }
+    assert listed[str(first_remote["id"])]["computer"]["id"] == computer["id"]
+    assert all(item["remote_run"] is None for item in listed.values())
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [

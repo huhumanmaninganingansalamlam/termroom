@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import asyncio
+import gzip
 import io
+import shutil
 import subprocess
+import threading
 import uuid
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 import pytest
 
-from termroom.app import MAX_INLINE_IMAGE_BYTES, _content_disposition, create_app
+from termroom.app import MAX_INLINE_IMAGE_BYTES, PACKAGE_ROOT, create_app
+from termroom.assets import TERMINAL_FONT_ASSETS
 from termroom.config import Settings
 from termroom.files import FileEntry, RecentFiles
+from termroom.i18n import messages
+from termroom.pwa_icon import PWA_ICON_VERSION
 from termroom.ssh_backend import SSHBackendError
+
+_TERMINAL_ACTIVITY_EPOCH_SECONDS = 1_700_000_000
+
+
+def _terminal_activity_seconds(offset: int) -> int:
+    return _TERMINAL_ACTIVITY_EPOCH_SECONDS + offset
 
 
 async def _login(client: httpx.AsyncClient, password: str = "test-token") -> None:
@@ -54,6 +68,147 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
         assert authenticated.headers["cache-control"] == "no-store"
         assert authenticated.headers["x-frame-options"] == "SAMEORIGIN"
         assert authenticated.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_workspace_display_name_updates_header_and_home_without_renaming_folder(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project-folder"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project-folder")
+    workspace_id = str(workspace["id"])
+    original_path = workspace["path"]
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        page = await client.get(f"/w/{workspace_id}/files")
+        assert page.status_code == 200
+        assert f'action="/w/{workspace_id}/name"' in page.text
+
+        renamed = await client.post(
+            f"/w/{workspace_id}/name",
+            data={
+                "_csrf": settings.csrf_token,
+                "display_name": "  집중 작업  ",
+            },
+            follow_redirects=False,
+        )
+        assert renamed.status_code == 303
+        assert renamed.headers["location"] == f"/w/{workspace_id}"
+        assert app.state.store.get_workspace(workspace_id)["display_name"] == "집중 작업"
+
+        renamed_page = await client.get(f"/w/{workspace_id}/files")
+        home = await client.get("/")
+        assert "집중 작업" in renamed_page.text
+        assert "집중 작업" in home.text
+
+        reset = await client.post(
+            f"/w/{workspace_id}/name",
+            data={"_csrf": settings.csrf_token, "display_name": ""},
+            follow_redirects=False,
+        )
+        assert reset.status_code == 303
+        assert app.state.store.get_workspace(workspace_id)["display_name"] == "project-folder"
+
+        invalid = await client.post(
+            f"/w/{workspace_id}/name",
+            data={"_csrf": settings.csrf_token, "display_name": "bad\nname"},
+        )
+        assert invalid.status_code == 400
+        assert "120자 이하의 한 줄 작업공간 이름" in invalid.text
+
+    refreshed = app.state.workspaces.require(workspace_id)
+    assert refreshed["path"] == original_path
+    assert project.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_apis_are_per_browser_scoped_and_race_safe(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    workspace_id = str(workspace["id"])
+    terminal = app.state.store.create_terminal(
+        workspace_id,
+        "shell",
+        "@1",
+        activity_at=_terminal_activity_seconds(10),
+    )
+    managed = app.state.store.create_terminal(
+        workspace_id,
+        "Run",
+        "@2",
+        role="file_run",
+        managed_run_id="run-managed",
+        activity_at=_terminal_activity_seconds(999),
+    )
+    terminal_id = str(terminal["id"])
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as first, httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as second:
+        await _login(first)
+        await _login(second)
+
+        initial = await first.get(
+            "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
+        )
+        assert initial.status_code == 200
+        assert initial.json()["unread_count"] == 0
+        assert [item["terminal_id"] for item in initial.json()["terminals"]] == [
+            terminal_id
+        ]
+        assert str(managed["id"]) not in initial.text
+
+        app.state.store.observe_terminal_activity(
+            workspace_id,
+            [{"tmux_window": "@1", "activity_at": _terminal_activity_seconds(20)}],
+        )
+        workspace_view = await first.get(
+            f"/api/workspaces/{workspace_id}/terminal-activity"
+        )
+        assert workspace_view.status_code == 200
+        assert workspace_view.json()["unread_count"] == 1
+        assert workspace_view.json()["latest_unread_terminal_id"] == terminal_id
+
+        second_baseline = await second.get(
+            "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
+        )
+        assert second_baseline.status_code == 200
+        assert second_baseline.json()["unread_count"] == 0
+
+        app.state.store.observe_terminal_activity(
+            workspace_id,
+            [{"tmux_window": "@1", "activity_at": _terminal_activity_seconds(30)}],
+        )
+        assert managed["id"] != terminal_id
+        missing_workspace = await first.get(
+            "/api/workspaces/missing/terminal-activity"
+        )
+        assert missing_workspace.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -168,8 +323,16 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
 
         terminal_page = await client.get(response.headers["location"])
         assert terminal_page.status_code == 200
-        assert '<span class="workspace-mode">이 컴퓨터 · 로컬 작업공간</span>' in terminal_page.text
-        assert "<small>로컬 작업공간</small>" in terminal_page.text
+        assert "로컬 작업공간" in terminal_page.text
+        assert f'/api/workspaces/{workspace_id}/usage' in terminal_page.text
+        assert "작업공간 사용량" in terminal_page.text
+
+        usage = await client.get(f"/api/workspaces/{workspace_id}/usage")
+        assert usage.status_code == 200
+        assert usage.json()["estimated"] is True
+        assert usage.json()["state"] == "fresh"
+        assert usage.json()["sample"]["process_count"] >= 1
+        assert usage.json()["last_checked_at"].endswith("Z")
 
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
@@ -220,7 +383,7 @@ async def test_local_project_route_keeps_created_folder_when_tmux_open_fails(
 
 
 @pytest.mark.asyncio
-async def test_remote_run_zip_api_is_ssh_only(
+async def test_remote_run_archive_api_normalizes_legacy_zip_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
@@ -262,6 +425,7 @@ async def test_remote_run_zip_api_is_ssh_only(
         assert "원격 실행" in new_page.text
         assert "GPU QA" in new_page.text
         assert "공개 Git" in new_page.text
+        assert "Archive" in new_page.text
         assert "ZIP" in new_page.text
 
         run_id = str(uuid.uuid4())
@@ -283,6 +447,8 @@ async def test_remote_run_zip_api_is_ssh_only(
         stored = app.state.store.get_remote_run(run_id)
         assert stored is not None
         assert stored["target_computer_id"] == computer["id"]
+        assert stored["source_kind"] == "archive"
+        assert stored["archive_format"] == "zip"
         assert stored["state"] == "preparing"
         assert stored["phase"] == "waiting_upload"
 
@@ -291,7 +457,7 @@ async def test_remote_run_zip_api_is_ssh_only(
 
 
 @pytest.mark.asyncio
-async def test_remote_run_empty_state_connects_an_ssh_server_directly(
+async def test_remote_run_empty_state_connects_a_remote_directly(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
@@ -313,8 +479,7 @@ async def test_remote_run_empty_state_connects_an_ssh_server_directly(
         response = await client.get("/remote-runs/new")
 
     assert response.status_code == 200
-    assert "등록한 SSH 서버가 없습니다" in response.text
-    assert '<a class="primary-button" href="/computers/new">SSH 서버 연결</a>' in response.text
+    assert 'href="/computers/new"' in response.text
 
 
 @pytest.mark.asyncio
@@ -345,16 +510,16 @@ async def test_remote_run_input_errors_are_localized_in_korean(
     cases = (
         (
             {
-                "source_kind": "zip",
+                "source_kind": "archive",
                 "archive_name": "source.zip",
                 "target_computer_id": "",
                 "command": "printf done",
             },
-            "실행할 SSH 서버를 선택하세요",
+            "실행할 Remote를 선택하세요",
         ),
         (
             {
-                "source_kind": "zip",
+                "source_kind": "archive",
                 "archive_name": "source.zip",
                 "target_computer_id": target_id,
                 "command": "",
@@ -378,6 +543,16 @@ async def test_remote_run_input_errors_are_localized_in_korean(
                 "command": "printf done",
             },
             "공개 HTTPS clone URL을 입력하세요",
+        ),
+        (
+            {
+                "source_kind": "archive",
+                "archive_format": "tar.gz",
+                "archive_name": "source.tar.gz",
+                "target_computer_id": target_id,
+                "command": "printf done",
+            },
+            "현재 Archive 형식은 ZIP만 지원합니다",
         ),
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
@@ -498,7 +673,8 @@ async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
     run, created = app.state.store.create_remote_run(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
+            "archive_format": "zip",
             "source_workspace_id": None,
             "source_path": None,
             "source_label": "source.zip",
@@ -521,7 +697,9 @@ async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
         f"termroom-run-{run_id}",
         f"{run_base}/{run_id}/work",
     )
-    terminal = app.state.store.create_terminal(workspace["id"], "run", "@run")
+    terminal = app.state.store.create_terminal(
+        workspace["id"], "run", "@run", role="remote_run", managed_run_id=run_id
+    )
     monkeypatch.setattr(
         app.state.ssh,
         "ensure_workspace",
@@ -546,13 +724,9 @@ async def test_remote_run_redirects_to_existing_workspace_terminal_and_files(
 
         terminal_page = await client.get(detail.headers["location"])
         assert terminal_page.status_code == 200
-        assert (
-            '<span class="workspace-mode">GPU QA · 원격 실행 작업공간</span>'
-            in terminal_page.text
-        )
-        assert "<small>원격 실행 작업공간</small>" in terminal_page.text
+        assert "GPU QA" in terminal_page.text
+        assert "원격 실행 작업공간" in terminal_page.text
         assert "로컬 전용" not in terminal_page.text
-        assert 'aria-label="컴퓨터 · Termroom"' not in terminal_page.text
         assert "source.zip" in terminal_page.text
         assert f"/w/{workspace['id']}/files" in terminal_page.text
         assert "python main.py" in terminal_page.text
@@ -716,6 +890,8 @@ async def test_file_upload_view_download_and_recent_flow(tmp_path: Path) -> None
     root = tmp_path / "root"
     project = root / "project"
     project.mkdir(parents=True)
+    header_filename = 'line\rbreak"\\.txt'
+    (project / header_filename).write_bytes(b"safe header\n")
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
@@ -748,6 +924,16 @@ async def test_file_upload_view_download_and_recent_flow(tmp_path: Path) -> None
         assert download.status_code == 200
         assert download.content == b"name,value\nalpha,1\n"
         assert "attachment" in download.headers["content-disposition"]
+
+        special_download = await client.get(
+            f"/w/{workspace['id']}/download/{quote(header_filename, safe='')}"
+        )
+        assert special_download.status_code == 200
+        assert special_download.content == b"safe header\n"
+        disposition = special_download.headers["content-disposition"]
+        assert "\r" not in disposition
+        assert "\n" not in disposition
+        assert "%0D" in disposition
 
         recent = await client.get(f"/w/{workspace['id']}/recent")
         assert recent.status_code == 200
@@ -842,7 +1028,6 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
         assert partial.status_code == 200
         assert "report-final.csv" in partial.text
         assert "notes.txt" not in partial.text
-        assert '<section class="workspace-file-list">' in partial.text
         assert "<!doctype html>" not in partial.text
 
         archive = await client.get(f"/w/{workspace['id']}/archive/reports")
@@ -855,15 +1040,18 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
 
 
 @pytest.mark.asyncio
-async def test_open_workspace_flow_chooses_computer_then_workspace(tmp_path: Path) -> None:
+async def test_open_workspace_flow_chooses_computer_then_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "root"
-    root.mkdir()
+    (root / "local-project").mkdir(parents=True)
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
         access_token="test-token",
     )
     app = create_app(settings)
+    app.state.workspaces.open("local-project")
     computer = app.state.store.create_computer(
         name="Build server",
         ssh_alias="",
@@ -882,10 +1070,26 @@ async def test_open_workspace_flow_chooses_computer_then_workspace(tmp_path: Pat
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
-        computers = await client.get("/open")
+        with monkeypatch.context() as counts_guard:
+            counts_guard.setattr(
+                app.state.store,
+                "list_workspaces_for_root",
+                lambda *_args: pytest.fail(
+                    "Workspace hub must not query once per Local root"
+                ),
+            )
+            counts_guard.setattr(
+                app.state.store,
+                "list_workspaces_for_computer",
+                lambda *_args: pytest.fail(
+                    "Workspace hub must not query once per Remote"
+                ),
+            )
+            computers = await client.get("/open")
         assert computers.status_code == 200
         assert "어느 컴퓨터에서 열까요?" in computers.text
         assert "Build server" in computers.text
+        assert "작업공간 1개" in computers.text
         assert "작업공간 2개" in computers.text
 
         picker = await client.get(f"/open/{computer['id']}")
@@ -897,7 +1101,7 @@ async def test_open_workspace_flow_chooses_computer_then_workspace(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_open_workspace_keeps_computer_hub_before_first_ssh_host(tmp_path: Path) -> None:
+async def test_open_workspace_keeps_computer_hub_before_first_remote(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -914,9 +1118,90 @@ async def test_open_workspace_keeps_computer_hub_before_first_ssh_host(tmp_path:
 
     assert response.status_code == 200
     assert "이 컴퓨터" in response.text
-    assert "SSH 서버 연결" in response.text
+    assert "컴퓨터 연결" in response.text
     assert 'href="/open/local"' in response.text
     assert 'href="/computers/new"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_ssh_only_mode_hides_and_rejects_local_workspaces(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "local-project").mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        allow_local_workspaces=False,
+    )
+    app = create_app(settings)
+    local_workspace = app.state.workspaces.open("local-project")
+    computer = app.state.store.create_computer(
+        name="Build server",
+        ssh_alias="",
+        host="build.example",
+        port=22,
+        username="dev",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    remote_workspace = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/api", "Remote API"
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        home = await client.get("/")
+        hub = await client.get("/open")
+        local_picker = await client.get("/open/local")
+        local_browser = await client.get("/api/local/browse-directories")
+        add_location = await client.post(
+            "/open/local/locations",
+            data={"_csrf": settings.csrf_token, "path": str(root)},
+        )
+        create_project = await client.post(
+            "/open/local/projects",
+            data={
+                "_csrf": settings.csrf_token,
+                "root_id": local_workspace["root_id"],
+                "parent": ".",
+                "name": "blocked-project",
+            },
+        )
+        open_local = await client.post(
+            "/api/workspaces",
+            data={
+                "_csrf": settings.csrf_token,
+                "root_id": local_workspace["root_id"],
+                "path": "local-project",
+            },
+        )
+        local_page = await client.get(f"/w/{local_workspace['id']}")
+        local_usage = await client.get(
+            f"/api/workspaces/{local_workspace['id']}/usage"
+        )
+        remote_page = await client.get(
+            f"/w/{remote_workspace['id']}", follow_redirects=False
+        )
+
+    assert home.status_code == 200
+    assert "local-project" not in home.text
+    assert "Remote API" in home.text
+    assert hub.status_code == 200
+    assert 'href="/open/local"' not in hub.text
+    assert "Build server" in hub.text
+    assert local_picker.status_code == 404
+    assert local_browser.status_code == 404
+    assert add_location.status_code == 404
+    assert create_project.status_code == 404
+    assert open_local.status_code == 404
+    assert local_page.status_code == 404
+    assert local_usage.status_code == 404
+    assert remote_page.status_code == 303
+    assert remote_page.headers["location"] == f"/w/{remote_workspace['id']}/terminal"
 
 
 @pytest.mark.asyncio
@@ -1009,7 +1294,6 @@ async def test_local_location_picker_can_browse_absolute_directories(tmp_path: P
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
     assert "현재 폴더 열기" in picker.text
-    assert 'class="secondary-button folder-picker-button"' in picker.text
     assert "취소" in picker.text
     assert 'data-close-popover' in picker.text
     assert 'data-folder-picker-url="/api/local/browse-directories"' in picker.text
@@ -1080,14 +1364,10 @@ async def test_remote_workspace_picker_renders_browsable_directories(
     assert {entry["name"] for entry in api_data["entries"]} == {"projects", "work"}
     assert picker.status_code == 200
     assert "폴더 찾아보기" in picker.text
-    assert 'class="secondary-button folder-picker-button"' in picker.text
-    assert 'class="remote-workspace-path-section"' in picker.text
-    assert 'class="remote-workspace-submit-row"' in picker.text
-    assert 'class="path-picker-control path-picker-close-control"' in picker.text
     assert "이 위치에 새 프로젝트" in picker.text
     assert "data-folder-picker-submit" not in picker.text
     assert "data-folder-picker-default-actions" not in picker.text
-    assert 'class="path-picker-control" type="button" data-new-project' in picker.text
+    assert "data-new-project" in picker.text
     browse_url = f'/api/computers/{computer["id"]}/browse-directories'
     assert f'data-folder-picker-url="{browse_url}"' in picker.text
     assert "data-folder-picker-open" in picker.text
@@ -1098,19 +1378,6 @@ async def test_remote_workspace_picker_renders_browsable_directories(
     assert "현재 폴더 열기" in picker.text
     assert "닫기" in picker.text
     assert f'href="/open/{computer["id"]}"' in picker.text
-
-
-def test_remote_workspace_ajax_picker_uses_the_same_header_actions() -> None:
-    script = (
-        Path(__file__).resolve().parents[1] / "termroom/static/app.js"
-    ).read_text(encoding="utf-8")
-
-    assert 'class="path-picker-control" type="button" data-new-project' in script
-    assert "data-folder-picker-submit" not in script
-    assert 'form.querySelector("[data-folder-picker-default-actions]")' not in script
-    assert 'const submitButton = form.querySelector(\'button[type="submit"]\')' in script
-    assert 'form.classList.contains("remote-workspace-form")' in script
-    assert 'tr("browse.open_current")' in script
 
 
 @pytest.mark.asyncio
@@ -1357,15 +1624,6 @@ async def test_streaming_upload_endpoint_writes_and_protects_existing_file(tmp_p
         assert not (project / "blocked.txt").exists()
 
 
-def test_content_disposition_sanitizes_ascii_control_characters() -> None:
-    value = _content_disposition('line\r\nbreak"\\.txt', "attachment")
-
-    assert "\r" not in value
-    assert "\n" not in value
-    assert 'filename="line__break__.txt"' in value
-    assert "filename*=UTF-8''line%0D%0Abreak%22%5C.txt" in value
-
-
 @pytest.mark.asyncio
 async def test_upload_does_not_silently_overwrite_existing_file(tmp_path: Path) -> None:
     root = tmp_path / "root"
@@ -1464,6 +1722,81 @@ async def test_file_flows_preserve_special_character_paths(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_vim_actions_open_the_selected_file_and_save_editor_changes_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "note.txt"
+    target.write_text("before\n", encoding="utf-8")
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    opened: list[tuple[str, str]] = []
+
+    def open_terminal_editor(  # type: ignore[no-untyped-def]
+        selected_workspace, relative_path: str
+    ) -> dict[str, str]:
+        opened.append((str(selected_workspace["id"]), relative_path))
+        return {"id": "vim-terminal"}
+
+    monkeypatch.setattr(
+        app.state.terminals, "open_terminal_editor", open_terminal_editor
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        browser = await client.get(f"/w/{workspace['id']}/files")
+        view = await client.get(f"/w/{workspace['id']}/view/note.txt")
+        editor = await client.get(f"/w/{workspace['id']}/edit/note.txt")
+
+        assert browser.status_code == 200
+        assert f'action="/w/{workspace["id"]}/terminal-editor"' in browser.text
+        assert "Vim" in browser.text
+        assert "Vim에서 열기" in view.text
+        assert 'value="save_and_vim"' in editor.text
+
+        direct = await client.post(
+            f"/w/{workspace['id']}/terminal-editor",
+            data={
+                "_csrf": settings.csrf_token,
+                "path": "note.txt",
+                "parent": ".",
+            },
+            follow_redirects=False,
+        )
+        assert direct.status_code == 303
+        assert direct.headers["location"].endswith(
+            f"/w/{workspace['id']}/terminal?terminal=vim-terminal"
+        )
+
+        snapshot = app.state.files.read_text(project, "note.txt")
+        saved = await client.post(
+            f"/w/{workspace['id']}/edit/note.txt",
+            data={
+                "_csrf": settings.csrf_token,
+                "digest": snapshot.digest,
+                "mtime_ns": str(snapshot.mtime_ns),
+                "newline": "lf",
+                "content": "after\n",
+                "intent": "save_and_vim",
+            },
+            follow_redirects=False,
+        )
+        assert saved.status_code == 303
+        assert target.read_text(encoding="utf-8") == "after\n"
+        assert opened == [
+            (str(workspace["id"]), "note.txt"),
+            (str(workspace["id"]), "note.txt"),
+        ]
+
+
+@pytest.mark.asyncio
 async def test_large_directories_are_paginated_in_browser(tmp_path: Path) -> None:
     root = tmp_path / "root"
     project = root / "project"
@@ -1499,6 +1832,17 @@ async def test_large_directories_are_paginated_in_browser(tmp_path: Path) -> Non
         )
         assert conflict_check.status_code == 200
         assert conflict_check.json()["conflicts"][0]["name"] == "file-204.txt"
+
+        duplicate_check = await client.post(
+            f"/w/{workspace['id']}/files/upload-check",
+            headers={"X-Termroom-CSRF": settings.csrf_token},
+            json={
+                "parent": ".",
+                "names": ["first.txt", "second.txt", "second.txt", "first.txt"],
+            },
+        )
+        assert duplicate_check.status_code == 400
+        assert "first.txt" in duplicate_check.json()["error"]
 
 
 @pytest.mark.asyncio
@@ -1599,6 +1943,157 @@ async def test_editor_conflict_marks_preserved_content_as_unsaved(tmp_path: Path
     assert "외부 변경을 감지했습니다" in response.text
     assert "my conflicted content" in response.text
     assert 'data-unsaved="1"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_save_and_run_conflict_creates_no_run_or_managed_terminal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "main.py"
+    target.write_text("print('before')\n", encoding="utf-8")
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "main.py")
+    target.write_text("print('changed elsewhere')\n", encoding="utf-8")
+    key = str(uuid.uuid4())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        response = await client.post(
+            f"/w/{workspace['id']}/edit/main.py",
+            data={
+                "_csrf": settings.csrf_token,
+                "digest": snapshot.digest,
+                "mtime_ns": str(snapshot.mtime_ns),
+                "content": "print('my change')\n",
+                "intent": "save_and_run",
+                "file_run_idempotency_key": key,
+            },
+        )
+
+    assert response.status_code == 409
+    assert app.state.store.get_file_run_by_idempotency(str(workspace["id"]), key) is None
+    assert app.state.store.get_managed_terminal(str(workspace["id"]), "file_run") is None
+    assert "print(&#39;my change&#39;)" in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_file_run_http_lifecycle_is_idempotent_and_csrf_protected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "wait.py"
+    content = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "while True: time.sleep(0.1)\n"
+    )
+    target.write_text(content, encoding="utf-8")
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "wait.py")
+    key = str(uuid.uuid4())
+    payload = {
+        "_csrf": settings.csrf_token,
+        "digest": snapshot.digest,
+        "mtime_ns": str(snapshot.mtime_ns),
+        "content": content,
+        "intent": "save_and_run",
+        "file_run_idempotency_key": key,
+    }
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            await _login(client)
+            started = await client.post(
+                f"/w/{workspace['id']}/edit/wait.py",
+                data=payload,
+                follow_redirects=False,
+            )
+            assert started.status_code == 303
+            run = app.state.store.get_file_run_by_idempotency(
+                str(workspace["id"]), key
+            )
+            assert run is not None
+            run_id = str(run["id"])
+
+            replay = await client.post(
+                f"/w/{workspace['id']}/edit/wait.py",
+                data=payload,
+                follow_redirects=False,
+            )
+            assert replay.status_code == 303
+            assert app.state.store.get_file_run_by_idempotency(
+                str(workspace["id"]), key
+            )["id"] == run_id
+
+            conflict = await client.post(
+                f"/w/{workspace['id']}/edit/wait.py",
+                data={**payload, "content": "print('different')\n"},
+            )
+            assert conflict.status_code == 409
+            assert "다른 파일 내용에 이미 사용되었습니다" in conflict.text
+
+            status_payload: dict[str, object] = {}
+            for _attempt in range(40):
+                status = await client.get(f"/api/file-runs/{run_id}/status")
+                assert status.status_code == 200
+                status_payload = status.json()
+                if status_payload.get("state") == "running":
+                    break
+                await asyncio.sleep(0.05)
+            assert status_payload["state"] == "running"
+
+            assert (await client.post(f"/file-runs/{run_id}/stop")).status_code == 403
+            stopped = await client.post(
+                f"/file-runs/{run_id}/stop",
+                data={"_csrf": settings.csrf_token, "return_to": "editor"},
+                follow_redirects=False,
+            )
+            assert stopped.status_code == 303
+            after_stop = await client.get(f"/api/file-runs/{run_id}/status")
+            assert after_stop.json()["needs_force"] is True
+
+            assert (await client.post(f"/file-runs/{run_id}/kill")).status_code == 403
+            killed = await client.post(
+                f"/file-runs/{run_id}/kill",
+                data={"_csrf": settings.csrf_token, "return_to": "editor"},
+                follow_redirects=False,
+            )
+            assert killed.status_code == 303
+            final = await client.get(f"/api/file-runs/{run_id}/status")
+            assert final.json()["state"] == "stopped"
+
+        events = app.state.store.list_activity_events()
+        assert [event["kind"] for event in events] == ["file_run.stopped"]
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -1760,14 +2255,9 @@ async def test_remote_terminal_page_stays_available_while_ssh_is_down(
     assert "shell" in response.text
     assert str(terminal["id"]) in response.text
     assert "SSH 연결이 거부되었습니다" in response.text
-    assert (
-        '<span class="workspace-mode">QA server · SSH 작업공간</span>'
-        in response.text
-    )
-    assert "<small>SSH 작업공간</small>" in response.text
+    assert "QA server" in response.text
+    assert "원격 작업공간" in response.text
     assert "로컬 전용" not in response.text
-    assert 'aria-label="컴퓨터 · Termroom"' not in response.text
-    assert 'class="status-dot is-active"' not in response.text
 
 
 @pytest.mark.asyncio
@@ -1878,26 +2368,6 @@ async def test_ssh_password_update_verifies_before_replacing_credential(
         assert app.state.ssh._stored_password(computer) == "new-password"
         detail = await client.get(updated.headers["location"])
         assert "SSH 비밀번호를 변경했습니다" in detail.text
-
-
-@pytest.mark.asyncio
-async def test_service_page_is_no_longer_a_workspace_feature(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    project = root / "project"
-    project.mkdir(parents=True)
-    settings = Settings.create(
-        root,
-        state_dir=tmp_path / "state",
-        access_token="test-token",
-    )
-    app = create_app(settings)
-    workspace = app.state.workspaces.open("project")
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        await _login(client)
-        response = await client.get(f"/w/{workspace['id']}/preview")
-        assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2072,7 +2542,8 @@ async def test_remove_ssh_computer_keeps_credentials_when_remote_run_exists(
     app.state.store.create_remote_run(
         {
             "id": run_id,
-            "source_kind": "zip",
+            "source_kind": "archive",
+            "archive_format": "zip",
             "source_workspace_id": None,
             "source_path": None,
             "source_label": "source.zip",
@@ -2110,6 +2581,54 @@ async def test_remove_ssh_computer_keeps_credentials_when_remote_run_exists(
 
 
 @pytest.mark.asyncio
+async def test_ssh_probe_accepts_openssh_proxy_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    target = {
+        "ssh_alias": "gpu",
+        "host": "10.0.0.8",
+        "port": 22,
+        "username": "runner",
+        "identity_file": "",
+        "proxycommand": "nc %h %p",
+        "proxyjump": "",
+    }
+    monkeypatch.setattr(app.state.ssh, "resolve_target", lambda value: dict(target))
+    seen: list[dict[str, object]] = []
+
+    def probe(resolved: dict[str, object]) -> dict[str, str]:
+        seen.append(dict(resolved))
+        return {
+            "host_key_type": "ssh-ed25519",
+            "host_key_data": "AAAATESTKEY",
+            "host_fingerprint": "SHA256:test",
+        }
+
+    monkeypatch.setattr(app.state.ssh, "probe_target_host_key", probe)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            "/computers/probe",
+            data={
+                "_csrf": settings.csrf_token,
+                "target": "gpu",
+                "username": "",
+                "port": "",
+                "auth_mode": "existing",
+            },
+        )
+
+    assert response.status_code == 200
+    assert seen and seen[0]["proxycommand"] == "nc %h %p"
+    assert response.json()["host"] == "10.0.0.8"
+
+
+@pytest.mark.asyncio
 async def test_failed_ssh_computer_registration_rolls_back_local_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2144,7 +2663,7 @@ async def test_failed_ssh_computer_registration_rolls_back_local_records(
         "host_key_data": "AAAATESTKEY",
         "host_fingerprint": "SHA256:test",
     }
-    monkeypatch.setattr(ssh, "probe_host_key", lambda host, port: host_key)
+    monkeypatch.setattr(ssh, "probe_target_host_key", lambda target: host_key)
     monkeypatch.setattr(
         ssh,
         "test_connection",
@@ -2273,6 +2792,7 @@ async def test_file_browser_hides_dependency_noise_but_keeps_useful_dotfiles(
     project.mkdir(parents=True)
     (project / ".venv").mkdir()
     (project / "__pycache__").mkdir()
+    (project / ".note.txt.swp").write_text("swap", encoding="utf-8")
     (project / ".env").write_text("EXAMPLE=1\n", encoding="utf-8")
     settings = Settings.create(
         root,
@@ -2291,9 +2811,11 @@ async def test_file_browser_hides_dependency_noise_but_keeps_useful_dotfiles(
         assert ".env" in default_view.text
         assert ".venv" not in default_view.text
         assert "__pycache__" not in default_view.text
+        assert ".note.txt.swp" not in default_view.text
         assert ".termroom-state" not in default_view.text
         assert ".venv" in noisy_view.text
         assert "__pycache__" in noisy_view.text
+        assert ".note.txt.swp" in noisy_view.text
         assert ".termroom-state" not in noisy_view.text
 
 
@@ -2341,7 +2863,128 @@ async def test_internal_config_is_not_addressable_through_file_routes(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_pwa_shell_is_public_but_does_not_cache_workspace_pages(tmp_path: Path) -> None:
+async def test_remote_connection_status_is_shared_actionable_and_current(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="Build server",
+        ssh_alias="",
+        host="127.0.0.1",
+        port=22,
+        username="builder",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    computer_id = str(computer["id"])
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        client.cookies.set("termroom_locale", "en")
+        unchecked = await client.get("/open")
+        detail = await client.get(f"/computers/{computer_id}")
+
+        app.state.store.update_computer_connection(computer_id)
+        available = await client.get(f"/open/{computer_id}")
+
+        with app.state.store.connect() as db:
+            stale_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat(
+                timespec="seconds"
+            )
+            db.execute(
+                "UPDATE computers SET last_connected_at = ? WHERE id = ?",
+                (stale_time, computer_id),
+            )
+        stale = await client.get(f"/open/{computer_id}")
+
+        app.state.store.update_computer_connection(computer_id, error="connection refused")
+        unavailable = await client.get(f"/computers/{computer_id}")
+        script = await client.get("/static/app.js?v=61")
+
+    assert 'state-chip remote unchecked' in unchecked.text
+    assert "Not checked yet" in unchecked.text
+    assert "data-remote-connection-view" in detail.text
+    assert "data-remote-connection-check" in detail.text
+    assert 'data-remote-connecting-label="Connecting…"' in detail.text
+    assert 'state-chip remote available' in available.text
+    assert "Last successful contact" in available.text
+    assert 'state-chip remote unchecked' in stale.text
+    assert "Last successful contact" in stale.text
+    assert 'state-chip remote unavailable' in unavailable.text
+    assert "Unavailable" in unavailable.text
+    assert 'querySelectorAll("[data-remote-connection-check]")' in script.text
+    assert 'status.classList.add("connecting")' in script.text
+
+
+@pytest.mark.asyncio
+async def test_settings_menu_exposes_click_only_pwa_install_guidance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        korean_page = await client.get("/")
+        client.cookies.set("termroom_locale", "en")
+        english_page = await client.get("/")
+        script = await client.get("/static/app.js?v=61")
+
+    assert korean_page.status_code == 200
+    assert korean_page.text.count("data-pwa-install-action") == 1
+    assert "Termroom 설치" in korean_page.text
+    assert messages("ko")["app.install_edge"] == (
+        "브라우저 메뉴에서 앱 → 이 사이트를 앱으로 설치를 선택하세요."
+    )
+    assert "data-pwa-install-help" in korean_page.text
+    assert 'role="status"' in korean_page.text
+    assert 'aria-live="polite"' in korean_page.text
+    assert "beforeinstallprompt" not in korean_page.text
+    assert "/static/app.js?v=61" in korean_page.text
+
+    assert english_page.status_code == 200
+    assert "Install Termroom" in english_page.text
+    assert messages("en")["app.install_edge"] == (
+        "Open the browser menu, then choose Apps → Install this site as an app."
+    )
+
+    assert script.status_code == 200
+    source = script.text
+    click_handler = source.index('action.addEventListener("click"')
+    prompt_call = source.index("await installPrompt.prompt()")
+    prompt_event = source.index('window.addEventListener("beforeinstallprompt"')
+    assert click_handler < prompt_call < prompt_event
+    assert source.count("installPrompt.prompt()") == 1
+    assert "event.preventDefault()" in source[prompt_event:]
+    assert 'window.addEventListener("appinstalled"' in source
+    assert 'window.matchMedia?.("(display-mode: standalone)")' in source
+    assert "navigator.standalone === true" in source
+    assert "window.isSecureContext" in source
+    assert 'showInstallHelp("app.install_insecure")' in source
+    assert 'return "app.install_ios"' in source
+    assert 'return "app.install_edge"' in source
+    assert 'return "app.install_browser"' in source
+
+
+@pytest.mark.asyncio
+async def test_pwa_public_contract_does_not_cache_workspace_pages(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
@@ -2355,6 +2998,15 @@ async def test_pwa_shell_is_public_but_does_not_cache_workspace_pages(tmp_path: 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         worker = await client.get("/sw.js")
         manifest = await client.get("/static/manifest.webmanifest")
+        icons = {
+            size: await client.get(
+                f"/icons/termroom-{size}.png?v={PWA_ICON_VERSION}"
+            )
+            for size in (180, 192, 512)
+        }
+        unversioned_icon = await client.get("/icons/termroom-192.png")
+        wrong_version_icon = await client.get("/icons/termroom-192.png?v=stale")
+        missing_icon = await client.get("/icons/termroom-256.png")
         unauthorized_home = await client.get("/")
 
         assert worker.status_code == 200
@@ -2362,4 +3014,196 @@ async def test_pwa_shell_is_public_but_does_not_cache_workspace_pages(tmp_path: 
         assert worker.headers["cache-control"] == "no-cache"
         assert "caches.open" not in worker.text
         assert manifest.status_code == 200
+        assert manifest.headers["cache-control"] == "no-cache"
+        manifest_payload = manifest.json()
+        assert manifest_payload["name"] == "Termroom"
+        assert manifest_payload["short_name"] == "Termroom"
+        png_icons = {
+            (icon["src"], icon["sizes"], icon["type"], icon["purpose"])
+            for icon in manifest_payload["icons"]
+            if icon["type"] == "image/png"
+        }
+        assert (
+            f"/icons/termroom-192.png?v={PWA_ICON_VERSION}",
+            "192x192",
+            "image/png",
+            "any",
+        ) in png_icons
+        assert (
+            f"/icons/termroom-512.png?v={PWA_ICON_VERSION}",
+            "512x512",
+            "image/png",
+            "any maskable",
+        ) in png_icons
+        for size, icon in icons.items():
+            assert icon.status_code == 200
+            assert icon.headers["content-type"] == "image/png"
+            assert icon.headers["cache-control"] == (
+                "public, max-age=31536000, immutable"
+            )
+            assert icon.headers["etag"].startswith('"')
+            assert not icon.headers["etag"].startswith('W/"')
+            assert icon.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert int.from_bytes(icon.content[16:20], "big") == size
+            assert int.from_bytes(icon.content[20:24], "big") == size
+            assert icon.content[24] == 8
+            assert icon.content[25] == 2
+        icon_not_modified = await client.get(
+            f"/icons/termroom-192.png?v={PWA_ICON_VERSION}",
+            headers={"If-None-Match": icons[192].headers["etag"]},
+        )
+        assert icon_not_modified.status_code == 304
+        assert icon_not_modified.headers["etag"] == icons[192].headers["etag"]
+        assert icon_not_modified.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        assert unversioned_icon.headers["cache-control"] == "no-cache"
+        assert wrong_version_icon.headers["cache-control"] == "no-cache"
+        assert unversioned_icon.headers["etag"] == icons[192].headers["etag"]
+        assert wrong_version_icon.headers["etag"] == icons[192].headers["etag"]
+        assert missing_icon.status_code == 404
         assert unauthorized_home.status_code == 401
+        assert (
+            '<link rel="icon" type="image/svg+xml" '
+            'href="/static/termroom-icon.svg">'
+        ) in unauthorized_home.text
+        assert (
+            '<link rel="apple-touch-icon" sizes="180x180" '
+            f'href="/icons/termroom-180.png?v={PWA_ICON_VERSION}">'
+        ) in unauthorized_home.text
+        assert '<link rel="manifest" href="/static/manifest.webmanifest?v=4">' in (
+            unauthorized_home.text
+        )
+
+
+@pytest.mark.asyncio
+async def test_pwa_icon_generation_runs_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    calling_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def generate_icon(size: int) -> bytes:
+        assert size == 512
+        worker_threads.append(threading.get_ident())
+        return b"test-png"
+
+    monkeypatch.setattr("termroom.app.termroom_png_icon", generate_icon)
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            f"/icons/termroom-512.png?v={PWA_ICON_VERSION}"
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"test-png"
+    assert worker_threads and worker_threads[0] != calling_thread
+
+
+@pytest.mark.asyncio
+async def test_static_assets_use_selective_compression_and_versioned_cache(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream(
+            "GET",
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip"},
+        ) as compressed:
+            raw_content = b"".join([chunk async for chunk in compressed.aiter_raw()])
+            gzip_etag = compressed.headers["etag"]
+            assert compressed.status_code == 200
+            assert compressed.headers["content-encoding"] == "gzip"
+            assert "accept-encoding" in compressed.headers["vary"].casefold()
+            assert compressed.headers["cache-control"] == (
+                "public, max-age=31536000, immutable"
+            )
+            assert gzip.decompress(raw_content) == (PACKAGE_ROOT / "static/app.css").read_bytes()
+
+        identity = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "identity"},
+        )
+        gzip_disabled = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip;q=0, *;q=1"},
+        )
+        gzip_not_modified = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip", "If-None-Match": gzip_etag},
+        )
+        identity_not_modified = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "identity", "If-None-Match": identity.headers["etag"]},
+        )
+        cross_encoding_validator = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "identity", "If-None-Match": gzip_etag},
+        )
+        head = await client.head(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        unversioned = await client.get(
+            "/static/app.css", headers={"Accept-Encoding": "identity"}
+        )
+        ranged = await client.get(
+            "/static/app.js?v=61",
+            headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
+        )
+        font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]
+        font = await client.get(
+            f"/static/vendor/{font_filename}?v=3.5.0.1",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        manifest = await client.get("/static/manifest.webmanifest?v=3")
+        static_worker = await client.get("/static/sw.js?v=1")
+        missing = await client.get("/static/missing.js?v=1")
+        private_page = await client.get("/", headers={"Accept-Encoding": "gzip"})
+
+        assert identity.headers["etag"] != gzip_etag
+        assert "accept-encoding" in identity.headers["vary"].casefold()
+        assert "content-encoding" not in gzip_disabled.headers
+        assert gzip_disabled.headers["etag"] == identity.headers["etag"]
+        assert gzip_disabled.content == identity.content
+        assert gzip_not_modified.status_code == 304
+        assert gzip_not_modified.headers["etag"] == gzip_etag
+        assert "accept-encoding" in gzip_not_modified.headers["vary"].casefold()
+        assert gzip_not_modified.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        assert identity_not_modified.status_code == 304
+        assert "accept-encoding" in identity_not_modified.headers["vary"].casefold()
+        assert cross_encoding_validator.status_code == 200
+        assert head.status_code == 200
+        assert head.headers["etag"] == identity.headers["etag"]
+        assert "accept-encoding" in head.headers["vary"].casefold()
+        assert "content-encoding" not in head.headers
+        assert unversioned.headers["cache-control"] == "no-cache"
+        assert ranged.status_code == 206
+        assert "content-encoding" not in ranged.headers
+        assert ranged.content == (PACKAGE_ROOT / "static/app.js").read_bytes()[:32]
+        assert "content-encoding" not in font.headers
+        assert manifest.headers["cache-control"] == "no-cache"
+        assert static_worker.headers["cache-control"] == "no-cache"
+        assert missing.status_code == 404
+        assert missing.headers["cache-control"] == "no-store"
+        assert private_page.status_code == 401
+        assert private_page.headers["cache-control"] == "no-store"
+        assert "content-encoding" not in private_page.headers

@@ -20,16 +20,6 @@
     }
   };
   const systemTheme = () => (themeMedia?.matches ? "light" : "dark");
-  const themeToggleTemplate = document.querySelector("#theme-toggle-template");
-  if (!document.querySelector("[data-theme-toggle]") && themeToggleTemplate) {
-    document
-      .querySelectorAll(".workspace-brand-actions, .workspace-mobile-actions")
-      .forEach((target) => {
-        const toggle = themeToggleTemplate.content.firstElementChild?.cloneNode(true);
-        if (toggle) target.prepend(toggle);
-      });
-  }
-
   const themeToggles = () => [...document.querySelectorAll("[data-theme-toggle]")];
   const updateThemeControls = (theme) => {
     const nextTheme = theme === "dark" ? "light" : "dark";
@@ -92,9 +82,825 @@
     set: (theme) => applyTheme(theme, { persist: true, source: "api" }),
   });
 
+  const userMenus = [...document.querySelectorAll("[data-user-menu]")];
+  const visibleUserMenu = (menu) => menu.getClientRects().length > 0;
+  const closeUserMenu = (menu, { restoreFocus = false } = {}) => {
+    if (!(menu instanceof HTMLDetailsElement) || !menu.open) return;
+    menu.open = false;
+    if (restoreFocus) menu.querySelector("summary")?.focus({ preventScroll: true });
+  };
+  userMenus.forEach((menu) => {
+    menu.addEventListener("toggle", () => {
+      if (!menu.open) return;
+      if (!visibleUserMenu(menu)) {
+        menu.open = false;
+        return;
+      }
+      userMenus.forEach((other) => {
+        if (other !== menu) closeUserMenu(other);
+      });
+    });
+  });
+  document.addEventListener("click", (event) => {
+    userMenus
+      .filter((menu) => menu.open && !menu.contains(event.target))
+      .forEach((menu) => closeUserMenu(menu));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const menu = userMenus.find((candidate) => candidate.open);
+    if (menu) closeUserMenu(menu, { restoreFocus: true });
+  });
+  window.addEventListener("resize", () => {
+    userMenus
+      .filter((menu) => menu.open && !visibleUserMenu(menu))
+      .forEach((menu) => closeUserMenu(menu));
+  });
+
+  const pwaInstallViews = [...document.querySelectorAll("[data-pwa-install]")];
+  if (pwaInstallViews.length) {
+    const installActions = pwaInstallViews
+      .map((view) => view.querySelector("[data-pwa-install-action]"))
+      .filter(Boolean);
+    const installHelp = pwaInstallViews
+      .map((view) => view.querySelector("[data-pwa-install-help]"))
+      .filter(Boolean);
+    const standaloneMedia = window.matchMedia?.("(display-mode: standalone)");
+    const userAgent = navigator.userAgent || "";
+    const iOSDevice = /iPad|iPhone|iPod/i.test(userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const iOSSafari = iOSDevice
+      && /Safari/i.test(userAgent)
+      && !/(CriOS|FxiOS|EdgiOS|OPiOS)/i.test(userAgent);
+    const edgeBrowser = /\bEdg\//i.test(userAgent);
+    let deferredInstallPrompt = null;
+    let installInFlight = false;
+
+    const installedStandalone = () => (
+      standaloneMedia?.matches === true || navigator.standalone === true
+    );
+    const setInstallVisibility = () => {
+      const hidden = installedStandalone();
+      pwaInstallViews.forEach((view) => { view.hidden = hidden; });
+      if (hidden) deferredInstallPrompt = null;
+    };
+    const setInstallBusy = (busy) => {
+      installInFlight = busy;
+      installActions.forEach((action) => {
+        action.disabled = busy;
+        action.setAttribute("aria-busy", busy ? "true" : "false");
+      });
+    };
+    const hideInstallHelp = () => {
+      installHelp.forEach((help) => {
+        help.hidden = true;
+        help.textContent = "";
+      });
+    };
+    const showInstallHelp = (key) => {
+      const message = tr(key);
+      installHelp.forEach((help) => {
+        help.textContent = message;
+        help.hidden = false;
+      });
+    };
+    const manualInstallHelp = () => {
+      if (iOSSafari) return "app.install_ios";
+      if (edgeBrowser) return "app.install_edge";
+      return "app.install_browser";
+    };
+
+    installActions.forEach((action) => {
+      action.addEventListener("click", async () => {
+        if (installInFlight) return;
+        if (installedStandalone()) {
+          setInstallVisibility();
+          return;
+        }
+        if (!window.isSecureContext) {
+          showInstallHelp("app.install_insecure");
+          return;
+        }
+        if (!deferredInstallPrompt) {
+          showInstallHelp(manualInstallHelp());
+          return;
+        }
+
+        const installPrompt = deferredInstallPrompt;
+        deferredInstallPrompt = null;
+        hideInstallHelp();
+        setInstallBusy(true);
+        try {
+          await installPrompt.prompt();
+          const choice = await installPrompt.userChoice;
+          showInstallHelp(
+            choice?.outcome === "accepted"
+              ? "app.install_accepted"
+              : manualInstallHelp(),
+          );
+        } catch {
+          showInstallHelp(manualInstallHelp());
+        } finally {
+          setInstallBusy(false);
+        }
+      });
+    });
+    window.addEventListener("beforeinstallprompt", (event) => {
+      event.preventDefault();
+      if (!window.isSecureContext || installedStandalone()) return;
+      deferredInstallPrompt = event;
+      hideInstallHelp();
+    });
+    window.addEventListener("appinstalled", () => {
+      deferredInstallPrompt = null;
+      hideInstallHelp();
+      pwaInstallViews.forEach((view) => { view.hidden = true; });
+    });
+    if (standaloneMedia?.addEventListener) {
+      standaloneMedia.addEventListener("change", setInstallVisibility);
+    } else {
+      standaloneMedia?.addListener?.(setInstallVisibility);
+    }
+    setInstallVisibility();
+    if (!window.isSecureContext && !installedStandalone()) {
+      showInstallHelp("app.install_insecure");
+    }
+  }
+
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
+
+  const activityLinks = [...document.querySelectorAll("[data-activity-link]")];
+  const activityLink = activityLinks[0];
+  const activityBadges = [...document.querySelectorAll("[data-activity-unread]")];
+  const notificationButton = document.querySelector("[data-notification-enable]");
+  const updateUnread = (value) => {
+    const count = Math.max(0, Number(value) || 0);
+    activityBadges.forEach((badge) => {
+      badge.hidden = count === 0;
+      badge.textContent = count > 99 ? "99+" : String(count);
+    });
+  };
+  const refreshActivitySummary = async () => {
+    if (!activityLink?.dataset.summaryUrl) return;
+    try {
+      const response = await fetch(activityLink.dataset.summaryUrl, {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      const result = await response.json();
+      if (response.ok && result.ok !== false) updateUnread(result.unread_count);
+    } catch {
+      // Activity is durable on the Core. A later refresh can recover this badge.
+    }
+  };
+  const claimActivityLink = activityLinks.find((link) => link.dataset.claimUrl);
+  const notificationSupported = (
+    window.isSecureContext
+    && "Notification" in window
+    && Boolean(claimActivityLink?.dataset.claimUrl)
+  );
+  const syncNotificationButton = () => {
+    if (!notificationButton) return;
+    if (!notificationSupported) {
+      notificationButton.disabled = true;
+      notificationButton.textContent = tr("activity.notifications_unsupported");
+      return;
+    }
+    if (Notification.permission === "granted") {
+      notificationButton.disabled = true;
+      notificationButton.textContent = tr("activity.notifications_enabled");
+      return;
+    }
+    if (Notification.permission === "denied") {
+      notificationButton.disabled = true;
+      notificationButton.textContent = tr("activity.notifications_denied");
+      return;
+    }
+    notificationButton.disabled = false;
+    notificationButton.textContent = tr("activity.notifications_enable");
+  };
+  const claimActivityNotifications = async () => {
+    if (!notificationSupported || Notification.permission !== "granted") return;
+    try {
+      const response = await fetch(claimActivityLink.dataset.claimUrl, {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Termroom-CSRF": claimActivityLink.dataset.csrf || "",
+        },
+        body: "{}",
+      });
+      const result = await response.json();
+      if (!response.ok || result.ok === false) return;
+      updateUnread(result.unread_count);
+      (result.events || []).forEach((activityEvent) => {
+        const notification = new Notification(activityEvent.title, {
+          body: activityEvent.body,
+          tag: `termroom-${activityEvent.id}`,
+          renotify: false,
+        });
+        notification.addEventListener("click", () => {
+          notification.close();
+          window.focus();
+          window.location.assign(activityEvent.url || "/activity");
+        });
+      });
+    } catch {
+      // Notification delivery is optional; the Activity record remains available.
+    }
+  };
+  let activityRefreshInFlight = false;
+  let lastActivityRefreshAt = 0;
+  const refreshActivityOnce = async ({ force = false } = {}) => {
+    const canNotifyInBackground = notificationSupported && Notification.permission === "granted";
+    if ((document.hidden && !canNotifyInBackground) || activityRefreshInFlight) return;
+    const now = window.performance.now();
+    if (!force && now - lastActivityRefreshAt < 750) return;
+    activityRefreshInFlight = true;
+    try {
+      if (notificationSupported && Notification.permission === "granted") {
+        await claimActivityNotifications();
+      } else {
+        await refreshActivitySummary();
+      }
+    } finally {
+      lastActivityRefreshAt = window.performance.now();
+      activityRefreshInFlight = false;
+    }
+  };
+  let activityRefreshTimer = 0;
+  const scheduleActivityRefresh = () => {
+    window.clearTimeout(activityRefreshTimer);
+    if (!notificationSupported || Notification.permission !== "granted") return;
+    const delay = document.hidden ? 30000 : 10000;
+    activityRefreshTimer = window.setTimeout(async () => {
+      try {
+        await refreshActivityOnce({ force: true });
+      } finally {
+        scheduleActivityRefresh();
+      }
+    }, delay);
+  };
+  notificationButton?.addEventListener("click", async () => {
+    if (!notificationSupported) return;
+    const permission = await Notification.requestPermission();
+    syncNotificationButton();
+    if (permission === "granted") await refreshActivityOnce({ force: true });
+    scheduleActivityRefresh();
+  });
+  if (activityLink) {
+    refreshActivityOnce({ force: true });
+    scheduleActivityRefresh();
+    document.addEventListener("visibilitychange", () => {
+      refreshActivityOnce();
+      scheduleActivityRefresh();
+    });
+    window.addEventListener("focus", () => {
+      refreshActivityOnce();
+      scheduleActivityRefresh();
+    });
+  }
+  syncNotificationButton();
+
+  const terminalActivitySummary = document.querySelector("[data-terminal-activity-summary]");
+  const workspaceTerminalActivity = document.querySelector("[data-workspace-terminal-activity]");
+  const terminalActivityEntries = (result, key) => {
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    const entries = payload?.[key];
+    if (Array.isArray(entries)) return entries;
+    if (entries && typeof entries === "object") return Object.values(entries);
+    return [];
+  };
+  const unreadTerminalCount = (entry) => {
+    const explicit = entry?.unread_terminal_count ?? entry?.unread_count;
+    if (explicit !== undefined && explicit !== null) {
+      return Math.max(0, Number(explicit) || 0);
+    }
+    return terminalActivityEntries(entry, "terminals").filter((item) => item?.unread).length;
+  };
+  const latestUnreadTerminalId = (entry) => {
+    const explicit = entry?.latest_unread_terminal_id ?? entry?.latest_terminal_id;
+    if (explicit) return String(explicit);
+    const unread = terminalActivityEntries(entry, "terminals").filter((item) => item?.unread);
+    unread.sort((left, right) => Number(right.activity_at || 0) - Number(left.activity_at || 0));
+    return unread[0]?.terminal_id || unread[0]?.id || "";
+  };
+  const renderHomeTerminalActivity = (result) => {
+    const entries = terminalActivityEntries(result, "workspaces");
+    const byWorkspace = new Map(
+      entries.map((entry) => [String(entry.workspace_id ?? entry.id ?? ""), entry]),
+    );
+    terminalActivitySummary
+      ?.querySelectorAll("[data-terminal-activity-workspace]")
+      .forEach((row) => {
+        const entry = byWorkspace.get(String(row.dataset.terminalActivityWorkspace || ""));
+        const count = unreadTerminalCount(entry);
+        const unread = row.querySelector("[data-terminal-activity-unread]");
+        const countNode = row.querySelector("[data-terminal-activity-count]");
+        if (unread) unread.hidden = count === 0;
+        if (countNode) {
+          countNode.textContent = tr(
+            count === 1
+              ? "terminal.activity.unread_terminal"
+              : "terminal.activity.unread_terminals",
+            { count },
+          );
+        }
+        const terminalId = latestUnreadTerminalId(entry);
+        row.href = count > 0 && terminalId
+          ? `/w/${encodeURIComponent(row.dataset.terminalActivityWorkspace)}/terminal?terminal=${encodeURIComponent(terminalId)}`
+          : row.dataset.workspaceHref;
+      });
+  };
+  const renderWorkspaceTerminalActivity = (result) => {
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    const count = unreadTerminalCount(payload);
+    document.querySelectorAll("[data-terminal-activity-nav-unread]").forEach((dot) => {
+      dot.hidden = count === 0;
+    });
+    const terminals = terminalActivityEntries(payload, "terminals");
+    const byTerminal = new Map(
+      terminals.map((entry) => [String(entry.terminal_id ?? entry.id ?? ""), entry]),
+    );
+    document.querySelectorAll("[data-terminal-activity-tab]").forEach((tab) => {
+      const dot = tab.querySelector("[data-terminal-activity-tab-unread]");
+      if (!dot || tab.dataset.terminalRole !== "shell") return;
+      dot.hidden = !Boolean(byTerminal.get(String(tab.dataset.terminalActivityTab))?.unread);
+    });
+  };
+  const syncWorkspaceTerminalUnreadFromTabs = () => {
+    const unread = [...document.querySelectorAll("[data-terminal-activity-tab-unread]")]
+      .some((dot) => !dot.hidden);
+    document.querySelectorAll("[data-terminal-activity-nav-unread]").forEach((dot) => {
+      dot.hidden = !unread;
+    });
+  };
+  let terminalActivityRefreshInFlight = false;
+  let lastTerminalActivityRefreshAt = 0;
+  const terminalActivityRequestUrl = (target) => {
+    const url = target?.dataset.summaryUrl || target?.dataset.activityUrl;
+    if (!url || !terminalActivitySummary) return url;
+    const workspaceIds = [
+      ...new Set(
+        [...terminalActivitySummary.querySelectorAll("[data-terminal-activity-workspace]")]
+          .map((row) => String(row.dataset.terminalActivityWorkspace || ""))
+          .filter(Boolean),
+      ),
+    ].slice(0, 20);
+    const searchParams = new URLSearchParams();
+    workspaceIds.forEach((workspaceId) => searchParams.append("workspace_id", workspaceId));
+    const query = searchParams.toString();
+    return query ? `${url}?${query}` : url;
+  };
+  const refreshTerminalActivity = async ({ force = false } = {}) => {
+    if (document.hidden || terminalActivityRefreshInFlight) return;
+    const now = window.performance.now();
+    if (!force && now - lastTerminalActivityRefreshAt < 750) return;
+    const target = terminalActivitySummary || workspaceTerminalActivity;
+    const url = terminalActivityRequestUrl(target);
+    if (!url) return;
+    terminalActivityRefreshInFlight = true;
+    try {
+      const response = await fetch(url, {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      const result = await response.json();
+      if (!response.ok || result?.ok === false) throw new Error("terminal activity unavailable");
+      if (terminalActivitySummary) renderHomeTerminalActivity(result);
+      if (workspaceTerminalActivity) renderWorkspaceTerminalActivity(result);
+      window.dispatchEvent(
+        new CustomEvent("termroom:terminal-activity-refreshed", { detail: result }),
+      );
+    } catch {
+      // Unread state is durable; leave the last rendered state until the next visit.
+    } finally {
+      lastTerminalActivityRefreshAt = window.performance.now();
+      terminalActivityRefreshInFlight = false;
+    }
+  };
+  if (terminalActivitySummary || workspaceTerminalActivity) {
+    refreshTerminalActivity({ force: true });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshTerminalActivity();
+    });
+    window.addEventListener("focus", () => {
+      refreshTerminalActivity();
+    });
+    window.addEventListener(
+      "termroom:terminal-activity-changed",
+      syncWorkspaceTerminalUnreadFromTabs,
+    );
+  }
+
+  const pendingWorkspaceLinks = [
+    ...document.querySelectorAll("[data-workspace-open-pending]"),
+  ];
+  const workspaceOpenAnnouncer = document.querySelector("[data-workspace-open-announcer]");
+  const resetWorkspaceOpenPending = (link) => {
+    link.removeAttribute("aria-busy");
+    link.removeAttribute("aria-disabled");
+    delete link.dataset.workspaceOpening;
+    link.querySelectorAll("[data-workspace-open-idle]").forEach((element) => {
+      element.hidden = false;
+    });
+    const status = link.querySelector("[data-workspace-open-status]");
+    if (status?.dataset.workspaceOpenInitiallyHidden === "true") status.hidden = true;
+    const label = link.querySelector("[data-workspace-open-status-label]");
+    if (label?.dataset.workspaceOpenIdleLabel !== undefined) {
+      label.textContent = label.dataset.workspaceOpenIdleLabel;
+    }
+  };
+  pendingWorkspaceLinks.forEach((link) => {
+    const status = link.querySelector("[data-workspace-open-status]");
+    const label = link.querySelector("[data-workspace-open-status-label]");
+    if (status) status.dataset.workspaceOpenInitiallyHidden = status.hidden ? "true" : "false";
+    if (label) label.dataset.workspaceOpenIdleLabel = label.textContent || "";
+    link.addEventListener("click", (event) => {
+      const modifiedClick = event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey;
+      if (
+        event.defaultPrevented
+        || modifiedClick
+        || link.target === "_blank"
+        || link.hasAttribute("download")
+      ) {
+        return;
+      }
+      if (link.dataset.workspaceOpening === "true") {
+        event.preventDefault();
+        return;
+      }
+      link.dataset.workspaceOpening = "true";
+      link.setAttribute("aria-busy", "true");
+      link.setAttribute("aria-disabled", "true");
+      link.querySelectorAll("[data-workspace-open-idle]").forEach((element) => {
+        element.hidden = true;
+      });
+      if (status) status.hidden = false;
+      const openingLabel = link.dataset.workspaceOpeningLabel || tr("terminal.status.connecting");
+      if (label) label.textContent = openingLabel;
+      if (workspaceOpenAnnouncer) workspaceOpenAnnouncer.textContent = openingLabel;
+    });
+  });
+  window.addEventListener("pageshow", () => {
+    pendingWorkspaceLinks.forEach(resetWorkspaceOpenPending);
+    if (workspaceOpenAnnouncer) workspaceOpenAnnouncer.textContent = "";
+  });
+
+  const workspaceRunMenus = [
+    ...document.querySelectorAll("[data-workspace-run-menu]"),
+  ];
+  const closeWorkspaceRunMenu = (menu, { restoreFocus = false } = {}) => {
+    if (!(menu instanceof HTMLDetailsElement) || !menu.open) return false;
+    menu.open = false;
+    if (restoreFocus) menu.querySelector("summary")?.focus({ preventScroll: true });
+    return true;
+  };
+  workspaceRunMenus.forEach((menu) => {
+    menu.querySelector("[data-workspace-run-close]")?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeWorkspaceRunMenu(menu, { restoreFocus: true });
+    });
+  });
+  document.addEventListener("click", (event) => {
+    workspaceRunMenus
+      .filter((menu) => menu.open && !menu.contains(event.target))
+      .forEach((menu) => closeWorkspaceRunMenu(menu));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const menu = workspaceRunMenus.find((candidate) => candidate.open);
+    if (!menu) return;
+    event.preventDefault();
+    closeWorkspaceRunMenu(menu, { restoreFocus: true });
+  });
+
+  const workspaceCommandForms = [
+    ...document.querySelectorAll("[data-workspace-command-run]"),
+  ];
+  const workspaceCommandAnnouncer = document.querySelector(
+    "[data-workspace-command-announcer]",
+  );
+  const resetWorkspaceCommandPending = (form) => {
+    form.removeAttribute("aria-busy");
+    delete form.dataset.workspaceCommandStarting;
+    const button = form.querySelector('button[type="submit"]');
+    if (button) {
+      button.removeAttribute("aria-busy");
+      button.removeAttribute("aria-disabled");
+    }
+    const label = form.querySelector("[data-workspace-command-label]");
+    if (label?.dataset.workspaceCommandIdleLabel !== undefined) {
+      label.textContent = label.dataset.workspaceCommandIdleLabel;
+    }
+  };
+  workspaceCommandForms.forEach((form) => {
+    const label = form.querySelector("[data-workspace-command-label]");
+    if (label) label.dataset.workspaceCommandIdleLabel = label.textContent || "";
+    form.addEventListener("submit", (event) => {
+      if (form.dataset.workspaceCommandStarting === "true") {
+        event.preventDefault();
+        return;
+      }
+      const button = form.querySelector('button[type="submit"]');
+      const startingLabel = form.dataset.workspaceCommandStartingLabel
+        || tr("workspace.run.starting");
+      form.dataset.workspaceCommandStarting = "true";
+      form.setAttribute("aria-busy", "true");
+      if (button) {
+        button.setAttribute("aria-busy", "true");
+        button.setAttribute("aria-disabled", "true");
+      }
+      if (label) label.textContent = startingLabel;
+      if (workspaceCommandAnnouncer) {
+        workspaceCommandAnnouncer.textContent = startingLabel;
+      }
+    });
+  });
+  window.addEventListener("pageshow", () => {
+    workspaceCommandForms.forEach(resetWorkspaceCommandPending);
+    if (workspaceCommandAnnouncer) workspaceCommandAnnouncer.textContent = "";
+  });
+
+  const remoteConnectionChecks = [
+    ...document.querySelectorAll("[data-remote-connection-check]"),
+  ];
+  remoteConnectionChecks.forEach((action) => {
+    const view = action.closest("[data-remote-connection-view]");
+    const status = view?.querySelector("[data-remote-connection-status]");
+    const label = view?.querySelector("[data-remote-connection-label]");
+    if (!status || !label) return;
+    const initialClass = status.className;
+    const initialLabel = label.textContent;
+    const lastSuccess = view.querySelector("[data-remote-last-success]");
+    const markConnecting = (event) => {
+      if (
+        event.type === "click"
+        && (event.button !== 0
+          || event.metaKey
+          || event.ctrlKey
+          || event.shiftKey
+          || event.altKey)
+      ) {
+        return;
+      }
+      status.classList.remove("unchecked", "available", "unavailable");
+      status.classList.add("connecting");
+      label.textContent = action.dataset.remoteConnectingLabel
+        || tr("remote.status.connecting");
+      if (lastSuccess) lastSuccess.hidden = true;
+      action.setAttribute("aria-busy", "true");
+    };
+    action.addEventListener(action.tagName === "FORM" ? "submit" : "click", markConnecting);
+    window.addEventListener("pageshow", () => {
+      status.className = initialClass;
+      label.textContent = initialLabel;
+      if (lastSuccess) lastSuccess.hidden = false;
+      action.removeAttribute("aria-busy");
+    });
+  });
+
+  const workspaceUsageViews = [...document.querySelectorAll("[data-workspace-usage-view]")];
+  if (workspaceUsageViews.length) {
+    const usageUrl = workspaceUsageViews.find((view) => view.dataset.usageUrl)?.dataset.usageUrl;
+    const numberFormat = new Intl.NumberFormat(document.documentElement.lang || undefined, {
+      maximumFractionDigits: 1,
+    });
+    let usageTimer = 0;
+    let lastUsage = null;
+    let usageRefreshInFlight = false;
+
+    const formatAge = (seconds) => {
+      const value = Math.max(0, Math.floor(Number(seconds) || 0));
+      if (value < 60) return tr("time.just_now");
+      const minutes = Math.floor(value / 60);
+      if (minutes < 60) return tr("time.minutes_ago", { count: minutes });
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return tr("time.hours_ago", { count: hours });
+      const days = Math.floor(hours / 24);
+      return tr(days === 1 ? "time.day_ago" : "time.days_ago", { count: days });
+    };
+    const timestampAge = (value) => {
+      const timestamp = Date.parse(value || "");
+      return Number.isFinite(timestamp) ? Math.max(0, (Date.now() - timestamp) / 1000) : 0;
+    };
+    const formatMemory = (bytes) => {
+      const value = Math.max(0, Number(bytes) || 0);
+      if (value >= 1024 ** 3) return `${numberFormat.format(value / 1024 ** 3)} GB`;
+      return `${numberFormat.format(value / 1024 ** 2)} MB`;
+    };
+    const usageStateLabel = (state) => tr(`workspace.usage.state.${state}`);
+
+    const renderWorkspaceUsage = (result) => {
+      const state = ["fresh", "stale", "unavailable", "offline"].includes(result?.state)
+        ? result.state
+        : "unavailable";
+      const sample = state === "fresh" && result?.sample ? result.sample : null;
+      const cpu = sample ? `${numberFormat.format(sample.cpu_percent)}%` : "—";
+      const memory = sample ? formatMemory(sample.memory_bytes) : "—";
+      const processes = sample ? numberFormat.format(sample.process_count) : "—";
+      const stateLabel = usageStateLabel(state);
+      const checked = tr("workspace.usage.checked", {
+        time: formatAge(timestampAge(result?.last_checked_at)),
+      });
+      const lastSample = result?.last_observed_at
+        ? tr("workspace.usage.last_sample", {
+            time: formatAge(result.age_seconds ?? timestampAge(result.last_observed_at)),
+          })
+        : tr("workspace.usage.no_sample");
+      const summary = sample
+        ? `CPU ${cpu} · ${memory} · ${tr("workspace.usage.process_short", { count: processes })}`
+        : stateLabel;
+      const meta = sample
+        ? `${tr("workspace.usage.estimated")} · ${checked}`
+        : `${stateLabel} · ${checked} · ${lastSample}`;
+      const accessible = `${tr("workspace.usage.heading")}. ${summary}. ${meta}`;
+
+      workspaceUsageViews.forEach((view) => {
+        view.dataset.usageState = state;
+        view.querySelectorAll("[data-workspace-usage-cpu]").forEach((node) => {
+          node.textContent = cpu;
+        });
+        view.querySelectorAll("[data-workspace-usage-memory]").forEach((node) => {
+          node.textContent = memory;
+        });
+        view.querySelectorAll("[data-workspace-usage-processes]").forEach((node) => {
+          node.textContent = processes;
+        });
+        view.querySelectorAll("[data-workspace-usage-summary]").forEach((node) => {
+          node.textContent = summary;
+          node.title = accessible;
+        });
+        view.querySelectorAll("[data-workspace-usage-meta]").forEach((node) => {
+          node.textContent = meta;
+          node.title = accessible;
+        });
+        view.querySelectorAll("[data-workspace-usage-dot]").forEach((node) => {
+          node.classList.toggle("is-active", state === "fresh");
+          node.classList.toggle("is-warning", state === "stale" || state === "unavailable");
+          node.classList.toggle("is-offline", state === "offline");
+        });
+        const summaryNode = view.matches("details") ? view.querySelector("summary") : null;
+        summaryNode?.setAttribute("aria-label", accessible);
+        summaryNode?.setAttribute("title", accessible);
+      });
+      lastUsage = {
+        ...result,
+        state,
+        sample,
+      };
+      return state;
+    };
+
+    const scheduleUsagePoll = (state) => {
+      window.clearTimeout(usageTimer);
+      const openView = workspaceUsageViews.some((view) => view.open && !document.hidden);
+      if (!openView) return;
+      const delay = state === "fresh" ? 10000 : 5000;
+      usageTimer = window.setTimeout(pollWorkspaceUsage, delay);
+    };
+    const pollWorkspaceUsage = async () => {
+      if (!usageUrl || usageRefreshInFlight || document.hidden) return;
+      if (!workspaceUsageViews.some((view) => view.open)) return;
+      usageRefreshInFlight = true;
+      let state = lastUsage?.state || "unavailable";
+      try {
+        const response = await fetch(usageUrl, {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        const result = await response.json();
+        if (!response.ok || result.ok === false) throw new Error("workspace usage unavailable");
+        state = renderWorkspaceUsage(result);
+      } catch {
+        state = renderWorkspaceUsage({
+          state: lastUsage?.last_observed_at ? "stale" : "unavailable",
+          sample: null,
+          last_observed_at: lastUsage?.last_observed_at || null,
+          last_checked_at: new Date().toISOString(),
+          age_seconds: lastUsage?.last_observed_at
+            ? timestampAge(lastUsage.last_observed_at)
+            : null,
+        });
+      } finally {
+        usageRefreshInFlight = false;
+      }
+      scheduleUsagePoll(state);
+    };
+    workspaceUsageViews.forEach((view) => {
+      view.addEventListener("toggle", () => {
+        if (view.open) {
+          pollWorkspaceUsage();
+        } else if (!workspaceUsageViews.some((candidate) => candidate.open)) {
+          window.clearTimeout(usageTimer);
+        }
+      });
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        window.clearTimeout(usageTimer);
+      } else {
+        pollWorkspaceUsage();
+      }
+    });
+  }
+
+  document.querySelectorAll("[data-file-run]").forEach((panel) => {
+    const stateNode = panel.querySelector("[data-file-run-state]");
+    const stateChip = panel.querySelector(".state-chip");
+    const durationNode = panel.querySelector("[data-file-run-duration]");
+    const exitNode = panel.querySelector("[data-file-run-exit]");
+    const errorNode = panel.querySelector("[data-file-run-error]");
+    const stopForm = panel.querySelector("[data-file-run-stop]");
+    const forceForm = panel.querySelector("[data-file-run-force]");
+    const submitButton = document.querySelector("[data-file-run-submit]");
+    let active = ["preparing", "running"].includes(panel.dataset.state || "");
+    let failures = 0;
+    let timer = 0;
+
+    const render = (result) => {
+      const previousState = panel.dataset.state || "";
+      panel.dataset.state = result.state || previousState;
+      panel.classList.remove(
+        "preparing",
+        "running",
+        "finished",
+        "stopped",
+        "failed",
+        "lost",
+      );
+      if (result.display_state || result.state) {
+        panel.classList.add(result.display_state || result.state);
+      }
+      if (stateNode && result.state_label) stateNode.textContent = result.state_label;
+      if (durationNode) {
+        durationNode.textContent = result.duration_seconds === null
+          || result.duration_seconds === undefined
+          ? ""
+          : tr("file_run.duration", { seconds: result.duration_seconds });
+      }
+      if (exitNode) {
+        exitNode.textContent = result.exit_code === null
+          || result.exit_code === undefined
+          ? ""
+          : tr("file_run.exit_code", { code: result.exit_code });
+      }
+      if (errorNode) {
+        const message = result.error_detail
+          || (result.connection === "offline" ? tr("file_run.connection_offline") : "");
+        errorNode.textContent = message;
+        errorNode.hidden = !message;
+      }
+      active = Boolean(result.active);
+      if (stateChip) stateChip.classList.toggle("running", active);
+      if (stopForm) stopForm.hidden = !active || Boolean(result.needs_force);
+      if (forceForm) forceForm.hidden = !active || !result.needs_force;
+      if (!active && submitButton) {
+        submitButton.disabled = false;
+        submitButton.type = "submit";
+        submitButton.name = "intent";
+        submitButton.value = "save_and_run";
+        submitButton.textContent = tr("file_run.run_again");
+      }
+    };
+
+    const schedule = (delay) => {
+      window.clearTimeout(timer);
+      if (active) timer = window.setTimeout(poll, delay);
+    };
+    const poll = async () => {
+      if (!active || !panel.dataset.statusUrl) return;
+      try {
+        const response = await fetch(panel.dataset.statusUrl, {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        const result = await response.json();
+        if (!response.ok || result.ok === false) throw new Error(result.error || response.status);
+        failures = 0;
+        render(result);
+      } catch {
+        failures += 1;
+      }
+      if (active) {
+        const normalDelay = document.hidden ? 5000 : 1000;
+        schedule(Math.min(15000, normalDelay * (2 ** Math.min(failures, 3))));
+      }
+    };
+    if (active) schedule(250);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && active) schedule(0);
+    });
+  });
 
   const setViewportHeight = () => {
     const height = window.visualViewport?.height || window.innerHeight;
@@ -467,9 +1273,12 @@
     event.preventDefault();
     if (activeUploadRequest) return;
     const selectedFiles = [...uploadInput.files];
-    const duplicateName = selectedFiles.find(
-      (file, index) => selectedFiles.findIndex((candidate) => candidate.name === file.name) !== index,
-    );
+    const selectedNames = new Set();
+    const duplicateName = selectedFiles.find((file) => {
+      if (selectedNames.has(file.name)) return true;
+      selectedNames.add(file.name);
+      return false;
+    });
     const maxUploadBytes = Number(uploadForm.dataset.maxUploadBytes || 0);
     const oversized = maxUploadBytes > 0
       ? selectedFiles.find((file) => file.size > maxUploadBytes)
@@ -538,78 +1347,100 @@
   });
 
   const popoverSelector =
-    "details.new-terminal-menu, details.more-keys, details.terminal-manage-menu, details.create-entry, details.add-location-menu";
-  const popoverDetails = [...document.querySelectorAll(popoverSelector)];
-  const locationPopovers = [...document.querySelectorAll("details.add-location-menu")];
+    ".new-terminal-menu[data-popover], .more-keys[data-popover], .terminal-manage-menu[data-popover], .create-entry[data-popover], .add-location-menu[data-popover]";
+  const popovers = [...document.querySelectorAll(popoverSelector)];
+  const locationPopovers = [...document.querySelectorAll(".add-location-menu[data-popover]")];
+  const popoverOpen = (popover) => popover?.hasAttribute("open") === true;
+  const syncPopover = (popover, open) => {
+    if (!popover) return;
+    popover.toggleAttribute("open", open);
+    popover.querySelector("[data-popover-trigger]")?.setAttribute(
+      "aria-expanded",
+      open ? "true" : "false",
+    );
+    popover.querySelectorAll("[data-popover-panel]").forEach((panel) => {
+      panel.hidden = !open;
+    });
+  };
 
   const syncLocationModalState = () => {
     document.body.classList.toggle(
       "path-picker-modal-open",
-      locationPopovers.some((details) => details.open),
+      locationPopovers.some(popoverOpen),
     );
   };
 
-  const closePopover = (details, { restoreFocus = false } = {}) => {
-    if (!(details instanceof HTMLDetailsElement)) return false;
-    if (!details.open) return false;
-    details.open = false;
-    if (details.dataset.popoverClearQuery === "1" && details.dataset.popoverCloseUrl) {
-      window.history.replaceState(null, "", details.dataset.popoverCloseUrl);
-      details.dataset.popoverClearQuery = "0";
+  const closePopover = (popover, { restoreFocus = false } = {}) => {
+    if (!popoverOpen(popover)) return false;
+    syncPopover(popover, false);
+    if (popover.dataset.popoverClearQuery === "1" && popover.dataset.popoverCloseUrl) {
+      window.history.replaceState(null, "", popover.dataset.popoverCloseUrl);
+      popover.dataset.popoverClearQuery = "0";
     }
     if (restoreFocus) {
-      details.querySelector("summary")?.focus({ preventScroll: true });
+      popover.querySelector("[data-popover-trigger]")?.focus({ preventScroll: true });
     }
     return true;
   };
 
-  locationPopovers.forEach((details) => {
+  const openPopover = (popover) => {
+    popovers.forEach((other) => {
+      if (other !== popover) closePopover(other);
+    });
+    syncPopover(popover, true);
+  };
+
+  popovers.forEach((popover) => syncPopover(popover, popoverOpen(popover)));
+  locationPopovers.forEach((popover) => {
     const focusFirstField = () => {
-      const input = details.querySelector(".add-location-form input:not([type='hidden'])");
+      const input = popover.querySelector(".add-location-form input:not([type='hidden'])");
       window.setTimeout(() => input?.focus({ preventScroll: true }), 0);
     };
-    details.addEventListener("toggle", () => {
-      syncLocationModalState();
-      if (details.open) focusFirstField();
-    });
-    if (details.open) focusFirstField();
+    popover._termroomFocusFirstField = focusFirstField;
+    if (popoverOpen(popover)) focusFirstField();
   });
   syncLocationModalState();
 
   document.addEventListener("click", (event) => {
     const closeButton = event.target.closest("[data-close-popover]");
     if (closeButton) {
-      closePopover(closeButton.closest("details"), { restoreFocus: true });
+      closePopover(closeButton.closest(popoverSelector), { restoreFocus: true });
+      syncLocationModalState();
       return;
     }
 
     const popover = event.target.closest(popoverSelector);
     if (popover) {
-      const summary = event.target.closest("summary");
-      if (summary && summary.parentElement === popover && !popover.open) {
-        popoverDetails.forEach((other) => {
-          if (other !== popover) closePopover(other);
-        });
+      const trigger = event.target.closest("[data-popover-trigger]");
+      if (trigger && trigger.parentElement === popover) {
+        if (popoverOpen(popover)) {
+          closePopover(popover);
+        } else {
+          openPopover(popover);
+          popover._termroomFocusFirstField?.();
+        }
+        syncLocationModalState();
       }
       return;
     }
-    popoverDetails.filter((details) => details.open).forEach(closePopover);
+    popovers.filter(popoverOpen).forEach(closePopover);
+    syncLocationModalState();
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      const openPopovers = popoverDetails.filter((details) => details.open);
+      const openPopovers = popovers.filter(popoverOpen);
       const activePopover = event.target.closest(popoverSelector);
       const focusPopover = openPopovers.includes(activePopover)
         ? activePopover
         : openPopovers.at(-1);
-      openPopovers.forEach((details) =>
-        closePopover(details, { restoreFocus: details === focusPopover }),
+      openPopovers.forEach((popover) =>
+        closePopover(popover, { restoreFocus: popover === focusPopover }),
       );
       syncLocationModalState();
       return;
     }
     if (event.key !== "Tab") return;
-    const modal = locationPopovers.find((details) => details.open);
+    const modal = locationPopovers.find(popoverOpen);
     if (!modal) return;
     const focusable = [
       ...modal.querySelectorAll(

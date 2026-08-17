@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import stat
 import unicodedata
@@ -278,7 +279,12 @@ def build_public_git_clone_invocation(
     return GitCloneInvocation(argv=argv, env=env)
 
 
-def normalize_source_relative_path(value: str, *, allow_root: bool = False) -> str:
+def normalize_source_relative_path(
+    value: str,
+    *,
+    allow_root: bool = False,
+    allow_metadata: bool = False,
+) -> str:
     """Return a strict POSIX relative path for a Source manifest."""
 
     if not isinstance(value, str) or not value:
@@ -304,7 +310,7 @@ def normalize_source_relative_path(value: str, *, allow_root: bool = False) -> s
             code="source_path_traversal",
             path=value,
         )
-    if any(part == ".termroom" for part in parts):
+    if not allow_metadata and any(part == ".termroom" for part in parts):
         raise SourceValidationError(
             "The .termroom metadata directory cannot be a Source path",
             code="source_path_metadata",
@@ -371,15 +377,21 @@ class WorkspaceEntry:
     mtime_ns: int = 0
     executable: bool = False
     link_target: str | None = None
+    digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceManifest:
     entries: tuple[WorkspaceEntry, ...]
     total_bytes: int
+    excluded_prefixes: tuple[str, ...] = ()
 
 
-def build_workspace_manifest(entries: Iterable[WorkspaceEntry]) -> WorkspaceManifest:
+def build_workspace_manifest(
+    entries: Iterable[WorkspaceEntry],
+    *,
+    excluded_prefixes: Iterable[str] = (),
+) -> WorkspaceManifest:
     """Validate and canonicalize one authoritative Workspace tree listing."""
 
     by_path: dict[str, WorkspaceEntry] = {}
@@ -404,6 +416,18 @@ def build_workspace_manifest(entries: Iterable[WorkspaceEntry]) -> WorkspaceMani
                 path=path,
             )
 
+        digest = entry.digest.casefold() if isinstance(entry.digest, str) else None
+        if digest is not None and (
+            entry.kind != "file"
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise SourceValidationError(
+                f"Invalid Source content digest: {path}",
+                code="source_entry_digest",
+                path=path,
+            )
+
         if entry.kind == "symlink":
             if entry.link_target is None:
                 raise SourceValidationError(
@@ -424,6 +448,7 @@ def build_workspace_manifest(entries: Iterable[WorkspaceEntry]) -> WorkspaceMani
             relative_path=path,
             size=entry.size if entry.kind == "file" else 0,
             executable=entry.executable if entry.kind == "file" else False,
+            digest=digest if entry.kind == "file" else None,
         )
         by_path[path] = canonical
 
@@ -457,9 +482,18 @@ def build_workspace_manifest(entries: Iterable[WorkspaceEntry]) -> WorkspaceMani
             ),
         )
     )
+    canonical_excluded_prefixes = tuple(
+        sorted(
+            {
+                normalize_source_relative_path(prefix, allow_metadata=True)
+                for prefix in excluded_prefixes
+            }
+        )
+    )
     return WorkspaceManifest(
         entries=ordered,
         total_bytes=sum(entry.size for entry in ordered if entry.kind == "file"),
+        excluded_prefixes=canonical_excluded_prefixes,
     )
 
 
@@ -558,7 +592,7 @@ def scan_local_workspace(
 
         for child in children:
             raw_relative = f"{prefix}/{child.name}" if prefix else child.name
-            relative = normalize_source_relative_path(raw_relative)
+            relative = normalize_source_relative_path(raw_relative, allow_metadata=True)
             if is_mandatory_excluded(relative):
                 continue
             if is_default_workspace_excluded(relative) and not _is_related_to_explicit_include(
@@ -640,7 +674,10 @@ def scan_local_workspace(
     finally:
         with contextlib.suppress(OSError):
             os.close(root_fd)
-    return build_workspace_manifest(collected)
+    return build_workspace_manifest(
+        collected,
+        excluded_prefixes=mandatory_relative,
+    )
 
 
 def iter_stable_local_file_chunks(
@@ -795,6 +832,14 @@ def _require_exact_chunks(
         raise SourceFileChangedError(path)
 
 
+def _digesting_chunks(
+    chunks: Iterable[bytes], digest: hashlib._Hash
+) -> Iterator[bytes]:
+    for chunk in chunks:
+        digest.update(chunk)
+        yield chunk
+
+
 def materialize_workspace_snapshot(
     source: SnapshotSource,
     sink: SnapshotSink,
@@ -811,7 +856,10 @@ def materialize_workspace_snapshot(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     scanned_manifest = source.scan()
-    manifest = build_workspace_manifest(scanned_manifest.entries)
+    manifest = build_workspace_manifest(
+        scanned_manifest.entries,
+        excluded_prefixes=scanned_manifest.excluded_prefixes,
+    )
     if manifest.total_bytes != scanned_manifest.total_bytes:
         raise SourceValidationError(
             "Workspace manifest total does not match its entries",
@@ -827,15 +875,17 @@ def materialize_workspace_snapshot(
         else:
             current_entry = entry
             for attempt in range(2):
+                content_digest = hashlib.sha256()
                 chunks = _require_exact_chunks(
                     source.iter_file_chunks(current_entry, chunk_size=chunk_size),
                     expected_size=current_entry.size,
                     path=current_entry.relative_path,
                 )
+
                 try:
                     sink.write_file(
                         current_entry.relative_path,
-                        chunks,
+                        _digesting_chunks(chunks, content_digest),
                         executable=current_entry.executable,
                         expected_size=current_entry.size,
                     )
@@ -850,5 +900,13 @@ def materialize_workspace_snapshot(
                         )
                         final_entries[entry_index] = current_entry
                     continue
+                current_entry = replace(
+                    current_entry,
+                    digest=content_digest.hexdigest(),
+                )
+                final_entries[entry_index] = current_entry
                 break
-    return build_workspace_manifest(final_entries)
+    return build_workspace_manifest(
+        final_entries,
+        excluded_prefixes=manifest.excluded_prefixes,
+    )
