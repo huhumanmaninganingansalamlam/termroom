@@ -106,9 +106,9 @@ def test_git_clone_invocation_replaces_target_git_and_credential_environment() -
         "protocol.https.allow=always",
         "http.followRedirects=false",
         "http.extraHeader=",
-        "http.sslCert=",
-        "http.sslKey=",
     } <= command_config
+    assert "http.sslCert=" not in command_config
+    assert "http.sslKey=" not in command_config
 
     assert dict(invocation.env) == {
         "GIT_ASKPASS": "/var/lib/termroom/bin/deny-askpass",

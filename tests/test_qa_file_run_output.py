@@ -62,9 +62,7 @@ def test_fast_file_run_keeps_output_instead_of_dead_pane_overlay(tmp_path: Path)
             text=True,
         )
         assert option.stdout == "\n"
-        assert "FAST_FILE_RUN_OUTPUT_OK" in terminals.capture_scrollback(
-            workspace, terminal
-        )
+        assert "FAST_FILE_RUN_OUTPUT_OK" in terminals.capture_scrollback(workspace, terminal)
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
