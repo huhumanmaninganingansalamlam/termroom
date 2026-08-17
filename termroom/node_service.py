@@ -248,7 +248,6 @@ class NodeServiceManager:
                 self._systemctl("disable", NODE_SERVICE_UNIT_NAME)
             self.unit_path.unlink()
             self._systemctl("daemon-reload")
-            return self.status()
         except Exception as exc:
             self._rollback(previous, was_enabled=was_enabled, was_active=was_active)
             if isinstance(exc, NodeServiceError):
@@ -256,6 +255,7 @@ class NodeServiceManager:
             raise NodeServiceError(
                 "Termroom Node service removal failed", code="service_uninstall_failed"
             ) from exc
+        return self.status()
 
     def status(self) -> NodeServiceStatus:
         self._ensure_manager()
@@ -267,7 +267,7 @@ class NodeServiceManager:
         active = installed and properties.get("ActiveState") == "active"
         sub_state = str(properties.get("SubState") or "dead")
         service_state = f"{properties.get('ActiveState') or 'inactive'}/{sub_state}"
-        runtime = read_node_runtime_status(self.state_dir)
+        runtime = read_node_runtime_status(self.state_dir) if installed else None
         core_state = "stopped"
         last_error_code: str | None = None
         if runtime is not None:

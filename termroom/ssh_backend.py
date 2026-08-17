@@ -37,6 +37,7 @@ from termroom.files import (
     DEFAULT_RECENT_EXCLUDES,
     MAX_RECENT_IGNORE_BYTES,
     RECENT_IGNORE_FILE,
+    DirectoryListingLimitError,
     FileConflictError,
     FileEntry,
     FileSnapshot,
@@ -55,15 +56,36 @@ from termroom.terminal_control import TerminalControl
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
     MAX_TERMINAL_MESSAGE_BYTES,
+    TERMINAL_EDITOR_WRAPPER,
+    TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
+    TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
+    TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
     TMUX_TERMINAL_RECORD_FORMAT,
     TMUX_TERMINAL_ROLE_OPTION,
+    TMUX_WORKSPACE_COMMAND_DIGEST_OPTION,
+    TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION,
+    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+    TMUX_WORKSPACE_COMMAND_SLOT_OPTION,
+    WORKSPACE_COMMAND_READY_POLL_SECONDS,
+    WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
+    WORKSPACE_COMMAND_WRAPPER,
     TerminalOutputDecoder,
     file_run_completion_was_stopped,
+    normalize_terminal_editor_path,
     normalize_terminal_name,
+    normalize_workspace_command,
+    parse_tmux_terminal_editor_records,
     parse_tmux_terminal_records,
+    parse_tmux_workspace_command_records,
+    terminal_editor_digest,
+    terminal_input_claims_grid,
     terminal_size,
     tmux_browser_view_session,
+    touch_terminal_output_if_present,
+    validate_workspace_command_launch,
+    validate_workspace_command_slot,
+    workspace_command_digest,
 )
 from termroom.workspace_usage import (
     WORKSPACE_USAGE_PANES_MARKER,
@@ -328,9 +350,7 @@ class _SSHRemoteWorkspaceSnapshotSource:
         self.sftp = sftp
         self.workspace = workspace
         self.source_root = source_root
-        self.exclusions = frozenset(
-            normalize_source_relative_path(value) for value in exclusions
-        )
+        self.exclusions = frozenset(normalize_source_relative_path(value) for value in exclusions)
         self.explicitly_included = frozenset(
             normalize_source_relative_path(value) for value in explicitly_included
         )
@@ -338,9 +358,7 @@ class _SSHRemoteWorkspaceSnapshotSource:
     @staticmethod
     def _related(path: str, values: frozenset[str]) -> bool:
         return any(
-            path == value
-            or path.startswith(value + "/")
-            or value.startswith(path + "/")
+            path == value or path.startswith(value + "/") or value.startswith(path + "/")
             for value in values
         )
 
@@ -403,9 +421,7 @@ class _SSHRemoteWorkspaceSnapshotSource:
                         )
                     )
                 elif stat_module.S_ISDIR(mode):
-                    collected.append(
-                        WorkspaceEntry(relative, "directory", mtime_ns=mtime_ns)
-                    )
+                    collected.append(WorkspaceEntry(relative, "directory", mtime_ns=mtime_ns))
                     walk(remote, relative)
                 elif stat_module.S_ISREG(mode):
                     collected.append(
@@ -425,7 +441,10 @@ class _SSHRemoteWorkspaceSnapshotSource:
                     )
 
         walk(self.source_root)
-        return build_workspace_manifest(collected)
+        return build_workspace_manifest(
+            collected,
+            excluded_prefixes=self.exclusions,
+        )
 
     def iter_file_chunks(self, entry: Any, *, chunk_size: int) -> Iterator[bytes]:
         from termroom.run_sources import (
@@ -621,9 +640,7 @@ class _ConfiguredAgent(AgentSSH):
             connection.connect(path)
             self._connect(connection)
             if allowed_keys is not None:
-                self._keys = tuple(
-                    key for key in self._keys if key.asbytes() in allowed_keys
-                )
+                self._keys = tuple(key for key in self._keys if key.asbytes() in allowed_keys)
         except Exception:
             connection.close()
             raise
@@ -687,11 +704,14 @@ class SSHBackend:
         self.secrets.initialize()
         self._reuse_connections = reuse_connections
         self._ssh_pool_lock = threading.Lock()
-        self._ssh_idle: dict[
-            tuple[Any, ...], list[tuple[paramiko.SSHClient, float]]
-        ] = {}
+        self._ssh_idle: dict[tuple[Any, ...], list[tuple[paramiko.SSHClient, float]]] = {}
         self._ssh_pool_generation: dict[str, int] = {}
         self._ssh_pool_closed = False
+        self._workspace_command_locks: dict[str, threading.RLock] = {}
+        self._workspace_command_locks_guard = threading.Lock()
+        self._browser_grid_locks: dict[str, threading.RLock] = {}
+        self._browser_grid_locks_guard = threading.Lock()
+        self._browser_grid_owners: dict[str, str] = {}
 
     @property
     def managed_key_path(self) -> Path:
@@ -804,9 +824,7 @@ class SSHBackend:
         except (OSError, subprocess.SubprocessError) as exc:
             raise SSHBackendError("Could not read OpenSSH configuration") from exc
         if result.returncode:
-            raise SSHBackendError(
-                result.stderr.strip() or "Could not read OpenSSH configuration"
-            )
+            raise SSHBackendError(result.stderr.strip() or "Could not read OpenSSH configuration")
         resolved: dict[str, list[str]] = {}
         for raw_line in result.stdout.splitlines():
             key, separator, raw_value = raw_line.partition(" ")
@@ -843,9 +861,7 @@ class SSHBackend:
             "identity_agent": "" if identity_agent_disabled else identity_agent,
             "identity_agent_disabled": identity_agent_disabled,
             "identities_only": first("identitiesonly").casefold() == "yes",
-            "proxycommand": ""
-            if proxycommand.casefold() == "none"
-            else proxycommand,
+            "proxycommand": "" if proxycommand.casefold() == "none" else proxycommand,
             "proxyjump": "" if proxyjump.casefold() == "none" else proxyjump,
             "host_key_alias": first("hostkeyalias", host),
         }
@@ -917,9 +933,7 @@ class SSHBackend:
                 raise SSHBackendError("OpenSSH ProxyCommand ends with an invalid token")
             token = command[index + 1]
             if token not in replacements:
-                raise SSHBackendError(
-                    f"OpenSSH ProxyCommand token %{token} is not supported"
-                )
+                raise SSHBackendError(f"OpenSSH ProxyCommand token %{token} is not supported")
             output.append(replacements[token])
             index += 2
         return "".join(output)
@@ -956,9 +970,7 @@ class SSHBackend:
         argv.extend(
             [
                 "-W",
-                self._proxy_endpoint(
-                    str(target.get("host") or ""), int(target.get("port") or 22)
-                ),
+                self._proxy_endpoint(str(target.get("host") or ""), int(target.get("port") or 22)),
                 "--",
                 jump_host,
             ]
@@ -981,9 +993,7 @@ class SSHBackend:
         try:
             transport.start_client(timeout=timeout)
             key = transport.get_remote_server_key()
-            fingerprint = base64.b64encode(
-                hashlib.sha256(key.asbytes()).digest()
-            ).decode("ascii")
+            fingerprint = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode("ascii")
             return {
                 "host_key_type": key.get_name(),
                 "host_key_data": key.get_base64(),
@@ -1034,13 +1044,9 @@ class SSHBackend:
         client = self._connect(computer)
         return self._connection_info(client)
 
-    def test_password_connection(
-        self, computer: dict[str, Any], password: str
-    ) -> dict[str, str]:
+    def test_password_connection(self, computer: dict[str, Any], password: str) -> dict[str, str]:
         self._require_ssh_client()
-        client = self._connect_password(
-            self._effective_connection_target(computer), password
-        )
+        client = self._connect_password(self._effective_connection_target(computer), password)
         return self._connection_info(client)
 
     @staticmethod
@@ -1081,9 +1087,7 @@ class SSHBackend:
             "{ echo '__TERMROOM_NO_TMUX__' >&2; exit 45; }; "
             f"cd {shlex.quote(normalized)} && pwd -P"
         )
-        canonical = self._exec(
-            computer, self._remote_posix_command(command)
-        ).strip()
+        canonical = self._exec(computer, self._remote_posix_command(command)).strip()
         if not canonical.startswith("/") or canonical == "/":
             raise SSHBackendError("Remote Workspace path could not be canonicalized safely")
         return canonical
@@ -1220,9 +1224,7 @@ class SSHBackend:
                 else:
                     raise
             if existing is not None:
-                raise ProjectPathExists(
-                    target, is_directory=stat_module.S_ISDIR(existing.st_mode)
-                )
+                raise ProjectPathExists(target, is_directory=stat_module.S_ISDIR(existing.st_mode))
             sftp.mkdir(target, mode=0o755)
             canonical = sftp.normalize(target)
             if not canonical.startswith("/") or canonical == "/":
@@ -1341,9 +1343,7 @@ class SSHBackend:
             staging = paths["work_staging"]
             if reset_staging:
                 if self._sftp_exists(sftp, staging):
-                    self._remove_remote_run_work_staging(
-                        client, sftp, paths, run_id
-                    )
+                    self._remove_remote_run_work_staging(client, sftp, paths, run_id)
                 sftp.mkdir(staging, mode=0o700)
             else:
                 attr = sftp.lstat(staging)
@@ -1367,9 +1367,7 @@ class SSHBackend:
             ):
                 raise SSHBackendError("Remote Run staging root is invalid")
             work_attr = sftp.lstat(paths["work"])
-            if stat_module.S_ISLNK(work_attr.st_mode) or not stat_module.S_ISDIR(
-                work_attr.st_mode
-            ):
+            if stat_module.S_ISLNK(work_attr.st_mode) or not stat_module.S_ISDIR(work_attr.st_mode):
                 raise SSHBackendError("Remote Run work root is invalid")
             if sftp.listdir_attr(paths["work"]):
                 raise SSHBackendError("Remote Run work root is already committed")
@@ -1406,9 +1404,7 @@ class SSHBackend:
                     sftp.rmdir(probe)
                 with contextlib.suppress(OSError):
                     sftp.rmdir(renamed)
-                raise SSHBackendError(
-                    f"Remote Run base is not writable: {run_base}"
-                ) from exc
+                raise SSHBackendError(f"Remote Run base is not writable: {run_base}") from exc
 
             tool_check = (
                 "test -x /bin/bash || { echo '__TERMROOM_NO_BASH__' >&2; exit 47; }; "
@@ -1440,9 +1436,7 @@ class SSHBackend:
                 warnings.append("disk_space_unknown")
             return {
                 "run_base": run_base,
-                "tools": dict(
-                    line.split("=", 1) for line in tools.splitlines() if "=" in line
-                ),
+                "tools": dict(line.split("=", 1) for line in tools.splitlines() if "=" in line),
                 "available_bytes": available_bytes,
                 "warnings": warnings,
             }
@@ -1466,15 +1460,11 @@ class SSHBackend:
             )
             quarantine = posixpath.join(run_base, f".termroom-deleting-{run_id}")
             deletion_marker = self._remote_run_deletion_marker(run_base, run_id)
-            if self._sftp_exists(sftp, quarantine) or self._sftp_exists(
-                sftp, deletion_marker
-            ):
+            if self._sftp_exists(sftp, quarantine) or self._sftp_exists(sftp, deletion_marker):
                 # A previous delete may have been interrupted after quarantine or
                 # after the tree itself vanished.  Finish that protocol before
                 # publishing a fresh UUID root for the same id.
-                self._delete_remote_run_root_connection(
-                    client, sftp, run_base, run_id
-                )
+                self._delete_remote_run_root_connection(client, sftp, run_base, run_id)
             paths = self._remote_run_paths(run_base, run_id)
             try:
                 existing = sftp.lstat(paths["root"])
@@ -1502,9 +1492,7 @@ class SSHBackend:
 
             creating = self._remote_run_creation_paths(run_base, run_id)
             if self._sftp_exists(sftp, creating["root"]):
-                self._discard_remote_run_creation(
-                    client, sftp, run_base, run_id
-                )
+                self._discard_remote_run_creation(client, sftp, run_base, run_id)
 
             try:
                 # Build the complete layout outside the public UUID path.  The
@@ -1512,9 +1500,7 @@ class SSHBackend:
                 # provably empty skeleton or a marked Termroom-owned tree.
                 sftp.mkdir(creating["root"], mode=0o700)
                 sftp.mkdir(creating["metadata"], mode=0o700)
-                self._sftp_atomic_write(
-                    sftp, creating["marker"], (run_id + "\n").encode()
-                )
+                self._sftp_atomic_write(sftp, creating["marker"], (run_id + "\n").encode())
                 sftp.mkdir(creating["work"], mode=0o700)
                 self._sftp_atomic_write(sftp, creating["cwd"], (cwd_rel + "\n").encode())
                 self._sftp_atomic_write(
@@ -1534,9 +1520,7 @@ class SSHBackend:
                 sftp.rename(creating["root"], paths["root"])
             except Exception as exc:
                 try:
-                    self._discard_remote_run_creation(
-                        client, sftp, run_base, run_id
-                    )
+                    self._discard_remote_run_creation(client, sftp, run_base, run_id)
                 except Exception as cleanup_exc:
                     exc.add_note(f"Remote Run staging cleanup also failed: {cleanup_exc}")
                 raise
@@ -1677,9 +1661,7 @@ class SSHBackend:
                 work_attr = sftp.lstat(paths["work"])
             except OSError as exc:
                 raise SSHBackendError("Remote Run work directory is unavailable") from exc
-            if stat_module.S_ISLNK(work_attr.st_mode) or not stat_module.S_ISDIR(
-                work_attr.st_mode
-            ):
+            if stat_module.S_ISLNK(work_attr.st_mode) or not stat_module.S_ISDIR(work_attr.st_mode):
                 raise SSHBackendError("Remote Run work path is not a real directory")
             if posixpath.normpath(sftp.normalize(paths["work"])) != paths["work"]:
                 raise SSHBackendError("Remote Run work path is not canonical")
@@ -1702,9 +1684,7 @@ class SSHBackend:
                     "-F '#{window_id}|#{window_name}'",
                 )
                 windows = self._parse_remote_run_windows(output)
-                shell = next(
-                    (window for window in windows if window["name"] == "shell"), None
-                )
+                shell = next((window for window in windows if window["name"] == "shell"), None)
                 if shell is None:
                     raise SSHBackendError("Recovered Remote Run session has no shell window")
                 created_session = True
@@ -1718,8 +1698,7 @@ class SSHBackend:
 
             output = self._exec_remote_run_bash(
                 client,
-                f"tmux list-windows -t {quoted_session} "
-                "-F '#{window_id}|#{window_name}'",
+                f"tmux list-windows -t {quoted_session} -F '#{{window_id}}|#{{window_name}}'",
             )
             windows = self._parse_remote_run_windows(output)
             shell = next((window for window in windows if window["name"] == "shell"), None)
@@ -1814,24 +1793,21 @@ class SSHBackend:
                 for value in env_i_argv
             ):
                 raise ValueError("Git clone argv must contain single-line values")
-            encoded_argv = b"\x00".join(
-                value.encode("utf-8") for value in env_i_argv
-            ) + b"\x00"
+            encoded_argv = b"\x00".join(value.encode("utf-8") for value in env_i_argv) + b"\x00"
             if len(encoded_argv) > 1024 * 1024:
                 raise ValueError("Git clone metadata is too large")
-            if any(
-                self._sftp_exists(sftp, paths[name])
-                for name in ("state", "prepare_result", "stop", "completion")
-            ) or self._remote_tmux_status(client, run_id)["exists"]:
+            if (
+                any(
+                    self._sftp_exists(sftp, paths[name])
+                    for name in ("state", "prepare_result", "stop", "completion")
+                )
+                or self._remote_tmux_status(client, run_id)["exists"]
+            ):
                 raise SSHBackendError("Remote Run has already started")
             if self._sftp_exists(sftp, paths["git_argv"]):
-                stored_argv = self._read_sftp_bytes(
-                    sftp, paths["git_argv"], max_bytes=1024 * 1024
-                )
+                stored_argv = self._read_sftp_bytes(sftp, paths["git_argv"], max_bytes=1024 * 1024)
                 if stored_argv != encoded_argv:
-                    raise SSHBackendError(
-                        "Remote Run id already belongs to a different Git Source"
-                    )
+                    raise SSHBackendError("Remote Run id already belongs to a different Git Source")
 
             if self._sftp_exists(sftp, paths["git_home"]):
                 home_attr = sftp.lstat(paths["git_home"])
@@ -1841,14 +1817,10 @@ class SSHBackend:
                     raise SSHBackendError("Remote Run Git HOME is invalid")
             else:
                 sftp.mkdir(paths["git_home"], mode=0o700)
-            self._sftp_atomic_write(
-                sftp, paths["git_askpass"], b"#!/bin/sh\nexit 1\n", mode=0o700
-            )
+            self._sftp_atomic_write(sftp, paths["git_askpass"], b"#!/bin/sh\nexit 1\n", mode=0o700)
             self._sftp_atomic_write(sftp, paths["git_argv"], encoded_argv)
             self._sftp_atomic_write(sftp, paths["git_url"], (url + "\n").encode())
-            self._sftp_atomic_write(
-                sftp, paths["git_path"], (argv[0] + "\n").encode("utf-8")
-            )
+            self._sftp_atomic_write(sftp, paths["git_path"], (argv[0] + "\n").encode("utf-8"))
             self._sftp_atomic_write(
                 sftp,
                 paths["git_bootstrap"],
@@ -2038,9 +2010,7 @@ class SSHBackend:
                 client,
                 f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null || true",
             )
-            completion, completion_valid = self._read_sftp_json(
-                sftp, paths["completion"]
-            )
+            completion, completion_valid = self._read_sftp_json(sftp, paths["completion"])
             if completion_valid and self._valid_completion_record(completion):
                 return {"killed": False, "completed": True}
             return {"killed": True, "completed": False}
@@ -2065,9 +2035,7 @@ class SSHBackend:
         run_id = self.validate_remote_run_id(run_id)
         with self.remote_run_connection(computer) as (client, sftp):
             base = self._assert_canonical_remote_run_base(sftp, run_base)
-            return self._delete_remote_run_root_connection(
-                client, sftp, base, run_id
-            )
+            return self._delete_remote_run_root_connection(client, sftp, base, run_id)
 
     def _delete_remote_run_root_connection(
         self,
@@ -2085,14 +2053,10 @@ class SSHBackend:
         quarantine_exists = self._sftp_exists(sftp, quarantine)
         deletion_started = self._sftp_exists(sftp, deletion_marker)
         if sum((original_exists, creating_exists, quarantine_exists)) > 1:
-            raise SSHBackendError(
-                "Multiple Remote Run roots exist; refusing automatic deletion"
-            )
+            raise SSHBackendError("Multiple Remote Run roots exist; refusing automatic deletion")
 
         if deletion_started:
-            self._assert_remote_run_deletion_marker(
-                sftp, run_base, run_id
-            )
+            self._assert_remote_run_deletion_marker(sftp, run_base, run_id)
 
         if not original_exists and not creating_exists and not quarantine_exists:
             self._kill_remote_run_session_connection(client, run_id)
@@ -2111,9 +2075,7 @@ class SSHBackend:
                 if deletion_started:
                     sftp.remove(deletion_marker)
                 self._kill_remote_run_session_connection(client, run_id)
-                self._remove_pristine_remote_run_creation(
-                    client, sftp, creating
-                )
+                self._remove_pristine_remote_run_creation(client, sftp, creating)
                 return {
                     "deleted": True,
                     "already_missing": False,
@@ -2121,9 +2083,7 @@ class SSHBackend:
                 }
             self._assert_remote_run_creation(sftp, run_base, run_id)
         elif deletion_started:
-            self._assert_quarantined_remote_run_container(
-                sftp, run_base, quarantine, run_id
-            )
+            self._assert_quarantined_remote_run_container(sftp, run_base, quarantine, run_id)
         else:
             self._assert_quarantined_remote_run(sftp, run_base, quarantine, run_id)
 
@@ -2142,12 +2102,8 @@ class SSHBackend:
             except OSError as exc:
                 raise SSHBackendError("Could not quarantine the Remote Run") from exc
 
-        self._assert_quarantined_remote_run_container(
-            sftp, run_base, quarantine, run_id
-        )
-        self._remove_marked_remote_tree_from_base(
-            client, sftp, run_base, quarantine, run_id
-        )
+        self._assert_quarantined_remote_run_container(sftp, run_base, quarantine, run_id)
+        self._remove_marked_remote_tree_from_base(client, sftp, run_base, quarantine, run_id)
         sftp.remove(deletion_marker)
         return {
             "deleted": True,
@@ -2155,9 +2111,7 @@ class SSHBackend:
             "quarantine": quarantine,
         }
 
-    def _kill_remote_run_session_connection(
-        self, client: paramiko.SSHClient, run_id: str
-    ) -> None:
+    def _kill_remote_run_session_connection(self, client: paramiko.SSHClient, run_id: str) -> None:
         session = self.remote_run_session_name(run_id)
         self._exec_remote_run_bash(
             client,
@@ -2168,9 +2122,7 @@ class SSHBackend:
     def _is_missing_sftp_error(exc: BaseException) -> bool:
         return isinstance(exc, FileNotFoundError) or getattr(exc, "errno", None) == 2
 
-    def _canonical_remote_run_base(
-        self, sftp: paramiko.SFTPClient, configured: str
-    ) -> str:
+    def _canonical_remote_run_base(self, sftp: paramiko.SFTPClient, configured: str) -> str:
         home = posixpath.normpath(sftp.normalize("."))
         if configured and configured != configured.strip():
             raise ValueError("Remote Run base cannot have surrounding whitespace")
@@ -2218,9 +2170,7 @@ class SSHBackend:
         self._assert_remote_run_base_permissions(attr)
         return canonical
 
-    def _assert_canonical_remote_run_base(
-        self, sftp: paramiko.SFTPClient, run_base: str
-    ) -> str:
+    def _assert_canonical_remote_run_base(self, sftp: paramiko.SFTPClient, run_base: str) -> str:
         stored = posixpath.normpath(run_base)
         if stored != run_base.rstrip("/") or not stored.startswith("/") or stored == "/":
             raise SSHBackendError("Stored Remote Run base is invalid")
@@ -2240,9 +2190,7 @@ class SSHBackend:
     def _assert_remote_run_base_permissions(attr: paramiko.SFTPAttributes) -> None:
         mode = int(attr.st_mode or 0)
         if mode & 0o022:
-            raise SSHBackendError(
-                "Remote Run base must not be writable by other users"
-            )
+            raise SSHBackendError("Remote Run base must not be writable by other users")
 
     @staticmethod
     def _is_remote_run_marker_temporary(name: str) -> bool:
@@ -2280,13 +2228,9 @@ class SSHBackend:
     def _remote_run_paths(self, run_base: str, run_id: str) -> dict[str, str]:
         return self._remote_run_paths_at_leaf(run_base, run_id, run_id)
 
-    def _remote_run_creation_paths(
-        self, run_base: str, run_id: str
-    ) -> dict[str, str]:
+    def _remote_run_creation_paths(self, run_base: str, run_id: str) -> dict[str, str]:
         run_id = self.validate_remote_run_id(run_id)
-        return self._remote_run_paths_at_leaf(
-            run_base, run_id, f".termroom-creating-{run_id}"
-        )
+        return self._remote_run_paths_at_leaf(run_base, run_id, f".termroom-creating-{run_id}")
 
     def _remote_run_deletion_marker(self, run_base: str, run_id: str) -> str:
         run_id = self.validate_remote_run_id(run_id)
@@ -2298,9 +2242,7 @@ class SSHBackend:
             raise SSHBackendError("Remote Run deletion marker path is invalid")
         return marker
 
-    def _remote_run_paths_at_leaf(
-        self, run_base: str, run_id: str, leaf: str
-    ) -> dict[str, str]:
+    def _remote_run_paths_at_leaf(self, run_base: str, run_id: str, leaf: str) -> dict[str, str]:
         run_id = self.validate_remote_run_id(run_id)
         base = posixpath.normpath(run_base)
         if not base.startswith("/") or base == "/":
@@ -2370,20 +2312,14 @@ class SSHBackend:
             raise RemoteRunLayoutError(
                 "Remote Run metadata directory is invalid", code="metadata_invalid"
             )
-        if stat_module.S_ISLNK(marker_attr.st_mode) or not stat_module.S_ISREG(
-            marker_attr.st_mode
-        ):
-            raise RemoteRunLayoutError(
-                "Run marker is not a regular file", code="marker_invalid"
-            )
+        if stat_module.S_ISLNK(marker_attr.st_mode) or not stat_module.S_ISREG(marker_attr.st_mode):
+            raise RemoteRunLayoutError("Run marker is not a regular file", code="marker_invalid")
         try:
-            marker = self._read_sftp_bytes(sftp, paths["marker"], max_bytes=128).decode(
-                "utf-8"
-            ).strip()
+            marker = (
+                self._read_sftp_bytes(sftp, paths["marker"], max_bytes=128).decode("utf-8").strip()
+            )
         except (OSError, UnicodeDecodeError) as exc:
-            raise RemoteRunLayoutError(
-                "Run marker is unreadable", code="marker_invalid"
-            ) from exc
+            raise RemoteRunLayoutError("Run marker is unreadable", code="marker_invalid") from exc
         if marker != run_id:
             raise RemoteRunLayoutError(
                 "Run marker does not match; refusing the operation",
@@ -2490,9 +2426,7 @@ class SSHBackend:
         return value
 
     @classmethod
-    def _read_sftp_json(
-        cls, sftp: paramiko.SFTPClient, path: str
-    ) -> tuple[Any, bool]:
+    def _read_sftp_json(cls, sftp: paramiko.SFTPClient, path: str) -> tuple[Any, bool]:
         try:
             raw = cls._read_sftp_bytes(sftp, path, max_bytes=1024 * 1024)
         except OSError as exc:
@@ -2535,9 +2469,7 @@ class SSHBackend:
             and bool(value.get("started_at"))
         )
 
-    def _remote_tmux_status(
-        self, client: paramiko.SSHClient, run_id: str
-    ) -> dict[str, Any]:
+    def _remote_tmux_status(self, client: paramiko.SSHClient, run_id: str) -> dict[str, Any]:
         session = self.remote_run_session_name(run_id)
         quoted = shlex.quote(session)
         pane_target = shlex.quote(f"{session}:run.0")
@@ -2597,9 +2529,7 @@ class SSHBackend:
         state_exists = self._sftp_exists(sftp, paths["state"])
         state, state_valid = self._read_sftp_json(sftp, paths["state"])
         stop_requested = self._sftp_exists(sftp, paths["stop"])
-        completion_record_valid = completion_valid and self._valid_completion_record(
-            completion
-        )
+        completion_record_valid = completion_valid and self._valid_completion_record(completion)
         prepare_record_valid = prepare_valid and self._valid_prepare_record(prepare)
         state_record_valid = state_valid and self._valid_state_record(state)
         record_errors = [
@@ -2644,21 +2574,15 @@ class SSHBackend:
             )
             if not tmux["running"]:
                 completion_exists = self._sftp_exists(sftp, paths["completion"])
-                completion, completion_valid = self._read_sftp_json(
-                    sftp, paths["completion"]
-                )
+                completion, completion_valid = self._read_sftp_json(sftp, paths["completion"])
                 prepare_exists = self._sftp_exists(sftp, paths["prepare_result"])
-                prepare, prepare_valid = self._read_sftp_json(
-                    sftp, paths["prepare_result"]
-                )
+                prepare, prepare_valid = self._read_sftp_json(sftp, paths["prepare_result"])
                 state_exists = self._sftp_exists(sftp, paths["state"])
                 state, state_valid = self._read_sftp_json(sftp, paths["state"])
-                completion_record_valid = (
-                    completion_valid and self._valid_completion_record(completion)
+                completion_record_valid = completion_valid and self._valid_completion_record(
+                    completion
                 )
-                prepare_record_valid = prepare_valid and self._valid_prepare_record(
-                    prepare
-                )
+                prepare_record_valid = prepare_valid and self._valid_prepare_record(prepare)
                 state_record_valid = state_valid and self._valid_state_record(state)
                 stop_requested = self._sftp_exists(sftp, paths["stop"])
                 result.update(
@@ -2816,9 +2740,7 @@ class SSHBackend:
             "eof": next_offset >= size,
         }
 
-    def _publish_stop_request(
-        self, sftp: paramiko.SFTPClient, paths: dict[str, str]
-    ) -> None:
+    def _publish_stop_request(self, sftp: paramiko.SFTPClient, paths: dict[str, str]) -> None:
         if self._sftp_exists(sftp, paths["stop"]):
             return
         value = datetime.now(UTC).isoformat(timespec="seconds") + "\n"
@@ -2841,12 +2763,8 @@ class SSHBackend:
         expected = posixpath.join(run_base, f".termroom-deleting-{run_id}")
         if quarantine != expected or posixpath.dirname(quarantine) != run_base:
             raise SSHBackendError("Remote Run quarantine path is invalid")
-        self._assert_quarantined_remote_run_container(
-            sftp, run_base, quarantine, run_id
-        )
-        self._assert_marked_remote_run_tree(
-            sftp, run_base, quarantine, run_id, label="quarantine"
-        )
+        self._assert_quarantined_remote_run_container(sftp, run_base, quarantine, run_id)
+        self._assert_marked_remote_run_tree(sftp, run_base, quarantine, run_id, label="quarantine")
 
     def _assert_quarantined_remote_run_container(
         self,
@@ -2896,9 +2814,11 @@ class SSHBackend:
             raise SSHBackendError("Remote Run deletion marker is invalid")
         if posixpath.normpath(sftp.normalize(marker)) != marker:
             raise SSHBackendError("Remote Run deletion marker is not canonical")
-        value = self._read_sftp_bytes(sftp, marker, max_bytes=128).decode(
-            "utf-8", errors="strict"
-        ).strip()
+        value = (
+            self._read_sftp_bytes(sftp, marker, max_bytes=128)
+            .decode("utf-8", errors="strict")
+            .strip()
+        )
         if value != run_id:
             raise SSHBackendError("Remote Run deletion marker does not match")
 
@@ -2939,13 +2859,13 @@ class SSHBackend:
             metadata_attr.st_mode
         ):
             raise SSHBackendError(f"Remote Run {label} metadata is invalid")
-        if stat_module.S_ISLNK(marker_attr.st_mode) or not stat_module.S_ISREG(
-            marker_attr.st_mode
-        ):
+        if stat_module.S_ISLNK(marker_attr.st_mode) or not stat_module.S_ISREG(marker_attr.st_mode):
             raise SSHBackendError(f"Remote Run {label} marker is invalid")
-        marker = self._read_sftp_bytes(sftp, marker_path, max_bytes=128).decode(
-            "utf-8", errors="strict"
-        ).strip()
+        marker = (
+            self._read_sftp_bytes(sftp, marker_path, max_bytes=128)
+            .decode("utf-8", errors="strict")
+            .strip()
+        )
         if marker != run_id:
             raise SSHBackendError("Run marker does not match; refusing automatic deletion")
 
@@ -2964,9 +2884,7 @@ class SSHBackend:
             return
 
         self._assert_remote_run_creation(sftp, run_base, run_id)
-        self._delete_remote_run_root_connection(
-            client, sftp, run_base, run_id
-        )
+        self._delete_remote_run_root_connection(client, sftp, run_base, run_id)
 
     def _remove_pristine_remote_run_creation(
         self,
@@ -2975,9 +2893,7 @@ class SSHBackend:
         paths: dict[str, str],
     ) -> None:
         root_attr = sftp.lstat(paths["root"])
-        if stat_module.S_ISLNK(root_attr.st_mode) or not stat_module.S_ISDIR(
-            root_attr.st_mode
-        ):
+        if stat_module.S_ISLNK(root_attr.st_mode) or not stat_module.S_ISDIR(root_attr.st_mode):
             raise SSHBackendError("Remote Run creation staging is invalid")
         if posixpath.normpath(sftp.normalize(paths["root"])) != paths["root"]:
             raise SSHBackendError("Remote Run creation staging is not canonical")
@@ -2991,9 +2907,9 @@ class SSHBackend:
             command = (
                 "set -eu; "
                 f"cd -- {quoted_base}; "
-                f"test \"$(pwd -P)\" = {quoted_base}; "
+                f'test "$(pwd -P)" = {quoted_base}; '
                 f"test ! -L {quoted_leaf}; test -d {quoted_leaf}; "
-                f"test -z \"$(ls -A -- {quoted_leaf})\"; "
+                f'test -z "$(ls -A -- {quoted_leaf})"; '
                 f"rmdir -- {quoted_leaf}"
             )
             self._exec_remote_run_bash(client, command)
@@ -3001,9 +2917,7 @@ class SSHBackend:
                 raise SSHBackendError("Remote Run creation staging still exists")
             return
         if len(root_entries) != 1 or root_entries[0].filename != ".termroom":
-            raise SSHBackendError(
-                "Remote Run creation staging contains unexpected files"
-            )
+            raise SSHBackendError("Remote Run creation staging contains unexpected files")
 
         metadata_attr = sftp.lstat(paths["metadata"])
         if stat_module.S_ISLNK(metadata_attr.st_mode) or not stat_module.S_ISDIR(
@@ -3021,9 +2935,7 @@ class SSHBackend:
                 or stat_module.S_ISLNK(child.st_mode)
                 or not stat_module.S_ISREG(child.st_mode)
             ):
-                raise SSHBackendError(
-                    "Remote Run creation metadata contains unexpected files"
-                )
+                raise SSHBackendError("Remote Run creation metadata contains unexpected files")
             marker_temporaries.append(name)
 
         quoted_root = shlex.quote(paths["root"])
@@ -3039,21 +2951,21 @@ class SSHBackend:
         command = (
             "set -eu; "
             f"cd -- {quoted_base}; "
-            f"test \"$(pwd -P)\" = {quoted_base}; "
+            f'test "$(pwd -P)" = {quoted_base}; '
             f"test ! -L {quoted_leaf}; "
             f"cd -- {quoted_leaf}; "
-            f"test \"$(pwd -P)\" = {quoted_root}; "
+            f'test "$(pwd -P)" = {quoted_root}; '
             "test ! -L .termroom; test -d .termroom; "
-            "test \"$(ls -A -- .)\" = .termroom; "
+            'test "$(ls -A -- .)" = .termroom; '
             "cd -- .termroom; "
-            f"test \"$(pwd -P)\" = {quoted_metadata}; "
+            f'test "$(pwd -P)" = {quoted_metadata}; '
             f"{remove_temporaries} "
-            "test -z \"$(ls -A -- .)\"; "
+            'test -z "$(ls -A -- .)"; '
             "cd -- ..; "
-            f"test \"$(pwd -P)\" = {quoted_root}; "
+            f'test "$(pwd -P)" = {quoted_root}; '
             "rmdir -- .termroom; "
             "cd -- ..; "
-            f"test \"$(pwd -P)\" = {quoted_base}; "
+            f'test "$(pwd -P)" = {quoted_base}; '
             f"rmdir -- {quoted_leaf}"
         )
         self._exec_remote_run_bash(client, command)
@@ -3079,8 +2991,8 @@ class SSHBackend:
         command = (
             "set -eu; "
             f"cd -- {quoted_root}; "
-            f"test \"$(pwd -P)\" = {quoted_root}; "
-            f"test \"$(cat -- .termroom/marker)\" = {quoted_run_id}; "
+            f'test "$(pwd -P)" = {quoted_root}; '
+            f'test "$(cat -- .termroom/marker)" = {quoted_run_id}; '
             "rm -rf -- work.tmp; "
             "test ! -e work.tmp; test ! -L work.tmp"
         )
@@ -3106,18 +3018,16 @@ class SSHBackend:
         self._assert_remote_run_deletion_marker(sftp, run_base, run_id)
         quoted_base = shlex.quote(run_base)
         quoted_leaf = shlex.quote(leaf)
-        marker_leaf = posixpath.basename(
-            self._remote_run_deletion_marker(run_base, run_id)
-        )
+        marker_leaf = posixpath.basename(self._remote_run_deletion_marker(run_base, run_id))
         quoted_marker = shlex.quote(marker_leaf)
         quoted_run_id = shlex.quote(run_id)
         command = (
             "set -eu; "
             f"cd -- {quoted_base}; "
-            f"test \"$(pwd -P)\" = {quoted_base}; "
+            f'test "$(pwd -P)" = {quoted_base}; '
             f"test ! -L {quoted_leaf}; "
             f"test -d {quoted_leaf}; "
-            f"test \"$(cat -- {quoted_marker})\" = {quoted_run_id}; "
+            f'test "$(cat -- {quoted_marker})" = {quoted_run_id}; '
             f"rm -rf -- {quoted_leaf}; "
             f"test ! -e {quoted_leaf}; test ! -L {quoted_leaf}"
         )
@@ -3137,13 +3047,9 @@ class SSHBackend:
         *,
         expected_directory: bool,
     ) -> tuple[str, paramiko.SFTPAttributes]:
-        relative = self._validate_run_relative_path(
-            relative_path, directory=expected_directory
-        )
+        relative = self._validate_run_relative_path(relative_path, directory=expected_directory)
         root_attr = sftp.lstat(root)
-        if stat_module.S_ISLNK(root_attr.st_mode) or not stat_module.S_ISDIR(
-            root_attr.st_mode
-        ):
+        if stat_module.S_ISLNK(root_attr.st_mode) or not stat_module.S_ISDIR(root_attr.st_mode):
             raise SSHBackendError("Remote tree root is not a real directory")
         canonical_root = posixpath.normpath(sftp.normalize(root))
         if canonical_root != posixpath.normpath(root):
@@ -3180,9 +3086,7 @@ class SSHBackend:
         if relative == ".":
             raise ValueError("A snapshot entry cannot replace its root")
         root_attr = sftp.lstat(root)
-        if stat_module.S_ISLNK(root_attr.st_mode) or not stat_module.S_ISDIR(
-            root_attr.st_mode
-        ):
+        if stat_module.S_ISLNK(root_attr.st_mode) or not stat_module.S_ISDIR(root_attr.st_mode):
             raise SSHBackendError("Remote snapshot root is invalid")
         current = root
         parts = relative.split("/")
@@ -3200,9 +3104,7 @@ class SSHBackend:
         return posixpath.join(current, parts[-1])
 
     @staticmethod
-    def _ensure_remote_directory(
-        sftp: paramiko.SFTPClient, path: str, *, mode: int
-    ) -> None:
+    def _ensure_remote_directory(sftp: paramiko.SFTPClient, path: str, *, mode: int) -> None:
         try:
             attr = sftp.lstat(path)
         except FileNotFoundError:
@@ -3273,8 +3175,8 @@ class SSHBackend:
         command = (
             "command -v tmux >/dev/null 2>&1 || exit 45; "
             f"for session in {sessions}; do "
-            "tmux has-session -t \"$session\" 2>/dev/null || continue; "
-            "tmux list-windows -t \"$session\" "
+            'tmux has-session -t "$session" 2>/dev/null || continue; '
+            'tmux list-windows -t "$session" '
             f"-F {shlex.quote(TMUX_TERMINAL_RECORD_FORMAT)}; "
             "done"
         )
@@ -3312,9 +3214,7 @@ class SSHBackend:
             "LC_ALL=C ps -eo pid=,ppid=,pcpu=,rss="
         )
         try:
-            output = self._exec(
-                self._computer(workspace), self._remote_posix_command(command)
-            )
+            output = self._exec(self._computer(workspace), self._remote_posix_command(command))
         except SSHCommandStatusUnknown as exc:
             raise WorkspaceUsageStale() from exc
         except SSHBackendError as exc:
@@ -3350,19 +3250,13 @@ class SSHBackend:
         )
         self._exec(self._computer(workspace), command)
         terminals = self.ensure_workspace(workspace)
-        terminal = next(
-            (item for item in terminals if item["tmux_window"] == tmux_window), None
-        )
+        terminal = next((item for item in terminals if item["tmux_window"] == tmux_window), None)
         if terminal is None:
-            raise SSHBackendError(
-                "Managed Terminal disappeared while recording identity"
-            )
+            raise SSHBackendError("Managed Terminal disappeared while recording identity")
         return terminal
 
     @staticmethod
-    def _file_run_metadata_paths(
-        home: str, workspace_id: str, run_id: str
-    ) -> dict[str, str]:
+    def _file_run_metadata_paths(home: str, workspace_id: str, run_id: str) -> dict[str, str]:
         root = posixpath.join(home, ".termroom-file-runs")
         workspace_root = posixpath.join(root, workspace_id)
         metadata = posixpath.join(workspace_root, run_id)
@@ -3380,9 +3274,7 @@ class SSHBackend:
         }
 
     @staticmethod
-    def _ensure_private_file_run_directory(
-        sftp: paramiko.SFTPClient, path: str
-    ) -> None:
+    def _ensure_private_file_run_directory(sftp: paramiko.SFTPClient, path: str) -> None:
         try:
             attr = sftp.lstat(path)
         except OSError as exc:
@@ -3412,22 +3304,20 @@ class SSHBackend:
             current = posixpath.join(current, component)
             self._ensure_private_file_run_directory(sftp, current)
             if posixpath.normpath(sftp.normalize(current)) != current:
-                raise SSHBackendError(
-                    "Remote File Run metadata path is not canonical"
-                )
+                raise SSHBackendError("Remote File Run metadata path is not canonical")
         try:
-            existing = self._read_sftp_bytes(
-                sftp, paths["request_id"], max_bytes=128
-            ).decode("utf-8").strip()
+            existing = (
+                self._read_sftp_bytes(sftp, paths["request_id"], max_bytes=128)
+                .decode("utf-8")
+                .strip()
+            )
         except OSError as exc:
             if not self._is_missing_sftp_error(exc):
                 raise
             existing = ""
         if existing and existing != run_id:
             raise SSHBackendError("Remote File Run metadata identity does not match")
-        self._sftp_atomic_write(
-            sftp, paths["request_id"], (run_id + "\n").encode("utf-8")
-        )
+        self._sftp_atomic_write(sftp, paths["request_id"], (run_id + "\n").encode("utf-8"))
         self._sftp_atomic_write(
             sftp,
             paths["wrapper"],
@@ -3507,9 +3397,7 @@ class SSHBackend:
                 self.ensure_workspace(workspace)
                 windows = self._remote_file_run_windows(client, workspace)
             self.store.reconcile_terminals(str(workspace["id"]), windows)
-            terminal = next(
-                (item for item in windows if item.get("role") == "file_run"), None
-            )
+            terminal = next((item for item in windows if item.get("role") == "file_run"), None)
             created = terminal is None
             if terminal is None:
                 safe_name = "Run"
@@ -3521,13 +3409,9 @@ class SSHBackend:
                 window_id = self._exec_client(client, create_command).strip()
                 terminal = {"tmux_window": window_id}
             else:
-                pane = self._remote_file_run_pane(
-                    client, str(terminal["tmux_window"])
-                )
+                pane = self._remote_file_run_pane(client, str(terminal["tmux_window"]))
                 if pane is not None and not pane["dead"]:
-                    raise SSHBackendError(
-                        "The managed File Run Terminal is still active"
-                    )
+                    raise SSHBackendError("The managed File Run Terminal is still active")
 
             tmux_window = str(terminal["tmux_window"])
             previous_role = str(terminal.get("role") or "shell")
@@ -3550,10 +3434,10 @@ class SSHBackend:
             ]
             quoted_target = shlex.quote(tmux_window)
             identity_matches = (
-                f"test \"$(tmux show-options -wv -t {quoted_target} "
-                f"{TMUX_TERMINAL_ROLE_OPTION})\" = file_run && "
-                f"test \"$(tmux show-options -wv -t {quoted_target} "
-                f"{TMUX_MANAGED_RUN_OPTION})\" = {shlex.quote(run_id)}"
+                f'test "$(tmux show-options -wv -t {quoted_target} '
+                f'{TMUX_TERMINAL_ROLE_OPTION})" = file_run && '
+                f'test "$(tmux show-options -wv -t {quoted_target} '
+                f'{TMUX_MANAGED_RUN_OPTION})" = {shlex.quote(run_id)}'
             )
             if created:
                 rollback = f"tmux kill-window -t {quoted_target} >/dev/null 2>&1 || true"
@@ -3569,8 +3453,7 @@ class SSHBackend:
                     f"tmux set-window-option -t {quoted_target} "
                     f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(previous_run_id)}"
                     if previous_run_id
-                    else f"tmux set-window-option -u -t {quoted_target} "
-                    f"{TMUX_MANAGED_RUN_OPTION}"
+                    else f"tmux set-window-option -u -t {quoted_target} {TMUX_MANAGED_RUN_OPTION}"
                 )
                 rollback = (
                     f"tmux set-window-option -t {quoted_target} "
@@ -3586,7 +3469,7 @@ class SSHBackend:
                 f"tmux set-window-option -t {quoted_target} "
                 f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(run_id)}; "
                 f"if {shlex.join(tokens)}; then :; else "
-                f"status=$?; {rollback_if_owned}; exit \"$status\"; fi"
+                f'status=$?; {rollback_if_owned}; exit "$status"; fi'
             )
             self._exec_client(client, self._remote_posix_command(command))
         finally:
@@ -3597,8 +3480,7 @@ class SSHBackend:
             (
                 item
                 for item in terminals
-                if item.get("role") == "file_run"
-                and item.get("managed_run_id") == run_id
+                if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
             ),
             None,
         )
@@ -3616,13 +3498,9 @@ class SSHBackend:
         try:
             home = posixpath.normpath(sftp.normalize("."))
             paths = self._file_run_metadata_paths(home, str(workspace["id"]), run_id)
-            completion_raw, completion_valid = self._read_sftp_json(
-                sftp, paths["completion"]
-            )
+            completion_raw, completion_valid = self._read_sftp_json(sftp, paths["completion"])
             completion = (
-                self._valid_file_run_record(completion_raw, run_id)
-                if completion_valid
-                else None
+                self._valid_file_run_record(completion_raw, run_id) if completion_valid else None
             )
             if completion is not None and isinstance(completion.get("exit_code"), int):
                 return {
@@ -3634,11 +3512,7 @@ class SSHBackend:
                     "exit_code": int(completion["exit_code"]),
                 }
             prepare_raw, prepare_valid = self._read_sftp_json(sftp, paths["prepare"])
-            prepare = (
-                self._valid_file_run_record(prepare_raw, run_id)
-                if prepare_valid
-                else None
-            )
+            prepare = self._valid_file_run_record(prepare_raw, run_id) if prepare_valid else None
             if prepare is not None and prepare.get("state") == "failed":
                 return {
                     "state": "failed",
@@ -3654,9 +3528,7 @@ class SSHBackend:
                 return {"state": "lost", "error_code": "managed_terminal_missing"}
             pane = self._remote_file_run_pane(client, str(slot["tmux_window"]))
             state_raw, state_valid = self._read_sftp_json(sftp, paths["state"])
-            state = (
-                self._valid_file_run_record(state_raw, run_id) if state_valid else None
-            )
+            state = self._valid_file_run_record(state_raw, run_id) if state_valid else None
             if pane is not None and not pane["dead"]:
                 return {
                     "state": "running"
@@ -3702,28 +3574,27 @@ class SSHBackend:
                 (
                     item
                     for item in windows
-                    if item.get("role") == "file_run"
-                    and item.get("managed_run_id") == run_id
+                    if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
                 ),
                 None,
             )
             if slot is None:
                 return False
-            requested_at = (
-                datetime.now(UTC).isoformat(timespec="microseconds") + "\n"
-            ).encode("utf-8")
+            requested_at = (datetime.now(UTC).isoformat(timespec="microseconds") + "\n").encode(
+                "utf-8"
+            )
             self._sftp_atomic_write(sftp, paths["stop"], requested_at)
             target = shlex.quote(str(slot["tmux_window"]))
             verification = (
-                f"test \"$(tmux show-options -wv -t {target} "
-                f"{TMUX_TERMINAL_ROLE_OPTION})\" = file_run && "
-                f"test \"$(tmux show-options -wv -t {target} "
-                f"{TMUX_MANAGED_RUN_OPTION})\" = {shlex.quote(run_id)}"
+                f'test "$(tmux show-options -wv -t {target} '
+                f'{TMUX_TERMINAL_ROLE_OPTION})" = file_run && '
+                f'test "$(tmux show-options -wv -t {target} '
+                f'{TMUX_MANAGED_RUN_OPTION})" = {shlex.quote(run_id)}'
             )
             if force:
                 action = (
                     f"pid=$(tmux display-message -p -t {target} '#{{pane_pid}}'); "
-                    "test -n \"$pid\" && kill -KILL -\"$pid\" 2>/dev/null"
+                    'test -n "$pid" && kill -KILL -"$pid" 2>/dev/null'
                 )
             else:
                 action = f"tmux send-keys -t {target} C-c"
@@ -3733,9 +3604,7 @@ class SSHBackend:
                 "else printf 'not-sent\\n'; fi; "
                 "else printf 'not-sent\\n'; fi"
             )
-            output = self._exec_client(
-                client, self._remote_posix_command(command)
-            )
+            output = self._exec_client(client, self._remote_posix_command(command))
             sent = output.strip() == "sent"
             if sent and force:
                 self._sftp_atomic_write(sftp, paths["force"], requested_at)
@@ -3744,9 +3613,7 @@ class SSHBackend:
             sftp.close()
             client.close()
 
-    def interrupt_file_run(
-        self, workspace: dict[str, Any], *, run_id: str
-    ) -> bool:
+    def interrupt_file_run(self, workspace: dict[str, Any], *, run_id: str) -> bool:
         return self._control_remote_file_run(workspace, run_id=run_id, force=False)
 
     def kill_file_run(self, workspace: dict[str, Any], *, run_id: str) -> bool:
@@ -3772,6 +3639,226 @@ class SSHBackend:
         )
         window_id = self._exec(computer, command).strip()
         return self.store.create_terminal(str(workspace["id"]), safe_name, window_id)
+
+    def open_terminal_editor(
+        self, workspace: dict[str, Any], relative_path: str
+    ) -> dict[str, Any]:
+        normalized = normalize_terminal_editor_path(relative_path)
+        target = self._remote_path(workspace, normalized)
+        digest = terminal_editor_digest(normalized)
+
+        with self._workspace_command_lock(str(workspace["id"])):
+            terminals = self.ensure_workspace(workspace)
+            computer = self._computer(workspace)
+            session = str(workspace["tmux_session"])
+            try:
+                self._exec(
+                    computer,
+                    "command -v nvim >/dev/null 2>&1 || "
+                    "command -v vim >/dev/null 2>&1 || "
+                    "command -v vi >/dev/null 2>&1 || "
+                    "{ printf '%s\\n' '__TERMROOM_NO_VIM__' >&2; exit 127; }",
+                )
+            except SSHBackendError as exc:
+                if "__TERMROOM_NO_VIM__" in str(exc):
+                    raise SSHBackendError(
+                        "Install Neovim or Vim on the remote computer to edit files"
+                    ) from exc
+                raise
+            listed = self._exec(
+                computer,
+                "tmux list-windows "
+                f"-t {shlex.quote(session)} "
+                f"-F {shlex.quote(TMUX_TERMINAL_EDITOR_RECORD_FORMAT)}",
+            )
+            try:
+                records = parse_tmux_terminal_editor_records(listed)
+            except ValueError as exc:
+                raise SSHBackendError(str(exc)) from exc
+            existing = next((item for item in records if item["digest"] == digest), None)
+            if existing is not None and not existing["dead"]:
+                terminal = next(
+                    (
+                        item
+                        for item in terminals
+                        if item["tmux_window"] == existing["tmux_window"]
+                    ),
+                    None,
+                )
+                if terminal is None:
+                    raise SSHBackendError("Vim Terminal is missing")
+                return terminal
+            if existing is not None:
+                self._exec(
+                    computer,
+                    "tmux kill-window "
+                    f"-t {shlex.quote(str(existing['tmux_window']))}",
+                )
+
+            create = " ".join(
+                (
+                    "tmux new-window -d -P -F '#{window_id}'",
+                    "-e",
+                    shlex.quote(f"TERMROOM_TERMINAL_EDITOR_FILE={target}"),
+                    "-e",
+                    shlex.quote(f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}"),
+                    "-t",
+                    shlex.quote(session),
+                    "-n",
+                    shlex.quote(
+                        normalize_terminal_name(
+                            f"vim-{PurePosixPath(normalized).name}"
+                        )
+                    ),
+                    "-c",
+                    shlex.quote(self._remote_root(workspace)),
+                    shlex.quote(TERMINAL_EDITOR_WRAPPER),
+                )
+            )
+            readiness_attempts = max(
+                1,
+                int(
+                    WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
+                    / WORKSPACE_COMMAND_READY_POLL_SECONDS
+                ),
+            )
+            start = (
+                f"window=$({create}) || exit $?; attempt=0; "
+                f'while test "$attempt" -lt {readiness_attempts}; do '
+                'ready=$(tmux display-message -p -t "$window" '
+                f"{shlex.quote(f'#{{{TMUX_TERMINAL_EDITOR_DIGEST_OPTION}}}')} "
+                "2>/dev/null || true); "
+                f"if test \"$ready\" = {shlex.quote(digest)}; then "
+                "printf '%s\\n' \"$window\"; exit 0; fi; "
+                "attempt=$((attempt + 1)); "
+                f"sleep {WORKSPACE_COMMAND_READY_POLL_SECONDS}; done; "
+                'tmux kill-window -t "$window" 2>/dev/null || true; exit 1'
+            )
+            window = self._exec(computer, start).strip()
+            terminals = self.ensure_workspace(workspace)
+            terminal = next(
+                (item for item in terminals if item["tmux_window"] == window), None
+            )
+            if terminal is None:
+                raise SSHBackendError("Vim Terminal disappeared while starting")
+            return terminal
+
+    def _workspace_command_lock(self, workspace_id: str) -> threading.RLock:
+        with self._workspace_command_locks_guard:
+            return self._workspace_command_locks.setdefault(workspace_id, threading.RLock())
+
+    def run_workspace_command(
+        self,
+        workspace: dict[str, Any],
+        *,
+        slot: int,
+        command: str,
+        launch_id: str,
+    ) -> dict[str, Any]:
+        with self._workspace_command_lock(str(workspace["id"])):
+            return self._run_workspace_command_locked(
+                workspace,
+                slot=slot,
+                command=command,
+                launch_id=launch_id,
+            )
+
+    def _run_workspace_command_locked(
+        self,
+        workspace: dict[str, Any],
+        *,
+        slot: int,
+        command: str,
+        launch_id: str,
+    ) -> dict[str, Any]:
+        safe_slot = validate_workspace_command_slot(slot)
+        safe_command = normalize_workspace_command(command)
+        safe_launch = validate_workspace_command_launch(launch_id)
+        digest = workspace_command_digest(safe_command)
+        terminals = self.ensure_workspace(workspace)
+        computer = self._computer(workspace)
+        session = str(workspace["tmux_session"])
+        listed = self._exec(
+            computer,
+            "tmux list-windows "
+            f"-t {shlex.quote(session)} "
+            f"-F {shlex.quote(TMUX_WORKSPACE_COMMAND_RECORD_FORMAT)}",
+        )
+        try:
+            records = parse_tmux_workspace_command_records(listed)
+        except ValueError as exc:
+            raise SSHBackendError(str(exc)) from exc
+        existing = next((item for item in records if item["slot"] == safe_slot), None)
+        if existing is not None:
+            terminal = next(
+                (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
+                None,
+            )
+            if terminal is None:
+                raise SSHBackendError("Workspace command Terminal is missing")
+            if existing["launch_id"] == safe_launch:
+                if existing["digest"] != digest:
+                    raise SSHBackendError(
+                        "Workspace command launch identity was reused for another command"
+                    )
+                return terminal
+            if not existing["dead"]:
+                return terminal
+            self._exec(
+                computer,
+                f"tmux kill-window -t {shlex.quote(str(existing['tmux_window']))}",
+            )
+
+        create = " ".join(
+            (
+                "tmux new-window -d -P -F '#{window_id}'",
+                "-e",
+                shlex.quote(f"TERMROOM_WORKSPACE_COMMAND={safe_command}"),
+                "-e",
+                shlex.quote(f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}"),
+                "-e",
+                shlex.quote(f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}"),
+                "-e",
+                shlex.quote(f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}"),
+                "-t",
+                shlex.quote(session),
+                "-n",
+                shlex.quote(f"run-{safe_slot + 1}"),
+                "-c",
+                shlex.quote(self._remote_root(workspace)),
+                shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+            )
+        )
+        readiness_format = "|".join(
+            (
+                f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}",
+                f"#{{{TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION}}}",
+                f"#{{{TMUX_WORKSPACE_COMMAND_DIGEST_OPTION}}}",
+            )
+        )
+        expected_readiness = f"{safe_slot}|{safe_launch}|{digest}"
+        readiness_attempts = max(
+            1,
+            int(WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS / WORKSPACE_COMMAND_READY_POLL_SECONDS),
+        )
+        start = (
+            f"window=$({create}) || exit $?; "
+            "attempt=0; "
+            f'while test "$attempt" -lt {readiness_attempts}; do '
+            'ready=$(tmux display-message -p -t "$window" '
+            f"{shlex.quote(readiness_format)} 2>/dev/null || true); "
+            f'if test "$ready" = {shlex.quote(expected_readiness)}; then '
+            "printf '%s\\n' \"$window\"; exit 0; fi; "
+            "attempt=$((attempt + 1)); "
+            f"sleep {WORKSPACE_COMMAND_READY_POLL_SECONDS}; done; "
+            'tmux kill-window -t "$window" 2>/dev/null || true; exit 1'
+        )
+        window = self._exec(computer, start).strip()
+        terminals = self.ensure_workspace(workspace)
+        terminal = next((item for item in terminals if item["tmux_window"] == window), None)
+        if terminal is None:
+            raise SSHBackendError("Workspace command Terminal disappeared while starting")
+        return terminal
 
     def rename_terminal(
         self, workspace: dict[str, Any], terminal: dict[str, Any], name: str
@@ -3825,9 +3912,15 @@ class SSHBackend:
         terminal_id = str(terminal["id"])
         client_id = self.control.register(terminal_id)
         view_session = tmux_browser_view_session(client_id)
-        process_pid, master_fd = self._spawn_ssh_tmux_client(
-            workspace, terminal, view_session
-        )
+        try:
+            process_pid, master_fd = self._spawn_ssh_tmux_client(
+                workspace, terminal, view_session
+            )
+        except Exception:
+            self.control.unregister(terminal_id, client_id)
+            self._forget_ssh_browser_grid_owner(terminal_id, client_id)
+            raise
+        last_viewport: tuple[int, int] | None = None
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
@@ -3838,7 +3931,7 @@ class SSHBackend:
                     tail = decoder.feed(b"", final=True)
                     if tail:
                         await asyncio.to_thread(
-                            self.store.touch_terminal_output, terminal_id
+                            touch_terminal_output_if_present, self.store, terminal_id
                         )
                         await websocket.send_text(tail)
                     return
@@ -3846,16 +3939,65 @@ class SSHBackend:
                     tail = decoder.feed(b"", final=True)
                     if tail:
                         await asyncio.to_thread(
-                            self.store.touch_terminal_output, terminal_id
+                            touch_terminal_output_if_present, self.store, terminal_id
                         )
                         await websocket.send_text(tail)
                     return
                 decoded = decoder.feed(chunk)
                 if decoded:
                     await asyncio.to_thread(
-                        self.store.touch_terminal_output, terminal_id
+                        touch_terminal_output_if_present, self.store, terminal_id
                     )
                     await websocket.send_text(decoded)
+
+        async def resize_browser_view(payload: dict[str, Any]) -> None:
+            nonlocal last_viewport
+            if "rows" not in payload or "cols" not in payload:
+                return
+            size = terminal_size(payload)
+            if size is None:
+                return
+            rows, cols = size
+            controls_grid, grid_resize = self.control.resize_plan(
+                terminal_id, client_id, rows=rows, cols=cols
+            )
+            role_changed = await asyncio.to_thread(
+                self._ssh_browser_grid_role_changed,
+                terminal_id,
+                client_id,
+                enabled=controls_grid,
+            )
+            if role_changed:
+                changed = await asyncio.to_thread(
+                    self._sync_ssh_browser_grid_role,
+                    terminal_id,
+                    client_id,
+                    workspace,
+                    view_session,
+                    enabled=controls_grid,
+                )
+                if not changed:
+                    return
+            if controls_grid and not self.control.can_resize(terminal_id, client_id):
+                changed = await asyncio.to_thread(
+                    self._sync_ssh_browser_grid_role,
+                    terminal_id,
+                    client_id,
+                    workspace,
+                    view_session,
+                    enabled=False,
+                )
+                if not changed:
+                    return
+                controls_grid = False
+                grid_resize = False
+            viewport = (rows, cols)
+            if viewport == last_viewport and not grid_resize:
+                return
+            self._set_window_size(master_fd, rows=rows, cols=cols)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process_pid, signal.SIGWINCH)
+            last_viewport = viewport
 
         async def browser_to_input() -> None:
             while True:
@@ -3868,6 +4010,10 @@ class SSHBackend:
                         await websocket.close(code=1009, reason="Terminal input is too large")
                         return
                     self.control.mark_input(terminal_id, client_id, device_id)
+                    if last_viewport is not None:
+                        await resize_browser_view(
+                            {"rows": last_viewport[0], "cols": last_viewport[1]}
+                        )
                     os.write(master_fd, payload_bytes)
                     continue
                 raw = message.get("text") or ""
@@ -3877,15 +4023,12 @@ class SSHBackend:
                 try:
                     payload = json.loads(raw)
                 except json.JSONDecodeError:
-                    self.control.mark_input(terminal_id, client_id, device_id)
                     os.write(master_fd, raw.encode())
                     continue
                 if not isinstance(payload, dict):
                     continue
                 kind = payload.get("kind")
-                if kind == "claim":
-                    self.control.claim_view(terminal_id, client_id)
-                elif kind == "activity_ack":
+                if kind == "activity_ack":
                     revision = payload.get("activity_at")
                     if isinstance(revision, bool) or not isinstance(revision, int):
                         continue
@@ -3899,17 +4042,10 @@ class SSHBackend:
                     except (KeyError, ValueError):
                         continue
                 elif kind == "resize":
-                    if not self.control.can_resize(terminal_id, client_id):
-                        continue
-                    size = terminal_size(payload)
-                    if size is None:
-                        continue
-                    rows, cols = size
-                    self._set_window_size(master_fd, rows=rows, cols=cols)
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process_pid, signal.SIGWINCH)
+                    await resize_browser_view(payload)
                 elif kind == "command":
                     self.control.mark_input(terminal_id, client_id, device_id)
+                    await resize_browser_view(payload)
                     command = str(payload.get("data", ""))
                     await asyncio.to_thread(
                         self.store.add_command,
@@ -3919,7 +4055,9 @@ class SSHBackend:
                     )
                     os.write(master_fd, command.encode() + b"\r")
                 elif kind == "input":
-                    self.control.mark_input(terminal_id, client_id, device_id)
+                    if terminal_input_claims_grid(payload):
+                        self.control.mark_input(terminal_id, client_id, device_id)
+                    await resize_browser_view(payload)
                     os.write(master_fd, str(payload.get("data", "")).encode())
 
         output_task = asyncio.create_task(output_to_browser())
@@ -3935,6 +4073,7 @@ class SSHBackend:
                     await task
         finally:
             self.control.unregister(terminal_id, client_id)
+            self._forget_ssh_browser_grid_owner(terminal_id, client_id)
             for task in (output_task, input_task):
                 if not task.done():
                     task.cancel()
@@ -3949,24 +4088,45 @@ class SSHBackend:
                 os.close(master_fd)
 
     def list_dir(
-        self, workspace: dict[str, Any], relative_path: str = "."
+        self,
+        workspace: dict[str, Any],
+        relative_path: str = ".",
+        *,
+        max_entries: int | None = None,
+        max_metadata_bytes: int | None = None,
     ) -> tuple[str, list[FileEntry]]:
+        if max_entries is not None and (type(max_entries) is not int or max_entries < 0):
+            raise ValueError("Directory entry limit is invalid")
+        if max_metadata_bytes is not None and (
+            type(max_metadata_bytes) is not int or max_metadata_bytes < 1
+        ):
+            raise ValueError("Directory metadata limit is invalid")
         client, sftp = self._sftp(workspace)
         try:
             remote, directory_attr = self._existing_sftp_path(sftp, workspace, relative_path)
             if not stat_module.S_ISDIR(directory_attr.st_mode):
                 raise NotADirectoryError(remote)
-            attributes = sftp.listdir_attr(remote)
             entries: list[FileEntry] = []
-            for attr in attributes:
+            scanned = 0
+            metadata_bytes = 0
+            for attr in sftp.listdir_iter(remote, read_aheads=1):
+                scanned += 1
+                if max_entries is not None and scanned > max_entries:
+                    raise DirectoryListingLimitError("Directory contains too many entries")
                 if stat_module.S_ISLNK(attr.st_mode):
                     continue
                 is_dir = stat_module.S_ISDIR(attr.st_mode)
                 child = posixpath.join(remote, attr.filename)
+                relative = self._relative_remote(workspace, child)
+                metadata_bytes += len(relative.encode("utf-8")) + 128
+                if max_metadata_bytes is not None and metadata_bytes > max_metadata_bytes:
+                    raise DirectoryListingLimitError(
+                        "Directory metadata exceeds the safe response limit"
+                    )
                 entries.append(
                     FileEntry(
                         name=attr.filename,
-                        relative_path=self._relative_remote(workspace, child),
+                        relative_path=relative,
                         is_dir=is_dir,
                         size=int(attr.st_size or 0),
                         mtime_ns=int(attr.st_mtime or 0) * 1_000_000_000,
@@ -4051,9 +4211,7 @@ class SSHBackend:
             try:
                 raw.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise UnsupportedFileError(
-                    "Only UTF-8 text files can be executed"
-                ) from exc
+                raise UnsupportedFileError("Only UTF-8 text files can be executed") from exc
             digest = file_digest(raw)
             if expected_digest is not None and digest != expected_digest:
                 raise FileConflictError("The file changed before execution")
@@ -4142,17 +4300,24 @@ class SSHBackend:
         try:
             remote, attr = self._existing_sftp_path(sftp, workspace, relative_path)
             temporary = f"{remote}.termroom-{uuid.uuid4().hex[:10]}"
-            if not stat_module.S_ISREG(attr.st_mode):
-                raise UnsupportedFileError("Only regular files can be saved")
-            with sftp.open(remote, "rb") as handle:
-                current = handle.read()
-            current_mtime = int(attr.st_mtime or 0) * 1_000_000_000
-            if current_mtime != expected_mtime_ns or file_digest(current) != expected_digest:
-                raise FileConflictError("The file changed after it was opened")
+
+            def require_expected_source() -> paramiko.SFTPAttributes:
+                checked, current_attr = self._existing_sftp_path(sftp, workspace, relative_path)
+                if checked != remote or not stat_module.S_ISREG(current_attr.st_mode):
+                    raise FileConflictError("The file changed after it was opened")
+                with sftp.open(checked, "rb") as current_handle:
+                    current = current_handle.read()
+                current_mtime = int(current_attr.st_mtime or 0) * 1_000_000_000
+                if current_mtime != expected_mtime_ns or file_digest(current) != expected_digest:
+                    raise FileConflictError("The file changed after it was opened")
+                return current_attr
+
+            attr = require_expected_source()
             with sftp.open(temporary, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
             sftp.chmod(temporary, int(attr.st_mode) & 0o777)
+            require_expected_source()
             try:
                 sftp.posix_rename(temporary, remote)
             except OSError as exc:
@@ -4167,9 +4332,7 @@ class SSHBackend:
             client.close()
         return self.read_text(workspace, relative_path, max_bytes)
 
-    def create(
-        self, workspace: dict[str, Any], parent: str, name: str, *, directory: bool
-    ) -> None:
+    def create(self, workspace: dict[str, Any], parent: str, name: str, *, directory: bool) -> None:
         if not name or name in {".", ".."} or "/" in name or "\\" in name:
             raise ValueError("Invalid name")
         client, sftp = self._sftp(workspace)
@@ -4281,14 +4444,28 @@ class SSHBackend:
                             raise
                     else:
                         raise FileExistsError(filename)
-            try:
-                await asyncio.to_thread(sftp.posix_rename, temporary, target)
-            except OSError as exc:
-                if exists:
-                    raise SSHBackendError(
-                        "Remote SFTP server cannot atomically overwrite this file"
-                    ) from exc
-                await asyncio.to_thread(sftp.rename, temporary, target)
+            if not overwrite:
+                try:
+                    await asyncio.to_thread(sftp.rename, temporary, target)
+                except OSError as exc:
+                    try:
+                        await asyncio.to_thread(sftp.lstat, target)
+                    except FileNotFoundError:
+                        raise exc from None
+                    except OSError as stat_exc:
+                        if getattr(stat_exc, "errno", None) == 2:
+                            raise exc from None
+                        raise
+                    raise FileExistsError(filename) from exc
+            else:
+                try:
+                    await asyncio.to_thread(sftp.posix_rename, temporary, target)
+                except OSError as exc:
+                    if exists:
+                        raise SSHBackendError(
+                            "Remote SFTP server cannot atomically overwrite this file"
+                        ) from exc
+                    await asyncio.to_thread(sftp.rename, temporary, target)
         finally:
             with contextlib.suppress(OSError):
                 await asyncio.to_thread(sftp.remove, temporary)
@@ -4354,14 +4531,28 @@ class SSHBackend:
                             raise
                     else:
                         raise FileExistsError(filename)
-            try:
-                await asyncio.to_thread(sftp.posix_rename, temporary, target)
-            except OSError as exc:
-                if exists:
-                    raise SSHBackendError(
-                        "Remote SFTP server cannot atomically overwrite this file"
-                    ) from exc
-                await asyncio.to_thread(sftp.rename, temporary, target)
+            if not overwrite:
+                try:
+                    await asyncio.to_thread(sftp.rename, temporary, target)
+                except OSError as exc:
+                    try:
+                        await asyncio.to_thread(sftp.lstat, target)
+                    except FileNotFoundError:
+                        raise exc from None
+                    except OSError as stat_exc:
+                        if getattr(stat_exc, "errno", None) == 2:
+                            raise exc from None
+                        raise
+                    raise FileExistsError(filename) from exc
+            else:
+                try:
+                    await asyncio.to_thread(sftp.posix_rename, temporary, target)
+                except OSError as exc:
+                    if exists:
+                        raise SSHBackendError(
+                            "Remote SFTP server cannot atomically overwrite this file"
+                        ) from exc
+                    await asyncio.to_thread(sftp.rename, temporary, target)
         finally:
             with contextlib.suppress(OSError):
                 await asyncio.to_thread(sftp.remove, temporary)
@@ -4497,9 +4688,7 @@ class SSHBackend:
 
         return FileService().content_type(relative_path)
 
-    def _effective_connection_target(
-        self, computer: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _effective_connection_target(self, computer: Mapping[str, Any]) -> dict[str, Any]:
         target = dict(computer)
         alias = str(computer.get("ssh_alias") or "").strip()
         if alias:
@@ -4531,9 +4720,7 @@ class SSHBackend:
             for value in computer.get("identity_files", ())
             if str(value)
         )
-        explicit_identity = os.path.expanduser(
-            str(computer.get("identity_file") or "")
-        )
+        explicit_identity = os.path.expanduser(str(computer.get("identity_file") or ""))
         if explicit_identity:
             identities = (explicit_identity,)
         identity_revisions: list[tuple[str, int | None, int | None]] = []
@@ -4567,9 +4754,7 @@ class SSHBackend:
     def _connection_active(client: paramiko.SSHClient) -> bool:
         transport = client.get_transport()
         return bool(
-            transport is not None
-            and transport.is_active()
-            and transport.is_authenticated()
+            transport is not None and transport.is_active() and transport.is_authenticated()
         )
 
     @staticmethod
@@ -4614,11 +4799,7 @@ class SSHBackend:
     def close_connections(self, computer_id: str | None = None) -> None:
         with self._ssh_pool_lock:
             if computer_id is None:
-                clients = [
-                    client
-                    for entries in self._ssh_idle.values()
-                    for client, _ in entries
-                ]
+                clients = [client for entries in self._ssh_idle.values() for client, _ in entries]
                 self._ssh_idle.clear()
                 for key in tuple(self._ssh_pool_generation):
                     self._ssh_pool_generation[key] += 1
@@ -4635,9 +4816,7 @@ class SSHBackend:
     def close(self) -> None:
         with self._ssh_pool_lock:
             self._ssh_pool_closed = True
-            clients = [
-                client for entries in self._ssh_idle.values() for client, _ in entries
-            ]
+            clients = [client for entries in self._ssh_idle.values() for client, _ in entries]
             self._ssh_idle.clear()
         self._close_clients(clients)
 
@@ -4669,9 +4848,7 @@ class SSHBackend:
         if close_client:
             client.close()
 
-    def _connect(
-        self, computer: dict[str, Any]
-    ) -> paramiko.SSHClient | _SSHClientLease:
+    def _connect(self, computer: dict[str, Any]) -> paramiko.SSHClient | _SSHClientLease:
         target = self._effective_connection_target(computer)
         if not self._reuse_connections:
             return self._connect_fresh(target)
@@ -4721,11 +4898,7 @@ class SSHBackend:
 
     @staticmethod
     def _configured_agent_key_blobs(computer: Mapping[str, Any]) -> set[bytes]:
-        raw_paths = [
-            str(value)
-            for value in computer.get("identity_files", ())
-            if str(value)
-        ]
+        raw_paths = [str(value) for value in computer.get("identity_files", ()) if str(value)]
         explicit = str(computer.get("identity_file") or "").strip()
         if explicit:
             raw_paths.insert(0, explicit)
@@ -4753,9 +4926,7 @@ class SSHBackend:
             return client
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(
-            _ExpectedHostKeyPolicy(
-                str(computer["host_key_type"]), str(computer["host_key_data"])
-            )
+            _ExpectedHostKeyPolicy(str(computer["host_key_type"]), str(computer["host_key_data"]))
         )
         configured_agent = os.path.expandvars(
             os.path.expanduser(str(computer.get("identity_agent") or ""))
@@ -4764,9 +4935,7 @@ class SSHBackend:
         agent_matches_process = not configured_agent or configured_agent == process_agent
         custom_agent: _ConfiguredAgent | None = None
         identities_only = bool(computer.get("identities_only"))
-        allowed_agent_keys = (
-            self._configured_agent_key_blobs(computer) if identities_only else None
-        )
+        allowed_agent_keys = self._configured_agent_key_blobs(computer) if identities_only else None
         agent_allowed = not bool(computer.get("identity_agent_disabled")) and (
             not identities_only or bool(allowed_agent_keys)
         )
@@ -4789,10 +4958,8 @@ class SSHBackend:
             "timeout": 10,
             "banner_timeout": 10,
             "auth_timeout": 15,
-            "allow_agent": agent_allowed
-            and (agent_matches_process or custom_agent is not None),
-            "look_for_keys": not bool(computer.get("ssh_alias"))
-            and not identities_only,
+            "allow_agent": agent_allowed and (agent_matches_process or custom_agent is not None),
+            "look_for_keys": not bool(computer.get("ssh_alias")) and not identities_only,
         }
         identities = self._configured_key_filenames(computer)
         if identities:
@@ -4815,9 +4982,7 @@ class SSHBackend:
             client.close()
             raise error from exc
         except (OSError, paramiko.SSHException) as exc:
-            error = self.connection_error(
-                exc, str(computer["host"]), int(computer["port"])
-            )
+            error = self.connection_error(exc, str(computer["host"]), int(computer["port"]))
             self._record_connection(computer, error=error)
             client.close()
             raise error from exc
@@ -4828,14 +4993,10 @@ class SSHBackend:
         self._record_connection(computer)
         return client
 
-    def _connect_password(
-        self, computer: dict[str, Any], password: str
-    ) -> paramiko.SSHClient:
+    def _connect_password(self, computer: dict[str, Any], password: str) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(
-            _ExpectedHostKeyPolicy(
-                str(computer["host_key_type"]), str(computer["host_key_data"])
-            )
+            _ExpectedHostKeyPolicy(str(computer["host_key_type"]), str(computer["host_key_data"]))
         )
         proxy = self._proxy_socket(computer)
         try:
@@ -4865,9 +5026,7 @@ class SSHBackend:
             if proxy is not None:
                 with contextlib.suppress(Exception):
                     proxy.close()
-            raise self.connection_error(
-                exc, str(computer["host"]), int(computer["port"])
-            ) from exc
+            raise self.connection_error(exc, str(computer["host"]), int(computer["port"])) from exc
         return client
 
     @staticmethod
@@ -4981,9 +5140,7 @@ class SSHBackend:
             status = stdout.channel.recv_exit_status()
         except (EOFError, OSError, paramiko.SSHException) as exc:
             SSHBackend._invalidate_client(client)
-            raise SSHCommandStatusUnknown(
-                "SSH command completion status is unknown"
-            ) from exc
+            raise SSHCommandStatusUnknown("SSH command completion status is unknown") from exc
         if status < 0:
             raise SSHCommandStatusUnknown("SSH command completion status is unknown")
         if status:
@@ -5034,12 +5191,24 @@ class SSHBackend:
         relative_path: str,
     ) -> tuple[str, paramiko.SFTPAttributes]:
         candidate = self._remote_path(workspace, relative_path)
-        attr = sftp.lstat(candidate)
-        if stat_module.S_ISLNK(attr.st_mode):
-            raise UnsupportedFileError("Symbolic links are not exposed")
+        root = self._remote_root(workspace)
+        relative = PurePosixPath(candidate).relative_to(PurePosixPath(root))
+        current = root
+        attr: paramiko.SFTPAttributes | None = None
+        for index, part in enumerate(relative.parts):
+            current = posixpath.join(current, part)
+            attr = sftp.lstat(current)
+            if stat_module.S_ISLNK(attr.st_mode):
+                raise UnsupportedFileError("Symbolic links are not exposed")
+            if index < len(relative.parts) - 1 and not stat_module.S_ISDIR(attr.st_mode):
+                raise NotADirectoryError(current)
+        if attr is None:
+            attr = sftp.lstat(root)
         canonical = sftp.normalize(candidate)
         self._ensure_remote_contained(workspace, canonical)
-        return canonical, attr
+        if posixpath.normpath(canonical) != posixpath.normpath(candidate):
+            raise UnsupportedFileError("Symbolic links are not exposed")
+        return candidate, attr
 
     def _new_sftp_path(
         self,
@@ -5050,15 +5219,10 @@ class SSHBackend:
     ) -> str:
         if not name or name in {".", ".."} or "/" in name or "\\" in name:
             raise ValueError("Invalid name")
-        parent_candidate = self._remote_path(workspace, parent)
-        parent_attr = sftp.lstat(parent_candidate)
-        if stat_module.S_ISLNK(parent_attr.st_mode) or not stat_module.S_ISDIR(
-            parent_attr.st_mode
-        ):
+        parent_candidate, parent_attr = self._existing_sftp_path(sftp, workspace, parent)
+        if not stat_module.S_ISDIR(parent_attr.st_mode):
             raise UnsupportedFileError("Upload/create parent must be a real directory")
-        canonical_parent = sftp.normalize(parent_candidate)
-        self._ensure_remote_contained(workspace, canonical_parent)
-        return posixpath.join(canonical_parent, name)
+        return posixpath.join(parent_candidate, name)
 
     def _ensure_remote_contained(self, workspace: dict[str, Any], canonical: str) -> None:
         root = posixpath.normpath(self._remote_root(workspace))
@@ -5100,14 +5264,128 @@ class SSHBackend:
             f"tmux new-session -d -s {quoted_view} -t {quoted_workspace_session} && "
             f"tmux select-window -t {quoted_window} && "
             f"trap {shlex.quote(cleanup)} EXIT HUP INT TERM; "
-            f"tmux attach-session -t {quoted_view}"
+            f"tmux attach-session -f ignore-size -t {quoted_view}"
         )
-        process_pid, master_fd = spawn_pty_process(
-            [*argv, remote_command], environment=environment
-        )
+        process_pid, master_fd = spawn_pty_process([*argv, remote_command], environment=environment)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process_pid, signal.SIGWINCH)
         return process_pid, master_fd
+
+    def _set_ssh_browser_view_grid_resize(
+        self,
+        workspace: dict[str, Any],
+        view_session: str,
+        *,
+        enabled: bool,
+    ) -> bool:
+        quoted_view = shlex.quote(view_session)
+        client_flag = shlex.quote("!ignore-size" if enabled else "ignore-size")
+        peer_update = ""
+        if enabled:
+            peer_update = (
+                'window=${target#*|}; '
+                "tmux list-clients -F '#{client_name}|#{session_name}|#{window_id}' "
+                "2>/dev/null | while IFS='|' read -r peer peer_session peer_window; do "
+                f'case "$peer_session" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
+                '[ "$peer_window" = "$window" ] || continue; '
+                '[ "$peer" = "$client" ] && continue; '
+                'if ! tmux refresh-client -t "$peer" -f ignore-size 2>/dev/null; then '
+                'current_peer_window=$(tmux display-message -p -c "$peer" '
+                "'#{window_id}' 2>/dev/null || true); "
+                '[ "$current_peer_window" != "$window" ] || exit 1; '
+                "fi; "
+                "done || exit 1; "
+            )
+        command = (
+            "attempt=0; "
+            'while [ "$attempt" -lt 20 ]; do '
+            f"target=$(tmux list-clients -t {quoted_view} "
+            "-F '#{client_name}|#{window_id}' "
+            "2>/dev/null | head -n 1); "
+            'client=${target%%|*}; '
+            'if [ -n "$client" ] && [ "$target" != "$client" ]; then '
+            f"{peer_update}"
+            f'exec tmux refresh-client -t "$client" -f {client_flag}; '
+            "fi; "
+            "attempt=$((attempt + 1)); sleep 0.05; "
+            "done; exit 1"
+        )
+        try:
+            self._exec(self._computer(workspace), command)
+        except SSHBackendError:
+            return False
+        return True
+
+    def _ssh_browser_grid_lock(self, terminal_id: str) -> threading.RLock:
+        with self._browser_grid_locks_guard:
+            return self._browser_grid_locks.setdefault(terminal_id, threading.RLock())
+
+    def _ssh_browser_grid_role_changed(
+        self,
+        terminal_id: str,
+        client_id: str,
+        *,
+        enabled: bool,
+    ) -> bool:
+        with self._ssh_browser_grid_lock(terminal_id):
+            return (self._browser_grid_owners.get(terminal_id) == client_id) != enabled
+
+    def _sync_ssh_browser_grid_role(
+        self,
+        terminal_id: str,
+        client_id: str,
+        workspace: dict[str, Any],
+        view_session: str,
+        *,
+        enabled: bool,
+    ) -> bool:
+        with self._ssh_browser_grid_lock(terminal_id):
+            current = self._browser_grid_owners.get(terminal_id)
+            if not enabled:
+                if current != client_id:
+                    return True
+                if not self._set_ssh_browser_view_grid_resize(
+                    workspace,
+                    view_session,
+                    enabled=False,
+                ):
+                    return False
+                if self._browser_grid_owners.get(terminal_id) == client_id:
+                    self._browser_grid_owners.pop(terminal_id, None)
+                return True
+            if current == client_id and self.control.can_resize(terminal_id, client_id):
+                return True
+            if not self.control.can_resize(terminal_id, client_id):
+                changed = self._set_ssh_browser_view_grid_resize(
+                    workspace,
+                    view_session,
+                    enabled=False,
+                )
+                if changed and self._browser_grid_owners.get(terminal_id) == client_id:
+                    self._browser_grid_owners.pop(terminal_id, None)
+                return changed
+            if not self._set_ssh_browser_view_grid_resize(
+                workspace,
+                view_session,
+                enabled=True,
+            ):
+                return False
+            self._browser_grid_owners[terminal_id] = client_id
+            if not self.control.can_resize(terminal_id, client_id):
+                if not self._set_ssh_browser_view_grid_resize(
+                    workspace,
+                    view_session,
+                    enabled=False,
+                ):
+                    return False
+                if self._browser_grid_owners.get(terminal_id) == client_id:
+                    self._browser_grid_owners.pop(terminal_id, None)
+            return True
+
+    def _forget_ssh_browser_grid_owner(self, terminal_id: str, client_id: str) -> None:
+        with self._ssh_browser_grid_lock(terminal_id):
+            if self._browser_grid_owners.get(terminal_id) == client_id:
+                self._browser_grid_owners.pop(terminal_id, None)
 
     def _ssh_argv(self, computer: dict[str, Any]) -> list[str]:
         target = str(computer.get("ssh_alias") or computer["host"])
@@ -5151,10 +5429,7 @@ class SSHBackend:
     def _ensure_askpass_helper(self) -> Path:
         helper = self.state_dir / "ssh" / "askpass"
         helper.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        expected = (
-            "#!/bin/sh\n"
-            f"exec {shlex.quote(sys.executable)} -m termroom.ssh_askpass \"$@\"\n"
-        )
+        expected = f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m termroom.ssh_askpass "$@"\n'
         try:
             current = helper.read_text(encoding="utf-8")
         except OSError:

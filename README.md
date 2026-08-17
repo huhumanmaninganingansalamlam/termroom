@@ -9,8 +9,8 @@ browser. `tmux` keeps terminal processes alive, so closing the browser or switch
 devices does not end the work that is already running.
 
 Termroom is aimed at workflows such as starting a long build or AI task on a laptop,
-checking it from a phone later, and working with remote Linux servers through the same
-terminal-and-files interface.
+checking it from a phone later, running a small set of explicit project commands, and
+working with remote Linux servers through the same terminal-and-files interface.
 
 > **Status: early release.** Termroom is available as a Python CLI package and the
 > project is still evolving quickly. Expect small workflow and UI changes between
@@ -23,9 +23,12 @@ terminal-and-files interface.
 - Browse, upload, download, or edit project files from the browser.
 - Move between several local projects from one interface.
 - Use SSH Linux servers and outbound-only Termroom Nodes in the same Workspace flow.
+- Save up to three explicit commands per Workspace and run them from its root.
 - Run the current Python, JavaScript, or Bash file without assembling its command by hand.
 - Send a Workspace snapshot, public HTTPS Git repository, or ZIP to another Remote and
   recover its output and result files later.
+- Download Remote Run results as a ZIP or review conflict-safe changes before bringing them
+  back to the source Workspace.
 
 Termroom is not a cloud IDE. **The real terminal processes and files stay on your Linux
 computer or on a Remote Linux computer you control.** Termroom provides the browser interface.
@@ -80,7 +83,7 @@ Store the Termroom login password once in its global configuration:
 
 ```bash
 mkdir -p ~/.config/termroom
-printf '%s\n' 'TERMROOM_PASSWORD=choose-a-password' 'TERMROOM_LOCALE=en' > ~/.config/termroom/.env
+printf '%s\n' 'TERMROOM_PASSWORD=choose-a-long-unique-password' 'TERMROOM_LOCALE=en' > ~/.config/termroom/.env
 chmod 600 ~/.config/termroom/.env
 ```
 
@@ -111,6 +114,7 @@ termroom .
 - Keep work running in `tmux` after the browser closes.
 - Create, rename, and close multiple terminals per Workspace.
 - Reopen the same terminal after reconnecting.
+- Use Vim/Neovim and other alternate-screen TUIs through the same real PTY and `tmux` path.
 - Mobile CJK/IME input and touch helper keys.
 - Optional command-editing mode for long commands.
 - Browser-local terminal font-size settings.
@@ -124,8 +128,20 @@ termroom .
 - Upload multiple files with overwrite confirmation.
 - Create files/folders, rename, and delete them.
 - Edit small text files directly in the browser.
+- Open any regular file directly in a persistent tmux Vim session; Termroom prefers
+  Neovim, then Vim/Vi, and reuses the live session for that file.
 - Preview images/PDFs, JSON/CSV, and bounded portions of large text files.
 - Use the same Files UI for local, SSH, and Termroom Node projects.
+
+### Run Workspace commands
+
+- Save up to three commands that you explicitly choose for a persistent Workspace.
+- Start them from the visible Run action at the Workspace root and reopen the managed
+  Terminal while they are running.
+- Use the tools, runtime, virtual environment, and permissions already present on that
+  computer.
+- Termroom does not infer commands from package manifests or add argument, environment,
+  task-graph, or Run Recipe configuration.
 
 ### Run the current file
 
@@ -134,7 +150,7 @@ termroom .
 - Use one managed interactive Terminal per Workspace, with exact exit status, stop, and
   force-stop controls.
 - Keep the active run attached to the saved file and recover its outcome after reconnecting.
-- Termroom does not infer project commands, install runtimes, or create environments.
+- This is a narrow file shortcut; Termroom does not install runtimes or create environments.
 
 ### Remote Run
 
@@ -144,19 +160,19 @@ termroom .
 - Keep the command alive in a dedicated remote `tmux` session when the browser disconnects.
 - Open the prepared folder through the normal Workspace Terminal and Files UI; there is no
   separate log dashboard or file viewer.
+- Download the retained execution folder as a result ZIP, including after a failed command,
+  when files remain within the configured entry, nesting, and size safety limits.
+- For a Workspace Source, preview added, modified, conflicting, and skipped files before
+  bringing eligible changes back. Apply is limited to small UTF-8 text files; a new file must
+  stay inside an existing Source directory. Termroom rechecks the current Source immediately
+  before publishing each change: existing files use atomic replace, while additions use
+  no-clobber creation. Remote deletions are never propagated. Binary, oversized,
+  non-UTF-8, newly nested, or otherwise skipped results remain available through the result ZIP
+  for manual merge. This is optimistic conflict detection, not a lock on external editors or Git.
 - Keep completed files for 24 hours, with immediate deletion available from the temporary
   Workspace header.
-- Remote Run does not configure environments, provide a sandbox, schedule jobs, or write
-  changes back to the Source.
-
-### Activity and Workspace usage
-
-- See File Run and Remote Run outcomes, Remote connection changes, unread state, and safe
-  browser notifications in one Activity view.
-- Open the exact Workspace, file, Remote Run, or Remote from an Activity item when it still
-  exists.
-- Check bounded estimates of a Workspace's CPU, memory, and process count without turning
-  Termroom into a monitoring dashboard.
+- Remote Run never configures environments, provides a sandbox, schedules jobs, continuously
+  syncs, or writes changes back automatically.
 
 ### Recent
 
@@ -166,6 +182,11 @@ termroom .
 - Exclude dependency/cache/hidden directories by default.
 - Add project-specific rules with `.termroomignore`.
 
+Activity is a compact way to return to File Run and Remote Run outcomes; it is not a Remote
+connection-history or monitoring dashboard. A Workspace menu may also show bounded CPU,
+memory, and process-count estimates when they are available. Those values are reference data,
+not resource accounting or alerts.
+
 ## The basic model
 
 In Termroom, a **Workspace is simply one project folder**.
@@ -173,6 +194,7 @@ In Termroom, a **Workspace is simply one project folder**.
 ```text
 Computer
 └─ Workspace (project folder)
+   ├─ Run (up to 3 explicit commands)
    ├─ Terminal
    ├─ Files
    └─ Recent
@@ -245,8 +267,59 @@ Termroom stores that verified path in the Node-local config and uses it for the 
 connection too; certificate verification cannot be disabled.
 
 Once paired, a compatible Node uses the same Remote picker and Workspace Terminal, Files,
-File Run, Remote Run, Activity, and recovery flows as SSH. Node requires `/bin/bash` and
-`tmux`, but no inbound SSH connection.
+Workspace Run, File Run, Remote Run, result-recovery, and reconnect flows as SSH. Node
+requires `/bin/bash` and `tmux`, but no inbound SSH connection.
+
+#### Run a Node with Docker
+
+The same official image and `compose.yaml` can run as a Node when you do not want to install
+Termroom directly on the remote Linux computer. The Node service opens no inbound port. It keeps
+configuration and Node identity in a named volume and exposes only the explicit host project
+bind mount.
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Change the single `TERMROOM_MODE` value in `.env` to `node` and set the remote-computer mount
+path. `COMPOSE_PROFILES` follows that value and does not need a separate edit:
+
+```text
+TERMROOM_MODE=node
+TERMROOM_WORKSPACES_HOST_PATH=/home/user/projects
+```
+
+With `TERMROOM_MODE=node`, the same image starts the Node process instead of the Core. Create a
+Node pairing code in the Core, run the pairing command once, then verify and approve the
+fingerprint shown in the Core:
+
+```bash
+docker compose run --rm termroom-node \
+  node --config-dir /config/node pair \
+  --core https://termroom.example \
+  --code <10-minute-one-time-code> \
+  --allow-root /workspace \
+  --name build-node
+```
+
+The pairing code expires after 10 minutes and is consumed when the pairing request is submitted,
+so do not store it in `.env`. After approval, start the long-running Node with the identity
+and configuration preserved in the named volume:
+
+```bash
+docker compose up -d --remove-orphans
+docker compose logs -f termroom-node
+```
+
+`--remove-orphans` removes the previous mode's container when the same directory switches
+between Core and Node.
+
+Do not run `termroom node install-service` in Docker. Compose's `restart: unless-stopped`
+manages the Node process. Terminals and commands run inside the Node container rather than
+directly on the host. Build a Node-specific image from the official image when the Workspace
+needs Git, Node.js, compilers, CUDA, or other additional tools. The Core URL must be an HTTPS
+address reachable from inside the container.
 
 ## Common commands
 
@@ -273,8 +346,9 @@ termroom /srv/projects --foreground --no-open
 The default bind address is `127.0.0.1`, so **only the computer running Termroom can
 connect by default.**
 
-For phones, tablets, or other computers, prefer an existing LAN, VPN/Tailscale network,
-or an HTTPS reverse proxy that you operate.
+For phones, tablets, or other computers, the recommended deployment is a private
+VPN such as Tailscale. Bind Termroom only to the interface that needs it when possible;
+`0.0.0.0` also exposes it to every reachable LAN interface.
 
 To bind to other interfaces explicitly:
 
@@ -282,14 +356,17 @@ To bind to other interfaces explicitly:
 termroom ~/projects --host 0.0.0.0
 ```
 
-Behind an HTTPS reverse proxy, enable secure cookies:
+Tailscale encrypts traffic between devices in the tailnet. A plain LAN does not:
+when using an untrusted network, put Termroom behind an HTTPS reverse proxy and enable
+secure cookies:
 
 ```bash
 termroom ~/projects --host 0.0.0.0 --secure-cookie
 ```
 
-Termroom is not designed to be exposed directly to the public internet without an
-appropriate private network or HTTPS setup.
+**Do not expose Termroom directly to the public internet.** Password login is a
+last application boundary, not a substitute for a firewall, private network, or HTTPS.
+Use a strong unique password even inside a tailnet.
 
 ## Password and configuration
 
@@ -304,6 +381,18 @@ TERMROOM_LOCALE=en
 `TERMROOM_LOCALE` controls the initial UI language for browsers that have not
 chosen a language yet. Supported values are `en` and `ko`. A language selected
 in the web UI is stored in that browser and overrides this default.
+
+Local Workspaces are enabled by default. For a Docker Core that should only open
+SSH or Termroom Node Workspaces, add this single setting to `.env`:
+
+```text
+TERMROOM_ALLOW_LOCAL_WORKSPACES=false
+```
+
+This removes local folders and Workspaces from the UI and makes their browse,
+create, open, file, and terminal routes return `404`. It does not affect SSH or
+Termroom Node Workspaces. The `./workspaces:/workspaces` bind mount can be removed
+from `compose.yaml` in this mode.
 
 Restrict the file so other users cannot read it:
 
@@ -325,7 +414,7 @@ TERMROOM_MIN_PASSWORD_LENGTH=12
 Persistent state defaults to `~/.config/termroom/`:
 
 ```text
-.env                 # optional global password / default locale
+.env                 # optional global password / locale / Workspace policy
 termroom.sqlite3
 access-token
 credential-key
@@ -337,7 +426,11 @@ Override the location with `--config-dir` or `TERMROOM_CONFIG_DIR`.
 
 SSH passwords are not stored as plaintext in project files or the SQLite DB. They are
 stored in owner-only encrypted credential files under the config directory. This is not
-a replacement for a hardware-backed vault.
+a replacement for a hardware-backed vault because the local encryption key is stored in
+the same owner-only config directory. The Termroom login password itself remains plaintext
+in `.env`; encrypting it with a key beside it would not add a meaningful security boundary.
+Termroom checks that a password-bearing `.env` is not accessible by group or other users,
+and removes `TERMROOM_PASSWORD` from the Core process environment after loading it.
 
 ## Docker Compose
 
@@ -349,9 +442,9 @@ To run the published image:
 
 ```bash
 cp .env.example .env
-# Change TERMROOM_PASSWORD
+# For the Core, keep TERMROOM_MODE=core and change TERMROOM_PASSWORD
 docker compose pull
-docker compose up -d
+docker compose up -d --remove-orphans
 ```
 
 The image is `ghcr.io/huhumanmaninganingansalamlam/termroom:latest`. Versioned tags
@@ -359,18 +452,27 @@ such as `0.1.1` and `0.1` are published as well. To build the container locally 
 the PyPI package instead, use `docker compose up -d --build`; the Dockerfile accepts
 `TERMROOM_VERSION` as a build argument.
 
-The included Compose configuration uses:
+`TERMROOM_MODE=core` in the shared `.env` selects the Core service;
+`TERMROOM_MODE=node` selects the outbound-only Node service. The included Compose configuration
+uses:
 
 - `termroom-config:/config` for persistent DB, SSH-key, and credential state
-- `./workspaces:/workspaces` for local content visible to the Core
-- `127.0.0.1:8765:8765` as the default host publish
+- `${TERMROOM_WORKSPACES_HOST_PATH}:/workspaces` for the selected host project folder
+- `127.0.0.1:8765:8765` as the default host publish in Core mode only
 
-Replace the volume or bind mount to fit your deployment.
+For an SSH/Node-only Core, keep `TERMROOM_MODE=core` and set
+`TERMROOM_ALLOW_LOCAL_WORKSPACES=false`. That Core policy is separate from
+`TERMROOM_MODE=node`, which runs this container as a Node process.
 
 ## PWA and languages
 
-Termroom includes an installable PWA manifest and icons. The Service Worker does not
-offline-cache authenticated Workspace, file, or terminal responses.
+Termroom includes a PWA manifest and icons. On a secure installation, open **Settings →
+Install Termroom** to use the browser's install prompt. On iPhone or iPad Safari, Settings
+shows the **Share → Add to Home Screen** path instead. The install action stays small and is
+hidden when Termroom is already running as an installed app.
+
+PWA installation requires HTTPS or a browser-recognized loopback secure context. The Service
+Worker does not offline-cache authenticated Workspace, file, terminal, or Run responses.
 
 The UI defaults to English. Korean is available from the language selector. Locale
 sources live in `termroom/locales/`.

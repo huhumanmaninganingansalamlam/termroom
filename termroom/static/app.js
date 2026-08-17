@@ -117,6 +117,116 @@
       .forEach((menu) => closeUserMenu(menu));
   });
 
+  const pwaInstallViews = [...document.querySelectorAll("[data-pwa-install]")];
+  if (pwaInstallViews.length) {
+    const installActions = pwaInstallViews
+      .map((view) => view.querySelector("[data-pwa-install-action]"))
+      .filter(Boolean);
+    const installHelp = pwaInstallViews
+      .map((view) => view.querySelector("[data-pwa-install-help]"))
+      .filter(Boolean);
+    const standaloneMedia = window.matchMedia?.("(display-mode: standalone)");
+    const userAgent = navigator.userAgent || "";
+    const iOSDevice = /iPad|iPhone|iPod/i.test(userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const iOSSafari = iOSDevice
+      && /Safari/i.test(userAgent)
+      && !/(CriOS|FxiOS|EdgiOS|OPiOS)/i.test(userAgent);
+    const edgeBrowser = /\bEdg\//i.test(userAgent);
+    let deferredInstallPrompt = null;
+    let installInFlight = false;
+
+    const installedStandalone = () => (
+      standaloneMedia?.matches === true || navigator.standalone === true
+    );
+    const setInstallVisibility = () => {
+      const hidden = installedStandalone();
+      pwaInstallViews.forEach((view) => { view.hidden = hidden; });
+      if (hidden) deferredInstallPrompt = null;
+    };
+    const setInstallBusy = (busy) => {
+      installInFlight = busy;
+      installActions.forEach((action) => {
+        action.disabled = busy;
+        action.setAttribute("aria-busy", busy ? "true" : "false");
+      });
+    };
+    const hideInstallHelp = () => {
+      installHelp.forEach((help) => {
+        help.hidden = true;
+        help.textContent = "";
+      });
+    };
+    const showInstallHelp = (key) => {
+      const message = tr(key);
+      installHelp.forEach((help) => {
+        help.textContent = message;
+        help.hidden = false;
+      });
+    };
+    const manualInstallHelp = () => {
+      if (iOSSafari) return "app.install_ios";
+      if (edgeBrowser) return "app.install_edge";
+      return "app.install_browser";
+    };
+
+    installActions.forEach((action) => {
+      action.addEventListener("click", async () => {
+        if (installInFlight) return;
+        if (installedStandalone()) {
+          setInstallVisibility();
+          return;
+        }
+        if (!window.isSecureContext) {
+          showInstallHelp("app.install_insecure");
+          return;
+        }
+        if (!deferredInstallPrompt) {
+          showInstallHelp(manualInstallHelp());
+          return;
+        }
+
+        const installPrompt = deferredInstallPrompt;
+        deferredInstallPrompt = null;
+        hideInstallHelp();
+        setInstallBusy(true);
+        try {
+          await installPrompt.prompt();
+          const choice = await installPrompt.userChoice;
+          showInstallHelp(
+            choice?.outcome === "accepted"
+              ? "app.install_accepted"
+              : manualInstallHelp(),
+          );
+        } catch {
+          showInstallHelp(manualInstallHelp());
+        } finally {
+          setInstallBusy(false);
+        }
+      });
+    });
+    window.addEventListener("beforeinstallprompt", (event) => {
+      event.preventDefault();
+      if (!window.isSecureContext || installedStandalone()) return;
+      deferredInstallPrompt = event;
+      hideInstallHelp();
+    });
+    window.addEventListener("appinstalled", () => {
+      deferredInstallPrompt = null;
+      hideInstallHelp();
+      pwaInstallViews.forEach((view) => { view.hidden = true; });
+    });
+    if (standaloneMedia?.addEventListener) {
+      standaloneMedia.addEventListener("change", setInstallVisibility);
+    } else {
+      standaloneMedia?.addListener?.(setInstallVisibility);
+    }
+    setInstallVisibility();
+    if (!window.isSecureContext && !installedStandalone()) {
+      showInstallHelp("app.install_insecure");
+    }
+  }
+
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
@@ -206,7 +316,8 @@
   let activityRefreshInFlight = false;
   let lastActivityRefreshAt = 0;
   const refreshActivityOnce = async ({ force = false } = {}) => {
-    if (document.hidden || activityRefreshInFlight) return;
+    const canNotifyInBackground = notificationSupported && Notification.permission === "granted";
+    if ((document.hidden && !canNotifyInBackground) || activityRefreshInFlight) return;
     const now = window.performance.now();
     if (!force && now - lastActivityRefreshAt < 750) return;
     activityRefreshInFlight = true;
@@ -221,18 +332,37 @@
       activityRefreshInFlight = false;
     }
   };
+  let activityRefreshTimer = 0;
+  const scheduleActivityRefresh = () => {
+    window.clearTimeout(activityRefreshTimer);
+    if (!notificationSupported || Notification.permission !== "granted") return;
+    const delay = document.hidden ? 30000 : 10000;
+    activityRefreshTimer = window.setTimeout(async () => {
+      try {
+        await refreshActivityOnce({ force: true });
+      } finally {
+        scheduleActivityRefresh();
+      }
+    }, delay);
+  };
   notificationButton?.addEventListener("click", async () => {
     if (!notificationSupported) return;
     const permission = await Notification.requestPermission();
     syncNotificationButton();
     if (permission === "granted") await refreshActivityOnce({ force: true });
+    scheduleActivityRefresh();
   });
   if (activityLink) {
     refreshActivityOnce({ force: true });
+    scheduleActivityRefresh();
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) refreshActivityOnce();
+      refreshActivityOnce();
+      scheduleActivityRefresh();
     });
-    window.addEventListener("focus", () => refreshActivityOnce());
+    window.addEventListener("focus", () => {
+      refreshActivityOnce();
+      scheduleActivityRefresh();
+    });
   }
   syncNotificationButton();
 
@@ -359,12 +489,185 @@
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) refreshTerminalActivity();
     });
-    window.addEventListener("focus", () => refreshTerminalActivity());
+    window.addEventListener("focus", () => {
+      refreshTerminalActivity();
+    });
     window.addEventListener(
       "termroom:terminal-activity-changed",
       syncWorkspaceTerminalUnreadFromTabs,
     );
   }
+
+  const pendingWorkspaceLinks = [
+    ...document.querySelectorAll("[data-workspace-open-pending]"),
+  ];
+  const workspaceOpenAnnouncer = document.querySelector("[data-workspace-open-announcer]");
+  const resetWorkspaceOpenPending = (link) => {
+    link.removeAttribute("aria-busy");
+    link.removeAttribute("aria-disabled");
+    delete link.dataset.workspaceOpening;
+    link.querySelectorAll("[data-workspace-open-idle]").forEach((element) => {
+      element.hidden = false;
+    });
+    const status = link.querySelector("[data-workspace-open-status]");
+    if (status?.dataset.workspaceOpenInitiallyHidden === "true") status.hidden = true;
+    const label = link.querySelector("[data-workspace-open-status-label]");
+    if (label?.dataset.workspaceOpenIdleLabel !== undefined) {
+      label.textContent = label.dataset.workspaceOpenIdleLabel;
+    }
+  };
+  pendingWorkspaceLinks.forEach((link) => {
+    const status = link.querySelector("[data-workspace-open-status]");
+    const label = link.querySelector("[data-workspace-open-status-label]");
+    if (status) status.dataset.workspaceOpenInitiallyHidden = status.hidden ? "true" : "false";
+    if (label) label.dataset.workspaceOpenIdleLabel = label.textContent || "";
+    link.addEventListener("click", (event) => {
+      const modifiedClick = event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey;
+      if (
+        event.defaultPrevented
+        || modifiedClick
+        || link.target === "_blank"
+        || link.hasAttribute("download")
+      ) {
+        return;
+      }
+      if (link.dataset.workspaceOpening === "true") {
+        event.preventDefault();
+        return;
+      }
+      link.dataset.workspaceOpening = "true";
+      link.setAttribute("aria-busy", "true");
+      link.setAttribute("aria-disabled", "true");
+      link.querySelectorAll("[data-workspace-open-idle]").forEach((element) => {
+        element.hidden = true;
+      });
+      if (status) status.hidden = false;
+      const openingLabel = link.dataset.workspaceOpeningLabel || tr("terminal.status.connecting");
+      if (label) label.textContent = openingLabel;
+      if (workspaceOpenAnnouncer) workspaceOpenAnnouncer.textContent = openingLabel;
+    });
+  });
+  window.addEventListener("pageshow", () => {
+    pendingWorkspaceLinks.forEach(resetWorkspaceOpenPending);
+    if (workspaceOpenAnnouncer) workspaceOpenAnnouncer.textContent = "";
+  });
+
+  const workspaceRunMenus = [
+    ...document.querySelectorAll("[data-workspace-run-menu]"),
+  ];
+  const closeWorkspaceRunMenu = (menu, { restoreFocus = false } = {}) => {
+    if (!(menu instanceof HTMLDetailsElement) || !menu.open) return false;
+    menu.open = false;
+    if (restoreFocus) menu.querySelector("summary")?.focus({ preventScroll: true });
+    return true;
+  };
+  workspaceRunMenus.forEach((menu) => {
+    menu.querySelector("[data-workspace-run-close]")?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeWorkspaceRunMenu(menu, { restoreFocus: true });
+    });
+  });
+  document.addEventListener("click", (event) => {
+    workspaceRunMenus
+      .filter((menu) => menu.open && !menu.contains(event.target))
+      .forEach((menu) => closeWorkspaceRunMenu(menu));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const menu = workspaceRunMenus.find((candidate) => candidate.open);
+    if (!menu) return;
+    event.preventDefault();
+    closeWorkspaceRunMenu(menu, { restoreFocus: true });
+  });
+
+  const workspaceCommandForms = [
+    ...document.querySelectorAll("[data-workspace-command-run]"),
+  ];
+  const workspaceCommandAnnouncer = document.querySelector(
+    "[data-workspace-command-announcer]",
+  );
+  const resetWorkspaceCommandPending = (form) => {
+    form.removeAttribute("aria-busy");
+    delete form.dataset.workspaceCommandStarting;
+    const button = form.querySelector('button[type="submit"]');
+    if (button) {
+      button.removeAttribute("aria-busy");
+      button.removeAttribute("aria-disabled");
+    }
+    const label = form.querySelector("[data-workspace-command-label]");
+    if (label?.dataset.workspaceCommandIdleLabel !== undefined) {
+      label.textContent = label.dataset.workspaceCommandIdleLabel;
+    }
+  };
+  workspaceCommandForms.forEach((form) => {
+    const label = form.querySelector("[data-workspace-command-label]");
+    if (label) label.dataset.workspaceCommandIdleLabel = label.textContent || "";
+    form.addEventListener("submit", (event) => {
+      if (form.dataset.workspaceCommandStarting === "true") {
+        event.preventDefault();
+        return;
+      }
+      const button = form.querySelector('button[type="submit"]');
+      const startingLabel = form.dataset.workspaceCommandStartingLabel
+        || tr("workspace.run.starting");
+      form.dataset.workspaceCommandStarting = "true";
+      form.setAttribute("aria-busy", "true");
+      if (button) {
+        button.setAttribute("aria-busy", "true");
+        button.setAttribute("aria-disabled", "true");
+      }
+      if (label) label.textContent = startingLabel;
+      if (workspaceCommandAnnouncer) {
+        workspaceCommandAnnouncer.textContent = startingLabel;
+      }
+    });
+  });
+  window.addEventListener("pageshow", () => {
+    workspaceCommandForms.forEach(resetWorkspaceCommandPending);
+    if (workspaceCommandAnnouncer) workspaceCommandAnnouncer.textContent = "";
+  });
+
+  const remoteConnectionChecks = [
+    ...document.querySelectorAll("[data-remote-connection-check]"),
+  ];
+  remoteConnectionChecks.forEach((action) => {
+    const view = action.closest("[data-remote-connection-view]");
+    const status = view?.querySelector("[data-remote-connection-status]");
+    const label = view?.querySelector("[data-remote-connection-label]");
+    if (!status || !label) return;
+    const initialClass = status.className;
+    const initialLabel = label.textContent;
+    const lastSuccess = view.querySelector("[data-remote-last-success]");
+    const markConnecting = (event) => {
+      if (
+        event.type === "click"
+        && (event.button !== 0
+          || event.metaKey
+          || event.ctrlKey
+          || event.shiftKey
+          || event.altKey)
+      ) {
+        return;
+      }
+      status.classList.remove("unchecked", "available", "unavailable");
+      status.classList.add("connecting");
+      label.textContent = action.dataset.remoteConnectingLabel
+        || tr("remote.status.connecting");
+      if (lastSuccess) lastSuccess.hidden = true;
+      action.setAttribute("aria-busy", "true");
+    };
+    action.addEventListener(action.tagName === "FORM" ? "submit" : "click", markConnecting);
+    window.addEventListener("pageshow", () => {
+      status.className = initialClass;
+      label.textContent = initialLabel;
+      if (lastSuccess) lastSuccess.hidden = false;
+      action.removeAttribute("aria-busy");
+    });
+  });
 
   const workspaceUsageViews = [...document.querySelectorAll("[data-workspace-usage-view]")];
   if (workspaceUsageViews.length) {
@@ -374,6 +677,7 @@
     });
     let usageTimer = 0;
     let lastUsage = null;
+    let usageRefreshInFlight = false;
 
     const formatAge = (seconds) => {
       const value = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -459,11 +763,15 @@
 
     const scheduleUsagePoll = (state) => {
       window.clearTimeout(usageTimer);
-      const delay = document.hidden ? 30000 : state === "fresh" ? 10000 : 5000;
+      const openView = workspaceUsageViews.some((view) => view.open && !document.hidden);
+      if (!openView) return;
+      const delay = state === "fresh" ? 10000 : 5000;
       usageTimer = window.setTimeout(pollWorkspaceUsage, delay);
     };
     const pollWorkspaceUsage = async () => {
-      if (!usageUrl) return;
+      if (!usageUrl || usageRefreshInFlight || document.hidden) return;
+      if (!workspaceUsageViews.some((view) => view.open)) return;
+      usageRefreshInFlight = true;
       let state = lastUsage?.state || "unavailable";
       try {
         const response = await fetch(usageUrl, {
@@ -483,12 +791,26 @@
             ? timestampAge(lastUsage.last_observed_at)
             : null,
         });
+      } finally {
+        usageRefreshInFlight = false;
       }
       scheduleUsagePoll(state);
     };
-    pollWorkspaceUsage();
+    workspaceUsageViews.forEach((view) => {
+      view.addEventListener("toggle", () => {
+        if (view.open) {
+          pollWorkspaceUsage();
+        } else if (!workspaceUsageViews.some((candidate) => candidate.open)) {
+          window.clearTimeout(usageTimer);
+        }
+      });
+    });
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) pollWorkspaceUsage();
+      if (document.hidden) {
+        window.clearTimeout(usageTimer);
+      } else {
+        pollWorkspaceUsage();
+      }
     });
   }
 

@@ -8,6 +8,7 @@ from termroom.node_protocol import (
     MAX_NODE_MESSAGE_BYTES,
     NODE_CAPABILITIES,
     NODE_OPTIONAL_CAPABILITIES,
+    NODE_PROTOCOL_VERSION,
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
     NODE_REQUEST_OPERATIONS,
     NODE_REQUIRED_CAPABILITIES,
@@ -24,6 +25,7 @@ from termroom.node_protocol import (
     public_key_fingerprint,
     public_key_text,
     sign_challenge,
+    validate_protocol_version,
     verify_challenge,
 )
 
@@ -85,6 +87,13 @@ def test_node_messages_and_capabilities_are_bounded_and_typed() -> None:
     assert exc_info.value.code == "message_too_large"
 
 
+def test_node_protocol_rejects_legacy_terminal_resize_contract() -> None:
+    assert NODE_PROTOCOL_VERSION == 2
+    with pytest.raises(NodeProtocolError) as exc_info:
+        validate_protocol_version(1)
+    assert exc_info.value.code == "version_incompatible"
+
+
 def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
     assert NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW == 8
     assert {"workspace", "terminal", "files"} == NODE_REQUIRED_CAPABILITIES
@@ -93,6 +102,8 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "recent",
         "remote_run",
         "remote_run_source",
+        "terminal_editor",
+        "workspace_command",
         "workspace_usage",
     } == NODE_OPTIONAL_CAPABILITIES
     assert {
@@ -103,38 +114,36 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "recent",
         "remote_run",
         "remote_run_source",
+        "terminal_editor",
+        "workspace_command",
         "workspace_usage",
     } == NODE_CAPABILITIES
     workspace_operations = {
-        operation
-        for operation in NODE_REQUEST_OPERATIONS
-        if operation.startswith("workspace.")
+        operation for operation in NODE_REQUEST_OPERATIONS if operation.startswith("workspace.")
     }
     assert workspace_operations == {
         "workspace.roots",
         "workspace.browse",
+        "workspace.command.run",
         "workspace.create_project",
         "workspace.validate",
         "workspace.ensure",
         "workspace.usage",
     }
     terminal_operations = {
-        operation
-        for operation in NODE_REQUEST_OPERATIONS
-        if operation.startswith("terminal.")
+        operation for operation in NODE_REQUEST_OPERATIONS if operation.startswith("terminal.")
     }
     assert terminal_operations == {
         "terminal.activity",
         "terminal.attach",
         "terminal.close",
         "terminal.create",
+        "terminal.editor.open",
         "terminal.rename",
         "terminal.scrollback",
     }
     file_run_operations = {
-        operation
-        for operation in NODE_REQUEST_OPERATIONS
-        if operation.startswith("file_run.")
+        operation for operation in NODE_REQUEST_OPERATIONS if operation.startswith("file_run.")
     }
     assert file_run_operations == {
         "file_run.inspect",
@@ -144,9 +153,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "file_run.kill",
     }
     remote_run_operations = {
-        operation
-        for operation in NODE_REQUEST_OPERATIONS
-        if operation.startswith("remote_run.")
+        operation for operation in NODE_REQUEST_OPERATIONS if operation.startswith("remote_run.")
     }
     assert remote_run_operations == {
         "remote_run.preflight",

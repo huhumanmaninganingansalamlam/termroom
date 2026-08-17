@@ -17,11 +17,13 @@ from termroom.db import StateStore
 from termroom.node_protocol import (
     MAX_NODE_STREAM_CHUNK_BYTES,
     NODE_CAPABILITIES,
+    NODE_PROTOCOL_VERSION,
     NODE_REQUIRED_CAPABILITIES,
     NodeProtocolError,
     decode_message,
     encode_message,
     normalize_capabilities,
+    request_budget_ms,
     validate_node_id,
     validate_protocol_version,
     validate_request_id,
@@ -30,8 +32,11 @@ from termroom.node_protocol import (
 )
 
 NODE_AUTH_TIMEOUT_SECONDS = 10.0
-NODE_REQUEST_TIMEOUT_SECONDS = 30.0
+NODE_REQUEST_ADMISSION_BUDGET_SECONDS = 30.0
+NODE_STREAM_FINISH_TIMEOUT_SECONDS = 30.0
 NODE_STREAM_QUEUE_DEPTH = 32
+NODE_CLOSED_STREAM_TOMBSTONES = 256
+NODE_CLOSED_REQUEST_TOMBSTONES = 256
 
 
 class NodeCoreError(RuntimeError):
@@ -109,19 +114,15 @@ class NodeStream:
             return
         self._closed = True
         with contextlib.suppress(NodeCoreError, RuntimeError):
-            await self.connection.send(
-                {"type": "stream.close", "stream_id": self.stream_id}
-            )
+            await self.connection.send({"type": "stream.close", "stream_id": self.stream_id})
         self.connection.drop_stream(self.stream_id)
 
     async def finish(
-        self, *, timeout: float = NODE_REQUEST_TIMEOUT_SECONDS
+        self, *, timeout: float = NODE_STREAM_FINISH_TIMEOUT_SECONDS
     ) -> dict[str, Any]:
         if self._closed:
             raise NodeUnavailableError("Node stream is already closed")
-        await self.connection.send(
-            {"type": "stream.close", "stream_id": self.stream_id}
-        )
+        await self.connection.send({"type": "stream.close", "stream_id": self.stream_id})
         try:
             final = await asyncio.wait_for(self.receive(), timeout=timeout)
         except TimeoutError as exc:
@@ -137,9 +138,7 @@ class NodeStream:
             return
         self._closed = True
         with contextlib.suppress(NodeCoreError, RuntimeError):
-            await self.connection.send(
-                {"type": "stream.abort", "stream_id": self.stream_id}
-            )
+            await self.connection.send({"type": "stream.abort", "stream_id": self.stream_id})
         self.connection.drop_stream(self.stream_id)
 
     def feed_data(self, chunk: bytes) -> None:
@@ -179,7 +178,9 @@ class NodeConnection:
         self.node_id = validate_node_id(node_id)
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._closed_requests: deque[str] = deque(maxlen=NODE_CLOSED_REQUEST_TOMBSTONES)
         self._streams: dict[str, NodeStream] = {}
+        self._closed_streams: deque[str] = deque(maxlen=NODE_CLOSED_STREAM_TOMBSTONES)
         self._closed = False
 
     async def send(self, message: Mapping[str, Any]) -> None:
@@ -197,9 +198,10 @@ class NodeConnection:
         operation: str,
         payload: Mapping[str, Any],
         *,
-        timeout: float = NODE_REQUEST_TIMEOUT_SECONDS,
+        admission_timeout: float = NODE_REQUEST_ADMISSION_BUDGET_SECONDS,
     ) -> dict[str, Any]:
         operation = validate_request_operation(operation)
+        budget_ms = request_budget_ms(admission_timeout)
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
@@ -208,15 +210,23 @@ class NodeConnection:
                 {
                     "type": "request",
                     "id": request_id,
+                    "protocol_version": NODE_PROTOCOL_VERSION,
+                    "budget_ms": budget_ms,
                     "operation": operation,
                     "payload": dict(payload),
                 }
             )
-            return await asyncio.wait_for(future, timeout=timeout)
-        except TimeoutError as exc:
-            raise NodeUnavailableError("Node did not answer in time") from exc
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            self._closed_requests.append(request_id)
+            raise
         finally:
             self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            else:
+                with contextlib.suppress(asyncio.CancelledError):
+                    future.exception()
 
     async def open_stream(
         self,
@@ -237,7 +247,8 @@ class NodeConnection:
         return result, stream
 
     def drop_stream(self, stream_id: str) -> None:
-        self._streams.pop(stream_id, None)
+        if self._streams.pop(stream_id, None) is not None:
+            self._closed_streams.append(stream_id)
 
     async def dispatch(self, message: Mapping[str, Any]) -> None:
         kind = message.get("type")
@@ -249,16 +260,18 @@ class NodeConnection:
             return
         if kind == "stream.close":
             stream = self._stream(message)
+            if stream is None:
+                return
             result = message.get("result", {})
             if not isinstance(result, dict):
-                raise NodeProtocolError(
-                    "Node stream result is invalid", code="stream_invalid"
-                )
+                raise NodeProtocolError("Node stream result is invalid", code="stream_invalid")
             stream.feed_end(result)
             self.drop_stream(stream.stream_id)
             return
         if kind == "stream.error":
             stream = self._stream(message)
+            if stream is None:
+                return
             stream.feed_error(
                 NodeRequestError(
                     str(message.get("error") or "Node stream failed")[:500],
@@ -273,6 +286,8 @@ class NodeConnection:
         request_id = validate_request_id(str(message.get("id") or ""))
         future = self._pending.get(request_id)
         if future is None or future.done():
+            if request_id in self._closed_requests:
+                return
             raise NodeProtocolError("Unknown Node response", code="response_unknown")
         if message.get("ok") is True:
             result = message.get("result", {})
@@ -289,6 +304,8 @@ class NodeConnection:
 
     def _dispatch_stream_data(self, message: Mapping[str, Any]) -> None:
         stream = self._stream(message)
+        if stream is None:
+            return
         value = message.get("data")
         if not isinstance(value, str):
             raise NodeProtocolError("Node stream data is invalid", code="stream_invalid")
@@ -300,10 +317,12 @@ class NodeConnection:
             raise NodeProtocolError("Node stream chunk is too large", code="stream_too_large")
         stream.feed_data(chunk)
 
-    def _stream(self, message: Mapping[str, Any]) -> NodeStream:
+    def _stream(self, message: Mapping[str, Any]) -> NodeStream | None:
         stream_id = validate_request_id(str(message.get("stream_id") or ""))
         stream = self._streams.get(stream_id)
         if stream is None:
+            if stream_id in self._closed_streams:
+                return None
             raise NodeProtocolError("Unknown Node stream", code="stream_unknown")
         return stream
 
@@ -350,7 +369,15 @@ class NodeCore:
         )
 
     def connection(self, node_id: str) -> NodeConnection:
-        connection = self._connections.get(validate_node_id(node_id))
+        node_id = validate_node_id(node_id)
+        computer = self.store.get_computer(node_id)
+        if (
+            computer is None
+            or computer.get("connection_method") != "node"
+            or computer.get("node_revoked_at") is not None
+        ):
+            raise NodeUnavailableError()
+        connection = self._connections.get(node_id)
         if connection is None:
             raise NodeUnavailableError()
         return connection
@@ -359,15 +386,37 @@ class NodeCore:
         await websocket.accept()
         try:
             connection = await self._authenticate(websocket, node_id)
-        except (KeyError, NodeProtocolError, NodeCoreError, TimeoutError, WebSocketDisconnect):
+        except NodeProtocolError as exc:
+            close_code = 4406 if exc.code == "version_incompatible" else 4401
+            close_reason = (
+                "Node protocol is incompatible; update Termroom on Core and Node"
+                if exc.code == "version_incompatible"
+                else "Node authentication failed"
+            )
+            with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                await websocket.close(code=close_code, reason=close_reason)
+            return
+        except (KeyError, NodeCoreError, TimeoutError, WebSocketDisconnect):
             with contextlib.suppress(RuntimeError, WebSocketDisconnect):
                 await websocket.close(code=4401, reason="Node authentication failed")
             return
 
-        previous: NodeConnection | None
+        previous: NodeConnection | None = None
+        revoked = False
         async with self._lock:
-            previous = self._connections.get(connection.node_id)
-            self._connections[connection.node_id] = connection
+            computer = self.store.get_computer(connection.node_id)
+            if (
+                computer is None
+                or computer.get("connection_method") != "node"
+                or computer.get("node_revoked_at") is not None
+            ):
+                revoked = True
+            else:
+                previous = self._connections.get(connection.node_id)
+                self._connections[connection.node_id] = connection
+        if revoked:
+            await connection.close(code=4403, reason="Node revoked")
+            return
         if previous is not None:
             await previous.close(code=4001, reason="Node reconnected")
         try:

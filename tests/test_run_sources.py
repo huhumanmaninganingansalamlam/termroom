@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from collections.abc import Iterable, Iterator
@@ -155,6 +156,13 @@ def test_git_clone_invocation_requires_explicit_absolute_normalized_paths(
 
 def test_source_relative_path_and_contained_symlink_primitives() -> None:
     assert normalize_source_relative_path("한글 project/src/main.py") == "한글 project/src/main.py"
+    assert (
+        normalize_source_relative_path(
+            "nested/.termroom/config.json",
+            allow_metadata=True,
+        )
+        == "nested/.termroom/config.json"
+    )
     assert validate_cwd_rel(".") == "."
     assert validate_cwd_rel("wrapper") == "wrapper"
     assert validate_contained_symlink_target("src/current.py", "../main.py") == "../main.py"
@@ -215,6 +223,7 @@ def test_local_workspace_scan_applies_mandatory_and_reviewable_excludes(tmp_path
     (workspace / "src").mkdir(parents=True)
     (workspace / ".git" / "objects").mkdir(parents=True)
     (workspace / ".uv-cache" / "wheels").mkdir(parents=True)
+    (workspace / "nested" / ".termroom").mkdir(parents=True)
     state.mkdir()
     (workspace / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
     tool = workspace / "src" / "tool.sh"
@@ -227,6 +236,10 @@ def test_local_workspace_scan_applies_mandatory_and_reviewable_excludes(tmp_path
     )
     (workspace / ".env").write_text("SECRET=1", encoding="utf-8")
     (state / "termroom.sqlite3").write_text("private", encoding="utf-8")
+    (workspace / "nested" / ".termroom" / "config.json").write_text(
+        "private metadata",
+        encoding="utf-8",
+    )
     (workspace / "src" / "current.py").symlink_to("main.py")
 
     manifest = scan_local_workspace(
@@ -245,6 +258,8 @@ def test_local_workspace_scan_applies_mandatory_and_reviewable_excludes(tmp_path
     assert ".uv-cache" not in entries
     assert ".env" not in entries
     assert ".private-state" not in entries
+    assert "nested/.termroom" not in entries
+    assert manifest.excluded_prefixes == (".private-state",)
 
     source = LocalWorkspaceSnapshotSource(
         workspace,
@@ -322,6 +337,7 @@ class _RetryingSource:
         self.manifest = WorkspaceManifest(
             entries=(WorkspaceEntry("input.txt", "file", size=2, mtime_ns=1),),
             total_bytes=2,
+            excluded_prefixes=(".private-state",),
         )
 
     def scan(self) -> WorkspaceManifest:
@@ -374,6 +390,8 @@ def test_workspace_materializer_retries_one_unstable_file_from_the_beginning() -
 
     manifest = materialize_workspace_snapshot(source, sink, chunk_size=1)
 
-    assert manifest == source.manifest
+    assert manifest.entries[0].digest == hashlib.sha256(b"ok").hexdigest()
+    assert manifest.total_bytes == source.manifest.total_bytes
+    assert manifest.excluded_prefixes == (".private-state",)
     assert source.attempts == 2
     assert sink.files == {"input.txt": b"ok"}

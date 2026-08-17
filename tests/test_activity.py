@@ -166,7 +166,7 @@ async def test_activity_read_open_deleted_target_and_safe_notification_claim(
         )
         assert opened.status_code == 303
         assert opened.headers["location"] == f"/remote-runs/{first_run_id}"
-        assert app.state.store.count_unread_events() == 0
+        assert (await client.get("/api/activity/summary")).json()["unread_count"] == 0
 
         registered = await client.post(
             "/api/activity/notifications/claim",
@@ -218,7 +218,36 @@ async def test_activity_read_open_deleted_target_and_safe_notification_claim(
             follow_redirects=False,
         )
         assert read_all.status_code == 303
-        assert app.state.store.count_unread_events() == 0
+        assert (await client.get("/api/activity/summary")).json()["unread_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_activity_read_state_is_scoped_to_each_browser(tmp_path: Path) -> None:
+    app, settings, computer = _app(tmp_path)
+    _terminal_run(app, computer, exit_code=0)
+    event = app.state.store.list_activity_events()[0]
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as first,
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as second,
+    ):
+        await _login(first)
+        await _login(second)
+        assert (await first.get("/api/activity/summary")).json()["unread_count"] == 1
+        assert (await second.get("/api/activity/summary")).json()["unread_count"] == 1
+
+        marked = await first.post(
+            f"/activity/{event['id']}/read",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=False,
+        )
+
+        assert marked.status_code == 303
+        assert (await first.get("/api/activity/summary")).json()["unread_count"] == 0
+        assert (await second.get("/api/activity/summary")).json()["unread_count"] == 1
+        second_page = await second.get("/activity")
+        assert 'class="activity-new"' in second_page.text
 
 
 @pytest.mark.asyncio

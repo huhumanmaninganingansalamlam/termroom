@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import csv
+import hashlib
 import io
 import ipaddress
 import json
@@ -31,7 +32,10 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
-from starlette.datastructures import UploadFile
+from starlette.datastructures import Headers, UploadFile
+from starlette.middleware.gzip import GZipMiddleware
+from starlette.staticfiles import NotModifiedResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from termroom.auth import AuthManager, AuthRateLimited
 from termroom.config import Settings
@@ -68,12 +72,22 @@ from termroom.node_protocol import (
     validate_protocol_version,
 )
 from termroom.node_remote_runs import NodeRemoteRunClient
-from termroom.pwa_icon import termroom_png_icon
+from termroom.pwa_icon import PWA_ICON_VERSION, termroom_png_icon
 from termroom.remote_access import (
     RemoteAccess,
     RemoteAccessError,
 )
-from termroom.remote_runs import RemoteRunConflict, RemoteRunError, RemoteRunManager
+from termroom.remote_runs import (
+    TERMINAL_STATES,
+    RemoteRunConflict,
+    RemoteRunError,
+    RemoteRunManager,
+)
+from termroom.run_results import (
+    RemoteRunResultCollector,
+    ResultCollectionConflict,
+    ResultCollectionError,
+)
 from termroom.run_sources import normalize_source_relative_path
 from termroom.runtime import runtime_stamp
 from termroom.security import (
@@ -85,7 +99,7 @@ from termroom.security import (
 )
 from termroom.ssh_backend import SSHBackend, SSHBackendError
 from termroom.terminal_control import TerminalControl
-from termroom.terminals import TerminalError, TerminalManager
+from termroom.terminals import TerminalError, TerminalManager, workspace_command_digest
 from termroom.workspace_usage import WorkspaceUsageOffline, WorkspaceUsageService
 from termroom.workspaces import (
     ProjectCreatedButWorkspaceFailed,
@@ -113,10 +127,150 @@ FILE_RUN_ERROR_KEYS = {
     "completion_missing": "file_run.error.completion_missing",
     "runner_metadata_invalid": "file_run.error.start_failed",
 }
+RESULT_COLLECTION_ERROR_KEYS = {
+    "result_not_ready": "remote_run.collect.error.not_ready",
+    "result_workspace_unavailable": "remote_run.collect.error.unavailable",
+    "result_too_large": "remote_run.collect.error.too_large",
+    "result_changed": "remote_run.collect.error.changed",
+    "source_collection_unsupported": "remote_run.collect.error.source_kind",
+    "collection_baseline_unavailable": "remote_run.collect.error.baseline",
+    "source_workspace_unavailable": "remote_run.collect.error.source_unavailable",
+    "plan_revision_mismatch": "remote_run.collect.error.plan_changed",
+    "collection_too_many_changes": "remote_run.collect.error.too_many_changes",
+    "result_path_duplicate": "remote_run.collect.error.invalid_result",
+    "result_too_many_entries": "remote_run.collect.error.invalid_result",
+    "result_too_deep": "remote_run.collect.error.invalid_result",
+    "result_metadata_invalid": "remote_run.collect.error.invalid_result",
+    "result_path_invalid": "remote_run.collect.error.invalid_result",
+    "result_read_invalid": "remote_run.collect.error.invalid_result",
+}
+RESULT_COLLECTION_REASON_KEYS = {
+    "source_unchanged_since_run": "remote_run.collect.reason.safe_modified",
+    "new_local_text_file": "remote_run.collect.reason.safe_added",
+    "new_remote_text_file": "remote_run.collect.reason.safe_added",
+    "source_matches_result": "remote_run.collect.reason.already_result",
+    "result_matches_baseline": "remote_run.collect.reason.already_result",
+    "deletion_not_applied": "remote_run.collect.reason.delete_skipped",
+    "file_too_large": "remote_run.collect.reason.download_only",
+    "unsupported_result_type": "remote_run.collect.reason.download_only",
+    "binary_result": "remote_run.collect.reason.download_only",
+    "non_utf8_result": "remote_run.collect.reason.download_only",
+    "excluded_new_path": "remote_run.collect.reason.excluded",
+    "source_parent_missing": "remote_run.collect.reason.parent_missing",
+    "result_type_conflict": "remote_run.collect.reason.source_conflict",
+    "baseline_type_conflict": "remote_run.collect.reason.source_conflict",
+    "source_path_is_directory": "remote_run.collect.reason.source_conflict",
+    "source_path_exists": "remote_run.collect.reason.source_conflict",
+    "source_changed_since_run": "remote_run.collect.reason.source_changed",
+    "source_changed_during_review": "remote_run.collect.reason.source_changed",
+    "source_changed_during_apply": "remote_run.collect.reason.source_changed",
+    "source_file_missing": "remote_run.collect.reason.source_missing",
+    "source_path_unsupported": "remote_run.collect.reason.source_unsupported",
+    "source_not_editable_text": "remote_run.collect.reason.source_unsupported",
+    "applied": "remote_run.collect.reason.applied",
+    "apply_failed": "remote_run.collect.reason.apply_failed",
+}
 templates = Jinja2Templates(
     directory=PACKAGE_ROOT / "templates",
     context_processors=[template_context],
 )
+templates.env.globals["pwa_icon_version"] = PWA_ICON_VERSION
+
+_REMOTE_STATUS_FRESH_FOR = timedelta(minutes=1)
+
+
+_COMPRESSIBLE_STATIC_SUFFIXES = frozenset({".css", ".js", ".json", ".svg", ".webmanifest"})
+_STATIC_GZIP_MINIMUM_SIZE = 1024
+
+
+def _static_request_suffix(scope: Scope) -> str:
+    return PurePosixPath(str(scope.get("path", ""))).suffix.casefold()
+
+
+def _static_request_has_range(scope: Scope) -> bool:
+    return any(name.lower() == b"range" for name, _ in scope.get("headers", ()))
+
+
+def _static_request_accepts_gzip(scope: Scope) -> bool:
+    explicit_quality: float | None = None
+    wildcard_quality: float | None = None
+    raw_values = Headers(scope=scope).getlist("Accept-Encoding")
+    for raw_value in raw_values:
+        for item in raw_value.split(","):
+            parts = [part.strip() for part in item.split(";")]
+            coding = parts[0].casefold()
+            quality = 1.0
+            for parameter in parts[1:]:
+                name, separator, value = parameter.partition("=")
+                if separator and name.strip().casefold() == "q":
+                    try:
+                        quality = float(value.strip())
+                    except ValueError:
+                        quality = 0.0
+                    if not 0 <= quality <= 1:
+                        quality = 0.0
+                    break
+            if coding == "gzip":
+                explicit_quality = max(explicit_quality or 0.0, quality)
+            elif coding == "*":
+                wildcard_quality = max(wildcard_quality or 0.0, quality)
+    selected = explicit_quality if explicit_quality is not None else wildcard_quality
+    return selected is not None and selected > 0
+
+
+class _CacheAwareStaticFiles(StaticFiles):
+    """Give compressed and identity representations distinct validators."""
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        request_headers = Headers(scope=scope)
+        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        can_compress = (
+            _static_request_suffix(scope) in _COMPRESSIBLE_STATIC_SUFFIXES
+            and stat_result.st_size >= _STATIC_GZIP_MINIMUM_SIZE
+        )
+        if can_compress:
+            response.headers.add_vary_header("Accept-Encoding")
+        if (
+            can_compress
+            and scope.get("method") == "GET"
+            and not _static_request_has_range(scope)
+            and _static_request_accepts_gzip(scope)
+        ):
+            etag = response.headers["etag"]
+            response.headers["etag"] = f'{etag[:-1]}-gzip"'
+        if self.is_not_modified(response.headers, request_headers):
+            return NotModifiedResponse(response.headers)
+        return response
+
+
+class _StaticGZipMiddleware:
+    """Compress text assets without touching fonts, ranges, or private responses."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self.gzip_app = GZipMiddleware(
+            app,
+            minimum_size=_STATIC_GZIP_MINIMUM_SIZE,
+            compresslevel=6,
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and not _static_request_has_range(scope)
+            and _static_request_suffix(scope) in _COMPRESSIBLE_STATIC_SUFFIXES
+            and _static_request_accepts_gzip(scope)
+        ):
+            await self.gzip_app(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -128,7 +282,11 @@ def create_app(settings: Settings) -> FastAPI:
     store = StateStore(settings.database_path)
     store.initialize()
     roots = RootManager(settings.root)
-    workspaces = WorkspaceManager(roots, store)
+    workspaces = WorkspaceManager(
+        roots,
+        store,
+        allow_local_workspaces=settings.allow_local_workspaces,
+    )
     files = FileService(settings.max_edit_bytes)
     terminal_control = TerminalControl()
     terminals = TerminalManager(store, terminal_control)
@@ -147,6 +305,14 @@ def create_app(settings: Settings) -> FastAPI:
         workspaces,
         ssh,
         node_remote_runs,
+        state_dir=settings.state_dir,
+        max_archive_bytes=settings.max_upload_bytes,
+    )
+    run_results = RemoteRunResultCollector(
+        remote_runs,
+        workspaces,
+        remote,
+        files,
         state_dir=settings.state_dir,
         max_archive_bytes=settings.max_upload_bytes,
     )
@@ -182,11 +348,16 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.node_core = node_core
     app.state.remote = remote
     app.state.remote_runs = remote_runs
+    app.state.run_results = run_results
     app.state.file_runs = file_runs
     app.state.workspace_usage = workspace_usage
     app.state.auth = auth
     app.state.runtime_stamp = runtime_stamp()
-    app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
+    app.mount(
+        "/static",
+        _StaticGZipMiddleware(_CacheAwareStaticFiles(directory=PACKAGE_ROOT / "static")),
+        name="static",
+    )
     app.router.add_event_handler("startup", remote_runs.startup)
     app.router.add_event_handler("startup", file_runs.startup)
     app.router.add_event_handler("shutdown", file_runs.shutdown)
@@ -249,12 +420,28 @@ def create_app(settings: Settings) -> FastAPI:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
-        if not request.url.path.startswith("/static/") and request.url.path != "/health":
+        path = request.url.path
+        if path.startswith("/static/"):
+            if response.status_code not in {200, 206, 304}:
+                response.headers["Cache-Control"] = "no-store"
+            elif path in {"/static/manifest.webmanifest", "/static/sw.js"}:
+                response.headers["Cache-Control"] = "no-cache"
+            elif request.query_params.get("v"):
+                response.headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable"
+                )
+            else:
+                response.headers["Cache-Control"] = "no-cache"
+        elif path != "/health":
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     def is_remote(workspace: Mapping[str, Any]) -> bool:
         return workspace.get("backend_kind") == "remote"
+
+    def require_local_workspaces() -> None:
+        if not settings.allow_local_workspaces:
+            raise HTTPException(status_code=404, detail="Local Workspaces are disabled")
 
     def ensure_exposed_local_path(
         workspace: Mapping[str, Any],
@@ -298,6 +485,15 @@ def create_app(settings: Settings) -> FastAPI:
             return await remote.stat(workspace, relative_path)
         ensure_exposed_local_path(workspace, relative_path)
         return files.stat(workspace["path"], relative_path)
+
+    async def open_workspace_terminal_editor(
+        workspace: dict[str, Any], relative_path: str
+    ) -> dict[str, Any]:
+        if is_remote(workspace):
+            return await remote.open_terminal_editor(workspace, relative_path)
+        return await asyncio.to_thread(
+            terminals.open_terminal_editor, workspace, relative_path
+        )
 
     async def read_workspace_text(workspace: dict[str, Any], relative_path: str):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
@@ -520,6 +716,7 @@ def create_app(settings: Settings) -> FastAPI:
                     error=None,
                 ),
                 status_code=401,
+                headers={"Cache-Control": "no-store"},
             )
         request.state.session = session
         return await call_next(request)
@@ -608,15 +805,28 @@ def create_app(settings: Settings) -> FastAPI:
         return response
 
     @app.get("/icons/termroom-{size}.png")
-    async def pwa_icon(size: int) -> Response:
+    async def pwa_icon(request: Request, size: int) -> Response:
         try:
-            content = termroom_png_icon(size)
+            content = await asyncio.to_thread(termroom_png_icon, size)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="Unsupported icon size") from exc
+        etag = f'"{hashlib.sha256(content).hexdigest()}"'
+        cache_control = (
+            "public, max-age=31536000, immutable"
+            if request.query_params.get("v") == PWA_ICON_VERSION
+            else "no-cache"
+        )
+        response_headers = {"Cache-Control": cache_control, "ETag": etag}
+        if_none_match = request.headers.get("if-none-match", "")
+        if any(
+            candidate.strip().removeprefix("W/") in {"*", etag}
+            for candidate in if_none_match.split(",")
+        ):
+            return Response(status_code=304, headers=response_headers)
         return Response(
             content=content,
             media_type="image/png",
-            headers={"Cache-Control": "public, max-age=604800, immutable"},
+            headers=response_headers,
         )
 
     @app.get("/locale/{locale}")
@@ -708,7 +918,11 @@ def create_app(settings: Settings) -> FastAPI:
     async def home(request: Request) -> HTMLResponse:
         locale = locale_from_request(request)
         remote_runs.schedule_cleanup()
-        recent = workspaces.list_recent()
+        recent = [
+            workspace
+            for workspace in workspaces.list_recent()
+            if settings.allow_local_workspaces or is_remote(workspace)
+        ]
         recent_runs = remote_runs.list_recent(limit=6)
         active_sessions = terminals.existing_sessions()
         for workspace in recent:
@@ -750,9 +964,10 @@ def create_app(settings: Settings) -> FastAPI:
         unavailable: bool = False,
     ) -> HTMLResponse:
         locale = locale_from_request(request)
+        device_id = str(request.state.session["id"])
         events = [
             _activity_event_view(event, locale=locale)
-            for event in store.list_activity_events()
+            for event in store.list_activity_events(device_id=device_id)
         ]
         return templates.TemplateResponse(
             request=request,
@@ -761,7 +976,7 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 title=translate(locale, "activity.heading"),
                 events=events,
-                unread_count=store.count_unread_events(),
+                unread_count=store.count_unread_events(device_id=device_id),
                 unavailable=unavailable,
             ),
         )
@@ -769,7 +984,7 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/activity/read-all")
     async def activity_read_all(request: Request) -> RedirectResponse:
         await _verified_form(request, settings)
-        store.mark_all_events_read()
+        store.mark_all_events_read(device_id=str(request.state.session["id"]))
         return RedirectResponse("/activity", status_code=303)
 
     @app.post("/activity/{event_id}/read")
@@ -778,7 +993,9 @@ def create_app(settings: Settings) -> FastAPI:
         event_id: str,
     ) -> RedirectResponse:
         await _verified_form(request, settings)
-        if store.mark_event_read(event_id) is None:
+        if store.mark_event_read(
+            event_id, device_id=str(request.state.session["id"])
+        ) is None:
             raise HTTPException(status_code=404, detail="Activity not found")
         return RedirectResponse("/activity", status_code=303)
 
@@ -788,7 +1005,9 @@ def create_app(settings: Settings) -> FastAPI:
         event_id: str,
     ) -> RedirectResponse:
         form = await _verified_form(request, settings)
-        event = store.mark_event_read(event_id)
+        event = store.mark_event_read(
+            event_id, device_id=str(request.state.session["id"])
+        )
         if event is None:
             raise HTTPException(status_code=404, detail="Activity not found")
         if event["subject_type"] == "remote_run" and event["subject_exists"]:
@@ -826,9 +1045,14 @@ def create_app(settings: Settings) -> FastAPI:
         return RedirectResponse("/activity?unavailable=1", status_code=303)
 
     @app.get("/api/activity/summary", response_class=JSONResponse)
-    async def activity_summary() -> JSONResponse:
+    async def activity_summary(request: Request) -> JSONResponse:
         return JSONResponse(
-            {"ok": True, "unread_count": store.count_unread_events()}
+            {
+                "ok": True,
+                "unread_count": store.count_unread_events(
+                    device_id=str(request.state.session["id"])
+                ),
+            }
         )
 
     async def _refresh_terminal_activity_provider(
@@ -940,6 +1164,10 @@ def create_app(settings: Settings) -> FastAPI:
         scoped_workspaces = store.terminal_activity_workspaces(requested_ids)
         if len(scoped_workspaces) != len(requested_ids):
             raise HTTPException(status_code=404, detail="Workspace not found")
+        if not settings.allow_local_workspaces and any(
+            not is_remote(workspace) for workspace in scoped_workspaces
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
         await refresh_terminal_activity_scope(scoped_workspaces)
         return terminal_activity_payload(
             request,
@@ -973,7 +1201,7 @@ def create_app(settings: Settings) -> FastAPI:
             {
                 "ok": True,
                 "events": events,
-                "unread_count": store.count_unread_events(),
+                "unread_count": store.count_unread_events(device_id=device_id),
             }
         )
 
@@ -1111,6 +1339,135 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=302,
         )
 
+    @app.get("/remote-runs/{run_id}/result.zip")
+    async def download_remote_run_result(
+        request: Request, run_id: str
+    ) -> FileResponse:
+        locale = locale_from_request(request)
+        try:
+            archive_path = await run_results.create_archive(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        except ResultCollectionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=_localized_result_collection_exception(locale, exc),
+            ) from exc
+        except (OSError, RemoteRunError, RemoteAccessError, SSHBackendError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=translate(locale, "remote_run.collect.error.unavailable"),
+            ) from exc
+        return FileResponse(
+            archive_path,
+            media_type="application/zip",
+            filename=f"termroom-{run_id}-result.zip",
+            background=BackgroundTask(os.unlink, archive_path),
+        )
+
+    @app.get("/remote-runs/{run_id}/collect", response_class=HTMLResponse)
+    async def review_remote_run_collection(
+        request: Request, run_id: str
+    ) -> HTMLResponse:
+        locale = locale_from_request(request)
+        try:
+            run = await asyncio.to_thread(remote_runs.get, run_id)
+            plan = await run_results.review(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        except ResultCollectionError as exc:
+            return _error_page(
+                request,
+                _localized_result_collection_exception(locale, exc),
+                409,
+            )
+        except (OSError, RemoteRunError, RemoteAccessError, SSHBackendError):
+            return _error_page(
+                request,
+                translate(locale, "remote_run.collect.error.unavailable"),
+                502,
+            )
+        return templates.TemplateResponse(
+            request=request,
+            name="remote_run_collect.html",
+            context=_context(
+                settings,
+                title=translate(locale, "remote_run.collect.heading"),
+                run=run,
+                plan=_remote_run_collection_view(plan, locale),
+                report=None,
+                collection_result=_remote_run_collection_result_query(request),
+                action_error=None,
+            ),
+        )
+
+    @app.post("/remote-runs/{run_id}/collect", response_class=HTMLResponse)
+    async def apply_remote_run_collection(
+        request: Request, run_id: str
+    ) -> Response:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        revision = str(form.get("revision") or "")
+        try:
+            run = await asyncio.to_thread(remote_runs.get, run_id)
+            report = await run_results.apply(run_id, revision)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        except ResultCollectionConflict as exc:
+            try:
+                run = await asyncio.to_thread(remote_runs.get, run_id)
+                plan = await run_results.review(run_id)
+            except (
+                OSError,
+                ResultCollectionError,
+                RemoteRunError,
+                RemoteAccessError,
+                SSHBackendError,
+            ):
+                return _error_page(
+                    request,
+                    _localized_result_collection_exception(locale, exc),
+                    409,
+                )
+            return templates.TemplateResponse(
+                request=request,
+                name="remote_run_collect.html",
+                context=_context(
+                    settings,
+                    title=translate(locale, "remote_run.collect.heading"),
+                    run=run,
+                    plan=_remote_run_collection_view(plan, locale),
+                    report=None,
+                    action_error=_localized_result_collection_exception(locale, exc),
+                ),
+                status_code=409,
+            )
+        except ResultCollectionError as exc:
+            return _error_page(
+                request,
+                _localized_result_collection_exception(locale, exc),
+                409,
+            )
+        except (OSError, RemoteRunError, RemoteAccessError, SSHBackendError):
+            return _error_page(
+                request,
+                translate(locale, "remote_run.collect.error.unavailable"),
+                502,
+            )
+        summary = report.as_dict()["summary"]
+        return RedirectResponse(
+            _url_with_query(
+                f"/remote-runs/{run_id}/collect",
+                collected=1,
+                applied=summary.get("applied", 0),
+                conflict=summary.get("conflict", 0),
+                already_result=summary.get("already_result", 0),
+                skipped=summary.get("skipped", 0),
+                failed=summary.get("failed", 0),
+            ),
+            status_code=303,
+        )
+
     @app.post("/api/remote-runs", response_class=JSONResponse)
     async def create_remote_run(request: Request) -> JSONResponse:
         locale = locale_from_request(request)
@@ -1243,6 +1600,12 @@ def create_app(settings: Settings) -> FastAPI:
                 run=run,
                 target_label=str(target.get("name") or ""),
                 action_error=error,
+                remote_run_results_available=run["state"] in TERMINAL_STATES,
+                remote_run_collect_available=(
+                    run["state"] in TERMINAL_STATES
+                    and str(run.get("source_kind") or "") == "workspace"
+                    and bool(run.get("source_workspace_id"))
+                ),
             ),
         )
 
@@ -1351,6 +1714,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def workspace_open_hub(
         request: Request, computer_removed: bool = False
     ) -> HTMLResponse:
+        locale = locale_from_request(request)
         computers = store.list_computers()
         local_roots = store.list_local_roots()
         root_workspace_counts, workspace_counts = store.workspace_location_counts()
@@ -1366,10 +1730,12 @@ def create_app(settings: Settings) -> FastAPI:
                 local_root_count=len(local_roots),
                 local_workspace_count=sum(root_workspace_counts.values()),
                 workspace_counts=workspace_counts,
-                node_statuses={
-                    str(computer["id"]): remote.status(computer)
+                allow_local_workspaces=settings.allow_local_workspaces,
+                remote_statuses={
+                    str(computer["id"]): _remote_connection_view(
+                        computer, remote=remote, locale=locale
+                    )
                     for computer in computers
-                    if computer.get("connection_method") == "node"
                 },
             ),
         )
@@ -1390,6 +1756,7 @@ def create_app(settings: Settings) -> FastAPI:
         project_workspace: str | None = None,
         project_name: str | None = None,
     ) -> HTMLResponse:
+        require_local_workspaces()
         locale = locale_from_request(request)
         local_roots = store.list_local_roots()
         root_by_id = {str(item["id"]): item for item in local_roots}
@@ -1512,6 +1879,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/open/local/locations")
     async def add_local_location(request: Request):  # type: ignore[no-untyped-def]
+        require_local_workspaces()
         locale = locale_from_request(request)
         form = await _verified_form(request, settings)
         raw_path = str(form.get("path", "")).strip()
@@ -1538,6 +1906,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/open/local/projects")
     async def create_local_project(request: Request):  # type: ignore[no-untyped-def]
+        require_local_workspaces()
         locale = locale_from_request(request)
         form = await _verified_form(request, settings)
         root_id = str(form.get("root_id", "")).strip()
@@ -1658,6 +2027,7 @@ def create_app(settings: Settings) -> FastAPI:
         path: str | None = None,
         hidden: bool = False,
     ) -> JSONResponse:
+        require_local_workspaces()
         locale = locale_from_request(request)
         try:
             picker = _local_location_picker(path, show_hidden=hidden)
@@ -1745,9 +2115,10 @@ def create_app(settings: Settings) -> FastAPI:
                 title=str(computer["name"]),
                 mode="remote",
                 computer=computer,
-                node_status=remote.status(computer)
-                if computer.get("connection_method") == "node"
-                else None,
+                remote_status=_remote_connection_view(
+                    computer, remote=remote, locale=locale
+                ),
+                can_remote_run=remote.supports_capability(computer, "remote_run"),
                 remote_workspaces=remote_workspaces,
                 remote_runs=computer_runs,
                 error=error,
@@ -2264,9 +2635,9 @@ def create_app(settings: Settings) -> FastAPI:
                 run_base_updated=run_base_updated,
                 name_updated=name_updated,
                 managed_key_path=str(ssh.managed_key_path),
-                node_status=remote.status(computer)
-                if computer.get("connection_method") == "node"
-                else None,
+                remote_status=_remote_connection_view(
+                    computer, remote=remote, locale=locale
+                ),
             ),
         )
 
@@ -2326,17 +2697,29 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/computers/{computer_id}/test")
     async def test_computer(request: Request, computer_id: str):  # type: ignore[no-untyped-def]
         locale = locale_from_request(request)
-        await _verified_form(request, settings)
+        form = await _verified_form(request, settings)
         computer = _require_computer(store, computer_id)
         if computer.get("connection_method") != "ssh":
             raise HTTPException(status_code=404, detail="SSH connection test is not supported")
+        return_to = str(form.get("return_to") or "")
         try:
             await asyncio.to_thread(ssh.test_connection, computer)
         except SSHBackendError as exc:
+            destination = (
+                return_to
+                if return_to == f"/open/{computer_id}"
+                else f"/computers/{computer_id}"
+            )
             return RedirectResponse(
-                f"/computers/{computer_id}?error="
-                f"{quote(_localized_exception(locale, exc))}",
+                _url_with_query(
+                    destination,
+                    error=_localized_exception(locale, exc),
+                ),
                 status_code=303,
+            )
+        if return_to == f"/open/{computer_id}":
+            return RedirectResponse(
+                _url_with_query(return_to, connected=1), status_code=303
             )
         return RedirectResponse(
             _url_with_query(f"/computers/{computer_id}", checked=1),
@@ -2508,6 +2891,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/workspaces")
     async def open_workspace(request: Request):  # type: ignore[no-untyped-def]
+        require_local_workspaces()
         form = await _verified_form(request, settings)
         root_id = str(form.get("root_id", "")).strip()
         if not root_id:
@@ -2546,6 +2930,90 @@ def create_app(settings: Settings) -> FastAPI:
                 detail=translate(locale, "workspace.name.invalid"),
             ) from exc
         return RedirectResponse(f"/w/{workspace_id}", status_code=303)
+
+    @app.post("/w/{workspace_id}/run-commands")
+    async def replace_workspace_run_commands(
+        request: Request, workspace_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        workspace = _require_workspace(workspaces, workspace_id)
+        if workspace.get("transient") or workspace.get("workspace_kind") != "workspace":
+            raise HTTPException(
+                status_code=404,
+                detail="Workspace commands are available only for persistent Workspaces",
+            )
+        try:
+            store.replace_workspace_commands(
+                workspace_id, form.getlist("commands")
+            )
+        except ValueError:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.invalid"),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/w/{workspace_id}", status_code=303)
+
+    @app.post("/w/{workspace_id}/run-commands/{slot}")
+    async def run_workspace_command(
+        request: Request, workspace_id: str, slot: int
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        workspace = _require_workspace(workspaces, workspace_id)
+        if workspace.get("transient") or workspace.get("workspace_kind") != "workspace":
+            raise HTTPException(
+                status_code=404,
+                detail="Workspace commands are available only for persistent Workspaces",
+            )
+        commands = store.list_workspace_commands(workspace_id)
+        if slot < 0 or slot >= len(commands):
+            raise HTTPException(status_code=404, detail="Workspace command not found")
+        if not secure_compare(
+            str(form.get("command_digest") or ""),
+            workspace_command_digest(commands[slot]),
+        ):
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.changed"),
+                ),
+                status_code=303,
+            )
+        launch_id = str(form.get("launch_id") or "")
+        try:
+            if is_remote(workspace):
+                terminal = await remote.run_workspace_command(
+                    workspace,
+                    slot=slot,
+                    command=commands[slot],
+                    launch_id=launch_id,
+                )
+            else:
+                terminal = await asyncio.to_thread(
+                    terminals.run_workspace_command,
+                    workspace,
+                    slot=slot,
+                    command=commands[slot],
+                    launch_id=launch_id,
+                )
+        except (ValueError, TerminalError, SSHBackendError, RemoteAccessError) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _url_with_query(
+                f"/w/{workspace_id}/terminal", terminal=str(terminal["id"])
+            ),
+            status_code=303,
+        )
 
     @app.get("/api/workspaces/{workspace_id}/usage", response_class=JSONResponse)
     async def workspace_usage_status(workspace_id: str) -> dict[str, Any]:
@@ -2614,6 +3082,9 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="terminal",
+                workspace_commands_supported=remote.supports_capability(
+                    workspace, "workspace_command"
+                ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 terminals=terminal_list,
                 terminal=selected,
@@ -2627,8 +3098,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/terminals/{terminal_id}/presence", response_class=JSONResponse)
     async def terminal_presence(terminal_id: str) -> dict[str, int | str]:
-        if not store.get_terminal(terminal_id):
+        terminal = store.get_terminal(terminal_id)
+        if not terminal:
             raise HTTPException(status_code=404, detail="Terminal not found")
+        _require_workspace(workspaces, str(terminal["workspace_id"]))
         return terminal_control.presence(terminal_id)
 
     @app.post("/w/{workspace_id}/terminals")
@@ -2714,6 +3187,9 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="terminal",
+                workspace_commands_supported=remote.supports_capability(
+                    workspace, "workspace_command"
+                ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 terminal=terminal,
                 output=output,
@@ -2774,6 +3250,9 @@ def create_app(settings: Settings) -> FastAPI:
             settings,
             workspace,
             active_tab="files",
+            workspace_commands_supported=remote.supports_capability(
+                workspace, "workspace_command"
+            ),
             recent_supported=remote.supports_capability(workspace, "recent"),
             path=relative,
             entries=entries,
@@ -2786,6 +3265,9 @@ def create_app(settings: Settings) -> FastAPI:
             page_count=page_count,
             total_entries=total_entries,
             query=query,
+            terminal_editor_supported=remote.supports_capability(
+                workspace, "terminal_editor"
+            ),
             can_remote_run_source=(
                 not workspace.get("transient")
                 and (
@@ -2807,6 +3289,45 @@ def create_app(settings: Settings) -> FastAPI:
             request=request,
             name=template_name,
             context=context,
+        )
+
+    @app.post("/w/{workspace_id}/terminal-editor")
+    async def open_file_in_terminal_editor(
+        request: Request, workspace_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        workspace = _require_workspace(workspaces, workspace_id)
+        form = await _verified_form(request, settings)
+        relative_path = str(form.get("path") or "")
+        parent = str(form.get("parent") or ".")
+        try:
+            entry = await stat_workspace_file(workspace, relative_path)
+            if entry.is_dir:
+                raise ValueError("Folders cannot be opened in Vim")
+            terminal = await open_workspace_terminal_editor(
+                workspace, entry.relative_path
+            )
+        except (
+            OSError,
+            RemoteAccessError,
+            SSHBackendError,
+            TerminalError,
+            UnsupportedFileError,
+            ValueError,
+        ) as exc:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/files",
+                    path=parent,
+                    error=_localized_exception(locale, exc),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _url_with_query(
+                f"/w/{workspace_id}/terminal", terminal=str(terminal["id"])
+            ),
+            status_code=303,
         )
 
     @app.get("/w/{workspace_id}/view/{file_path:path}", response_class=HTMLResponse)
@@ -2877,6 +3398,9 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="files",
+                workspace_commands_supported=remote.supports_capability(
+                    workspace, "workspace_command"
+                ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 entry=entry,
                 file_path=file_path,
@@ -2895,6 +3419,9 @@ def create_app(settings: Settings) -> FastAPI:
                 can_edit=(
                     kind in {"text", "json", "csv"}
                     and entry.size <= settings.max_edit_bytes
+                ),
+                terminal_editor_supported=remote.supports_capability(
+                    workspace, "terminal_editor"
                 ),
                 format_size=_format_size,
                 format_time_ns=lambda value: _relative_time_ns(value, locale),
@@ -3385,6 +3912,7 @@ def create_app(settings: Settings) -> FastAPI:
         save_error: str | None,
         run_error: str | None,
         editor_unsaved: bool,
+        terminal_editor_error: str | None = None,
         submitted_content: str | None = None,
         selected_run_id: str | None = None,
         idempotency_key: str | None = None,
@@ -3398,7 +3926,11 @@ def create_app(settings: Settings) -> FastAPI:
             "conflict": conflict,
             "save_error": save_error,
             "run_error": run_error,
+            "terminal_editor_error": terminal_editor_error,
             "editor_unsaved": editor_unsaved,
+            "terminal_editor_supported": remote.supports_capability(
+                workspace, "terminal_editor"
+            ),
             **await editor_file_run_context(
                 workspace,
                 snapshot,
@@ -3417,6 +3949,9 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="files",
+                workspace_commands_supported=remote.supports_capability(
+                    workspace, "workspace_command"
+                ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 **values,
             ),
@@ -3594,6 +4129,40 @@ def create_app(settings: Settings) -> FastAPI:
             file_runs.wake()
             return RedirectResponse(
                 _file_run_destination(store, run, prefer_terminal=True),
+                status_code=303,
+            )
+        if intent == "save_and_vim":
+            try:
+                terminal = await open_workspace_terminal_editor(
+                    workspace, saved_snapshot.relative_path
+                )
+            except (
+                OSError,
+                RemoteAccessError,
+                SSHBackendError,
+                TerminalError,
+                UnsupportedFileError,
+                ValueError,
+            ) as exc:
+                return await render_editor(
+                    request,
+                    workspace,
+                    saved_snapshot,
+                    saved=True,
+                    conflict=None,
+                    save_error=None,
+                    run_error=None,
+                    terminal_editor_error=_localized_exception(locale, exc),
+                    editor_unsaved=False,
+                    idempotency_key=idempotency_key or None,
+                    status_code=502
+                    if isinstance(exc, (RemoteAccessError, SSHBackendError))
+                    else 409,
+                )
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal", terminal=str(terminal["id"])
+                ),
                 status_code=303,
             )
         return RedirectResponse(
@@ -3861,6 +4430,9 @@ def create_app(settings: Settings) -> FastAPI:
                 settings,
                 workspace,
                 active_tab="recent",
+                workspace_commands_supported=remote.supports_capability(
+                    workspace, "workspace_command"
+                ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 recent_files=recent_file_rows,
                 recent_scan=recent_scan,
@@ -3895,8 +4467,8 @@ def create_app(settings: Settings) -> FastAPI:
             await reject(4404, "Terminal not found")
             return
         try:
-            workspace = workspaces.require(terminal["workspace_id"])
-        except KeyError:
+            workspace = _require_workspace(workspaces, str(terminal["workspace_id"]))
+        except (KeyError, HTTPException):
             await reject(4404, "Workspace not found")
             return
         await websocket.accept()
@@ -4002,9 +4574,17 @@ def _workspace_context(
     workspace: Mapping[str, Any],
     *,
     active_tab: str,
+    workspace_commands_supported: bool,
     **values: Any,
 ) -> dict[str, Any]:
     remote_run = workspace.get("remote_run")
+    persistent_workspace = bool(
+        not workspace.get("transient")
+        and workspace.get("workspace_kind") == "workspace"
+    )
+    stored_commands = (
+        StateStore.workspace_commands_from(workspace) if persistent_workspace else ()
+    )
     remote_run_display_state = (
         _run_display_state(remote_run.get("state"), remote_run.get("exit_code"))
         if isinstance(remote_run, Mapping)
@@ -4020,6 +4600,19 @@ def _workspace_context(
         title=workspace["display_name"],
         workspace=workspace,
         active_tab=active_tab,
+        workspace_commands_visible=persistent_workspace,
+        workspace_commands_supported=(
+            persistent_workspace and workspace_commands_supported
+        ),
+        workspace_commands=[
+            {
+                "slot": slot,
+                "command": command,
+                "command_digest": workspace_command_digest(command),
+                "launch_id": uuid.uuid4().hex,
+            }
+            for slot, command in enumerate(stored_commands)
+        ],
         remote_run_display_state=remote_run_display_state,
         remote_run_source_url=(
             f"/remote-runs/{remote_run['id']}/source"
@@ -4517,9 +5110,15 @@ def _relative_time(value: str, locale: str = "ko") -> str:
 
 def _require_workspace(manager: WorkspaceManager, workspace_id: str) -> dict[str, Any]:
     try:
-        return manager.require(workspace_id)
+        workspace = manager.require(workspace_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    if (
+        not manager.allow_local_workspaces
+        and workspace.get("backend_kind", "local") != "remote"
+    ):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return workspace
 
 
 def _require_terminal(
@@ -4658,8 +5257,15 @@ def _is_internal_state_entry(
 
 
 def _file_browser_entry_is_noise(entry: Any) -> bool:
-    return entry.name in DEFAULT_FILE_BROWSER_NOISE or (
-        bool(entry.is_dir) and entry.name.startswith(".")
+    name = str(entry.name)
+    return (
+        name in DEFAULT_FILE_BROWSER_NOISE
+        or (bool(entry.is_dir) and name.startswith("."))
+        or (
+            not bool(entry.is_dir)
+            and name.startswith(".")
+            and name.endswith((".swp", ".swo", ".swn", ".swm", ".swl", ".swk"))
+        )
     )
 
 
@@ -4757,6 +5363,56 @@ def _require_computer(store: StateStore, computer_id: str) -> dict[str, Any]:
     return computer
 
 
+def _remote_connection_view(
+    computer: Mapping[str, Any],
+    *,
+    remote: RemoteAccess,
+    locale: str,
+) -> dict[str, Any]:
+    """Return the small current-state view shared by SSH and Node surfaces."""
+
+    method = str(computer.get("connection_method") or "ssh")
+    live = False
+    if method == "node" and computer.get("node_revoked_at") is None:
+        with contextlib.suppress(KeyError, ValueError):
+            live = remote.status(computer)["online"] is True
+    last_success_at = str(
+        computer.get("last_seen_at") or computer.get("last_connected_at") or ""
+    )
+    recently_successful = False
+    if last_success_at:
+        with contextlib.suppress(ValueError):
+            last_success = datetime.fromisoformat(last_success_at)
+            if last_success.tzinfo is None:
+                last_success = last_success.replace(tzinfo=UTC)
+            age = datetime.now(UTC) - last_success.astimezone(UTC)
+            recently_successful = timedelta(0) <= age <= _REMOTE_STATUS_FRESH_FOR
+    if computer.get("node_revoked_at") is not None:
+        state = "unavailable"
+    elif live:
+        state = "available"
+    elif method == "node":
+        state = (
+            "unavailable"
+            if last_success_at or computer.get("last_error")
+            else "unchecked"
+        )
+    elif computer.get("last_error"):
+        state = "unavailable"
+    elif recently_successful:
+        state = "available"
+    else:
+        state = "unchecked"
+    return {
+        "state": state,
+        "label": translate(locale, f"remote.status.{state}"),
+        "last_success_at": last_success_at or None,
+        "last_success_label": _relative_time(last_success_at, locale)
+        if last_success_at
+        else None,
+    }
+
+
 def _query_message(exc: BaseException) -> str:
     return urlencode({"message": str(exc)})[8:]
 
@@ -4791,6 +5447,47 @@ def _localized_remote_run_exception(locale: str, exc: BaseException) -> str:
     if localized != str(exc):
         return localized
     return translate(locale, "remote_run.error.prepare_failed")
+
+
+def _localized_result_collection_exception(
+    locale: str, exc: ResultCollectionError
+) -> str:
+    key = RESULT_COLLECTION_ERROR_KEYS.get(
+        exc.code, "remote_run.collect.error.unavailable"
+    )
+    return translate(locale, key)
+
+
+def _remote_run_collection_view(value: Any, locale: str) -> dict[str, Any]:
+    payload = value.as_dict()
+    for item in payload["items"]:
+        change = str(item["change"])
+        item["change_label"] = translate(
+            locale, f"remote_run.collect.change.{change}"
+        )
+        state_field = "outcome" if "outcome" in item else "status"
+        state = str(item[state_field])
+        item[f"{state_field}_label"] = translate(
+            locale, f"remote_run.collect.{state_field}.{state}"
+        )
+        reason_key = RESULT_COLLECTION_REASON_KEYS.get(
+            str(item["reason"]), "remote_run.collect.reason.source_conflict"
+        )
+        item["reason_label"] = translate(locale, reason_key)
+    return payload
+
+
+def _remote_run_collection_result_query(request: Request) -> dict[str, int] | None:
+    if request.query_params.get("collected") != "1":
+        return None
+    result: dict[str, int] = {}
+    for key in ("applied", "conflict", "already_result", "skipped", "failed"):
+        try:
+            value = int(request.query_params.get(key, "0"))
+        except ValueError:
+            value = 0
+        result[key] = min(max(value, 0), 1_000_000_000)
+    return result
 
 
 def _localized_remote_run_error_detail(

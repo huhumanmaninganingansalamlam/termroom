@@ -16,8 +16,10 @@
   const MIN_TERMINAL_FONT_SIZE = 12;
   const MAX_TERMINAL_FONT_SIZE = 20;
   const BUNDLED_TERMINAL_FONT_FAMILY = '"Termroom D2Koding Nerd Mono"';
-  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C\uE0B0\uF013\u{F0001}";
-  const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 5000;
+  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C";
+  // Let fast cached/local loads avoid a font swap without holding terminal input
+  // behind a slow first-visit font download.
+  const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400;
   const BUNDLED_TERMINAL_FONT_DESCRIPTOR =
     `normal 400 ${DEFAULT_TERMINAL_FONT_SIZE}px ${BUNDLED_TERMINAL_FONT_FAMILY}`;
   const clampTerminalFontSize = (value) =>
@@ -80,27 +82,34 @@
       : systemFamily;
   };
 
-  const loadBundledTerminalFont = async () => {
-    if (typeof document.fonts?.load !== "function") return false;
-    const loadFace = document.fonts
+  const beginBundledTerminalFontLoad = () => {
+    if (typeof document.fonts?.load !== "function") {
+      const unavailable = Promise.resolve(false);
+      return { initial: unavailable, completed: unavailable };
+    }
+    const completed = document.fonts
       .load(BUNDLED_TERMINAL_FONT_DESCRIPTOR, BUNDLED_TERMINAL_FONT_PROBE)
       .then((faces) => faces.length > 0)
       .catch(() => false);
-    let timeoutId;
-    const timeout = new Promise((resolve) => {
-      timeoutId = window.setTimeout(
-        () => resolve(false),
-        BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS,
-      );
-    });
-    const loaded = await Promise.race([loadFace, timeout]);
-    window.clearTimeout(timeoutId);
-    return loaded;
+    const initial = (async () => {
+      let timeoutId;
+      const timeout = new Promise((resolve) => {
+        timeoutId = window.setTimeout(
+          () => resolve(false),
+          BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS,
+        );
+      });
+      const loaded = await Promise.race([completed, timeout]);
+      window.clearTimeout(timeoutId);
+      return loaded;
+    })();
+    return { initial, completed };
   };
 
   const status = document.querySelector("#terminal-status");
   const statusLabel = status.querySelector(".terminal-status-label");
-  const bundledTerminalFontLoaded = await loadBundledTerminalFont();
+  const bundledTerminalFontLoad = beginBundledTerminalFontLoad();
+  let bundledTerminalFontLoaded = await bundledTerminalFontLoad.initial;
   host.dataset.terminalFont = bundledTerminalFontLoaded ? "bundled" : "system-fallback";
   const term = new window.Terminal({
     cursorBlink: true,
@@ -113,10 +122,27 @@
     theme: terminalTheme(),
   });
   term.open(host);
+  const refreshTerminalFont = () => {
+    term.clearTextureAtlas?.();
+    term.refresh(0, Math.max(0, term.rows - 1));
+  };
+  document.fonts?.addEventListener?.("loadingdone", () => {
+    refreshTerminalFont();
+    scheduleResize(true);
+  });
+  void bundledTerminalFontLoad.completed.then((loaded) => {
+    if (!loaded || bundledTerminalFontLoaded) return;
+    bundledTerminalFontLoaded = true;
+    host.dataset.terminalFont = "bundled";
+    term.options.fontFamily = terminalFontFamily(true);
+    refreshTerminalFont();
+    scheduleResize(true);
+  });
   window.addEventListener("themechange", () => {
     term.options.theme = terminalTheme();
     term.options.fontFamily = terminalFontFamily(bundledTerminalFontLoaded);
     term.refresh(0, Math.max(0, term.rows - 1));
+    scheduleResize(true);
   });
 
   // xterm owns the actual IME/composition lifecycle. Do not mirror the hidden
@@ -333,25 +359,24 @@
       try {
         window.localStorage.setItem(TERMINAL_FONT_SIZE_KEY, String(size));
       } catch {
-        // Storage is optional; the live terminal still updates immediately.
+        // Storage is optional; the local font size still applies.
       }
     }
-    term.refresh(0, Math.max(0, term.rows - 1));
-    window.setTimeout(() => scheduleResize(true), 0);
+    scheduleResize(true);
   };
   updateFontSizeControls(initialTerminalFontSize);
   fontSizeDecrease?.addEventListener("click", () =>
-    applyTerminalFontSize(term.options.fontSize - 1),
+    applyTerminalFontSize(Number(term.options.fontSize) - 1),
   );
   fontSizeIncrease?.addEventListener("click", () =>
-    applyTerminalFontSize(term.options.fontSize + 1),
+    applyTerminalFontSize(Number(term.options.fontSize) + 1),
   );
   fontSizeReset?.addEventListener("click", () =>
     applyTerminalFontSize(DEFAULT_TERMINAL_FONT_SIZE),
   );
   window.addEventListener("storage", (event) => {
-    if (event.key === TERMINAL_FONT_SIZE_KEY && event.newValue) {
-      applyTerminalFontSize(event.newValue, { persist: false });
+    if (event.key === TERMINAL_FONT_SIZE_KEY) {
+      applyTerminalFontSize(event.newValue || DEFAULT_TERMINAL_FONT_SIZE, { persist: false });
     }
   });
 
@@ -366,7 +391,7 @@
         term.focus();
       }
     }
-    window.setTimeout(() => scheduleResize(true), 0);
+    window.setTimeout(() => scheduleResize(), 0);
   };
 
   const updateMobileKeyboardState = () => {
@@ -392,7 +417,7 @@
       !widthChanged &&
       (layoutGap > keyboardThreshold || mobileViewportBaseline - height > keyboardThreshold);
     document.body.classList.toggle("terminal-keyboard-open", keyboardOpen);
-    window.setTimeout(() => scheduleResize(true), 0);
+    window.setTimeout(() => scheduleResize(), 0);
   };
 
   openCommandEditor?.addEventListener("click", () => setComposerOpen(true));
@@ -404,22 +429,18 @@
   });
   setComposerOpen(false, { focus: false });
 
-  const claimVisibleTerminal = () => {
-    if (document.visibilityState !== "visible") return;
-    send({ kind: "claim" });
-    scheduleResize(true);
-  };
-
   const connect = () => {
     window.clearTimeout(reconnectTimer);
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    socket = new WebSocket(`${scheme}://${location.host}/ws/terminal/${host.dataset.terminalId}`);
+    socket = new WebSocket(
+      `${scheme}://${location.host}/ws/terminal/${host.dataset.terminalId}`,
+    );
     setStatus(tr("terminal.status.connecting"));
 
     socket.addEventListener("open", () => {
       reconnectDelay = 500;
       setStatus(tr("terminal.status.connected"), true);
-      claimVisibleTerminal();
+      scheduleResize(true);
       updatePresence();
       if (!coarsePrimaryPointer.matches) term.focus();
     });
@@ -450,7 +471,29 @@
     socket.addEventListener("error", () => socket.close());
   };
 
-  term.onData((data) => send({ kind: "input", data }));
+  let nextTerminalDataIsUserInput = false;
+  const onUserInput = term._core?.coreService?.onUserInput;
+  const hasUserInputSignal = typeof onUserInput === "function";
+  if (hasUserInputSignal) {
+    onUserInput(() => {
+      nextTerminalDataIsUserInput = true;
+    });
+  }
+  term.onData((data) => {
+    const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;
+    nextTerminalDataIsUserInput = false;
+    send({
+      kind: "input",
+      data,
+      rows: term.rows,
+      cols: term.cols,
+      user_input: userInput,
+    });
+  });
+  term.onBinary((data) => {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    socket.send(Uint8Array.from(data, (character) => character.charCodeAt(0)));
+  });
   term.onScroll(scheduleActivityAcknowledge);
   window.addEventListener(
     "termroom:terminal-activity-refreshed",
@@ -469,11 +512,9 @@
       connect();
       return;
     }
-    claimVisibleTerminal();
     scheduleActivityAcknowledge();
   });
   window.addEventListener("focus", () => {
-    claimVisibleTerminal();
     scheduleActivityAcknowledge();
   });
   window.addEventListener("orientationchange", () => {
@@ -593,7 +634,12 @@
     event.preventDefault();
     if (composerComposing) return;
     if (!commandInput.value.trim()) return;
-    send({ kind: "command", data: commandInput.value });
+    send({
+      kind: "command",
+      data: commandInput.value,
+      rows: term.rows,
+      cols: term.cols,
+    });
     commandInput.value = "";
     updateCommandComposer();
     commandInput.blur();

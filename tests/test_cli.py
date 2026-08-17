@@ -62,6 +62,87 @@ def test_node_pair_parser_accepts_custom_ca_file() -> None:
     assert "--ca-file CA_FILE" in result.stdout
 
 
+def test_core_scrubs_login_password_from_runtime_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERMROOM_PASSWORD", "must-not-reach-child-processes")
+
+    cli._scrub_runtime_secrets()
+
+    assert "TERMROOM_PASSWORD" not in os.environ
+
+
+def test_ssh_only_foreground_core_does_not_create_local_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "root"
+    root.mkdir()
+    state_dir = tmp_path / "state"
+    served_apps: list[object] = []
+    monkeypatch.setenv("TERMROOM_PASSWORD", "test-password")
+    monkeypatch.setenv("TERMROOM_ALLOW_LOCAL_WORKSPACES", "false")
+    monkeypatch.setattr(cli, "_validate_user", lambda *_args: None)
+    monkeypatch.setattr(cli, "_require_tmux", lambda *_args: None)
+    monkeypatch.setattr(cli, "ensure_xterm_assets", lambda: None)
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "run",
+        lambda app, **_kwargs: served_apps.append(app),
+    )
+
+    cli.main(
+        [
+            str(root),
+            "--state-dir",
+            str(state_dir),
+            "--port",
+            "9876",
+            "--no-open",
+            "--foreground",
+        ]
+    )
+
+    assert len(served_apps) == 1
+    app = served_apps[0]
+    assert app.state.settings.allow_local_workspaces is False  # type: ignore[attr-defined]
+    assert app.state.store.list_recent_workspaces() == []  # type: ignore[attr-defined]
+    output = capsys.readouterr().out
+    assert "Mode:      SSH / Node Workspaces only" in output
+    assert "Local:     http://127.0.0.1:9876/" in output
+    assert "Open:      http://127.0.0.1:9876/" in output
+    assert "Workspace:" not in output
+
+
+def test_core_settings_match_includes_local_workspace_policy(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    enabled = Settings.create(
+        root,
+        state_dir=tmp_path / "enabled-state",
+        access_token="token",
+        login_password="password",
+    )
+    disabled = Settings.create(
+        root,
+        state_dir=tmp_path / "disabled-state",
+        access_token="token",
+        login_password="password",
+        allow_local_workspaces=False,
+    )
+    legacy_metadata = {"default_locale": "en"}
+    disabled_metadata = {
+        "default_locale": "en",
+        "allow_local_workspaces": False,
+    }
+
+    assert cli._core_settings_match(legacy_metadata, enabled)
+    assert not cli._core_settings_match(legacy_metadata, disabled)
+    assert cli._core_settings_match(disabled_metadata, disabled)
+    assert not cli._core_settings_match(disabled_metadata, enabled)
+
+
 def test_node_cli_reports_invalid_stored_ca_without_traceback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:  # type: ignore[no-untyped-def]
@@ -114,7 +195,10 @@ def test_termroom_dot_reuses_running_core_and_registers_new_root(
         matches = [item for item in manager_from_first_core.list_recent() if item["path"] == second]
         assert len(matches) == 1
         created_session = str(matches[0]["tmux_session"])
-        assert "Termroom Core is already running" in capsys.readouterr().out
+        output = capsys.readouterr().out
+        assert "Termroom Core is already running" in output
+        assert "Login:     password required" in output
+        assert "TERMROOM_PASSWORD" not in output
     finally:
         if created_session:
             with contextlib.suppress(Exception):

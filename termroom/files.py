@@ -28,6 +28,10 @@ class UnsupportedFileError(ValueError):
     pass
 
 
+class DirectoryListingLimitError(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class FileSnapshot:
     path: Path
@@ -167,37 +171,65 @@ class FileService:
         self.max_edit_bytes = max_edit_bytes
 
     def list_dir(
-        self, workspace_path: Path, relative_path: str = "."
+        self,
+        workspace_path: Path,
+        relative_path: str = ".",
+        *,
+        max_entries: int | None = None,
+        max_metadata_bytes: int | None = None,
     ) -> tuple[Path, list[FileEntry]]:
-        directory = resolve_inside(workspace_path, relative_path)
+        if max_entries is not None and (type(max_entries) is not int or max_entries < 0):
+            raise ValueError("Directory entry limit is invalid")
+        if max_metadata_bytes is not None and (
+            type(max_metadata_bytes) is not int or max_metadata_bytes < 1
+        ):
+            raise ValueError("Directory metadata limit is invalid")
+        directory = self._resolve_existing(workspace_path, relative_path)
         if not directory.is_dir():
             raise NotADirectoryError(directory)
         entries: list[FileEntry] = []
-        children = sorted(
-            directory.iterdir(),
-            key=lambda item: (not item.is_dir(), item.name.casefold()),
-        )
-        for child in children:
-            try:
-                if child.is_symlink():
-                    continue
-                stat = child.stat()
-                entries.append(
-                    FileEntry(
-                        name=child.name,
-                        relative_path=child.relative_to(workspace_path).as_posix(),
-                        is_dir=child.is_dir(),
-                        size=stat.st_size,
-                        mtime_ns=stat.st_mtime_ns,
+        scanned = 0
+        metadata_bytes = 0
+        with os.scandir(directory) as children:
+            for child in children:
+                scanned += 1
+                if max_entries is not None and scanned > max_entries:
+                    raise DirectoryListingLimitError(
+                        "Directory contains too many entries"
                     )
-                )
-            except OSError:
-                continue
+                try:
+                    if child.is_symlink():
+                        continue
+                    info = child.stat(follow_symlinks=False)
+                    target = Path(child.path)
+                    relative = target.relative_to(workspace_path).as_posix()
+                    metadata_bytes += len(relative.encode("utf-8")) + 128
+                    if (
+                        max_metadata_bytes is not None
+                        and metadata_bytes > max_metadata_bytes
+                    ):
+                        raise DirectoryListingLimitError(
+                            "Directory metadata exceeds the safe response limit"
+                        )
+                    entries.append(
+                        FileEntry(
+                            name=child.name,
+                            relative_path=relative,
+                            is_dir=child.is_dir(follow_symlinks=False),
+                            size=info.st_size,
+                            mtime_ns=info.st_mtime_ns,
+                        )
+                    )
+                except DirectoryListingLimitError:
+                    raise
+                except OSError:
+                    continue
+        entries.sort(key=lambda item: (not item.is_dir, item.name.casefold()))
         return directory, entries
 
     def read_text(self, workspace_path: Path, relative_path: str) -> FileSnapshot:
-        target = resolve_inside(workspace_path, relative_path)
-        if target.is_symlink() or not target.is_file():
+        target = self._resolve_existing(workspace_path, relative_path)
+        if not target.is_file():
             raise UnsupportedFileError("Only regular files can be edited")
         stat = target.stat()
         if stat.st_size > self.max_edit_bytes:
@@ -251,9 +283,7 @@ class FileService:
         )
 
     def stat(self, workspace_path: Path, relative_path: str) -> FileEntry:
-        target = resolve_inside(workspace_path, relative_path)
-        if target.is_symlink():
-            raise UnsupportedFileError("Symbolic links are not exposed")
+        target = self._resolve_existing(workspace_path, relative_path)
         stat = target.stat()
         return FileEntry(
             name=target.name,
@@ -264,10 +294,23 @@ class FileService:
         )
 
     def resolve_regular_file(self, workspace_path: Path, relative_path: str) -> Path:
-        target = resolve_inside(workspace_path, relative_path)
-        if target.is_symlink() or not target.is_file():
+        target = self._resolve_existing(workspace_path, relative_path)
+        if not target.is_file():
             raise UnsupportedFileError("Only regular files can be opened")
         return target
+
+    @staticmethod
+    def _resolve_existing(workspace_path: Path, relative_path: str) -> Path:
+        if relative_path in {"", "."}:
+            return workspace_path.resolve(strict=True)
+        try:
+            return resolve_no_symlink_inside(workspace_path, relative_path)
+        except PathBoundaryError:
+            raise
+        except OSError as exc:
+            if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+                raise
+            raise UnsupportedFileError("Symbolic links are not exposed") from exc
 
     def content_type(self, relative_path: str) -> str:
         basename = Path(relative_path).name.casefold()
@@ -462,17 +505,29 @@ class FileService:
         if len(encoded) > self.max_edit_bytes:
             raise UnsupportedFileError("Content exceeds the editable size limit")
 
-        target = resolve_inside(workspace_path, relative_path)
-        if target.is_symlink() or not target.is_file():
+        target = self._resolve_existing(workspace_path, relative_path)
+        if not target.is_file():
             raise UnsupportedFileError("Only regular files can be saved")
 
-        current_stat = target.stat()
-        current = target.read_bytes()
-        if (
-            current_stat.st_mtime_ns != expected_mtime_ns
-            or file_digest(current) != expected_digest
-        ):
-            raise FileConflictError("The file changed after it was opened")
+        def require_expected_source() -> os.stat_result:
+            checked = self._resolve_existing(workspace_path, relative_path)
+            if checked != target or not checked.is_file():
+                raise FileConflictError("The file changed after it was opened")
+            before = checked.stat()
+            current = checked.read_bytes()
+            after = checked.stat()
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or after.st_mtime_ns != expected_mtime_ns
+                or file_digest(current) != expected_digest
+            ):
+                raise FileConflictError("The file changed after it was opened")
+            return after
+
+        current_stat = require_expected_source()
 
         parent = target.parent.resolve(strict=True)
         boundary = workspace_path.resolve(strict=True)
@@ -490,7 +545,65 @@ class FileService:
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.chmod(temp_path, mode)
+            require_expected_source()
             os.replace(temp_path, target)
+            directory_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        return self.read_text(workspace_path, relative_path)
+
+    def write_new_text(
+        self,
+        workspace_path: Path,
+        relative_path: str,
+        content: str,
+    ) -> FileSnapshot:
+        """Create one UTF-8 file without ever replacing an existing path."""
+
+        encoded = content.encode("utf-8")
+        if len(encoded) > self.max_edit_bytes:
+            raise UnsupportedFileError("Content exceeds the editable size limit")
+        raw = Path(relative_path)
+        if (
+            raw.is_absolute()
+            or not raw.parts
+            or any(part in {"", ".", ".."} for part in raw.parts)
+        ):
+            raise PathBoundaryError("Path must be a normalized Workspace-relative path")
+        parent_relative = raw.parent.as_posix()
+        parent = (
+            workspace_path.resolve(strict=True)
+            if parent_relative == "."
+            else self._resolve_existing(workspace_path, parent_relative)
+        )
+        if not parent.is_dir():
+            raise NotADirectoryError(parent)
+        target = parent / raw.name
+        boundary = workspace_path.resolve(strict=True)
+        if not is_within(parent, boundary):
+            raise PathBoundaryError("Save destination escapes the workspace")
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(target)
+
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=parent, prefix=f".{target.name}.", delete=False
+            ) as temporary:
+                temp_path = temporary.name
+                temporary.write(encoded)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.chmod(temp_path, 0o644)
+            try:
+                os.link(temp_path, target, follow_symlinks=False)
+            except FileExistsError:
+                raise FileExistsError(target) from None
             directory_fd = os.open(parent, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)

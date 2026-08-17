@@ -41,6 +41,40 @@ def test_missing_remote_git_error_is_localized() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locale", "heading", "copy"),
+    [
+        ("en", "Sign in", "Enter your Termroom password."),
+        ("ko", "로그인", "Termroom 접속 비밀번호를 입력하세요."),
+    ],
+)
+async def test_login_uses_user_facing_copy_without_operator_configuration(
+    tmp_path: Path,
+    locale: str,
+    heading: str,
+    copy: str,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "config",
+        access_token="internal-secret",
+        login_password="termroom-password",
+        default_locale=locale,
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 401
+    assert f"<h1>{heading}</h1>" in response.text
+    assert copy in response.text
+    assert "TERMROOM_PASSWORD" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_english_is_default_until_locale_cookie_switches_ui(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

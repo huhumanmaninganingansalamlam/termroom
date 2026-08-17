@@ -93,9 +93,16 @@ class RootManager:
 
 
 class WorkspaceManager:
-    def __init__(self, root_manager: RootManager, store: StateStore) -> None:
+    def __init__(
+        self,
+        root_manager: RootManager,
+        store: StateStore,
+        *,
+        allow_local_workspaces: bool = True,
+    ) -> None:
         self.root_manager = root_manager
         self.store = store
+        self.allow_local_workspaces = allow_local_workspaces
         self.root_record = store.ensure_root(root_manager.root)
 
     def open(self, relative_path: str) -> dict[str, Any]:

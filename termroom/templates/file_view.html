@@ -8,6 +8,14 @@
       <p>{{ file_path }}</p>
     </div>
     <div class="file-view-actions">
+      {% if terminal_editor_supported %}
+      <form method="post" action="/w/{{ workspace.id }}/terminal-editor">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="path" value="{{ file_path }}">
+        <input type="hidden" name="parent" value="{{ file_path.rsplit('/', 1)[0] if '/' in file_path else '.' }}">
+        <button class="secondary-button" type="submit">{{ t('terminal_editor.open') }}</button>
+      </form>
+      {% endif %}
       {% if can_edit %}<a class="secondary-button" href="/w/{{ workspace.id }}/edit/{{ file_path | urlencode }}">{{ t('file_view.edit') }}</a>{% endif %}
       {% if copy_text is not none %}<button class="secondary-button" type="button" data-copy-target="#file-copy-source">{{ t('file_view.copy_content') }}</button>{% endif %}
       {% if not sensitive_file %}<button id="file-share"

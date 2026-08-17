@@ -1,20 +1,47 @@
-/*
- * D2KodingLigature Nerd Font Mono v3.5.0 Regular is the terminal primary.
- * Only current Nerd Fonts v3 PUA mappings are enabled; legacy/extra PUA
- * glyphs with unsafe xterm cell overhang deliberately fall through.
- */
+/* D2KodingLigature Nerd Font Mono v3.5.0, split for range-based loading. */
 @font-face {
   font-family: "Termroom D2Koding Nerd Mono";
-  src: url("vendor/d2koding-ligature-nerd-font-mono-3.5.0.woff2?v=3.5.0")
+  src: url("vendor/d2koding-ligature-nerd-font-mono-3.5.0-core-hangul.woff2?v=3.5.0.1")
     format("woff2");
   font-style: normal;
   font-weight: 400;
   font-display: block;
-  unicode-range: U+0000-DFFF, U+E000-E00A, U+E0A0-E0A3, U+E0B0-E0C8, U+E0CA,
+  unicode-range: U+0000-4DFF, U+AC00-DFFF, U+FB00-FFFF;
+}
+
+@font-face {
+  font-family: "Termroom D2Koding Nerd Mono";
+  src: url("vendor/d2koding-ligature-nerd-font-mono-3.5.0-cjk.woff2?v=3.5.0.1")
+    format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+4E00-ABFF, U+F900-FAFF;
+}
+
+@font-face {
+  font-family: "Termroom D2Koding Nerd Mono";
+  src: url("vendor/d2koding-ligature-nerd-font-mono-3.5.0-nerd-bmp.woff2?v=3.5.0.1")
+    format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  /* Unsafe legacy/extra PUA glyphs deliberately fall through. */
+  unicode-range: U+E000-E00A, U+E0A0-E0A3, U+E0B0-E0C8, U+E0CA,
     U+E0CC-E0D2, U+E0D4, U+E0D6-E0D7, U+E200-E2A9, U+E300-E3E3, U+E5FA-E6BB,
     U+E700-E8EF, U+EA60-EA88, U+EA8A-EA8C, U+EA8F-EAC7, U+EAC9, U+EACC-EB09,
     U+EB0B-EB4E, U+EB50-EC5E, U+EC60-EC84, U+ED00-EFCF, U+F000-F385,
-    U+F400-F533, U+F900-FFFF, U+F0001-F1AF0;
+    U+F400-F533;
+}
+
+@font-face {
+  font-family: "Termroom D2Koding Nerd Mono";
+  src: url("vendor/d2koding-ligature-nerd-font-mono-3.5.0-nerd-supp.woff2?v=3.5.0.1")
+    format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+F0001-F1AF0;
 }
 
 .terminal-host {

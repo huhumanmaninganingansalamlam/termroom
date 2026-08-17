@@ -4,20 +4,23 @@ import asyncio
 import codecs
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import signal
 import struct
 import subprocess
 import termios
+import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from termroom.db import StateStore
+from termroom.db import MAX_WORKSPACE_COMMANDS, StateStore, normalize_workspace_commands
 from termroom.pty_process import spawn_pty_process
 from termroom.terminal_control import TerminalControl
 from termroom.workspace_usage import (
@@ -41,10 +44,189 @@ MAX_TERMINAL_COLS = 1000
 TMUX_TERMINAL_ROLE_OPTION = "@termroom_terminal_role"
 TMUX_MANAGED_RUN_OPTION = "@termroom_managed_run_id"
 TMUX_BROWSER_VIEW_PREFIX = "termroom-view-"
+TMUX_WORKSPACE_COMMAND_SLOT_OPTION = "@termroom_workspace_command_slot"
+TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION = "@termroom_workspace_command_launch"
+TMUX_WORKSPACE_COMMAND_DIGEST_OPTION = "@termroom_workspace_command_digest"
+TMUX_TERMINAL_EDITOR_DIGEST_OPTION = "@termroom_terminal_editor_digest"
+WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS = 2.0
+WORKSPACE_COMMAND_READY_POLL_SECONDS = 0.01
+TMUX_WORKSPACE_COMMAND_RECORD_FORMAT = (
+    "#{window_id}|#{pane_dead}|"
+    f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}|"
+    f"#{{{TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION}}}|"
+    f"#{{{TMUX_WORKSPACE_COMMAND_DIGEST_OPTION}}}"
+)
+TMUX_TERMINAL_EDITOR_RECORD_FORMAT = (
+    "#{window_id}|#{pane_dead}|"
+    f"#{{{TMUX_TERMINAL_EDITOR_DIGEST_OPTION}}}"
+)
 TMUX_TERMINAL_RECORD_FORMAT = (
     "#{session_name}|#{window_id}|#{window_activity}|#{window_name}|"
     f"#{{{TMUX_TERMINAL_ROLE_OPTION}}}|#{{{TMUX_MANAGED_RUN_OPTION}}}"
 )
+
+WORKSPACE_COMMAND_WRAPPER = r"""/bin/bash --noprofile --norc -c '
+set -eu
+pane=${TMUX_PANE:?}
+command=${TERMROOM_WORKSPACE_COMMAND:?}
+slot=${TERMROOM_WORKSPACE_COMMAND_SLOT:?}
+launch=${TERMROOM_WORKSPACE_COMMAND_LAUNCH:?}
+digest=${TERMROOM_WORKSPACE_COMMAND_DIGEST:?}
+tmux set-window-option -t "$pane" remain-on-exit on
+tmux set-window-option -t "$pane" @termroom_workspace_command_digest "$digest"
+tmux set-window-option -t "$pane" @termroom_workspace_command_launch "$launch"
+tmux set-window-option -t "$pane" @termroom_workspace_command_slot "$slot"
+unset TERMROOM_WORKSPACE_COMMAND TERMROOM_WORKSPACE_COMMAND_SLOT \
+    TERMROOM_WORKSPACE_COMMAND_LAUNCH TERMROOM_WORKSPACE_COMMAND_DIGEST
+eval -- "$command"
+'
+"""
+
+TERMINAL_EDITOR_WRAPPER = r"""/bin/sh -c '
+set -eu
+pane=${TMUX_PANE:?}
+file=${TERMROOM_TERMINAL_EDITOR_FILE:?}
+digest=${TERMROOM_TERMINAL_EDITOR_DIGEST:?}
+tmux set-window-option -t "$pane" @termroom_terminal_editor_digest "$digest"
+unset TERMROOM_TERMINAL_EDITOR_FILE TERMROOM_TERMINAL_EDITOR_DIGEST
+for editor in nvim vim vi; do
+    if command -v "$editor" >/dev/null 2>&1; then
+        exec "$editor" "$file"
+    fi
+done
+printf "Termroom: install Neovim or Vim to edit this file.\n" >&2
+exit 127
+'
+"""
+
+
+def normalize_terminal_editor_path(value: object) -> str:
+    raw = str(value)
+    path = PurePosixPath(raw)
+    if (
+        not raw
+        or "\x00" in raw
+        or path.is_absolute()
+        or path == PurePosixPath(".")
+        or any(part == ".." for part in path.parts)
+    ):
+        raise ValueError("Terminal editor file path is invalid")
+    return path.as_posix()
+
+
+def terminal_editor_digest(relative_path: object) -> str:
+    normalized = normalize_terminal_editor_path(relative_path)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def parse_tmux_terminal_editor_records(output: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        parts = line.split("|", 2)
+        if (
+            len(parts) != 3
+            or not parts[0].startswith("@")
+            or not parts[0][1:].isdigit()
+            or parts[1] not in {"0", "1"}
+        ):
+            raise ValueError("tmux exposed an invalid Terminal editor record")
+        window, dead, digest = parts
+        if not digest:
+            continue
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError("tmux exposed an invalid Terminal editor digest")
+        records.append(
+            {"tmux_window": window, "dead": dead == "1", "digest": digest}
+        )
+    return records
+
+
+def normalize_workspace_command(value: object) -> str:
+    commands = normalize_workspace_commands((value,))
+    if len(commands) != 1:
+        raise ValueError("Workspace command cannot be empty")
+    return commands[0]
+
+
+def validate_workspace_command_slot(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("Workspace command slot is invalid")
+    if value < 0 or value >= MAX_WORKSPACE_COMMANDS:
+        raise ValueError("Workspace command slot is invalid")
+    return value
+
+
+def validate_workspace_command_launch(value: object) -> str:
+    launch_id = str(value)
+    try:
+        parsed = uuid.UUID(hex=launch_id)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("Workspace command launch identity is invalid") from exc
+    if parsed.hex != launch_id:
+        raise ValueError("Workspace command launch identity is invalid")
+    return launch_id
+
+
+def workspace_command_digest(command: str) -> str:
+    return hashlib.sha256(normalize_workspace_command(command).encode("utf-8")).hexdigest()
+
+
+def parse_tmux_workspace_command_records(output: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        parts = line.split("|", 4)
+        if (
+            len(parts) != 5
+            or not parts[0].startswith("@")
+            or not parts[0][1:].isdigit()
+            or parts[1] not in {"0", "1"}
+        ):
+            raise ValueError("tmux exposed an invalid Workspace command record")
+        window, dead, slot_raw, launch_id, digest = parts
+        if not slot_raw:
+            continue
+        if not slot_raw.isdigit():
+            raise ValueError("tmux exposed an invalid Workspace command slot")
+        slot = validate_workspace_command_slot(int(slot_raw))
+        validate_workspace_command_launch(launch_id)
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("tmux exposed an invalid Workspace command digest")
+        records.append(
+            {
+                "tmux_window": window,
+                "dead": dead == "1",
+                "slot": slot,
+                "launch_id": launch_id,
+                "digest": digest,
+            }
+        )
+    slots = [record["slot"] for record in records]
+    if len(slots) != len(set(slots)):
+        raise ValueError("tmux exposed duplicate Workspace command slots")
+    return records
+
+
+def workspace_command_record_is_ready(
+    output: str,
+    *,
+    window: str,
+    slot: int,
+    launch_id: str,
+    digest: str,
+) -> bool:
+    return any(
+        record["tmux_window"] == window
+        and record["slot"] == slot
+        and record["launch_id"] == launch_id
+        and record["digest"] == digest
+        for record in parse_tmux_workspace_command_records(output)
+    )
 
 
 def tmux_browser_view_session(client_id: str) -> str:
@@ -57,6 +239,73 @@ def tmux_browser_view_session(client_id: str) -> str:
     if parsed.hex != client_id:
         raise TerminalError("Browser Terminal view identity is invalid")
     return f"{TMUX_BROWSER_VIEW_PREFIX}{client_id}"
+
+
+def set_tmux_browser_view_grid_resize(
+    run_tmux: Any,
+    view_session: str,
+    *,
+    enabled: bool,
+) -> bool:
+    """Make one browser view the only size-affecting client for its window."""
+
+    def listed_clients() -> tuple[bool, list[tuple[str, str, str]]]:
+        listed = run_tmux(
+            "list-clients",
+            "-F",
+            "#{client_name}\t#{session_name}\t#{window_id}",
+            check=False,
+        )
+        clients: list[tuple[str, str, str]] = []
+        for line in listed.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and all(parts):
+                clients.append((parts[0], parts[1], parts[2]))
+        return listed.returncode == 0, clients
+
+    deadline = time.monotonic() + 1.0
+    while True:
+        _listed, clients = listed_clients()
+        target = next((item for item in clients if item[1] == view_session), None)
+        if target is not None:
+            client_name, _, window_id = target
+            if enabled:
+                for peer_name, peer_session, peer_window in clients:
+                    if (
+                        peer_name == client_name
+                        or peer_window != window_id
+                        or not peer_session.startswith(TMUX_BROWSER_VIEW_PREFIX)
+                    ):
+                        continue
+                    demoted = run_tmux(
+                        "refresh-client",
+                        "-t",
+                        peer_name,
+                        "-f",
+                        "ignore-size",
+                        check=False,
+                    )
+                    if demoted.returncode:
+                        rechecked, current_clients = listed_clients()
+                        if not rechecked or any(
+                            current_name == peer_name
+                            and current_session.startswith(TMUX_BROWSER_VIEW_PREFIX)
+                            and current_window == window_id
+                            for current_name, current_session, current_window in current_clients
+                        ):
+                            return False
+            result = run_tmux(
+                "refresh-client",
+                "-t",
+                client_name,
+                "-f",
+                "!ignore-size" if enabled else "ignore-size",
+                check=False,
+            )
+            return result.returncode == 0
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
 
 
 def parse_tmux_terminal_records(output: str) -> list[dict[str, str | int | None]]:
@@ -218,10 +467,31 @@ def terminal_size(payload: dict[str, Any]) -> tuple[int, int] | None:
     )
 
 
+def terminal_input_claims_grid(payload: dict[str, Any]) -> bool:
+    """Let only an explicit real-user signal claim the shared terminal grid."""
+
+    return payload.get("user_input") is True
+
+
+def touch_terminal_output_if_present(store: StateStore, terminal_id: str) -> bool:
+    """Ignore the expected attach-exit race after reconciliation removes a window."""
+
+    try:
+        store.touch_terminal_output(terminal_id)
+    except KeyError:
+        return False
+    return True
+
+
 class TerminalManager:
     def __init__(self, store: StateStore, control: TerminalControl | None = None) -> None:
         self.store = store
         self.control = control or TerminalControl()
+        self._workspace_command_locks: dict[str, threading.RLock] = {}
+        self._workspace_command_locks_guard = threading.Lock()
+        self._browser_grid_locks: dict[str, threading.RLock] = {}
+        self._browser_grid_locks_guard = threading.Lock()
+        self._browser_grid_owners: dict[str, str] = {}
 
     @staticmethod
     def _run_tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -279,9 +549,7 @@ class TerminalManager:
         # A Core login secret must never become shell environment. If Termroom
         # is using an already-running tmux server, remove it before a new pane
         # is created.
-        self._run_tmux(
-            "set-environment", "-g", "-u", "TERMROOM_PASSWORD", check=False
-        )
+        self._run_tmux("set-environment", "-g", "-u", "TERMROOM_PASSWORD", check=False)
         if not self.session_exists(session):
             self._run_tmux(
                 "new-session",
@@ -310,9 +578,7 @@ class TerminalManager:
             str(workspace["id"]), self._list_tmux_window_records(session)
         )
 
-    def _list_tmux_window_records(
-        self, session_name: str
-    ) -> list[dict[str, str | int | None]]:
+    def _list_tmux_window_records(self, session_name: str) -> list[dict[str, str | int | None]]:
         result = self._run_tmux(
             "list-windows",
             "-t",
@@ -326,9 +592,7 @@ class TerminalManager:
                 record["tmux_session"] = session_name
         return records
 
-    def refresh_activity(
-        self, workspaces: list[dict[str, Any]]
-    ) -> dict[str, list[dict[str, Any]]]:
+    def refresh_activity(self, workspaces: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         """Refresh requested Local workspaces with one tmux server query."""
 
         requested = {
@@ -352,11 +616,7 @@ class TerminalManager:
                 continue
             grouped[str(workspace["id"])].append(record)
         return self.store.observe_terminal_activity_batch(
-            {
-                workspace_id: records
-                for workspace_id, records in grouped.items()
-                if records
-            }
+            {workspace_id: records for workspace_id, records in grouped.items() if records}
         )
 
     def _list_tmux_windows(self, session_name: str) -> list[tuple[str, str]]:
@@ -390,9 +650,7 @@ class TerminalManager:
             managed_run_id,
         )
         terminals = self.ensure_workspace(workspace)
-        terminal = next(
-            (item for item in terminals if item["tmux_window"] == tmux_window), None
-        )
+        terminal = next((item for item in terminals if item["tmux_window"] == tmux_window), None)
         if terminal is None:
             raise TerminalError("Managed Terminal disappeared while recording identity")
         return terminal
@@ -423,8 +681,7 @@ class TerminalManager:
             "-t",
             tmux_window,
             "-F",
-            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t"
-            "#{pane_dead_time}",
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_dead_time}",
             check=False,
         )
         if result.returncode != 0:
@@ -457,9 +714,7 @@ class TerminalManager:
             current = next(
                 (
                     item
-                    for item in self._list_tmux_window_records(
-                        str(workspace["tmux_session"])
-                    )
+                    for item in self._list_tmux_window_records(str(workspace["tmux_session"]))
                     if item["tmux_window"] == tmux_window
                 ),
                 None,
@@ -470,9 +725,7 @@ class TerminalManager:
             if current_run_id not in {run_id, previous_run_id}:
                 return
             if created:
-                result = self._run_tmux(
-                    "kill-window", "-t", tmux_window, check=False
-                )
+                result = self._run_tmux("kill-window", "-t", tmux_window, check=False)
                 if result.returncode == 0:
                     self.ensure_workspace(workspace)
                     return
@@ -548,9 +801,7 @@ class TerminalManager:
             raise TerminalError("File Run argv is empty")
         wrapper = self._write_file_run_metadata(metadata_dir, run_id=run_id)
         terminals = self.ensure_workspace(workspace)
-        terminal = next(
-            (item for item in terminals if item.get("role") == "file_run"), None
-        )
+        terminal = next((item for item in terminals if item.get("role") == "file_run"), None)
         created = terminal is None
         if terminal is None:
             terminal = self.create_terminal(workspace, "Run")
@@ -563,9 +814,7 @@ class TerminalManager:
         previous_role = str(terminal.get("role") or "shell")
         previous_run_id = str(terminal.get("managed_run_id") or "") or None
         try:
-            self._run_tmux(
-                "set-window-option", "-t", tmux_window, "remain-on-exit", "on"
-            )
+            self._run_tmux("set-window-option", "-t", tmux_window, "remain-on-exit", "on")
             terminal = self.set_managed_identity(
                 workspace,
                 tmux_window,
@@ -592,9 +841,7 @@ class TerminalManager:
                 check=False,
             )
             if result.returncode:
-                raise TerminalError(
-                    result.stderr.strip() or "File Run could not start"
-                )
+                raise TerminalError(result.stderr.strip() or "File Run could not start")
             return terminal
         except TerminalError:
             self._rollback_file_run_slot(
@@ -627,9 +874,7 @@ class TerminalManager:
         completion = self._read_file_run_record(metadata_dir / "completion.json", run_id)
         if completion is not None and isinstance(completion.get("exit_code"), int):
             return {
-                "state": "stopped"
-                if file_run_completion_was_stopped(completion)
-                else "finished",
+                "state": "stopped" if file_run_completion_was_stopped(completion) else "finished",
                 "started_at": completion.get("started_at"),
                 "ended_at": completion.get("ended_at"),
                 "exit_code": int(completion["exit_code"]),
@@ -688,8 +933,7 @@ class TerminalManager:
             (
                 item
                 for item in terminals
-                if item.get("role") == "file_run"
-                and item.get("managed_run_id") == run_id
+                if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
             ),
             None,
         )
@@ -698,9 +942,7 @@ class TerminalManager:
         pane = self._file_run_pane(str(terminal["tmux_window"]))
         if pane is None or pane["dead"]:
             return False
-        (metadata_dir / "stop-requested-at").write_text(
-            str(time.time()) + "\n", encoding="utf-8"
-        )
+        (metadata_dir / "stop-requested-at").write_text(str(time.time()) + "\n", encoding="utf-8")
         result = self._run_tmux(
             "send-keys",
             "-t",
@@ -722,8 +964,7 @@ class TerminalManager:
             (
                 item
                 for item in terminals
-                if item.get("role") == "file_run"
-                and item.get("managed_run_id") == run_id
+                if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
             ),
             None,
         )
@@ -735,16 +976,12 @@ class TerminalManager:
         pane_pid = pane.get("pane_pid")
         if not isinstance(pane_pid, int):
             raise TerminalError("Managed File Run process identity is unavailable")
-        (metadata_dir / "stop-requested-at").write_text(
-            str(time.time()) + "\n", encoding="utf-8"
-        )
+        (metadata_dir / "stop-requested-at").write_text(str(time.time()) + "\n", encoding="utf-8")
         try:
             os.killpg(pane_pid, signal.SIGKILL)
         except ProcessLookupError:
             return False
-        (metadata_dir / "force-stopped").write_text(
-            str(time.time()) + "\n", encoding="utf-8"
-        )
+        (metadata_dir / "force-stopped").write_text(str(time.time()) + "\n", encoding="utf-8")
         return True
 
     def create_terminal(self, workspace: dict[str, Any], name: str = "shell") -> dict[str, Any]:
@@ -764,6 +1001,217 @@ class TerminalManager:
             str(workspace["path"]),
         )
         return self.store.create_terminal(workspace["id"], safe_name, result.stdout.strip())
+
+    def open_terminal_editor(
+        self, workspace: dict[str, Any], relative_path: str
+    ) -> dict[str, Any]:
+        """Open one file in a persistent tmux-hosted Vim-compatible editor."""
+
+        normalized = normalize_terminal_editor_path(relative_path)
+        root = Path(workspace["path"]).resolve(strict=True)
+        target = (root / normalized).resolve(strict=True)
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise TerminalError("Terminal editor file is outside the Workspace") from exc
+        if not target.is_file():
+            raise TerminalError("Terminal editor target is not a regular file")
+        if not any(shutil.which(candidate) for candidate in ("nvim", "vim", "vi")):
+            raise TerminalError("Install Neovim or Vim to edit files in the Terminal")
+
+        with self._workspace_command_lock(str(workspace["id"])):
+            terminals = self.ensure_workspace(workspace)
+            session = str(workspace["tmux_session"])
+            digest = terminal_editor_digest(normalized)
+            listed = self._run_tmux(
+                "list-windows", "-t", session, "-F", TMUX_TERMINAL_EDITOR_RECORD_FORMAT
+            )
+            try:
+                records = parse_tmux_terminal_editor_records(listed.stdout)
+            except ValueError as exc:
+                raise TerminalError(str(exc)) from exc
+            existing = next((item for item in records if item["digest"] == digest), None)
+            if existing is not None and not existing["dead"]:
+                terminal = next(
+                    (
+                        item
+                        for item in terminals
+                        if item["tmux_window"] == existing["tmux_window"]
+                    ),
+                    None,
+                )
+                if terminal is None:
+                    raise TerminalError("Vim Terminal is missing")
+                return terminal
+            if existing is not None:
+                self._run_tmux(
+                    "kill-window", "-t", str(existing["tmux_window"]), check=False
+                )
+
+            created = self._run_tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-e",
+                f"TERMROOM_TERMINAL_EDITOR_FILE={target}",
+                "-e",
+                f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}",
+                "-t",
+                session,
+                "-n",
+                normalize_terminal_name(f"vim-{PurePosixPath(normalized).name}"),
+                "-c",
+                str(root),
+                TERMINAL_EDITOR_WRAPPER,
+            )
+            window = created.stdout.strip()
+            try:
+                deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
+                while time.monotonic() < deadline:
+                    ready = self._run_tmux(
+                        "display-message",
+                        "-p",
+                        "-t",
+                        window,
+                        f"#{{{TMUX_TERMINAL_EDITOR_DIGEST_OPTION}}}",
+                        check=False,
+                    )
+                    if ready.returncode == 0 and ready.stdout.strip() == digest:
+                        break
+                    time.sleep(WORKSPACE_COMMAND_READY_POLL_SECONDS)
+                else:
+                    raise TerminalError("Vim Terminal did not finish starting")
+            except Exception:
+                self._run_tmux("kill-window", "-t", window, check=False)
+                raise
+            terminals = self.ensure_workspace(workspace)
+            terminal = next(
+                (item for item in terminals if item["tmux_window"] == window), None
+            )
+            if terminal is None:
+                raise TerminalError("Vim Terminal disappeared while starting")
+            return terminal
+
+    def _workspace_command_lock(self, workspace_id: str) -> threading.RLock:
+        with self._workspace_command_locks_guard:
+            return self._workspace_command_locks.setdefault(workspace_id, threading.RLock())
+
+    def run_workspace_command(
+        self,
+        workspace: dict[str, Any],
+        *,
+        slot: int,
+        command: str,
+        launch_id: str,
+    ) -> dict[str, Any]:
+        """Open or reuse one explicit Workspace-root command window."""
+
+        with self._workspace_command_lock(str(workspace["id"])):
+            return self._run_workspace_command_locked(
+                workspace,
+                slot=slot,
+                command=command,
+                launch_id=launch_id,
+            )
+
+    def _run_workspace_command_locked(
+        self,
+        workspace: dict[str, Any],
+        *,
+        slot: int,
+        command: str,
+        launch_id: str,
+    ) -> dict[str, Any]:
+        safe_slot = validate_workspace_command_slot(slot)
+        safe_command = normalize_workspace_command(command)
+        safe_launch = validate_workspace_command_launch(launch_id)
+        digest = workspace_command_digest(safe_command)
+        terminal_list = self.ensure_workspace(workspace)
+        session = str(workspace["tmux_session"])
+        result = self._run_tmux(
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+        )
+        try:
+            records = parse_tmux_workspace_command_records(result.stdout)
+        except ValueError as exc:
+            raise TerminalError(str(exc)) from exc
+        existing = next((item for item in records if item["slot"] == safe_slot), None)
+        if existing is not None:
+            terminal = next(
+                (item for item in terminal_list if item["tmux_window"] == existing["tmux_window"]),
+                None,
+            )
+            if terminal is None:
+                raise TerminalError("Workspace command Terminal is missing")
+            if existing["launch_id"] == safe_launch:
+                if existing["digest"] != digest:
+                    raise TerminalError(
+                        "Workspace command launch identity was reused for another command"
+                    )
+                return terminal
+            if not existing["dead"]:
+                return terminal
+            self._run_tmux("kill-window", "-t", str(existing["tmux_window"]))
+
+        created = self._run_tmux(
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+            "-t",
+            session,
+            "-n",
+            f"run-{safe_slot + 1}",
+            "-c",
+            str(workspace["path"]),
+            WORKSPACE_COMMAND_WRAPPER,
+        )
+        window = created.stdout.strip()
+        try:
+            deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                ready = self._run_tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    window,
+                    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                    check=False,
+                )
+                if ready.returncode == 0 and workspace_command_record_is_ready(
+                    ready.stdout,
+                    window=window,
+                    slot=safe_slot,
+                    launch_id=safe_launch,
+                    digest=digest,
+                ):
+                    break
+                time.sleep(WORKSPACE_COMMAND_READY_POLL_SECONDS)
+            else:
+                raise TerminalError("Workspace command Terminal did not finish starting")
+        except Exception:
+            self._run_tmux("kill-window", "-t", window, check=False)
+            raise
+        terminal_list = self.ensure_workspace(workspace)
+        terminal = next((item for item in terminal_list if item["tmux_window"] == window), None)
+        if terminal is None:
+            raise TerminalError("Workspace command Terminal disappeared while starting")
+        return terminal
 
     def rename_terminal(
         self, workspace: dict[str, Any], terminal: dict[str, Any], name: str
@@ -834,6 +1282,7 @@ class TerminalManager:
         view_session = tmux_browser_view_session(client_id)
         process_pid: int | None = None
         master_fd: int | None = None
+        last_viewport: tuple[int, int] | None = None
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
@@ -846,7 +1295,7 @@ class TerminalManager:
                     tail = decoder.feed(b"", final=True)
                     if tail:
                         await asyncio.to_thread(
-                            self.store.touch_terminal_output, terminal_id
+                            touch_terminal_output_if_present, self.store, terminal_id
                         )
                         await websocket.send_text(tail)
                     return
@@ -854,16 +1303,63 @@ class TerminalManager:
                     tail = decoder.feed(b"", final=True)
                     if tail:
                         await asyncio.to_thread(
-                            self.store.touch_terminal_output, terminal_id
+                            touch_terminal_output_if_present, self.store, terminal_id
                         )
                         await websocket.send_text(tail)
                     return
                 decoded = decoder.feed(chunk)
                 if decoded:
                     await asyncio.to_thread(
-                        self.store.touch_terminal_output, terminal_id
+                        touch_terminal_output_if_present, self.store, terminal_id
                     )
                     await websocket.send_text(decoded)
+
+        async def resize_browser_view(payload: dict[str, Any]) -> None:
+            nonlocal last_viewport
+            if "rows" not in payload or "cols" not in payload:
+                return
+            size = terminal_size(payload)
+            if size is None or master_fd is None or process_pid is None:
+                return
+            rows, cols = size
+            controls_grid, grid_resize = self.control.resize_plan(
+                terminal_id, client_id, rows=rows, cols=cols
+            )
+            role_changed = await asyncio.to_thread(
+                self._browser_grid_role_changed,
+                terminal_id,
+                client_id,
+                enabled=controls_grid,
+            )
+            if role_changed:
+                changed = await asyncio.to_thread(
+                    self._sync_browser_grid_role,
+                    terminal_id,
+                    client_id,
+                    view_session,
+                    enabled=controls_grid,
+                )
+                if not changed:
+                    return
+            if controls_grid and not self.control.can_resize(terminal_id, client_id):
+                changed = await asyncio.to_thread(
+                    self._sync_browser_grid_role,
+                    terminal_id,
+                    client_id,
+                    view_session,
+                    enabled=False,
+                )
+                if not changed:
+                    return
+                controls_grid = False
+                grid_resize = False
+            viewport = (rows, cols)
+            if viewport == last_viewport and not grid_resize:
+                return
+            self._set_window_size(master_fd, rows=rows, cols=cols)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process_pid, signal.SIGWINCH)
+            last_viewport = viewport
 
         async def browser_to_input() -> None:
             while True:
@@ -878,6 +1374,10 @@ class TerminalManager:
                     if master_fd is None:
                         return
                     self.control.mark_input(terminal_id, client_id, device_id)
+                    if last_viewport is not None:
+                        await resize_browser_view(
+                            {"rows": last_viewport[0], "cols": last_viewport[1]}
+                        )
                     os.write(master_fd, payload_bytes)
                     continue
                 raw = message.get("text") or ""
@@ -889,16 +1389,13 @@ class TerminalManager:
                 except json.JSONDecodeError:
                     if master_fd is None:
                         return
-                    self.control.mark_input(terminal_id, client_id, device_id)
                     os.write(master_fd, raw.encode())
                     continue
 
                 if not isinstance(payload, dict):
                     continue
                 kind = payload.get("kind")
-                if kind == "claim":
-                    self.control.claim_view(terminal_id, client_id)
-                elif kind == "activity_ack":
+                if kind == "activity_ack":
                     revision = payload.get("activity_at")
                     if isinstance(revision, bool) or not isinstance(revision, int):
                         continue
@@ -912,19 +1409,12 @@ class TerminalManager:
                     except (KeyError, ValueError):
                         continue
                 elif kind == "resize":
-                    if not self.control.can_resize(terminal_id, client_id):
-                        continue
-                    size = terminal_size(payload)
-                    if size is None or master_fd is None or process_pid is None:
-                        continue
-                    rows, cols = size
-                    self._set_window_size(master_fd, rows=rows, cols=cols)
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process_pid, signal.SIGWINCH)
+                    await resize_browser_view(payload)
                 elif kind == "command":
                     if master_fd is None:
                         return
                     self.control.mark_input(terminal_id, client_id, device_id)
+                    await resize_browser_view(payload)
                     command = str(payload.get("data", ""))
                     await asyncio.to_thread(
                         self.store.add_command, workspace["id"], terminal["id"], command
@@ -933,7 +1423,9 @@ class TerminalManager:
                 elif kind == "input":
                     if master_fd is None:
                         return
-                    self.control.mark_input(terminal_id, client_id, device_id)
+                    if terminal_input_claims_grid(payload):
+                        self.control.mark_input(terminal_id, client_id, device_id)
+                    await resize_browser_view(payload)
                     os.write(master_fd, str(payload.get("data", "")).encode())
 
         output_task: asyncio.Task[None] | None = None
@@ -956,6 +1448,7 @@ class TerminalManager:
                     await task
         finally:
             self.control.unregister(terminal_id, client_id)
+            self._forget_browser_grid_owner(terminal_id, client_id)
             for task in (output_task, input_task):
                 if task is not None and not task.done():
                     task.cancel()
@@ -1015,13 +1508,83 @@ class TerminalManager:
         environment["TERM"] = "xterm-256color"
         target_session = view_session or str(workspace["tmux_session"])
         process_pid, master_fd = spawn_pty_process(
-            [*command, "attach-session", "-t", target_session],
+            [
+                *command,
+                "attach-session",
+                "-f",
+                "ignore-size",
+                "-t",
+                target_session,
+            ],
             cwd=str(workspace["path"]),
             environment=environment,
         )
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process_pid, signal.SIGWINCH)
         return process_pid, master_fd
+
+    def _set_browser_view_grid_resize(self, view_session: str, *, enabled: bool) -> bool:
+        """Choose whether one browser client may affect shared tmux dimensions."""
+
+        return set_tmux_browser_view_grid_resize(
+            self._run_tmux,
+            view_session,
+            enabled=enabled,
+        )
+
+    def _browser_grid_lock(self, terminal_id: str) -> threading.RLock:
+        with self._browser_grid_locks_guard:
+            return self._browser_grid_locks.setdefault(terminal_id, threading.RLock())
+
+    def _browser_grid_role_changed(
+        self,
+        terminal_id: str,
+        client_id: str,
+        *,
+        enabled: bool,
+    ) -> bool:
+        with self._browser_grid_lock(terminal_id):
+            return (self._browser_grid_owners.get(terminal_id) == client_id) != enabled
+
+    def _sync_browser_grid_role(
+        self,
+        terminal_id: str,
+        client_id: str,
+        view_session: str,
+        *,
+        enabled: bool,
+    ) -> bool:
+        with self._browser_grid_lock(terminal_id):
+            current = self._browser_grid_owners.get(terminal_id)
+            if not enabled:
+                if current != client_id:
+                    return True
+                if not self._set_browser_view_grid_resize(view_session, enabled=False):
+                    return False
+                if self._browser_grid_owners.get(terminal_id) == client_id:
+                    self._browser_grid_owners.pop(terminal_id, None)
+                return True
+            if current == client_id and self.control.can_resize(terminal_id, client_id):
+                return True
+            if not self.control.can_resize(terminal_id, client_id):
+                changed = self._set_browser_view_grid_resize(view_session, enabled=False)
+                if changed and self._browser_grid_owners.get(terminal_id) == client_id:
+                    self._browser_grid_owners.pop(terminal_id, None)
+                return changed
+            if not self._set_browser_view_grid_resize(view_session, enabled=True):
+                return False
+            self._browser_grid_owners[terminal_id] = client_id
+            if not self.control.can_resize(terminal_id, client_id):
+                if not self._set_browser_view_grid_resize(view_session, enabled=False):
+                    return False
+                if self._browser_grid_owners.get(terminal_id) == client_id:
+                    self._browser_grid_owners.pop(terminal_id, None)
+            return True
+
+    def _forget_browser_grid_owner(self, terminal_id: str, client_id: str) -> None:
+        with self._browser_grid_lock(terminal_id):
+            if self._browser_grid_owners.get(terminal_id) == client_id:
+                self._browser_grid_owners.pop(terminal_id, None)
 
     @staticmethod
     def _wait_for_pid(process_pid: int, timeout: float) -> bool:

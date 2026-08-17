@@ -22,6 +22,11 @@
       <p>{{ t('home.recent_workspaces_copy') }}</p>
     </div>
   </header>
+  <p class="sr-only"
+     role="status"
+     aria-live="polite"
+     aria-atomic="true"
+     data-workspace-open-announcer></p>
 
   {% if recent %}
   <div class="workspace-table"
@@ -35,7 +40,11 @@
     <a class="workspace-item"
        href="/w/{{ workspace.id }}"
        data-terminal-activity-workspace="{{ workspace.id }}"
-       data-workspace-href="/w/{{ workspace.id }}">
+       data-workspace-href="/w/{{ workspace.id }}"
+       {% if workspace.backend_kind == 'remote' %}
+       data-workspace-open-pending
+       data-workspace-opening-label="{{ t('terminal.status.connecting') }}"
+       {% endif %}>
       <span class="workspace-main">
         <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
         <span>
@@ -45,9 +54,12 @@
       </span>
       <span class="workspace-last-opened">{{ workspace.last_opened_label }}</span>
       <span class="workspace-state-summary">
-        <span class="state-chip {{ workspace.session_status_class }}">
-          <span class="status-dot"></span>
-          {{ t(workspace.session_status_label) }}
+        <span class="state-chip {{ workspace.session_status_class }}"
+              {% if workspace.backend_kind == 'remote' %}
+              data-workspace-open-status
+              {% endif %}>
+          <span class="status-dot" aria-hidden="true"></span>
+          <span {% if workspace.backend_kind == 'remote' %}data-workspace-open-status-label{% endif %}>{{ t(workspace.session_status_label) }}</span>
         </span>
         <small>{{ t('common.terminal') }} {{ workspace.terminal_count }} · {{ workspace.connection_label or t('home.this_computer') }}</small>
         <small class="workspace-terminal-unread" data-terminal-activity-unread hidden>
@@ -99,5 +111,5 @@
 {% endif %}
 {% endblock %}
 {% block scripts %}
-{% if recent_runs %}<script src="{{ url_for('static', path='remote_run.js') }}?v=10" defer></script>{% endif %}
+{% if recent_runs %}<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>{% endif %}
 {% endblock %}

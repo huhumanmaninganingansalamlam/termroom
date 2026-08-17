@@ -15,6 +15,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from termroom.file_runs import RUNNER_REGISTRY_VERSION
+from termroom.files import DirectoryListingLimitError
 from termroom.node_agent import (
     NodeAgent,
     NodeAgentError,
@@ -29,9 +30,10 @@ from termroom.node_protocol import (
     NODE_WORKSPACE_USAGE_VERSION,
     generate_private_key,
 )
-from termroom.remote_access import _cancel_bridge_tasks, _settle_bridge_tasks
+from termroom.remote_access import RemoteAccess, _cancel_bridge_tasks, _settle_bridge_tasks
 from termroom.run_sources import SourceFileChangedError, SourceValidationError
 from termroom.security import PathBoundaryError
+from termroom.terminal_control import TerminalControl
 
 
 def _payload(workspace: Path, **values: Any) -> dict[str, Any]:
@@ -72,24 +74,30 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
     runtime = NodeRuntime([allowed])
     roots = runtime._handle_sync("workspace.roots", {})
     assert roots == {"roots": [{"path": str(allowed), "name": "allowed"}]}
-    assert runtime._handle_sync("workspace.validate", {"path": str(workspace)})[
-        "path"
-    ] == str(workspace)
+    assert runtime._handle_sync("workspace.validate", {"path": str(workspace)})["path"] == str(
+        workspace
+    )
     with pytest.raises(PathBoundaryError):
         runtime._handle_sync("workspace.validate", {"path": str(outside)})
     with pytest.raises(PathBoundaryError):
         runtime._handle_sync("workspace.validate", {"path": str(allowed / "escape")})
 
-    listed = runtime._handle_sync(
-        "files.list", {"workspace_path": str(workspace), "path": "."}
-    )
+    listed = runtime._handle_sync("files.list", {"workspace_path": str(workspace), "path": "."})
     assert [entry["name"] for entry in listed["entries"]] == ["hello.txt"]
-    recent = runtime._handle_sync(
-        "files.recent", {"workspace_path": str(workspace), "limit": 5}
-    )
+    recent = runtime._handle_sync("files.recent", {"workspace_path": str(workspace), "limit": 5})
     assert [entry["relative_path"] for entry in recent["entries"]] == ["hello.txt"]
     assert recent["scanned_files"] == 1
     assert recent["truncated"] is False
+    (workspace / "second.txt").write_text("second\n", encoding="utf-8")
+    with pytest.raises(DirectoryListingLimitError):
+        runtime._handle_sync(
+            "files.list",
+            {
+                "workspace_path": str(workspace),
+                "path": ".",
+                "max_entries": 1,
+            },
+        )
     sent: list[dict[str, Any]] = []
 
     async def send(message: Any) -> None:
@@ -108,11 +116,14 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
     )
     assert read.start is not None
     await read.start()
-    assert b"".join(
-        base64.b64decode(message["data"])
-        for message in sent
-        if message["type"] == "stream.data"
-    ) == b"before\n"
+    assert (
+        b"".join(
+            base64.b64decode(message["data"])
+            for message in sent
+            if message["type"] == "stream.data"
+        )
+        == b"before\n"
+    )
     snapshot = read.value["snapshot"]
 
     write_id = uuid.uuid4().hex
@@ -195,9 +206,7 @@ async def test_node_workspace_source_streams_manifest_and_stable_files_with_loca
     assert 0 < opened.value["frame_count"] <= NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW
     manifest_stream = runtime.streams[manifest_id]
     with pytest.raises(NodeAgentError) as invalid_credit:
-        await manifest_stream.control(
-            "credit", {"count": NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW + 1}
-        )
+        await manifest_stream.control("credit", {"count": NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW + 1})
     assert invalid_credit.value.code == "stream_control_invalid"
     await manifest_stream.control("credit", {"count": opened.value["frame_count"]})
     with pytest.raises(NodeAgentError) as duplicate_credit:
@@ -205,9 +214,7 @@ async def test_node_workspace_source_streams_manifest_and_stable_files_with_loca
     assert duplicate_credit.value.code == "stream_control_invalid"
     await opened.start()
     encoded_manifest = b"".join(
-        base64.b64decode(message["data"])
-        for message in sent
-        if message["type"] == "stream.data"
+        base64.b64decode(message["data"]) for message in sent if message["type"] == "stream.data"
     )
     entries = [json.loads(line) for line in encoded_manifest.splitlines()]
     by_path = {entry["path"]: entry for entry in entries}
@@ -259,9 +266,9 @@ async def test_node_workspace_source_streams_manifest_and_stable_files_with_loca
             send,
         )
     assert changed.value.current_size == len(content) + len(b"changed\n")
-    current = runtime._handle_sync(
-        "remote_run_source.stat", {**base, "path": "src/run.sh"}
-    )["entry"]
+    current = runtime._handle_sync("remote_run_source.stat", {**base, "path": "src/run.sh"})[
+        "entry"
+    ]
     assert current["size"] == changed.value.current_size
 
     with pytest.raises(NodeAgentError) as transient:
@@ -339,9 +346,7 @@ async def test_node_workspace_source_manifest_stream_exceeds_single_message_limi
     )
     await opened.start()
     frames = [
-        base64.b64decode(message["data"])
-        for message in sent
-        if message["type"] == "stream.data"
+        base64.b64decode(message["data"]) for message in sent if message["type"] == "stream.data"
     ]
     assert opened.value["entry_count"] == 4_500
     assert opened.value["total_bytes"] == 4_500
@@ -363,9 +368,7 @@ async def test_node_workspace_source_file_stream_backpressures_slow_core_consume
     source_file.write_bytes(content)
     source_stat = source_file.stat()
     runtime = NodeRuntime([tmp_path])
-    messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
-        maxsize=NODE_STREAM_QUEUE_DEPTH
-    )
+    messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=NODE_STREAM_QUEUE_DEPTH)
     peak_data_depth = 0
     overflowed = False
 
@@ -375,9 +378,7 @@ async def test_node_workspace_source_file_stream_backpressures_slow_core_consume
             messages.put_nowait(dict(message))
         except asyncio.QueueFull as exc:
             overflowed = True
-            raise NodeCoreError(
-                "Node stream exceeded its buffer", code="stream_overflow"
-            ) from exc
+            raise NodeCoreError("Node stream exceeded its buffer", code="stream_overflow") from exc
         if message.get("type") == "stream.data":
             peak_data_depth = max(peak_data_depth, messages.qsize())
 
@@ -403,9 +404,7 @@ async def test_node_workspace_source_file_stream_backpressures_slow_core_consume
     frame_count = opened.value["frame_count"]
     stream = runtime.streams[stream_id]
     remaining_to_grant = frame_count
-    batch_remaining = min(
-        NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW, remaining_to_grant
-    )
+    batch_remaining = min(NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW, remaining_to_grant)
     credit_batches = [batch_remaining]
     await stream.control("credit", {"count": batch_remaining})
     remaining_to_grant -= batch_remaining
@@ -422,9 +421,7 @@ async def test_node_workspace_source_file_stream_backpressures_slow_core_consume
             received_frames += 1
             batch_remaining -= 1
             if batch_remaining == 0 and remaining_to_grant:
-                batch_remaining = min(
-                    NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW, remaining_to_grant
-                )
+                batch_remaining = min(NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW, remaining_to_grant)
                 credit_batches.append(batch_remaining)
                 await stream.control("credit", {"count": batch_remaining})
                 remaining_to_grant -= batch_remaining
@@ -471,11 +468,14 @@ async def test_node_text_streams_support_the_exact_editor_limit(tmp_path: Path) 
     await read.start()
     assert "content" not in read.value["snapshot"]
     assert read.value["size"] == limit
-    assert b"".join(
-        base64.b64decode(message["data"])
-        for message in sent
-        if message["type"] == "stream.data"
-    ) == source
+    assert (
+        b"".join(
+            base64.b64decode(message["data"])
+            for message in sent
+            if message["type"] == "stream.data"
+        )
+        == source
+    )
 
     write_id = uuid.uuid4().hex
     await runtime.handle(
@@ -524,9 +524,9 @@ def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Pa
         assert first == second
         assert len(first) == 1
 
-        created = runtime._handle_sync(
-            "terminal.create", {**payload, "name": "한글 shell"}
-        )["terminal"]
+        created = runtime._handle_sync("terminal.create", {**payload, "name": "한글 shell"})[
+            "terminal"
+        ]
         renamed = runtime._handle_sync(
             "terminal.rename",
             {
@@ -541,9 +541,32 @@ def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Pa
         )["terminals"]
         assert terminals == first
     finally:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session], check=False, capture_output=True
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
+
+
+@pytest.mark.skipif(
+    shutil.which("tmux") is None
+    or not any(shutil.which(editor) for editor in ("nvim", "vim", "vi")),
+    reason="tmux and a Vim-compatible editor are required",
+)
+def test_node_terminal_editor_reuses_the_live_file_window(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("hello\n", encoding="utf-8")
+    runtime = NodeRuntime([tmp_path])
+    payload = _payload(workspace)
+    session = str(payload["tmux_session"])
+    try:
+        first = runtime._handle_sync(
+            "terminal.editor.open", {**payload, "path": "note.txt"}
         )
+        second = runtime._handle_sync(
+            "terminal.editor.open", {**payload, "path": "note.txt"}
+        )
+        assert first["terminal"]["tmux_window"] == second["terminal"]["tmux_window"]
+        assert first["terminal"]["name"] == "vim-note.txt"
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -586,9 +609,7 @@ def test_node_workspace_usage_is_versioned_fixed_and_tracks_descendants(
             )
         assert exc_info.value.code == "workspace_usage_version_incompatible"
     finally:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session], check=False, capture_output=True
-        )
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -618,9 +639,7 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
     )
     session = str(base["tmux_session"])
     try:
-        inspected = runtime._handle_sync(
-            "file_run.inspect", {**base, "path": script_name}
-        )
+        inspected = runtime._handle_sync("file_run.inspect", {**base, "path": script_name})
         assert inspected["runner"] == {
             "id": "python3",
             "version": RUNNER_REGISTRY_VERSION,
@@ -675,9 +694,7 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         assert metadata.is_dir()
         assert not any(path.name == "request.json" for path in workspace.rglob("*"))
     finally:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session], check=False, capture_output=True
-        )
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -709,9 +726,7 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
     )
     session = str(base["tmux_session"])
     try:
-        inspected = runtime._handle_sync(
-            "file_run.inspect", {**base, "path": "interactive.py"}
-        )
+        inspected = runtime._handle_sync("file_run.inspect", {**base, "path": "interactive.py"})
         run_id = str(uuid.uuid4())
         started = runtime._handle_sync(
             "file_run.start",
@@ -725,22 +740,16 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
             },
         )
         window = str(started["terminal"]["tmux_window"])
-        _wait_for_node_file_run(
-            runtime, {**base, "run_id": run_id}, states={"running"}
-        )
+        _wait_for_node_file_run(runtime, {**base, "run_id": run_id}, states={"running"})
         runtime._tmux("send-keys", "-t", window, "hello-node", "Enter")
-        _wait_for_node_file_run(
-            runtime, {**base, "run_id": run_id}, states={"finished"}
-        )
+        _wait_for_node_file_run(runtime, {**base, "run_id": run_id}, states={"finished"})
         output = runtime._handle_sync(
             "terminal.scrollback",
             {**base, "tmux_window": window, "lines": 200},
         )["output"]
         assert "received:hello-node" in output
 
-        inspected = runtime._handle_sync(
-            "file_run.inspect", {**base, "path": "stubborn.py"}
-        )
+        inspected = runtime._handle_sync("file_run.inspect", {**base, "path": "stubborn.py"})
         stubborn_id = str(uuid.uuid4())
         runtime._handle_sync(
             "file_run.start",
@@ -753,19 +762,16 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
                 "runner_version": RUNNER_REGISTRY_VERSION,
             },
         )
-        _wait_for_node_file_run(
-            runtime, {**base, "run_id": stubborn_id}, states={"running"}
-        )
-        assert runtime._handle_sync(
-            "file_run.interrupt", {**base, "run_id": stubborn_id}
-        )["sent"]
+        _wait_for_node_file_run(runtime, {**base, "run_id": stubborn_id}, states={"running"})
+        assert runtime._handle_sync("file_run.interrupt", {**base, "run_id": stubborn_id})["sent"]
         time.sleep(0.2)
-        assert runtime._handle_sync(
-            "file_run.observe", {**base, "run_id": stubborn_id}
-        )["observation"]["state"] == "running"
-        assert runtime._handle_sync(
-            "file_run.kill", {**base, "run_id": stubborn_id}
-        )["sent"]
+        assert (
+            runtime._handle_sync("file_run.observe", {**base, "run_id": stubborn_id})[
+                "observation"
+            ]["state"]
+            == "running"
+        )
+        assert runtime._handle_sync("file_run.kill", {**base, "run_id": stubborn_id})["sent"]
         stopped = _wait_for_node_file_run(
             runtime,
             {**base, "run_id": stubborn_id},
@@ -787,9 +793,7 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
                 )
             assert protected.value.code == "terminal_managed"
     finally:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session], check=False, capture_output=True
-        )
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
 
 @pytest.mark.asyncio
@@ -819,9 +823,7 @@ async def test_node_file_streams_are_chunked_atomic_and_abortable(tmp_path: Path
     assert download.start is not None
     await download.start()
     content = b"".join(
-        base64.b64decode(message["data"])
-        for message in sent
-        if message["type"] == "stream.data"
+        base64.b64decode(message["data"]) for message in sent if message["type"] == "stream.data"
     )
     assert content == b"23456"
     assert sent[-1] == {"type": "stream.close", "stream_id": download_id}
@@ -888,7 +890,7 @@ async def test_node_agent_retrieves_expected_background_disconnects(
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: observed.append(context))
 
-    async def disconnect(_message: Any) -> None:
+    async def disconnect(_message: Any, **_kwargs: Any) -> None:
         raise NodeAgentError("control connection closed", code="node_offline")
 
     agent._handle_request = disconnect  # type: ignore[method-assign]
@@ -940,6 +942,271 @@ async def test_node_terminal_bridge_retrieves_the_canceled_direction() -> None:
         loop.set_exception_handler(previous_handler)
 
     assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_node_terminal_binary_and_structured_input_take_over_before_send() -> None:
+    events: list[tuple[Any, ...]] = []
+
+    class FakeStore:
+        def touch_terminal(self, _terminal_id: str) -> None:
+            return None
+
+        def touch_terminal_output(self, _terminal_id: str) -> None:
+            return None
+
+        def add_command(self, _workspace_id: str, _terminal_id: str, command: str) -> None:
+            events.append(("command", command))
+
+    class FakeStream:
+        def __aiter__(self) -> FakeStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def control(self, action: str, **values: Any) -> None:
+            events.append(("control", action, values))
+
+        async def send(self, value: bytes) -> None:
+            events.append(("send", value))
+
+        async def close(self) -> None:
+            return None
+
+    stream = FakeStream()
+
+    class FakeConnection:
+        async def open_stream(
+            self, _operation: str, _payload: dict[str, Any]
+        ) -> tuple[dict[str, Any], FakeStream]:
+            return {}, stream
+
+    class FakeNodes:
+        def connection(self, _computer_id: str) -> FakeConnection:
+            return FakeConnection()
+
+    messages = [
+        {
+            "type": "websocket.receive",
+            "text": json.dumps({"kind": "resize", "rows": 24, "cols": 80}),
+        },
+        {"type": "websocket.receive", "text": "raw-passive"},
+        {"type": "websocket.receive", "bytes": b"binary-input"},
+        {
+            "type": "websocket.receive",
+            "text": json.dumps(
+                {
+                    "kind": "input",
+                    "data": "a",
+                    "rows": 37,
+                    "cols": 111,
+                    "user_input": True,
+                }
+            ),
+        },
+        {
+            "type": "websocket.receive",
+            "text": json.dumps(
+                {
+                    "kind": "input",
+                    "data": "b",
+                    "rows": 37,
+                    "cols": 111,
+                    "user_input": True,
+                }
+            ),
+        },
+        {
+            "type": "websocket.receive",
+            "text": json.dumps({"kind": "command", "data": "pwd", "rows": 38, "cols": 112}),
+        },
+        {
+            "type": "websocket.receive",
+            "text": json.dumps({"kind": "input", "data": "legacy"}),
+        },
+        {"type": "websocket.disconnect", "code": 1000},
+    ]
+
+    class FakeWebSocket:
+        async def receive(self) -> dict[str, Any]:
+            return messages.pop(0)
+
+        async def send_text(self, _value: str) -> None:
+            return None
+
+        async def close(self, *, code: int, reason: str) -> None:
+            raise AssertionError((code, reason))
+
+    control = TerminalControl()
+    existing_owner = control.register("terminal")
+    control.mark_input("terminal", existing_owner)
+    access = RemoteAccess(
+        FakeStore(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        FakeNodes(),  # type: ignore[arg-type]
+        control,
+    )
+
+    async def ensure_workspace(_workspace: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
+    access.ensure_workspace = ensure_workspace  # type: ignore[method-assign]
+    workspace = {
+        "id": "workspace",
+        "path": "/project",
+        "tmux_session": "termroom-project",
+        "computer": {"id": "node", "connection_method": "node"},
+    }
+    terminal = {"id": "terminal", "tmux_window": "@1"}
+
+    await access.bridge(
+        FakeWebSocket(),  # type: ignore[arg-type]
+        workspace,
+        terminal,
+        device_id="device",
+    )
+
+    assert events == [
+        (
+            "control",
+            "resize",
+            {"rows": 24, "cols": 80, "affects_grid": False},
+        ),
+        ("send", b"raw-passive"),
+        (
+            "control",
+            "resize",
+            {"rows": 24, "cols": 80, "affects_grid": True},
+        ),
+        ("send", b"binary-input"),
+        (
+            "control",
+            "resize",
+            {"rows": 37, "cols": 111, "affects_grid": True},
+        ),
+        ("send", b"a"),
+        ("send", b"b"),
+        (
+            "control",
+            "resize",
+            {"rows": 38, "cols": 112, "affects_grid": True},
+        ),
+        ("command", "pwd"),
+        ("send", b"pwd\r"),
+        ("send", b"legacy"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_node_terminal_bridge_demotes_owner_that_changes_during_control() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    control = TerminalControl()
+    competing_client = control.register("terminal")
+
+    class FakeStore:
+        def touch_terminal(self, _terminal_id: str) -> None:
+            return None
+
+        def touch_terminal_output(self, _terminal_id: str) -> None:
+            return None
+
+    class FakeStream:
+        def __aiter__(self) -> FakeStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def control(self, action: str, **values: Any) -> None:
+            events.append((action, values))
+            if len(events) == 1:
+                control.mark_input("terminal", competing_client)
+
+        async def send(self, _value: bytes) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    stream = FakeStream()
+
+    class FakeConnection:
+        async def open_stream(
+            self, _operation: str, _payload: dict[str, Any]
+        ) -> tuple[dict[str, Any], FakeStream]:
+            return {}, stream
+
+    class FakeNodes:
+        def connection(self, _computer_id: str) -> FakeConnection:
+            return FakeConnection()
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages = [
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps(
+                        {
+                            "kind": "input",
+                            "data": "",
+                            "rows": 37,
+                            "cols": 111,
+                            "user_input": True,
+                        }
+                    ),
+                },
+                {"type": "websocket.disconnect", "code": 1000},
+            ]
+
+        async def receive(self) -> dict[str, Any]:
+            return self.messages.pop(0)
+
+        async def send_text(self, _value: str) -> None:
+            return None
+
+        async def close(self, *, code: int, reason: str) -> None:
+            raise AssertionError((code, reason))
+
+    access = RemoteAccess(
+        FakeStore(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        FakeNodes(),  # type: ignore[arg-type]
+        control,
+    )
+
+    async def ensure_workspace(_workspace: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
+    access.ensure_workspace = ensure_workspace  # type: ignore[method-assign]
+    workspace = {
+        "id": "workspace",
+        "path": "/project",
+        "tmux_session": "termroom-project",
+        "computer": {"id": "node", "connection_method": "node"},
+    }
+    try:
+        await access.bridge(
+            FakeWebSocket(),  # type: ignore[arg-type]
+            workspace,
+            {"id": "terminal", "tmux_window": "@1"},
+            device_id="device",
+        )
+    finally:
+        control.unregister("terminal", competing_client)
+
+    assert events == [
+        (
+            "resize",
+            {"rows": 37, "cols": 111, "affects_grid": True},
+        ),
+        (
+            "resize",
+            {"rows": 37, "cols": 111, "affects_grid": False},
+        ),
+    ]
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,31 @@ SQLITE_MAX_INTEGER = (1 << 63) - 1
 TERMINAL_ACTIVITY_READ_RETENTION = timedelta(days=30)
 TERMINAL_ACTIVITY_CLOCK_SKEW_ALLOWANCE = timedelta(days=1)
 TERMINAL_ACTIVITY_READ_CLEANUP_INTERVAL_SECONDS = 60 * 60
+MAX_WORKSPACE_COMMANDS = 3
+MAX_WORKSPACE_COMMAND_BYTES = 4096
+
+
+def normalize_workspace_commands(values: Iterable[object]) -> tuple[str, ...]:
+    """Validate the compact, explicit command list stored on a Workspace."""
+
+    commands: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("Workspace commands must be text")
+        if any(
+            unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+            for character in value
+        ):
+            raise ValueError("Workspace commands must be one line without control characters")
+        command = value.strip()
+        if not command:
+            continue
+        if len(command.encode("utf-8")) > MAX_WORKSPACE_COMMAND_BYTES:
+            raise ValueError("Workspace command exceeds 4096 UTF-8 bytes")
+        commands.append(command)
+    if len(commands) > MAX_WORKSPACE_COMMANDS:
+        raise ValueError("A Workspace can store at most three commands")
+    return tuple(commands)
 
 
 def _computers_table_sql(
@@ -163,6 +188,7 @@ class StateStore:
                     computer_id TEXT,
                     canonical_path TEXT,
                     workspace_kind TEXT NOT NULL DEFAULT 'workspace',
+                    workspace_commands_json TEXT NOT NULL DEFAULT '[]',
                     UNIQUE(root_id, relative_path)
                 );
 
@@ -248,6 +274,13 @@ class StateStore:
                     UNIQUE(subject_type, subject_id, subject_revision)
                 );
 
+                CREATE TABLE IF NOT EXISTS event_reads (
+                    event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    device_id TEXT NOT NULL,
+                    read_at TEXT NOT NULL,
+                    PRIMARY KEY(event_id, device_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS notification_devices (
                     id TEXT PRIMARY KEY,
                     start_sequence INTEGER NOT NULL,
@@ -289,6 +322,8 @@ class StateStore:
                     WHERE read_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_event_notification_claims_device
                     ON event_notification_claims(device_id, claimed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_event_reads_device
+                    ON event_reads(device_id, read_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_terminal_activity_reads_updated_at
                     ON terminal_activity_reads(updated_at);
                 """
@@ -310,6 +345,12 @@ class StateStore:
                 "workspaces",
                 "workspace_kind",
                 "TEXT NOT NULL DEFAULT 'workspace'",
+            )
+            self._ensure_column(
+                db,
+                "workspaces",
+                "workspace_commands_json",
+                "TEXT NOT NULL DEFAULT '[]'",
             )
             self._ensure_column(
                 db, "computers", "auth_kind", "TEXT NOT NULL DEFAULT 'key'"
@@ -759,6 +800,48 @@ class StateStore:
                 (workspace_id,),
             ).fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def workspace_commands_from(workspace: Mapping[str, Any]) -> tuple[str, ...]:
+        raw = workspace.get("workspace_commands_json") or "[]"
+        try:
+            values = json.loads(str(raw))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Stored Workspace commands are invalid") from exc
+        if not isinstance(values, list):
+            raise RuntimeError("Stored Workspace commands are invalid")
+        try:
+            commands = normalize_workspace_commands(values)
+        except ValueError as exc:
+            raise RuntimeError("Stored Workspace commands are invalid") from exc
+        if list(commands) != values:
+            raise RuntimeError("Stored Workspace commands are invalid")
+        return commands
+
+    def list_workspace_commands(self, workspace_id: str) -> tuple[str, ...]:
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            raise KeyError(f"Unknown Workspace: {workspace_id}")
+        return self.workspace_commands_from(workspace)
+
+    def replace_workspace_commands(
+        self, workspace_id: str, values: Iterable[object]
+    ) -> tuple[str, ...]:
+        commands = normalize_workspace_commands(values)
+        encoded = json.dumps(commands, ensure_ascii=False, separators=(",", ":"))
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT workspace_kind FROM workspaces WHERE id = ?", (workspace_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown Workspace: {workspace_id}")
+            if row["workspace_kind"] != "workspace":
+                raise ValueError("Commands are available only for persistent Workspaces")
+            db.execute(
+                "UPDATE workspaces SET workspace_commands_json = ? WHERE id = ?",
+                (encoded, workspace_id),
+            )
+        return commands
 
     def find_remote_workspace(
         self,
@@ -2329,10 +2412,34 @@ class StateStore:
         )
 
     @staticmethod
-    def _activity_select() -> str:
-        return """
+    def _activity_select(device_id: str | None = None) -> str:
+        read_at = (
+            "COALESCE(event_reads.read_at, events.read_at)"
+            if device_id is not None
+            else "events.read_at"
+        )
+        read_join = (
+            "LEFT JOIN event_reads "
+            "ON event_reads.event_id = events.id AND event_reads.device_id = ?"
+            if device_id is not None
+            else ""
+        )
+        return f"""
             SELECT
-                events.*,
+                events.sequence,
+                events.id,
+                events.kind,
+                events.subject_type,
+                events.subject_id,
+                events.subject_revision,
+                events.primary_label,
+                events.secondary_label,
+                events.exit_code,
+                events.duration_seconds,
+                events.occurred_at,
+                events.created_at,
+                {read_at} AS read_at,
+                events.notify,
                 CASE
                     WHEN events.subject_type = 'remote_run'
                          AND remote_runs.id IS NOT NULL THEN 1
@@ -2361,6 +2468,7 @@ class StateStore:
                     ELSE NULL
                 END AS current_terminal_id
             FROM events
+            {read_join}
             LEFT JOIN remote_runs
               ON events.subject_type = 'remote_run'
              AND remote_runs.id = events.subject_id
@@ -2375,44 +2483,104 @@ class StateStore:
               ON file_terminals.id = file_runs.terminal_id
         """
 
-    def list_activity_events(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_activity_events(
+        self,
+        limit: int = 100,
+        *,
+        device_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 200))
+        parameters: tuple[Any, ...] = (
+            (device_id, safe_limit) if device_id is not None else (safe_limit,)
+        )
         with self.connect() as db:
             rows = db.execute(
-                f"{self._activity_select()} ORDER BY events.sequence DESC LIMIT ?",
-                (safe_limit,),
+                f"{self._activity_select(device_id)} ORDER BY events.sequence DESC LIMIT ?",
+                parameters,
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def get_activity_event(self, event_id: str) -> dict[str, Any] | None:
+    def get_activity_event(
+        self,
+        event_id: str,
+        *,
+        device_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        parameters: tuple[Any, ...] = (
+            (device_id, event_id) if device_id is not None else (event_id,)
+        )
         with self.connect() as db:
             row = db.execute(
-                f"{self._activity_select()} WHERE events.id = ?",
-                (event_id,),
+                f"{self._activity_select(device_id)} WHERE events.id = ?",
+                parameters,
             ).fetchone()
             return dict(row) if row else None
 
-    def count_unread_events(self) -> int:
+    def count_unread_events(self, *, device_id: str | None = None) -> int:
         with self.connect() as db:
-            row = db.execute(
-                "SELECT COUNT(*) AS count FROM events WHERE read_at IS NULL"
-            ).fetchone()
+            if device_id is None:
+                row = db.execute(
+                    "SELECT COUNT(*) AS count FROM events WHERE read_at IS NULL"
+                ).fetchone()
+            else:
+                row = db.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM events
+                    LEFT JOIN event_reads
+                      ON event_reads.event_id = events.id
+                     AND event_reads.device_id = ?
+                    WHERE COALESCE(event_reads.read_at, events.read_at) IS NULL
+                    """,
+                    (device_id,),
+                ).fetchone()
             return int(row["count"] if row else 0)
 
-    def mark_event_read(self, event_id: str) -> dict[str, Any] | None:
+    def mark_event_read(
+        self,
+        event_id: str,
+        *,
+        device_id: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.connect() as db:
-            db.execute(
-                "UPDATE events SET read_at = COALESCE(read_at, ?) WHERE id = ?",
-                (utc_now(), event_id),
-            )
-        return self.get_activity_event(event_id)
+            if device_id is None:
+                db.execute(
+                    "UPDATE events SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+                    (utc_now(), event_id),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO event_reads(event_id, device_id, read_at)
+                    SELECT id, ?, ? FROM events WHERE id = ?
+                    ON CONFLICT(event_id, device_id) DO NOTHING
+                    """,
+                    (device_id, utc_now(), event_id),
+                )
+        return self.get_activity_event(event_id, device_id=device_id)
 
-    def mark_all_events_read(self) -> int:
+    def mark_all_events_read(self, *, device_id: str | None = None) -> int:
         with self.connect() as db:
-            cursor = db.execute(
-                "UPDATE events SET read_at = ? WHERE read_at IS NULL",
-                (utc_now(),),
-            )
+            if device_id is None:
+                cursor = db.execute(
+                    "UPDATE events SET read_at = ? WHERE read_at IS NULL",
+                    (utc_now(),),
+                )
+            else:
+                cursor = db.execute(
+                    """
+                    INSERT INTO event_reads(event_id, device_id, read_at)
+                    SELECT events.id, ?, ?
+                    FROM events
+                    WHERE events.read_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM event_reads
+                          WHERE event_reads.event_id = events.id
+                            AND event_reads.device_id = ?
+                      )
+                    """,
+                    (device_id, utc_now(), device_id),
+                )
             return cursor.rowcount
 
     def claim_event_notifications(

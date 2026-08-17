@@ -30,15 +30,27 @@
       <span class="file-name">{{ entry.name }}</span><span class="file-size">{{ format_size(entry.size) }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
     </a>
     {% endif %}
-    <button type="button"
-            class="file-actions-button"
-            data-file-actions
-            data-file-path="{{ entry.relative_path }}"
-            data-file-name="{{ entry.name }}"
-            data-file-size="{{ entry.size }}"
-            data-file-mtime="{{ format_time_ns(entry.mtime_ns) }}"
-            data-file-directory="{{ '1' if entry.is_dir else '0' }}"
-            aria-label="{{ t('files.item_actions', name=entry.name) }}">•••</button>
+    <span class="file-inline-actions">
+      {% if not entry.is_dir and terminal_editor_supported %}
+      <form method="post" action="/w/{{ workspace.id }}/terminal-editor">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="path" value="{{ entry.relative_path }}">
+        <input type="hidden" name="parent" value="{{ path }}">
+        <button type="submit"
+                class="file-vim-button"
+                aria-label="{{ t('terminal_editor.open_file', name=entry.name) }}">Vim</button>
+      </form>
+      {% endif %}
+      <button type="button"
+              class="file-actions-button"
+              data-file-actions
+              data-file-path="{{ entry.relative_path }}"
+              data-file-name="{{ entry.name }}"
+              data-file-size="{{ entry.size }}"
+              data-file-mtime="{{ format_time_ns(entry.mtime_ns) }}"
+              data-file-directory="{{ '1' if entry.is_dir else '0' }}"
+              aria-label="{{ t('files.item_actions', name=entry.name) }}">•••</button>
+    </span>
   </div>
   {% else %}
   <div class="empty-state quiet-empty"><p>{% if query %}{{ t('files.no_search_results', query=query) }}{% else %}{{ t('files.empty') }}{% endif %}</p></div>

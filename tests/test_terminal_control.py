@@ -1,14 +1,14 @@
 from termroom.terminal_control import TerminalControl
 
 
-def test_last_input_client_owns_resize_until_disconnect() -> None:
+def test_only_last_input_client_owns_resize() -> None:
     control = TerminalControl()
     first = control.register("term")
     second = control.register("term")
 
     assert control.client_count("term") == 2
     assert not control.can_resize("term", first)
-    assert control.can_resize("term", second)
+    assert not control.can_resize("term", second)
 
     control.mark_input("term", second)
     assert not control.can_resize("term", first)
@@ -16,39 +16,28 @@ def test_last_input_client_owns_resize_until_disconnect() -> None:
 
     control.unregister("term", second)
     assert control.client_count("term") == 1
+    assert not control.can_resize("term", first)
+
+    control.mark_input("term", first)
     assert control.can_resize("term", first)
 
     control.unregister("term", first)
     assert control.client_count("term") == 0
 
 
-def test_newest_connection_controls_resize_until_someone_types() -> None:
+def test_new_connections_stay_passive_until_someone_types() -> None:
     control = TerminalControl()
     first = control.register("term")
     second = control.register("term")
 
-    assert control.can_resize("term", second)
+    assert not control.can_resize("term", first)
+    assert not control.can_resize("term", second)
 
     control.mark_input("term", first)
     third = control.register("term")
 
     assert control.can_resize("term", first)
     assert not control.can_resize("term", third)
-
-
-def test_focused_view_can_claim_resize_before_any_input() -> None:
-    control = TerminalControl()
-    first = control.register("term")
-    second = control.register("term")
-
-    control.claim_view("term", first)
-    assert control.can_resize("term", first)
-    assert not control.can_resize("term", second)
-
-    control.mark_input("term", second)
-    control.claim_view("term", first)
-    assert not control.can_resize("term", first)
-    assert control.can_resize("term", second)
 
 
 def test_presence_reports_client_count_and_input_device() -> None:
@@ -72,4 +61,21 @@ def test_input_from_unknown_client_does_not_take_resize_ownership() -> None:
 
     control.mark_input("term", "unknown")
 
-    assert control.can_resize("term", first)
+    assert not control.can_resize("term", first)
+
+
+def test_resize_is_applied_only_when_owner_or_dimensions_change() -> None:
+    control = TerminalControl()
+    first = control.register("term")
+    second = control.register("term")
+
+    assert not control.should_resize("term", second, rows=24, cols=80)
+    control.mark_input("term", second)
+    assert control.should_resize("term", second, rows=24, cols=80)
+    assert not control.should_resize("term", second, rows=24, cols=80)
+    assert control.should_resize("term", second, rows=25, cols=80)
+
+    control.mark_input("term", first)
+    assert control.should_resize("term", first, rows=25, cols=80)
+    assert not control.should_resize("term", second, rows=30, cols=100)
+    assert not control.should_resize("term", first, rows=25, cols=80)

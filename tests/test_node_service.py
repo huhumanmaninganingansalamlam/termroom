@@ -11,6 +11,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import Close
 
 from termroom import cli
 from termroom.node_agent import (
@@ -22,7 +24,7 @@ from termroom.node_agent import (
     load_node_identity,
     save_node_config,
 )
-from termroom.node_protocol import NodeProtocolError, generate_private_key
+from termroom.node_protocol import generate_private_key
 from termroom.node_service import (
     NODE_PROCESS_LOCK_FILE,
     NODE_RUNTIME_STATUS_FILE,
@@ -245,13 +247,14 @@ async def test_permanent_protocol_failure_stops_reconnect_and_records_status(
     )
 
     async def incompatible() -> None:
-        raise NodeProtocolError("Update Termroom", code="version_incompatible")
+        raise ConnectionClosed(Close(4406, "Node protocol is incompatible; update Termroom"), None)
 
     agent.run_once = incompatible  # type: ignore[method-assign]
     with pytest.raises(NodePermanentError) as exc_info:
         await agent.run_forever()
 
     assert exc_info.value.code == "version_incompatible"
+    assert "Update Termroom" in str(exc_info.value)
     status = read_node_runtime_status(state_dir)
     assert status is not None
     assert status["state"] == "error"
@@ -332,6 +335,27 @@ def test_uninstall_resets_a_failed_owned_unit(tmp_path: Path) -> None:
     assert not removed.installed
     assert manager.failed is False
     assert ("reset-failed", "termroom-node.service") in manager.calls
+
+
+def test_uninstall_does_not_restore_service_for_invalid_stale_runtime_status(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    manager = _FakeSystemd(state_dir, tmp_path / "units")
+    manager.install(_command(state_dir))
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / NODE_RUNTIME_STATUS_FILE).write_text("{", encoding="utf-8")
+
+    removed = manager.uninstall()
+
+    assert not removed.installed
+    assert not removed.enabled
+    assert not removed.active
+    assert not manager.unit_path.exists()
+    assert manager.enabled is False
+    assert manager.active is False
+    assert sum(call[0] == "start" for call in manager.calls) == 1
+    assert sum(call[0] == "enable" for call in manager.calls) == 1
 
 
 def test_install_failure_removes_new_partial_service_state(tmp_path: Path) -> None:

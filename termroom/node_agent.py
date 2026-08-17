@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import ssl
@@ -31,6 +32,7 @@ from websockets.exceptions import ConnectionClosed
 
 from termroom.file_runs import RUNNER_REGISTRY_VERSION, resolve_runner
 from termroom.files import (
+    DirectoryListingLimitError,
     FileConflictError,
     FileService,
     RunnableFile,
@@ -43,6 +45,7 @@ from termroom.node_protocol import (
     NODE_PROTOCOL_VERSION,
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
     NODE_REMOTE_RUN_SOURCE_VERSION,
+    NODE_REQUEST_DEFAULT_BUDGET_MS,
     NODE_REQUIRED_CAPABILITIES,
     NODE_WORKSPACE_USAGE_VERSION,
     NodeProtocolError,
@@ -57,6 +60,8 @@ from termroom.node_protocol import (
     public_key_text,
     sign_challenge,
     validate_node_id,
+    validate_protocol_version,
+    validate_request_budget_ms,
     validate_request_id,
     validate_request_operation,
 )
@@ -87,13 +92,30 @@ from termroom.security import (
 )
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
+    TERMINAL_EDITOR_WRAPPER,
     TMUX_MANAGED_RUN_OPTION,
+    TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
+    TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
     TMUX_TERMINAL_RECORD_FORMAT,
     TMUX_TERMINAL_ROLE_OPTION,
+    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+    WORKSPACE_COMMAND_READY_POLL_SECONDS,
+    WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
+    WORKSPACE_COMMAND_WRAPPER,
     file_run_completion_was_stopped,
+    normalize_terminal_editor_path,
     normalize_terminal_name,
+    normalize_workspace_command,
+    parse_tmux_terminal_editor_records,
     parse_tmux_terminal_records,
+    parse_tmux_workspace_command_records,
+    set_tmux_browser_view_grid_resize,
+    terminal_editor_digest,
     tmux_browser_view_session,
+    validate_workspace_command_launch,
+    validate_workspace_command_slot,
+    workspace_command_digest,
+    workspace_command_record_is_ready,
 )
 from termroom.workspace_usage import (
     WorkspaceUsageCollectionError,
@@ -107,6 +129,20 @@ NODE_CONFIG_FILE = "node.json"
 NODE_PRIVATE_KEY_FILE = "node-key.pem"
 NODE_HEARTBEAT_SECONDS = 10.0
 NODE_RECONNECT_MAX_SECONDS = 30.0
+NODE_RECONNECT_JITTER_PER_MILLE = 200
+NODE_FILE_LIST_MAX_ENTRIES = 10_000
+NODE_FILE_LIST_MAX_METADATA_BYTES = 768 * 1024
+
+
+def node_reconnect_delay(base_seconds: float) -> float:
+    """Return bounded ±20% jitter so many Nodes do not reconnect in lockstep."""
+
+    base = max(0.25, min(float(base_seconds), NODE_RECONNECT_MAX_SECONDS))
+    offset = secrets.randbelow(NODE_RECONNECT_JITTER_PER_MILLE * 2 + 1)
+    factor = 1 + (offset - NODE_RECONNECT_JITTER_PER_MILLE) / 1000
+    return max(0.25, min(base * factor, NODE_RECONNECT_MAX_SECONDS))
+
+
 NODE_MAX_CONCURRENT_REQUESTS = 8
 NODE_SESSION_PATTERN = re.compile(r"^termroom-[A-Za-z0-9_-]{1,112}$")
 NODE_WINDOW_PATTERN = re.compile(r"^@[0-9]+$")
@@ -276,9 +312,7 @@ def normalize_run_root(value: object, *, state_dir: Path) -> Path:
         return state_dir.resolve() / "runs"
     raw = Path(str(value)).expanduser()
     if not raw.is_absolute():
-        raise NodeAgentError(
-            "Node Remote Run root must be absolute", code="config_invalid"
-        )
+        raise NodeAgentError("Node Remote Run root must be absolute", code="config_invalid")
     return raw.resolve(strict=False)
 
 
@@ -291,9 +325,7 @@ def normalize_ca_file(value: object, *, core_url: str) -> Path | None:
     except OSError as exc:
         raise NodeAgentError("Node CA file is unavailable", code="ca_file_invalid") from exc
     if not resolved.is_file():
-        raise NodeAgentError(
-            "Node CA file must resolve to a file", code="ca_file_invalid"
-        )
+        raise NodeAgentError("Node CA file must resolve to a file", code="ca_file_invalid")
     if not core_url.startswith("https://"):
         raise NodeAgentError(
             "Node CA file requires an HTTPS Core URL", code="ca_file_requires_https"
@@ -402,6 +434,9 @@ class NodeRuntime:
         self.source_private_boundaries = tuple(dict.fromkeys(private_boundaries))
         self._file_run_locks: dict[str, threading.RLock] = {}
         self._file_run_locks_guard = threading.Lock()
+        self._workspace_command_locks: dict[str, threading.RLock] = {}
+        self._workspace_command_locks_guard = threading.Lock()
+        self._browser_grid_resize_lock = threading.RLock()
 
     async def handle(
         self,
@@ -455,8 +490,12 @@ class NodeRuntime:
             return {"terminals": self._ensure_workspace(payload)}
         if operation == "workspace.usage":
             return self._workspace_usage(payload)
+        if operation == "workspace.command.run":
+            return self._run_workspace_command(payload)
         if operation == "terminal.create":
             return {"terminal": self._create_terminal(payload)}
+        if operation == "terminal.editor.open":
+            return self._open_terminal_editor(payload)
         if operation == "terminal.rename":
             return {"terminal": self._rename_terminal(payload)}
         if operation == "terminal.close":
@@ -467,7 +506,30 @@ class NodeRuntime:
             return {"output": self._capture_scrollback(payload)}
         if operation == "files.list":
             root = self._workspace_path(payload)
-            directory, entries = self.files.list_dir(root, str(payload.get("path") or "."))
+            raw_max_entries = payload.get("max_entries")
+            if raw_max_entries is None:
+                max_entries = NODE_FILE_LIST_MAX_ENTRIES
+            elif type(raw_max_entries) is not int or not (
+                0 <= raw_max_entries <= NODE_FILE_LIST_MAX_ENTRIES
+            ):
+                raise NodeAgentError("Directory entry limit is invalid", code="request_invalid")
+            else:
+                max_entries = raw_max_entries
+            raw_metadata_bytes = payload.get("max_metadata_bytes")
+            if raw_metadata_bytes is None:
+                max_metadata_bytes = NODE_FILE_LIST_MAX_METADATA_BYTES
+            elif type(raw_metadata_bytes) is not int or not (
+                1 <= raw_metadata_bytes <= NODE_FILE_LIST_MAX_METADATA_BYTES
+            ):
+                raise NodeAgentError("Directory metadata limit is invalid", code="request_invalid")
+            else:
+                max_metadata_bytes = raw_metadata_bytes
+            directory, entries = self.files.list_dir(
+                root,
+                str(payload.get("path") or "."),
+                max_entries=max_entries,
+                max_metadata_bytes=max_metadata_bytes,
+            )
             return {
                 "directory": self._relative(root, directory),
                 "entries": [asdict(entry) for entry in entries],
@@ -608,9 +670,7 @@ class NodeRuntime:
                 code="remote_run_source_version_incompatible",
             )
 
-    def _remote_run_source_context(
-        self, payload: Mapping[str, Any]
-    ) -> _WorkspaceSourceContext:
+    def _remote_run_source_context(self, payload: Mapping[str, Any]) -> _WorkspaceSourceContext:
         self._require_remote_run_source_version(payload)
         if payload.get("remote_run_id") not in {None, ""}:
             raise NodeAgentError(
@@ -618,9 +678,7 @@ class NodeRuntime:
                 code="source_workspace_transient",
             )
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
-        workspace_root = self._workspace_path(
-            {"workspace_path": payload.get("workspace_path")}
-        )
+        workspace_root = self._workspace_path({"workspace_path": payload.get("workspace_path")})
         source_path = normalize_source_relative_path(
             str(payload.get("source_path") or "."), allow_root=True
         )
@@ -648,9 +706,7 @@ class NodeRuntime:
             or len(raw_includes) > 10_000
             or any(not isinstance(value, str) for value in raw_includes)
         ):
-            raise SourceValidationError(
-                "Explicit Source paths are invalid", code="source_options"
-            )
+            raise SourceValidationError("Explicit Source paths are invalid", code="source_options")
         return _WorkspaceSourceContext(
             workspace_id=workspace_id,
             workspace_root=workspace_root,
@@ -660,13 +716,9 @@ class NodeRuntime:
         )
 
     @staticmethod
-    def _workspace_source_related(
-        path: str, explicitly_included: frozenset[str]
-    ) -> bool:
+    def _workspace_source_related(path: str, explicitly_included: frozenset[str]) -> bool:
         return any(
-            path == include
-            or path.startswith(include + "/")
-            or include.startswith(path + "/")
+            path == include or path.startswith(include + "/") or include.startswith(path + "/")
             for include in explicitly_included
         )
 
@@ -713,9 +765,7 @@ class NodeRuntime:
             executable=bool(info.st_mode & 0o111),
         )
 
-    def _remote_run_source_stat_entry(
-        self, payload: Mapping[str, Any]
-    ) -> WorkspaceEntry:
+    def _remote_run_source_stat_entry(self, payload: Mapping[str, Any]) -> WorkspaceEntry:
         context = self._remote_run_source_context(payload)
         _target, entry = self._workspace_source_file(context, payload.get("path"))
         return entry
@@ -734,11 +784,7 @@ class NodeRuntime:
         )
         stream_id = validate_request_id(str(payload.get("stream_id") or ""))
         frame_count = sum(
-            (
-                len(self._workspace_source_entry_bytes(entry))
-                + MAX_NODE_STREAM_CHUNK_BYTES
-                - 1
-            )
+            (len(self._workspace_source_entry_bytes(entry)) + MAX_NODE_STREAM_CHUNK_BYTES - 1)
             // MAX_NODE_STREAM_CHUNK_BYTES
             for entry in manifest.entries
         )
@@ -811,9 +857,7 @@ class NodeRuntime:
                 "stream_id": stream_id,
                 "remote_run_source_version": NODE_REMOTE_RUN_SOURCE_VERSION,
                 "stream_window": NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
-                "frame_count": (
-                    entry.size + MAX_NODE_STREAM_CHUNK_BYTES - 1
-                )
+                "frame_count": (entry.size + MAX_NODE_STREAM_CHUNK_BYTES - 1)
                 // MAX_NODE_STREAM_CHUNK_BYTES,
                 "size": entry.size,
                 "mtime_ns": entry.mtime_ns,
@@ -845,9 +889,7 @@ class NodeRuntime:
 
     def _remote_run_runtime(self) -> NodeRemoteRunRuntime:
         if self.remote_runs is None:
-            raise NodeAgentError(
-                "Node Remote Run is unavailable", code="capability_unsupported"
-            )
+            raise NodeAgentError("Node Remote Run is unavailable", code="capability_unsupported")
         return self.remote_runs
 
     def _browse(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -893,13 +935,122 @@ class NodeRuntime:
         root = self._workspace_path(payload)
         session = self._session(payload)
         if self._tmux("has-session", "-t", session, check=False).returncode:
-            self._tmux(
-                "new-session", "-d", "-s", session, "-c", str(root), "-n", "shell"
-            )
-        self._tmux(
-            "set-window-option", "-t", session, "window-size", "latest", check=False
-        )
+            self._tmux("new-session", "-d", "-s", session, "-c", str(root), "-n", "shell")
+        self._tmux("set-window-option", "-t", session, "window-size", "latest", check=False)
         return self._list_terminals(session)
+
+    def _workspace_command_lock(self, session: str) -> threading.RLock:
+        with self._workspace_command_locks_guard:
+            return self._workspace_command_locks.setdefault(session, threading.RLock())
+
+    def _run_workspace_command(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        session = self._session(payload)
+        with self._workspace_command_lock(session):
+            return self._run_workspace_command_locked(payload)
+
+    def _run_workspace_command_locked(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        root = self._workspace_path(payload)
+        session = self._session(payload)
+        try:
+            safe_slot = validate_workspace_command_slot(payload.get("slot"))
+            safe_command = normalize_workspace_command(payload.get("command"))
+            safe_launch = validate_workspace_command_launch(payload.get("launch_id"))
+        except ValueError as exc:
+            raise NodeAgentError(str(exc), code="workspace_command_invalid") from exc
+        digest = workspace_command_digest(safe_command)
+        terminals = self._ensure_workspace(payload)
+        listed = self._tmux(
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+        )
+        try:
+            records = parse_tmux_workspace_command_records(listed.stdout)
+        except ValueError as exc:
+            raise NodeAgentError(str(exc), code="workspace_command_invalid") from exc
+        existing = next((item for item in records if item["slot"] == safe_slot), None)
+        if existing is not None:
+            terminal = next(
+                (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
+                None,
+            )
+            if terminal is None:
+                raise NodeAgentError(
+                    "Workspace command Terminal is missing",
+                    code="workspace_command_invalid",
+                )
+            if existing["launch_id"] == safe_launch:
+                if existing["digest"] != digest:
+                    raise NodeAgentError(
+                        "Workspace command launch identity was reused for another command",
+                        code="idempotency_conflict",
+                    )
+                return {"terminal": terminal, "terminals": terminals}
+            if not existing["dead"]:
+                return {"terminal": terminal, "terminals": terminals}
+            self._tmux("kill-window", "-t", str(existing["tmux_window"]))
+
+        created = self._tmux(
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+            "-e",
+            f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+            "-t",
+            session,
+            "-n",
+            f"run-{safe_slot + 1}",
+            "-c",
+            str(root),
+            WORKSPACE_COMMAND_WRAPPER,
+        )
+        window = created.stdout.strip()
+        try:
+            deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                ready = self._tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    window,
+                    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                    check=False,
+                )
+                if ready.returncode == 0 and workspace_command_record_is_ready(
+                    ready.stdout,
+                    window=window,
+                    slot=safe_slot,
+                    launch_id=safe_launch,
+                    digest=digest,
+                ):
+                    break
+                time.sleep(WORKSPACE_COMMAND_READY_POLL_SECONDS)
+            else:
+                raise NodeAgentError(
+                    "Workspace command Terminal did not finish starting",
+                    code="workspace_command_invalid",
+                )
+        except Exception:
+            self._tmux("kill-window", "-t", window, check=False)
+            raise
+        terminals = self._list_terminals(session)
+        terminal = next((item for item in terminals if item["tmux_window"] == window), None)
+        if terminal is None:
+            raise NodeAgentError(
+                "Workspace command Terminal disappeared while starting",
+                code="workspace_command_invalid",
+            )
+        return {"terminal": terminal, "terminals": terminals}
 
     def _workspace_usage(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         version = payload.get("workspace_usage_version")
@@ -930,9 +1081,7 @@ class NodeRuntime:
                 code="refresh_incomplete",
             )
         try:
-            usage = workspace_usage_from_outputs(
-                panes.stdout, read_system_process_output()
-            )
+            usage = workspace_usage_from_outputs(panes.stdout, read_system_process_output())
         except WorkspaceUsageCollectionError as exc:
             raise NodeAgentError(str(exc), code=exc.code) from exc
         return {
@@ -961,6 +1110,111 @@ class NodeRuntime:
         window = result.stdout.strip()
         return next(item for item in self._list_terminals(session) if item["tmux_window"] == window)
 
+    def _open_terminal_editor(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        root = self._workspace_path(payload)
+        session = self._session(payload)
+        try:
+            normalized = normalize_terminal_editor_path(payload.get("path"))
+        except ValueError as exc:
+            raise NodeAgentError(str(exc), code="terminal_editor_invalid") from exc
+        target = (root / normalized).resolve(strict=True)
+        if not is_within(target, root) or not target.is_file():
+            raise NodeAgentError(
+                "Terminal editor target is not a Workspace file",
+                code="terminal_editor_invalid",
+            )
+        if not any(shutil.which(candidate) for candidate in ("nvim", "vim", "vi")):
+            raise NodeAgentError(
+                "Install Neovim or Vim on this Node to edit files",
+                code="terminal_editor_unavailable",
+            )
+        digest = terminal_editor_digest(normalized)
+
+        with self._workspace_command_lock(session):
+            terminals = self._ensure_workspace(payload)
+            listed = self._tmux(
+                "list-windows",
+                "-t",
+                session,
+                "-F",
+                TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
+            )
+            try:
+                records = parse_tmux_terminal_editor_records(listed.stdout)
+            except ValueError as exc:
+                raise NodeAgentError(
+                    str(exc), code="terminal_editor_invalid"
+                ) from exc
+            existing = next((item for item in records if item["digest"] == digest), None)
+            if existing is not None and not existing["dead"]:
+                terminal = next(
+                    (
+                        item
+                        for item in terminals
+                        if item["tmux_window"] == existing["tmux_window"]
+                    ),
+                    None,
+                )
+                if terminal is None:
+                    raise NodeAgentError(
+                        "Vim Terminal is missing", code="terminal_editor_invalid"
+                    )
+                return {"terminal": terminal, "terminals": terminals}
+            if existing is not None:
+                self._tmux("kill-window", "-t", str(existing["tmux_window"]))
+
+            created = self._tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-e",
+                f"TERMROOM_TERMINAL_EDITOR_FILE={target}",
+                "-e",
+                f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}",
+                "-t",
+                session,
+                "-n",
+                normalize_terminal_name(f"vim-{Path(normalized).name}"),
+                "-c",
+                str(root),
+                TERMINAL_EDITOR_WRAPPER,
+            )
+            window = created.stdout.strip()
+            try:
+                deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
+                while time.monotonic() < deadline:
+                    ready = self._tmux(
+                        "display-message",
+                        "-p",
+                        "-t",
+                        window,
+                        f"#{{{TMUX_TERMINAL_EDITOR_DIGEST_OPTION}}}",
+                        check=False,
+                    )
+                    if ready.returncode == 0 and ready.stdout.strip() == digest:
+                        break
+                    time.sleep(WORKSPACE_COMMAND_READY_POLL_SECONDS)
+                else:
+                    raise NodeAgentError(
+                        "Vim Terminal did not finish starting",
+                        code="terminal_editor_start_failed",
+                    )
+            except Exception:
+                self._tmux("kill-window", "-t", window, check=False)
+                raise
+            terminals = self._ensure_workspace(payload)
+            terminal = next(
+                (item for item in terminals if item["tmux_window"] == window), None
+            )
+            if terminal is None:
+                raise NodeAgentError(
+                    "Vim Terminal disappeared while starting",
+                    code="terminal_editor_start_failed",
+                )
+            return {"terminal": terminal, "terminals": terminals}
+
     def _rename_terminal(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._workspace_path(payload)
         session = self._session(payload)
@@ -969,9 +1223,7 @@ class NodeRuntime:
             item for item in self._list_terminals(session) if item["tmux_window"] == window
         )
         if terminal.get("role") != "shell":
-            raise NodeAgentError(
-                "Managed Terminals cannot be renamed", code="terminal_managed"
-            )
+            raise NodeAgentError("Managed Terminals cannot be renamed", code="terminal_managed")
         safe_name = normalize_terminal_name(str(payload.get("name") or "shell"))
         self._tmux("rename-window", "-t", window, safe_name)
         return next(item for item in self._list_terminals(session) if item["tmux_window"] == window)
@@ -983,9 +1235,7 @@ class NodeRuntime:
         terminals = self._list_terminals(session)
         terminal = next(item for item in terminals if item["tmux_window"] == window)
         if terminal.get("role") != "shell":
-            raise NodeAgentError(
-                "Managed Terminals cannot be closed", code="terminal_managed"
-            )
+            raise NodeAgentError("Managed Terminals cannot be closed", code="terminal_managed")
         if len(terminals) <= 1:
             raise NodeAgentError("The last Terminal cannot be closed", code="terminal_last")
         self._tmux("kill-window", "-t", window)
@@ -1036,9 +1286,7 @@ class NodeRuntime:
             requested[session] = windows
         if not requested:
             return []
-        result = self._tmux(
-            "list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT, check=False
-        )
+        result = self._tmux("list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT, check=False)
         if result.returncode:
             raise NodeAgentError(
                 "Terminal activity is unavailable", code="terminal_activity_unavailable"
@@ -1085,7 +1333,14 @@ class NodeRuntime:
         try:
             process_pid, master_fd = await asyncio.to_thread(
                 spawn_pty_process,
-                [*command, "attach-session", "-t", view_session],
+                [
+                    *command,
+                    "attach-session",
+                    "-f",
+                    "ignore-size",
+                    "-t",
+                    view_session,
+                ],
                 cwd=str(root),
                 environment=environment,
                 rows=rows,
@@ -1100,12 +1355,21 @@ class NodeRuntime:
             master_fd,
             send,
             self.streams,
-            cleanup=lambda: self._tmux(
-                "kill-session", "-t", view_session, check=False
+            set_grid_resize=lambda enabled: self._set_browser_view_grid_resize(
+                view_session, enabled=enabled
             ),
+            cleanup=lambda: self._tmux("kill-session", "-t", view_session, check=False),
         )
         self.streams[stream_id] = stream
         return OperationResult({"stream_id": stream_id}, start=stream.start)
+
+    def _set_browser_view_grid_resize(self, view_session: str, *, enabled: bool) -> bool:
+        with self._browser_grid_resize_lock:
+            return set_tmux_browser_view_grid_resize(
+                self._tmux,
+                view_session,
+                enabled=enabled,
+            )
 
     async def _read_text_open(
         self,
@@ -1144,10 +1408,7 @@ class NodeRuntime:
             max(1, int(payload.get("max_bytes") or 1)),
         )
         current = await asyncio.to_thread(self.files.read_text, root, relative_path)
-        if (
-            current.digest != expected_digest
-            or current.mtime_ns != expected_mtime_ns
-        ):
+        if current.digest != expected_digest or current.mtime_ns != expected_mtime_ns:
             raise FileConflictError("The file changed after it was opened")
         stream_id = validate_request_id(str(payload.get("stream_id") or ""))
         stream = TextUploadAgentStream(
@@ -1175,13 +1436,9 @@ class NodeRuntime:
         length_value = payload.get("length")
         length = None if length_value is None else max(0, int(length_value))
         stream_id = validate_request_id(str(payload.get("stream_id") or ""))
-        stream = DownloadAgentStream(
-            stream_id, target, offset, length, send, self.streams
-        )
+        stream = DownloadAgentStream(stream_id, target, offset, length, send, self.streams)
         self.streams[stream_id] = stream
-        return OperationResult(
-            {"stream_id": stream_id, "size": info.st_size}, start=stream.start
-        )
+        return OperationResult({"stream_id": stream_id, "size": info.st_size}, start=stream.start)
 
     async def _upload_open(self, payload: Mapping[str, Any]) -> OperationResult:
         root = self._workspace_path(payload)
@@ -1257,9 +1514,7 @@ class NodeRuntime:
     def _file_run_workspace_id(value: object) -> str:
         workspace_id = str(value or "")
         if not NODE_WORKSPACE_ID_PATTERN.fullmatch(workspace_id):
-            raise NodeAgentError(
-                "File Run Workspace identity is invalid", code="file_run_invalid"
-            )
+            raise NodeAgentError("File Run Workspace identity is invalid", code="file_run_invalid")
         return workspace_id
 
     @staticmethod
@@ -1316,9 +1571,7 @@ class NodeRuntime:
         run_id: str,
         request_record: Mapping[str, Any],
     ) -> Path:
-        metadata_dir = self._file_run_metadata_dir(
-            metadata_dir.parent.name, run_id, create=True
-        )
+        metadata_dir = self._file_run_metadata_dir(metadata_dir.parent.name, run_id, create=True)
         request_id = metadata_dir / "request-id"
         if request_id.exists():
             if request_id.is_symlink() or not request_id.is_file():
@@ -1335,9 +1588,9 @@ class NodeRuntime:
         _atomic_private_write(request_id, (run_id + "\n").encode("utf-8"), mode=0o600)
         _atomic_private_write(
             metadata_dir / "request.json",
-            json.dumps(
-                dict(request_record), ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8"),
+            json.dumps(dict(request_record), ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            ),
             mode=0o600,
         )
         wrapper = metadata_dir / "runner.sh"
@@ -1372,9 +1625,7 @@ class NodeRuntime:
         version = self._runner_registry_version(payload)
         root = self._workspace_path(payload)
         expected_value = payload.get("expected_digest")
-        expected_digest = (
-            None if expected_value is None else self._file_run_digest(expected_value)
-        )
+        expected_digest = None if expected_value is None else self._file_run_digest(expected_value)
         runnable = self.files.inspect_runnable(
             root,
             str(payload.get("path") or ""),
@@ -1384,9 +1635,7 @@ class NodeRuntime:
         return {
             "runner_registry_version": version,
             "runnable": self._runnable_payload(runnable),
-            "runner": None
-            if runner is None
-            else {"id": runner.id, "version": runner.version},
+            "runner": None if runner is None else {"id": runner.id, "version": runner.version},
         }
 
     def _start_file_run(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1400,9 +1649,7 @@ class NodeRuntime:
         expected_runner_version = payload.get("runner_version")
         relative_path = str(payload.get("path") or "")
         if isinstance(expected_runner_version, bool):
-            raise NodeAgentError(
-                "File Run Runner version is invalid", code="runner_mismatch"
-            )
+            raise NodeAgentError("File Run Runner version is invalid", code="runner_mismatch")
         try:
             runner_version = int(expected_runner_version)
         except (TypeError, ValueError) as exc:
@@ -1419,13 +1666,9 @@ class NodeRuntime:
         }
 
         with self._file_run_lock(workspace_id):
-            metadata_dir = self._file_run_metadata_dir(
-                workspace_id, run_id, create=False
-            )
+            metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
             if metadata_dir.exists():
-                stored_request = self._read_file_run_record(
-                    metadata_dir / "request.json", run_id
-                )
+                stored_request = self._read_file_run_record(metadata_dir / "request.json", run_id)
                 if stored_request is None:
                     raise NodeAgentError(
                         "File Run was already handled but its request metadata is unavailable",
@@ -1436,15 +1679,12 @@ class NodeRuntime:
                         "File Run identity was reused with a different request",
                         code="idempotency_conflict",
                     )
-                observation, windows = self._file_run_observation(
-                    session, metadata_dir, run_id
-                )
+                observation, windows = self._file_run_observation(session, metadata_dir, run_id)
                 terminal = next(
                     (
                         item
                         for item in windows or []
-                        if item.get("role") == "file_run"
-                        and item.get("managed_run_id") == run_id
+                        if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
                     ),
                     None,
                 )
@@ -1474,17 +1714,11 @@ class NodeRuntime:
                     code="runner_mismatch",
                 )
 
-            metadata_dir = self._file_run_metadata_dir(
-                workspace_id, run_id, create=True
-            )
-            wrapper = self._write_file_run_metadata(
-                metadata_dir, run_id, request_record
-            )
+            metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=True)
+            wrapper = self._write_file_run_metadata(metadata_dir, run_id, request_record)
             self._ensure_workspace(payload)
             windows = self._list_terminals(session)
-            terminal = next(
-                (item for item in windows if item.get("role") == "file_run"), None
-            )
+            terminal = next((item for item in windows if item.get("role") == "file_run"), None)
             created = terminal is None
             if terminal is None:
                 result = self._tmux(
@@ -1517,9 +1751,7 @@ class NodeRuntime:
             previous_role = str(terminal.get("role") or "shell")
             previous_run_id = str(terminal.get("managed_run_id") or "") or None
             try:
-                self._tmux(
-                    "set-window-option", "-t", tmux_window, "remain-on-exit", "on"
-                )
+                self._tmux("set-window-option", "-t", tmux_window, "remain-on-exit", "on")
                 self._tmux(
                     "set-window-option",
                     "-t",
@@ -1571,8 +1803,7 @@ class NodeRuntime:
                 (
                     item
                     for item in windows
-                    if item.get("role") == "file_run"
-                    and item.get("managed_run_id") == run_id
+                    if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
                 ),
                 None,
             )
@@ -1595,12 +1826,8 @@ class NodeRuntime:
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))
         with self._file_run_lock(workspace_id):
-            metadata_dir = self._file_run_metadata_dir(
-                workspace_id, run_id, create=False
-            )
-            observation, windows = self._file_run_observation(
-                session, metadata_dir, run_id
-            )
+            metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
+            observation, windows = self._file_run_observation(session, metadata_dir, run_id)
             result: dict[str, Any] = {"observation": observation}
             if windows is not None:
                 result["terminals"] = windows
@@ -1609,9 +1836,7 @@ class NodeRuntime:
     def _file_run_observation(
         self, session: str, metadata_dir: Path, run_id: str
     ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
-        completion = self._read_file_run_record(
-            metadata_dir / "completion.json", run_id
-        )
+        completion = self._read_file_run_record(metadata_dir / "completion.json", run_id)
         if completion is not None and isinstance(completion.get("exit_code"), int):
             windows = self._list_terminals(session) if self._session_exists(session) else None
             return (
@@ -1696,9 +1921,7 @@ class NodeRuntime:
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))
         with self._file_run_lock(workspace_id):
-            metadata_dir = self._file_run_metadata_dir(
-                workspace_id, run_id, create=False
-            )
+            metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
             request_id = metadata_dir / "request-id"
             try:
                 stored_id = request_id.read_text(encoding="utf-8").strip()
@@ -1712,8 +1935,7 @@ class NodeRuntime:
                 (
                     item
                     for item in self._list_terminals(session)
-                    if item.get("role") == "file_run"
-                    and item.get("managed_run_id") == run_id
+                    if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
                 ),
                 None,
             )
@@ -1835,8 +2057,7 @@ class NodeRuntime:
             "-t",
             tmux_window,
             "-F",
-            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t"
-            "#{pane_dead_time}",
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_dead_time}",
             check=False,
         )
         if result.returncode:
@@ -1904,9 +2125,7 @@ class NodeRuntime:
         return "." if value == Path(".") else value.as_posix()
 
     @staticmethod
-    def _snapshot(
-        snapshot: Any, *, include_content: bool = True
-    ) -> dict[str, Any]:
+    def _snapshot(snapshot: Any, *, include_content: bool = True) -> dict[str, Any]:
         result = {
             "relative_path": snapshot.relative_path,
             "digest": snapshot.digest,
@@ -2003,6 +2222,7 @@ class WorkspaceManifestAgentStream:
 
     async def start(self) -> None:
         try:
+
             def chunks() -> Iterator[bytes]:
                 for entry in self.manifest.entries:
                     encoded = NodeRuntime._workspace_source_entry_bytes(entry)
@@ -2047,9 +2267,7 @@ class WorkspaceManifestAgentStream:
             await self.close()
 
     async def feed(self, chunk: bytes) -> None:
-        raise NodeAgentError(
-            "Workspace manifest stream is read-only", code="stream_direction"
-        )
+        raise NodeAgentError("Workspace manifest stream is read-only", code="stream_direction")
 
     async def control(self, kind: str, values: Mapping[str, Any]) -> None:
         await self.flow.grant(kind, values)
@@ -2124,9 +2342,7 @@ class WorkspaceFileAgentStream:
             await self.close()
 
     async def feed(self, chunk: bytes) -> None:
-        raise NodeAgentError(
-            "Workspace file stream is read-only", code="stream_direction"
-        )
+        raise NodeAgentError("Workspace file stream is read-only", code="stream_direction")
 
     async def control(self, kind: str, values: Mapping[str, Any]) -> None:
         await self.flow.grant(kind, values)
@@ -2153,6 +2369,7 @@ class TerminalAgentStream:
         master_fd: int,
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
         registry: dict[str, AgentStream],
+        set_grid_resize: Callable[[bool], bool] | None = None,
         cleanup: Callable[[], object] | None = None,
     ) -> None:
         self.stream_id = stream_id
@@ -2160,7 +2377,10 @@ class TerminalAgentStream:
         self.master_fd = master_fd
         self.send = send
         self.registry = registry
+        self.set_grid_resize = set_grid_resize
         self.cleanup = cleanup
+        self.grid_active = False
+        self.last_viewport: tuple[int, int] | None = None
         self.closed = False
 
     async def start(self) -> None:
@@ -2188,12 +2408,29 @@ class TerminalAgentStream:
     async def control(self, kind: str, values: Mapping[str, Any]) -> None:
         if self.closed or kind != "resize":
             return
+        affects_grid = values.get("affects_grid", False)
+        if type(affects_grid) is not bool:
+            raise NodeAgentError(
+                "Terminal resize control is invalid", code="stream_control_invalid"
+            )
+        role_changed = affects_grid != self.grid_active
+        sync_grid_role = role_changed or affects_grid
+        if sync_grid_role:
+            if self.set_grid_resize is not None and not await asyncio.to_thread(
+                self.set_grid_resize, affects_grid
+            ):
+                return
+            self.grid_active = affects_grid
         rows = max(4, min(int(values.get("rows") or 24), 500))
         cols = max(20, min(int(values.get("cols") or 80), 1000))
+        viewport = (rows, cols)
+        if viewport == self.last_viewport and not (sync_grid_role and affects_grid):
+            return
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         await asyncio.to_thread(fcntl.ioctl, self.master_fd, termios.TIOCSWINSZ, winsize)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(self.process_pid, signal.SIGWINCH)
+        self.last_viewport = viewport
 
     async def close(self) -> None:
         if self.closed:
@@ -2371,12 +2608,18 @@ class UploadAgentStream:
         await asyncio.to_thread(self._temporary.flush)
         await asyncio.to_thread(os.fsync, self._temporary.fileno())
         await asyncio.to_thread(self._temporary.close)
-        if self.target.exists() and not self.overwrite:
+        if not self.overwrite:
+            os.chmod(self.temp_path, 0o644)
+            try:
+                os.link(self.temp_path, self.target, follow_symlinks=False)
+            except FileExistsError:
+                self.temp_path.unlink(missing_ok=True)
+                raise FileExistsError(self.target.name) from None
             self.temp_path.unlink(missing_ok=True)
-            raise FileExistsError(self.target.name)
-        mode = self.target.stat().st_mode & 0o777 if self.target.exists() else 0o644
-        os.chmod(self.temp_path, mode)
-        os.replace(self.temp_path, self.target)
+        else:
+            mode = self.target.stat().st_mode & 0o777 if self.target.exists() else 0o644
+            os.chmod(self.temp_path, mode)
+            os.replace(self.temp_path, self.target)
         directory_fd = os.open(self.target.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -2506,7 +2749,7 @@ class NodeAgent:
             else:
                 delay = 1.0
                 self._record_status("disconnected", error_code="node_offline")
-            await asyncio.sleep(delay)
+            await asyncio.sleep(node_reconnect_delay(delay))
             delay = min(NODE_RECONNECT_MAX_SECONDS, delay * 2)
 
     async def run_once(self) -> None:
@@ -2621,7 +2864,9 @@ class NodeAgent:
         if kind == "heartbeat.ack":
             return
         if kind == "request":
-            self._start_request_task(self._handle_request(message))
+            self._start_request_task(
+                self._handle_request(message, received_at=asyncio.get_running_loop().time())
+            )
             return
         if kind in {"stream.data", "stream.control", "stream.close", "stream.abort"}:
             stream_id = validate_request_id(str(message.get("stream_id") or ""))
@@ -2688,23 +2933,59 @@ class NodeAgent:
             return
         raise NodeProtocolError("Unexpected Core message", code="message_unexpected")
 
-    async def _handle_request(self, message: Mapping[str, Any]) -> None:
+    async def _handle_request(
+        self,
+        message: Mapping[str, Any],
+        *,
+        received_at: float | None = None,
+    ) -> None:
         request_id = validate_request_id(str(message.get("id") or ""))
-        operation = validate_request_operation(message.get("operation"))
-        payload = message.get("payload")
-        if not isinstance(payload, dict):
-            await self._send_error(request_id, NodeAgentError("Request payload is invalid"))
-            return
-        async with self._request_limit:
+        try:
+            has_version = "protocol_version" in message
+            has_budget = "budget_ms" in message
+            if has_version != has_budget:
+                raise NodeAgentError("Node request envelope is invalid", code="request_invalid")
+            if has_version:
+                validate_protocol_version(message.get("protocol_version"))
+                budget_seconds = validate_request_budget_ms(message.get("budget_ms"))
+            else:
+                budget_seconds = NODE_REQUEST_DEFAULT_BUDGET_MS / 1000
+            operation = validate_request_operation(message.get("operation"))
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                raise NodeAgentError("Request payload is invalid", code="request_invalid")
+            loop = asyncio.get_running_loop()
+            admission_deadline = (
+                received_at if received_at is not None else loop.time()
+            ) + budget_seconds
+            remaining = admission_deadline - loop.time()
+            if remaining <= 0:
+                raise NodeAgentError("Node request budget expired", code="deadline_exceeded")
             try:
+                async with asyncio.timeout(remaining):
+                    await self._request_limit.acquire()
+            except TimeoutError as exc:
+                raise NodeAgentError(
+                    "Node request budget expired", code="deadline_exceeded"
+                ) from exc
+            try:
+                if loop.time() >= admission_deadline:
+                    raise NodeAgentError("Node request budget expired", code="deadline_exceeded")
                 result = await self.runtime.handle(operation, payload, self._send)
                 await self._send(
-                    {"type": "response", "id": request_id, "ok": True, "result": result.value}
+                    {
+                        "type": "response",
+                        "id": request_id,
+                        "ok": True,
+                        "result": result.value,
+                    }
                 )
                 if result.start is not None:
                     self._start_request_task(result.start())
-            except Exception as exc:
-                await self._send_error(request_id, exc)
+            finally:
+                self._request_limit.release()
+        except Exception as exc:
+            await self._send_error(request_id, exc)
 
     async def _send_error(self, request_id: str, error: BaseException) -> None:
         await self._send(
@@ -2743,10 +3024,10 @@ def _permanent_connection_error(error: BaseException) -> tuple[str, str] | None:
     if isinstance(error, NodePermanentError):
         return error.code, str(error)
     if isinstance(error, ConnectionClosed):
-        close_code = getattr(error, "code", None)
+        received = getattr(error, "rcvd", None)
+        close_code = getattr(received, "code", None)
         if close_code is None:
-            received = getattr(error, "rcvd", None)
-            close_code = getattr(received, "code", None)
+            close_code = getattr(error, "code", None)
         if close_code == 4001:
             return (
                 "identity_in_use",
@@ -2754,6 +3035,11 @@ def _permanent_connection_error(error: BaseException) -> tuple[str, str] | None:
             )
         if close_code == 4403:
             return "identity_revoked", "This Termroom Node identity was revoked in Core."
+        if close_code == 4406:
+            return (
+                "version_incompatible",
+                "Core requires a different Node protocol. Update Termroom on Core and Node.",
+            )
         if close_code == 4401:
             return (
                 "identity_rejected",
@@ -2781,6 +3067,8 @@ def _error_code(error: BaseException) -> str:
         return "file_conflict"
     if isinstance(error, UnsupportedFileError):
         return "file_unsupported"
+    if isinstance(error, DirectoryListingLimitError):
+        return "directory_listing_limit"
     if isinstance(error, PathBoundaryError):
         return "path_outside"
     if isinstance(error, FileExistsError):

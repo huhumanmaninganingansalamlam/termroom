@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import os
 import shlex
 import shutil
@@ -39,9 +40,7 @@ def _free_port() -> int:
 
 
 @contextlib.contextmanager
-def _test_sshd(
-    tmp_path: Path, *, log_level: str = "ERROR"
-) -> Iterator[dict[str, object]]:
+def _test_sshd(tmp_path: Path, *, log_level: str = "ERROR") -> Iterator[dict[str, object]]:
     qa = tmp_path / "sshd"
     qa.mkdir()
     remote_tmux_root = qa / "tmux"
@@ -99,9 +98,7 @@ def _test_sshd(
                     break
             except OSError as exc:
                 if process.poll() is not None:
-                    raise RuntimeError(
-                        (qa / "sshd.log").read_text(encoding="utf-8")
-                    ) from exc
+                    raise RuntimeError((qa / "sshd.log").read_text(encoding="utf-8")) from exc
                 time.sleep(0.05)
         else:
             raise RuntimeError("test sshd did not start")
@@ -314,9 +311,7 @@ def test_ssh_backend_reuses_idle_authenticated_transport(tmp_path: Path) -> None
         deadline = time.monotonic() + 2
         accepted = 0
         while time.monotonic() < deadline:
-            accepted = log_path.read_text(encoding="utf-8", errors="replace").count(
-                auth_marker
-            )
+            accepted = log_path.read_text(encoding="utf-8", errors="replace").count(auth_marker)
             if accepted >= 1:
                 break
             time.sleep(0.02)
@@ -326,9 +321,7 @@ def test_ssh_backend_reuses_idle_authenticated_transport(tmp_path: Path) -> None
         assert backend.test_connection(computer)["tmux"].startswith("tmux ")
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            accepted = log_path.read_text(encoding="utf-8", errors="replace").count(
-                auth_marker
-            )
+            accepted = log_path.read_text(encoding="utf-8", errors="replace").count(auth_marker)
             if accepted >= 2:
                 break
             time.sleep(0.02)
@@ -415,6 +408,191 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
     assert sys.executable in helper.read_text(encoding="utf-8")
 
 
+def test_ssh_grid_owner_retries_promotion_without_losing_previous_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    terminal_id = "terminal"
+    previous = backend.control.register(terminal_id)
+    candidate = backend.control.register(terminal_id)
+    backend.control.mark_input(terminal_id, previous)
+    backend._browser_grid_owners[terminal_id] = previous
+    backend.control.mark_input(terminal_id, candidate)
+    outcomes = iter((False, True))
+    attempts: list[bool] = []
+
+    def set_grid_role(
+        _workspace: dict[str, object], _view_session: str, *, enabled: bool
+    ) -> bool:
+        attempts.append(enabled)
+        return next(outcomes)
+
+    monkeypatch.setattr(backend, "_set_ssh_browser_view_grid_resize", set_grid_role)
+    workspace: dict[str, object] = {}
+
+    assert not backend._sync_ssh_browser_grid_role(
+        terminal_id,
+        candidate,
+        workspace,  # type: ignore[arg-type]
+        tmux_browser_view_session(candidate),
+        enabled=True,
+    )
+    assert backend._browser_grid_owners[terminal_id] == previous
+
+    assert backend._sync_ssh_browser_grid_role(
+        terminal_id,
+        candidate,
+        workspace,  # type: ignore[arg-type]
+        tmux_browser_view_session(candidate),
+        enabled=True,
+    )
+    assert backend._browser_grid_owners[terminal_id] == candidate
+    assert attempts == [True, True]
+
+
+def test_ssh_grid_owner_is_forgotten_only_after_demotion_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    terminal_id = "terminal"
+    client_id = backend.control.register(terminal_id)
+    backend.control.mark_input(terminal_id, client_id)
+    backend._browser_grid_owners[terminal_id] = client_id
+    outcomes = iter((False, True))
+
+    def set_grid_role(
+        _workspace: dict[str, object], _view_session: str, *, enabled: bool
+    ) -> bool:
+        assert not enabled
+        return next(outcomes)
+
+    monkeypatch.setattr(backend, "_set_ssh_browser_view_grid_resize", set_grid_role)
+    workspace: dict[str, object] = {}
+
+    assert not backend._sync_ssh_browser_grid_role(
+        terminal_id,
+        client_id,
+        workspace,  # type: ignore[arg-type]
+        tmux_browser_view_session(client_id),
+        enabled=False,
+    )
+    assert backend._browser_grid_owners[terminal_id] == client_id
+
+    assert backend._sync_ssh_browser_grid_role(
+        terminal_id,
+        client_id,
+        workspace,  # type: ignore[arg-type]
+        tmux_browser_view_session(client_id),
+        enabled=False,
+    )
+    assert terminal_id not in backend._browser_grid_owners
+
+
+def test_ssh_grid_promotion_allows_peer_that_disconnected_during_demotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "tmux.log"
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$TERMROOM_TEST_TMUX_LOG\"\n"
+        "if [ \"$1\" = 'list-clients' ]; then\n"
+        "  if [ \"$2\" = '-t' ]; then printf 'target|@1\\n';\n"
+        "  else printf 'peer|termroom-view-peer|@1\\ntarget|termroom-view-target|@1\\n'; fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = 'refresh-client' ] && [ \"$3\" = 'peer' ]; then exit 1; fi\n"
+        "if [ \"$1\" = 'display-message' ] && [ \"$4\" = 'peer' ]; then exit 1; fi\n"
+        "if [ \"$1\" = 'refresh-client' ] && [ \"$3\" = 'target' ]; then exit 0; fi\n"
+        "exit 92\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+    monkeypatch.setenv("TERMROOM_TEST_TMUX_LOG", str(log_path))
+    observed: list[tuple[str, int, str]] = []
+
+    def run_locally(_computer: dict[str, object], command: str) -> str:
+        command = command.replace("tmux ", f"{shlex.quote(str(fake_tmux))} ")
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "TERMROOM_TEST_TMUX_LOG": str(log_path),
+            },
+        )
+        observed.append((command, result.returncode, result.stderr))
+        if result.returncode:
+            raise SSHBackendError(result.stderr or "fake tmux command failed")
+        return result.stdout
+
+    monkeypatch.setattr(backend, "_exec", run_locally)
+    workspace = {"computer": {"id": "computer"}}
+
+    promoted = backend._set_ssh_browser_view_grid_resize(
+        workspace,  # type: ignore[arg-type]
+        tmux_browser_view_session(uuid.uuid4().hex),
+        enabled=True,
+    )
+    assert promoted, observed
+    calls = log_path.read_text(encoding="utf-8").splitlines()
+    assert "refresh-client -t peer -f ignore-size" in calls
+    assert "display-message -p -c peer #{window_id}" in calls
+    assert "refresh-client -t target -f !ignore-size" in calls
+
+
+@pytest.mark.asyncio
+async def test_ssh_bridge_cleans_control_registration_when_tmux_spawn_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    terminal_id = "terminal"
+    monkeypatch.setattr(backend, "ensure_workspace", lambda _workspace: [])
+
+    def fail_spawn(
+        _workspace: dict[str, object],
+        _terminal: dict[str, object],
+        view_session: str,
+    ) -> tuple[int, int]:
+        client_id = view_session.removeprefix("termroom-view-")
+        backend._browser_grid_owners[terminal_id] = client_id
+        raise SSHBackendError("tmux spawn failed")
+
+    monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", fail_spawn)
+
+    with pytest.raises(SSHBackendError, match="tmux spawn failed"):
+        await backend.bridge(  # type: ignore[arg-type]
+            object(),
+            {"id": "workspace"},
+            {"id": terminal_id},
+            device_id="device",
+        )
+
+    assert backend.control.client_count(terminal_id) == 0
+    assert terminal_id not in backend._browser_grid_owners
+
+
 @pytest.mark.asyncio
 async def test_password_setup_failure_never_echoes_or_stores_password(tmp_path: Path) -> None:
     local_root = tmp_path / "local"
@@ -430,9 +608,7 @@ async def test_password_setup_failure_never_echoes_or_stores_password(tmp_path: 
         )
         app = create_app(settings)
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             login = await client.post(
                 "/login", data={"password": "termroom-password"}, follow_redirects=False
             )
@@ -470,9 +646,7 @@ async def test_password_setup_failure_never_echoes_or_stores_password(tmp_path: 
             assert secret not in failed.text
             assert app.state.store.list_computers() == []
             with app.state.store.connect() as db:
-                columns = {
-                    str(row["name"]) for row in db.execute("PRAGMA table_info(computers)")
-                }
+                columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(computers)")}
                 assert "password" not in columns
 
 
@@ -564,9 +738,7 @@ async def test_public_key_setup_route_uses_persistent_termroom_key(tmp_path: Pat
             handle.write(managed["public_key"] + "\n")
 
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             login = await client.post(
                 "/login", data={"password": "termroom-password"}, follow_redirects=False
             )
@@ -701,7 +873,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             assert remote_range.offset == 16_000
             assert remote_range.bytes_read <= 4096
             assert "remote-line-" in remote_range.content
-            with pytest.raises(SSHBackendError):
+            with pytest.raises((SSHBackendError, UnsupportedFileError)):
                 backend.read_text(workspace, "escape/secret.txt", 1024)
             backend.create(workspace, ".", "empty.txt", directory=False)
             assert backend.stat(workspace, "empty.txt").size == 0
@@ -772,6 +944,9 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                     computer,
                     f"tmux display-message -p -t {shlex.quote(view_session)} '#{{window_id}}'",
                 ).strip() == str(browser_terminal["tmux_window"])
+                assert backend._set_ssh_browser_view_grid_resize(
+                    workspace, view_session, enabled=True
+                )
                 backend._set_window_size(master_fd, rows=41, cols=123)
                 os.killpg(process_pid, signal.SIGWINCH)
                 deadline = time.monotonic() + 2
@@ -787,12 +962,189 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                         break
                     time.sleep(0.05)
                 assert "123x41" in sizes
+
+                passive_view = tmux_browser_view_session(uuid.uuid4().hex)
+                passive_pid, passive_fd = backend._spawn_ssh_tmux_client(
+                    workspace,
+                    browser_terminal,
+                    passive_view,
+                )
+                try:
+                    backend._set_window_size(passive_fd, rows=28, cols=51)
+                    os.killpg(passive_pid, signal.SIGWINCH)
+                    deadline = time.monotonic() + 2
+                    passive_sizes: list[str] = []
+                    while time.monotonic() < deadline:
+                        try:
+                            output = backend._exec(
+                                computer,
+                                f"tmux list-clients -t {shlex.quote(passive_view)} "
+                                "-F '#{client_width}x#{client_height}'",
+                            )
+                        except SSHBackendError:
+                            time.sleep(0.05)
+                            continue
+                        passive_sizes = output.strip().splitlines()
+                        if "51x28" in passive_sizes:
+                            break
+                        time.sleep(0.05)
+                    assert "51x28" in passive_sizes
+                    assert (
+                        backend._exec(
+                            computer,
+                            "tmux display-message -p -t "
+                            f"{shlex.quote(str(browser_terminal['tmux_window']))} "
+                            "'#{window_width}x#{window_height}'",
+                        ).strip()
+                        == "123x40"
+                    )
+
+                    assert backend._set_ssh_browser_view_grid_resize(
+                        workspace, passive_view, enabled=True
+                    )
+                    backend._set_window_size(passive_fd, rows=28, cols=51)
+                    os.killpg(passive_pid, signal.SIGWINCH)
+                    deadline = time.monotonic() + 2
+                    window_size = ""
+                    while time.monotonic() < deadline:
+                        window_size = backend._exec(
+                            computer,
+                            "tmux display-message -p -t "
+                            f"{shlex.quote(str(browser_terminal['tmux_window']))} "
+                            "'#{window_width}x#{window_height}'",
+                        ).strip()
+                        if window_size == "51x27":
+                            break
+                        time.sleep(0.05)
+                    assert window_size == "51x27"
+
+                    assert backend._set_ssh_browser_view_grid_resize(
+                        workspace, view_session, enabled=False
+                    )
+                    backend._set_window_size(master_fd, rows=29, cols=77)
+                    os.killpg(process_pid, signal.SIGWINCH)
+                    deadline = time.monotonic() + 2
+                    active_sizes: list[str] = []
+                    while time.monotonic() < deadline:
+                        output = backend._exec(
+                            computer,
+                            f"tmux list-clients -t {shlex.quote(view_session)} "
+                            "-F '#{client_width}x#{client_height}'",
+                        )
+                        active_sizes = output.strip().splitlines()
+                        if "77x29" in active_sizes:
+                            break
+                        time.sleep(0.05)
+                    assert "77x29" in active_sizes
+                    assert (
+                        backend._exec(
+                            computer,
+                            "tmux display-message -p -t "
+                            f"{shlex.quote(str(browser_terminal['tmux_window']))} "
+                            "'#{window_width}x#{window_height}'",
+                        ).strip()
+                        == "51x27"
+                    )
+                finally:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(passive_pid, signal.SIGTERM)
+                    backend._wait_for_pid(passive_pid, 1)
+                    os.close(passive_fd)
             finally:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process_pid, signal.SIGTERM)
                 backend._wait_for_pid(process_pid, 1)
                 os.close(master_fd)
                 backend.close_terminal(workspace, browser_terminal)
+
+            applied_input_sizes: list[tuple[int, int]] = []
+            original_set_window_size = backend._set_window_size
+            original_set_grid_resize = backend._set_ssh_browser_view_grid_resize
+            grid_resize_attempts: list[bool] = []
+            terminal_id = str(terminal["id"])
+            competing_client = backend.control.register(terminal_id)
+            backend.control.mark_input(terminal_id, competing_client)
+
+            def record_input_size(fd: int, *, rows: int, cols: int) -> None:
+                applied_input_sizes.append((rows, cols))
+                original_set_window_size(fd, rows=rows, cols=cols)
+
+            def retry_grid_resize(
+                resize_workspace: dict[str, object],
+                resize_view: str,
+                *,
+                enabled: bool,
+            ) -> bool:
+                grid_resize_attempts.append(enabled)
+                if len(grid_resize_attempts) == 1:
+                    return False
+                changed = original_set_grid_resize(
+                    resize_workspace,  # type: ignore[arg-type]
+                    resize_view,
+                    enabled=enabled,
+                )
+                if len(grid_resize_attempts) == 2:
+                    backend.control.mark_input(terminal_id, competing_client)
+                return changed
+
+            class InputWebSocket:
+                def __init__(self) -> None:
+                    self.messages = [
+                        {
+                            "type": "websocket.receive",
+                            "text": json.dumps(
+                                {
+                                    "kind": "input",
+                                    "data": "",
+                                    "rows": 37,
+                                    "cols": 111,
+                                    "user_input": True,
+                                }
+                            ),
+                        },
+                        {
+                            "type": "websocket.receive",
+                            "text": json.dumps(
+                                {
+                                    "kind": "input",
+                                    "data": "",
+                                    "rows": 37,
+                                    "cols": 111,
+                                    "user_input": True,
+                                }
+                            ),
+                        },
+                        {
+                            "type": "websocket.receive",
+                            "text": json.dumps({"kind": "input", "data": ""}),
+                        },
+                        {"type": "websocket.disconnect", "code": 1000},
+                    ]
+
+                async def receive(self) -> dict[str, object]:
+                    return self.messages.pop(0)
+
+                async def send_text(self, _value: str) -> None:
+                    return None
+
+                async def close(self, *, code: int, reason: str) -> None:
+                    raise AssertionError((code, reason))
+
+            backend._set_window_size = record_input_size  # type: ignore[method-assign]
+            backend._set_ssh_browser_view_grid_resize = retry_grid_resize  # type: ignore[method-assign]
+            try:
+                await backend.bridge(
+                    InputWebSocket(),  # type: ignore[arg-type]
+                    workspace,
+                    terminal,
+                    device_id="ssh-device",
+                )
+            finally:
+                backend._set_window_size = original_set_window_size  # type: ignore[method-assign]
+                backend._set_ssh_browser_view_grid_resize = original_set_grid_resize  # type: ignore[method-assign]
+                backend.control.unregister(terminal_id, competing_client)
+            assert grid_resize_attempts == [True, True, False]
+            assert applied_input_sizes == [(37, 111)]
 
             settings = Settings.create(
                 local_root,
@@ -857,11 +1209,9 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 terminal_page = await client.get(f"/w/{workspace['id']}/terminal")
                 assert terminal_page.status_code == 200
                 assert "Loopback QA" in terminal_page.text
-                assert f'/api/workspaces/{workspace["id"]}/usage' in terminal_page.text
+                assert f"/api/workspaces/{workspace['id']}/usage" in terminal_page.text
 
-                usage_response = await client.get(
-                    f"/api/workspaces/{workspace['id']}/usage"
-                )
+                usage_response = await client.get(f"/api/workspaces/{workspace['id']}/usage")
                 assert usage_response.status_code == 200
                 assert usage_response.json()["state"] == "fresh"
                 assert usage_response.json()["sample"]["process_count"] >= 2
@@ -872,20 +1222,18 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                     follow_redirects=False,
                 )
                 assert server_open.status_code == 303
-                assert server_open.headers["location"] == (
-                    f"/w/{server_workspace['id']}/terminal"
-                )
+                assert server_open.headers["location"] == (f"/w/{server_workspace['id']}/terminal")
                 server_page = await client.get(server_open.headers["location"])
                 assert server_page.status_code == 200
                 assert "SSH server terminal" in server_page.text
                 assert remote_home in server_page.text
                 assert server_terminal["id"] in server_page.text
-                assert f'/w/{server_workspace["id"]}/files' not in server_page.text
-                assert f'/api/workspaces/{server_workspace["id"]}/usage' not in server_page.text
+                assert f"/w/{server_workspace['id']}/files" not in server_page.text
+                assert f"/api/workspaces/{server_workspace['id']}/usage" not in server_page.text
 
                 picker_page = await client.get(f"/open/{computer['id']}")
                 assert picker_page.status_code == 200
-                assert f'/w/{server_workspace["id"]}' not in picker_page.text
+                assert f"/w/{server_workspace['id']}" not in picker_page.text
         finally:
             with contextlib.suppress(Exception):
                 backend._exec(computer, f"tmux kill-session -t {workspace['tmux_session']}")
@@ -943,9 +1291,7 @@ def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
             max_edit_bytes=1024 * 1024,
         )
         remote_home = backend.home_directory(computer)
-        metadata_workspace = (
-            Path(remote_home) / ".termroom-file-runs" / str(workspace["id"])
-        )
+        metadata_workspace = Path(remote_home) / ".termroom-file-runs" / str(workspace["id"])
 
         def wait_for(run_id: str, *, terminal: bool) -> dict[str, object]:
             deadline = time.monotonic() + 8
@@ -962,9 +1308,7 @@ def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
                 "value = input('remote value: ')\nprint('seen:' + value)\n",
                 encoding="utf-8",
             )
-            digest = backend.inspect_runnable(
-                workspace, "ask.py", max_bytes=1024 * 1024
-            ).digest
+            digest = backend.inspect_runnable(workspace, "ask.py", max_bytes=1024 * 1024).digest
             interactive = manager.start(
                 workspace,
                 "ask.py",
@@ -984,9 +1328,7 @@ def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
             completed = wait_for(str(interactive["id"]), terminal=True)
             assert completed["state"] == "finished"
             assert completed["exit_code"] == 0
-            assert "seen:SSH 한글 value" in backend.capture_scrollback(
-                workspace, terminal
-            )
+            assert "seen:SSH 한글 value" in backend.capture_scrollback(workspace, terminal)
 
             special_path = "한글 $(touch PWNED); value.py"
             (project / special_path).write_text("print('safe remote path')\n", encoding="utf-8")
@@ -1072,9 +1414,7 @@ def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
                 idempotency_key=str(uuid.uuid4()),
             )
             wait_for(str(waiting["id"]), terminal=False)
-            waiting_terminal = store.get_managed_terminal(
-                str(workspace["id"]), "file_run"
-            )
+            waiting_terminal = store.get_managed_terminal(str(workspace["id"]), "file_run")
             assert waiting_terminal is not None
             waiting_window = str(waiting_terminal["tmux_window"])
             original_windows = backend._remote_file_run_windows
@@ -1088,15 +1428,9 @@ def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
                 )
                 return windows
 
-            monkeypatch.setattr(
-                backend, "_remote_file_run_windows", drift_identity
-            )
-            assert backend.interrupt_file_run(
-                workspace, run_id=str(waiting["id"])
-            ) is False
-            monkeypatch.setattr(
-                backend, "_remote_file_run_windows", original_windows
-            )
+            monkeypatch.setattr(backend, "_remote_file_run_windows", drift_identity)
+            assert backend.interrupt_file_run(workspace, run_id=str(waiting["id"])) is False
+            monkeypatch.setattr(backend, "_remote_file_run_windows", original_windows)
             backend._exec(
                 computer,
                 "tmux set-window-option -t "
@@ -1105,8 +1439,7 @@ def test_ssh_file_run_end_to_end_recovers_reuses_and_stops_exact_slot(
             )
             pane_dead = backend._exec(
                 computer,
-                "tmux display-message -p -t "
-                f"{shlex.quote(waiting_window)} '#{{pane_dead}}'",
+                f"tmux display-message -p -t {shlex.quote(waiting_window)} '#{{pane_dead}}'",
             ).strip()
             assert pane_dead == "0"
             interrupted = manager.stop(str(waiting["id"]))
@@ -1260,12 +1593,9 @@ async def test_remote_model_upgrade_preserves_live_ssh_tmux_and_files(
         ).strip()
 
         with sqlite3.connect(store.path) as legacy:
+            legacy.execute("ALTER TABLE computers RENAME COLUMN connection_method TO kind")
             legacy.execute(
-                "ALTER TABLE computers RENAME COLUMN connection_method TO kind"
-            )
-            legacy.execute(
-                "ALTER TABLE remote_runs RENAME COLUMN archive_format "
-                "TO legacy_archive_format"
+                "ALTER TABLE remote_runs RENAME COLUMN archive_format TO legacy_archive_format"
             )
             legacy.execute(
                 "UPDATE workspaces SET backend_kind = 'ssh' WHERE backend_kind = 'remote'"
@@ -1286,9 +1616,7 @@ async def test_remote_model_upgrade_preserves_live_ssh_tmux_and_files(
         assert after_panes == before_panes
 
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             login = await client.post(
                 "/login",
                 data={"password": "test-token"},
@@ -1301,9 +1629,10 @@ async def test_remote_model_upgrade_preserves_live_ssh_tmux_and_files(
         assert "upgrade.txt" in files_page.text
         assert terminal_page.status_code == 200
         assert "원격 작업공간" in terminal_page.text
-        assert app.state.ssh.read_text(
-            migrated_workspace, "upgrade.txt", 1024
-        ).content == "preserved through upgrade\n"
+        assert (
+            app.state.ssh.read_text(migrated_workspace, "upgrade.txt", 1024).content
+            == "preserved through upgrade\n"
+        )
 
         with contextlib.suppress(Exception):
             app.state.ssh._exec(
@@ -1363,7 +1692,7 @@ async def test_remote_run_end_to_end_uses_real_ssh_sftp_tmux_and_workspace(
                 "source_path": ".",
                 "target_computer_id": str(computer["id"]),
                 "command": (
-                    "test \"$(cat input.txt)\" = source-data\n"
+                    'test "$(cat input.txt)" = source-data\n'
                     "false\n"
                     "printf 'continued-after-false\\n' > result.txt"
                 ),
@@ -1457,7 +1786,7 @@ async def test_archive_remote_run_end_to_end_uses_real_ssh_and_one_event(
                 "archive_name": "source.zip",
                 "target_computer_id": str(computer["id"]),
                 "command": (
-                    "test \"$(cat input.txt)\" = archive-source\n"
+                    'test "$(cat input.txt)" = archive-source\n'
                     "printf 'archive-result\\n' > result.txt"
                 ),
             }
@@ -1493,9 +1822,7 @@ async def test_archive_remote_run_end_to_end_uses_real_ssh_and_one_event(
                 "archive-result\n"
             )
             matching_events = [
-                event
-                for event in store.list_activity_events()
-                if event["subject_id"] == run_id
+                event for event in store.list_activity_events() if event["subject_id"] == run_id
             ]
             assert len(matching_events) == 1
             assert matching_events[0]["kind"] == "remote_run.completed"
@@ -1567,7 +1894,7 @@ async def test_remote_run_observer_reconciles_real_ssh_completion_after_restart(
                     "target_computer_id": str(computer["id"]),
                     "command": (
                         "sleep 3\n"
-                        "test \"$(cat input.txt)\" = observer-source\n"
+                        'test "$(cat input.txt)" = observer-source\n'
                         "printf 'observed-after-restart\\n' > observed.txt"
                     ),
                 }
@@ -1598,17 +1925,13 @@ async def test_remote_run_observer_reconciles_real_ssh_completion_after_restart(
             completion_deadline = time.monotonic() + 15
             while time.monotonic() < completion_deadline:
                 matching_events = [
-                    event
-                    for event in store.list_activity_events()
-                    if event["subject_id"] == run_id
+                    event for event in store.list_activity_events() if event["subject_id"] == run_id
                 ]
                 if matching_events:
                     break
                 await asyncio.sleep(0.1)
             else:
-                pytest.fail(
-                    "Background observer did not record the real SSH completion"
-                )
+                pytest.fail("Background observer did not record the real SSH completion")
 
             stored = store.get_remote_run(run_id)
             assert stored is not None
@@ -1616,9 +1939,10 @@ async def test_remote_run_observer_reconciles_real_ssh_completion_after_restart(
             assert stored["exit_code"] == 0
             assert len(matching_events) == 1
             assert matching_events[0]["kind"] == "remote_run.completed"
-            assert remote_run_base.joinpath(run_id, "work", "observed.txt").read_text(
-                encoding="utf-8"
-            ) == "observed-after-restart\n"
+            assert (
+                remote_run_base.joinpath(run_id, "work", "observed.txt").read_text(encoding="utf-8")
+                == "observed-after-restart\n"
+            )
 
             deleted = second_manager.request_delete(run_id)
             assert deleted["deleted"] is True

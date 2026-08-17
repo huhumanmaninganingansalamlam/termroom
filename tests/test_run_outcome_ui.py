@@ -21,6 +21,73 @@ async def _login(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_remote_run_recovery_uses_compact_connection_state_without_layout_jump(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="GPU",
+        ssh_alias="",
+        host="gpu.example.test",
+        port=22,
+        username="runner",
+        identity_file="/tmp/key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    run_id = str(uuid.uuid4())
+    _run, created = app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "git",
+            "source_workspace_id": None,
+            "source_path": None,
+            "source_label": "model",
+            "source_url": "https://example.test/model.git",
+            "source_options_json": '{"policy":1}',
+            "source_revision": None,
+            "source_size": None,
+            "target_computer_id": str(computer["id"]),
+            "command": "python main.py",
+            "run_base": "/home/runner/.cache/termroom/runs",
+            "workspace_id": None,
+            "state": "running",
+            "phase": None,
+            "created_at": "2026-08-16T00:00:00+00:00",
+        }
+    )
+    assert created is True
+    connection = "offline"
+
+    def poll(*_args: object, **_kwargs: object) -> dict[str, object]:
+        run = dict(app.state.remote_runs.get(run_id))
+        run["connection"] = connection
+        return run
+
+    monkeypatch.setattr(app.state.remote_runs, "poll", poll)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        offline = await client.get(f"/remote-runs/{run_id}")
+        connection = "online"
+        online = await client.get(f"/remote-runs/{run_id}")
+
+    assert offline.status_code == 200
+    assert 'class="state-chip remote-run-connection-state"' in offline.text
+    assert "data-run-connection>" in offline.text
+    assert "Rechecking connection…" in offline.text
+    assert 'class="connection-notice error"' not in offline.text
+    assert "Lost connection to GPU" not in offline.text
+    assert online.status_code == 200
+    assert "data-run-connection hidden>" in online.text
+
+
+@pytest.mark.asyncio
 async def test_nonzero_file_run_is_presented_as_failed_without_changing_lifecycle_state(
     tmp_path: Path,
 ) -> None:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -12,11 +15,15 @@ import pytest
 
 from termroom.db import StateStore
 from termroom.terminals import (
+    TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
     TMUX_TERMINAL_RECORD_FORMAT,
     TerminalManager,
     TerminalOutputDecoder,
+    normalize_terminal_editor_path,
     normalize_terminal_name,
+    parse_tmux_terminal_editor_records,
     parse_tmux_terminal_records,
+    terminal_editor_digest,
     terminal_size,
 )
 from termroom.workspace_usage import WorkspaceUsageStale
@@ -27,6 +34,56 @@ def test_terminal_names_preserve_unicode_and_sanitize_shell_unsafe_characters() 
     assert normalize_terminal_name("크롤러 로그") == "크롤러-로그"
     assert normalize_terminal_name("  빌드_1.2  ") == "빌드_1.2"
     assert normalize_terminal_name("***") == "shell"
+
+
+def test_terminal_editor_paths_and_tmux_records_are_bounded() -> None:
+    assert normalize_terminal_editor_path("src/한글 file.py") == "src/한글 file.py"
+    digest = terminal_editor_digest("src/한글 file.py")
+    assert parse_tmux_terminal_editor_records(f"@7|0|{digest}\n@8|0|\n") == [
+        {"tmux_window": "@7", "dead": False, "digest": digest}
+    ]
+    with pytest.raises(ValueError, match="file path is invalid"):
+        normalize_terminal_editor_path("../secret")
+    with pytest.raises(ValueError, match="invalid Terminal editor digest"):
+        parse_tmux_terminal_editor_records("@7|0|not-a-digest\n")
+
+
+@pytest.mark.skipif(
+    shutil.which("tmux") is None
+    or not any(shutil.which(editor) for editor in ("nvim", "vim", "vi")),
+    reason="tmux and a Vim-compatible editor are required",
+)
+def test_terminal_editor_opens_file_once_and_reuses_live_tmux_window(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "hello world.txt"
+    source.write_text("hello\n", encoding="utf-8")
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+    try:
+        first = manager.open_terminal_editor(workspace, "hello world.txt")
+        second = manager.open_terminal_editor(workspace, "hello world.txt")
+        assert first["id"] == second["id"]
+        assert first["tmux_window"] == second["tmux_window"]
+        record = manager._run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            str(first["tmux_window"]),
+            TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
+        ).stdout.strip()
+        assert record.endswith(terminal_editor_digest("hello world.txt"))
+    finally:
+        manager._run_tmux(
+            "kill-session",
+            "-t",
+            str(workspace["tmux_session"]),
+            check=False,
+        )
 
 
 def test_terminal_resize_payload_is_clamped_and_invalid_values_are_ignored() -> None:
@@ -49,6 +106,82 @@ def test_terminal_output_decoder_preserves_multibyte_characters_across_chunks() 
     ]
 
     assert "".join(pieces) == "한글🙂"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_local_grid_client_lookup_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+    terminal = manager.ensure_workspace(workspace)[0]
+
+    class ResizeWebSocket:
+        def __init__(self) -> None:
+            self.messages = [
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps(
+                        {
+                            "kind": "input",
+                            "data": "",
+                            "rows": 37,
+                            "cols": 111,
+                            "user_input": True,
+                        }
+                    ),
+                },
+                {"type": "websocket.disconnect", "code": 1000},
+            ]
+
+        async def receive(self) -> dict[str, object]:
+            return self.messages.pop(0)
+
+        async def send_text(self, _value: str) -> None:
+            return None
+
+        async def close(self, *, code: int, reason: str) -> None:
+            raise AssertionError((code, reason))
+
+    helper_done = threading.Event()
+
+    def slow_missing_client(_view_session: str, *, enabled: bool) -> bool:
+        assert enabled
+        time.sleep(0.2)
+        helper_done.set()
+        return False
+
+    monkeypatch.setattr(manager, "_set_browser_view_grid_resize", slow_missing_client)
+
+    async def ticker() -> float:
+        loop = asyncio.get_running_loop()
+        ticks = [loop.time()]
+        while not helper_done.is_set():
+            await asyncio.sleep(0.01)
+            ticks.append(loop.time())
+        return max(
+            (current - previous for previous, current in zip(ticks, ticks[1:], strict=False)),
+            default=0,
+        )
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await manager.bridge(
+            ResizeWebSocket(),  # type: ignore[arg-type]
+            workspace,
+            terminal,
+        )
+        assert helper_done.is_set()
+        assert await ticker_task < 0.1
+    finally:
+        if not ticker_task.done():
+            ticker_task.cancel()
+        manager._run_tmux("kill-session", "-t", str(workspace["tmux_session"]), check=False)
 
 
 def test_managed_terminal_row_survives_tmux_window_id_drift(tmp_path: Path) -> None:
@@ -153,9 +286,7 @@ def test_terminal_activity_refresh_batches_local_sessions_without_running_tmux(
     manager = TerminalManager(store)
     calls: list[tuple[tuple[str, ...], bool]] = []
 
-    def fake_tmux(
-        *args: str, check: bool = True
-    ) -> subprocess.CompletedProcess[str]:
+    def fake_tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         calls.append((args, check))
         return subprocess.CompletedProcess(
             ["tmux", *args],
@@ -172,9 +303,7 @@ def test_terminal_activity_refresh_batches_local_sessions_without_running_tmux(
 
     refreshed = manager.refresh_activity([first, second])
 
-    assert calls == [
-        (("list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT), False)
-    ]
+    assert calls == [(("list-windows", "-a", "-F", TMUX_TERMINAL_RECORD_FORMAT), False)]
     assert refreshed[str(first["id"])][0]["id"] == first_terminal["id"]
     assert refreshed[str(first["id"])][0]["activity_at"] == 100
     assert refreshed[str(second["id"])][0]["id"] == second_terminal["id"]

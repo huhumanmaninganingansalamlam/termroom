@@ -168,11 +168,13 @@ def _login(base_url: str, password: str) -> tuple[httpx.Client, str]:
     return client, match.group(1)
 
 
-def _node_status_is(client: httpx.Client, node_id: str, status: str) -> bool:
+def _remote_connection_state_is(
+    client: httpx.Client, node_id: str, state: str
+) -> bool:
     response = client.get(f"/computers/{node_id}")
     return (
         response.status_code == 200
-        and f"<p><strong>{status}</strong></p>" in response.text
+        and f'class="state-chip remote {state}"' in response.text
     )
 
 
@@ -542,7 +544,7 @@ def test_real_node_pairing_and_control_connection_use_custom_ca(tmp_path: Path) 
         )
         handles.append(handle)
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             description="custom-CA Node WSS control connection",
         )
         assert node.poll() is None
@@ -681,7 +683,7 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         )
         handles.append(handle)
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             description="Node control connection",
         )
 
@@ -916,9 +918,16 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
             additional_headers={"Cookie": f"termroom_session={session_cookie}"},
             open_timeout=5,
         ) as websocket:
-            websocket.send(json.dumps({"kind": "claim"}))
             websocket.send(
-                json.dumps({"kind": "input", "data": "printf 'NODE_E2E_한글\\n'\r"})
+                json.dumps(
+                    {
+                        "kind": "input",
+                        "data": "printf 'NODE_E2E_한글\\n'\r",
+                        "rows": 24,
+                        "cols": 80,
+                        "user_input": True,
+                    }
+                )
             )
             output = ""
             deadline = time.monotonic() + 8
@@ -935,7 +944,7 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         assert len(store.list_terminals(workspace_id)) == 2
 
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             description="Node connection after Terminal stream close",
         )
 
@@ -979,7 +988,7 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         )
         client, csrf = _login(base_url, "node-e2e-password")
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="Node reconnect after Core restart",
         )
@@ -1021,8 +1030,17 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
             additional_headers={"Cookie": f"termroom_session={session_cookie}"},
             open_timeout=5,
         ) as websocket:
-            websocket.send(json.dumps({"kind": "claim"}))
-            websocket.send(json.dumps({"kind": "input", "data": "after-restart\r"}))
+            websocket.send(
+                json.dumps(
+                    {
+                        "kind": "input",
+                        "data": "after-restart\r",
+                        "rows": 24,
+                        "cols": 80,
+                        "user_input": True,
+                    }
+                )
+            )
             output = ""
             deadline = time.monotonic() + 8
             while "NODE_FILE_RUN:after-restart" not in output and time.monotonic() < deadline:
@@ -1067,7 +1085,7 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         _stop_process(node)
         node = None
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Offline"),
+            lambda: _remote_connection_state_is(client, node_id, "unavailable"),
             description="Node disconnect",
         )
         offline_usage = _wait_until(
@@ -1096,7 +1114,7 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         )
         handles.append(handle)
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="Node process reconnect",
         )
@@ -1183,11 +1201,11 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         )
         assert revoked.status_code == 303
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Revoked"),
+            lambda: _remote_connection_state_is(client, node_id, "unavailable"),
             description="Node revocation",
         )
         time.sleep(1.5)
-        assert not _node_status_is(client, node_id, "Online")
+        assert not _remote_connection_state_is(client, node_id, "available")
         computer = store.get_computer(node_id)
         assert computer is not None
         assert computer["connection_method"] == "node"
@@ -1302,7 +1320,7 @@ def test_real_node_workspace_source_streams_to_a_separate_node(tmp_path: Path) -
         node_processes.append(process)
         handles.append(process_handle)
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             description=f"{name} control connection",
         )
         return node_id
@@ -1523,7 +1541,7 @@ def test_real_node_workspace_source_streams_to_ssh_target(tmp_path: Path) -> Non
             )
             handles.append(handle)
             _wait_until(
-                lambda: _node_status_is(client, node_id, "Online"),
+                lambda: _remote_connection_state_is(client, node_id, "available"),
                 description="Node control connection",
             )
 
@@ -1758,7 +1776,7 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
         service_installed = True
         assert "Installed: yes" in installed.stdout
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="systemd Node connection",
         )
@@ -1808,7 +1826,7 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
         stopped = systemctl("stop", NODE_SERVICE_UNIT_NAME)
         assert stopped.returncode == 0, stopped.stderr
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Offline"),
+            lambda: _remote_connection_state_is(client, node_id, "unavailable"),
             description="Node service stop",
         )
         assert subprocess.run(
@@ -1825,7 +1843,7 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
         started = systemctl("start", NODE_SERVICE_UNIT_NAME)
         assert started.returncode == 0, started.stderr
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="Node service start reconnect",
         )
@@ -1844,8 +1862,17 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
             additional_headers={"Cookie": f"termroom_session={session_cookie}"},
             open_timeout=5,
         ) as websocket:
-            websocket.send(json.dumps({"kind": "claim"}))
-            websocket.send(json.dumps({"kind": "input", "data": "service-reconnect\r"}))
+            websocket.send(
+                json.dumps(
+                    {
+                        "kind": "input",
+                        "data": "service-reconnect\r",
+                        "rows": 24,
+                        "cols": 80,
+                        "user_input": True,
+                    }
+                )
+            )
             output = ""
             deadline = time.monotonic() + 8
             while "SERVICE_RUN:service-reconnect" not in output and time.monotonic() < deadline:
@@ -1867,7 +1894,7 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
             description="bounded systemd process restart",
         )
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="Node reconnect after process failure",
         )
@@ -1888,7 +1915,7 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
         )
         client, csrf = _login(base_url, "node-service-e2e-password")
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="service reconnect after Core restart",
         )
@@ -1923,7 +1950,7 @@ def test_real_node_systemd_service_preserves_identity_tmux_and_reconnects(
         assert reinstalled.returncode == 0, reinstalled.stderr
         service_installed = True
         _wait_until(
-            lambda: _node_status_is(client, node_id, "Online"),
+            lambda: _remote_connection_state_is(client, node_id, "available"),
             timeout=20,
             description="same identity after service reinstall",
         )

@@ -14,8 +14,81 @@
 {% endif %}
 {% set workspace_sidebar_status = t('server_terminal.mode') if server_terminal else t(session_status_label) %}
 {% set workspace_sidebar_detail = t('common.terminal') ~ ' ' ~ terminal_count %}
+{% macro workspace_run_menu(placement) %}
+{% if workspace_commands_visible %}
+<details class="workspace-run-menu workspace-run-menu-{{ placement }}" data-workspace-run-menu>
+  <summary aria-label="{{ t('workspace.run.open') }}" title="{{ t('workspace.run.open') }}">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 10 7-10 7Z"/></svg>
+    <span>{{ t('workspace.run.open') }}</span>
+  </summary>
+  <section class="workspace-run-popover">
+    <header>
+      <div class="workspace-run-heading">
+        <strong>{{ t('workspace.run.heading') }}</strong>
+        <small>{{ t('workspace.run.copy') }}</small>
+      </div>
+      <button class="workspace-run-close"
+              type="button"
+              data-workspace-run-close
+              aria-label="{{ t('common.close') }}"
+              title="{{ t('common.close') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m7 7 10 10M17 7 7 17"/>
+        </svg>
+      </button>
+    </header>
+    {% if workspace_commands_supported %}
+    <div class="workspace-run-command-list">
+      {% for item in workspace_commands %}
+      <form method="post"
+            action="/w/{{ workspace.id }}/run-commands/{{ item.slot }}"
+            data-workspace-command-run
+            data-workspace-command-starting-label="{{ t('workspace.run.starting') }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="launch_id" value="{{ item.launch_id }}">
+        <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
+        <button type="submit" title="{{ item.command }}">
+          <code>{{ item.command }}</code>
+          <span data-workspace-command-label>{{ t('workspace.run.command') }}</span>
+        </button>
+      </form>
+      {% else %}
+      <p class="workspace-run-empty">{{ t('workspace.run.empty') }}</p>
+      {% endfor %}
+    </div>
+    <details class="workspace-run-config">
+      <summary>{{ t('workspace.run.configure') }}</summary>
+      <form method="post" action="/w/{{ workspace.id }}/run-commands">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <p>{{ t('workspace.run.configure_copy') }}</p>
+        {% for index in range(3) %}
+        <label>
+          <span>{{ t('workspace.run.slot', number=index + 1) }}</span>
+          <input name="commands"
+                 value="{{ workspace_commands[index].command if workspace_commands | length > index else '' }}"
+                 maxlength="4096"
+                 autocomplete="off"
+                 spellcheck="false"
+                 placeholder="{{ t('workspace.run.placeholder') }}">
+        </label>
+        {% endfor %}
+        <button class="primary-button" type="submit">{{ t('workspace.run.save') }}</button>
+      </form>
+    </details>
+    {% else %}
+    <p class="workspace-run-empty">{{ t('workspace.run.unsupported_node') }}</p>
+    {% endif %}
+  </section>
+</details>
+{% endif %}
+{% endmacro %}
 {% block body_class %}workspace-page{% endblock %}
 {% block body %}
+<p class="sr-only"
+   role="status"
+   aria-live="polite"
+   aria-atomic="true"
+   data-workspace-command-announcer></p>
 <header class="workspace-header">
   <div class="workspace-brand-row">
     <a class="workspace-brand" href="/" aria-label="{{ t('app.home') }}">
@@ -132,9 +205,13 @@
     </form>
     {% endif %}
     {% else %}
+    <a class="primary-button" href="/remote-runs/{{ remote_run.id }}/result.zip" download>{{ t('remote_run.result_download') }}</a>
+    {% if remote_run_source_url %}
+    <a class="secondary-button" href="/remote-runs/{{ remote_run.id }}/collect">{{ t('remote_run.collect.open') }}</a>
+    {% endif %}
     {% if remote_run_display_state == 'failed' and remote_run_source_url and remote_run_retry_url %}
     <a class="secondary-button" href="{{ remote_run_source_url }}">{{ t('remote_run.open_source') }}</a>
-    <a class="primary-button" href="{{ remote_run_retry_url }}">{{ t('remote_run.retry_setup') }}</a>
+    <a class="secondary-button" href="{{ remote_run_retry_url }}">{{ t('remote_run.retry_setup') }}</a>
     {% endif %}
     <form method="post" action="/remote-runs/{{ remote_run.id }}/delete">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -180,21 +257,43 @@
   </a>
   {% endif %}
   {% endif %}
+  {{ workspace_run_menu('navigation') }}
 </nav>
+{% if workspace.transient %}
 <footer class="workspace-sidebar-footer"
-        aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}"
-        {% if not workspace.transient %}data-workspace-usage-view data-usage-url="/api/workspaces/{{ workspace.id }}/usage"{% endif %}>
+        aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}">
   <span class="status-dot {% if session_active %}is-active{% endif %}"{% if not workspace.transient %} data-workspace-usage-dot{% endif %}></span>
   <span class="workspace-sidebar-copy">
-    {% if workspace.transient %}
     <strong title="{{ workspace_sidebar_status }}">{{ workspace_sidebar_status }}</strong>
     <small title="{{ workspace_sidebar_detail }}">{{ workspace_sidebar_detail }}</small>
-    {% else %}
-    <strong data-workspace-usage-summary>{{ t('workspace.usage.loading') }}</strong>
-    <small data-workspace-usage-meta>{{ t('workspace.usage.estimated') }}</small>
-    {% endif %}
   </span>
 </footer>
+{% else %}
+<details class="workspace-sidebar-footer workspace-usage-menu workspace-sidebar-usage-menu"
+         data-workspace-usage-view
+         data-usage-url="/api/workspaces/{{ workspace.id }}/usage">
+  <summary aria-label="{{ t('workspace.usage.heading') }}"
+           title="{{ t('workspace.usage.heading') }}">
+    <span class="status-dot {% if session_active %}is-active{% endif %}" data-workspace-usage-dot></span>
+    <span class="workspace-sidebar-copy">
+      <strong data-workspace-usage-summary>{{ t('workspace.usage.heading') }}</strong>
+      <small data-workspace-usage-meta>{{ t('workspace.usage.estimated') }}</small>
+    </span>
+  </summary>
+  <section class="workspace-usage-popover">
+    <header>
+      <strong>{{ t('workspace.usage.heading') }}</strong>
+      <small>{{ t('workspace.usage.estimated') }}</small>
+    </header>
+    <dl>
+      <div><dt>{{ t('workspace.usage.cpu') }}</dt><dd data-workspace-usage-cpu>—</dd></div>
+      <div><dt>{{ t('workspace.usage.memory') }}</dt><dd data-workspace-usage-memory>—</dd></div>
+      <div><dt>{{ t('workspace.usage.processes') }}</dt><dd data-workspace-usage-processes>—</dd></div>
+    </dl>
+    <p data-workspace-usage-meta>{{ t('workspace.usage.loading') }}</p>
+  </section>
+</details>
+{% endif %}
 {% block workspace_scripts %}{% endblock %}
 {% if remote_run %}
 <script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>

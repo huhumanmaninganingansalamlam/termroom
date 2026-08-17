@@ -43,6 +43,22 @@
         {% endfor %}
       </select>
     </label>
+    <div data-pwa-install>
+      <button class="user-menu-action"
+              type="button"
+              data-pwa-install-action
+              aria-describedby="pwa-install-help-{{ placement }}">
+        <span class="user-menu-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3v10M8 9l4 4 4-4M5 16v3h14v-3"/></svg>
+        </span>
+        <span>{{ t('app.install') }}</span>
+      </button>
+      <small id="pwa-install-help-{{ placement }}"
+             data-pwa-install-help
+             role="status"
+             aria-live="polite"
+             hidden></small>
+    </div>
     {% if authenticated %}
     <form class="user-menu-logout" method="post" action="/logout">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -90,9 +106,10 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>{{ title }} · Termroom</title>
-  <link rel="icon" href="data:,">
-  <link rel="manifest" href="/static/manifest.webmanifest?v=3">
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=24">
+  <link rel="icon" type="image/svg+xml" href="/static/termroom-icon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/termroom-180.png?v={{ pwa_icon_version }}">
+  <link rel="manifest" href="/static/manifest.webmanifest?v=4">
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=41">
   <script>
     window.TermroomLocale = {{ locale | tojson }};
     window.TermroomI18n = {{ i18n_messages | tojson }};
@@ -135,7 +152,7 @@
     {% block content %}{% endblock %}
   </main>
   {% endblock %}
-  <script src="{{ url_for('static', path='app.js') }}?v=54" defer></script>
+  <script src="{{ url_for('static', path='app.js') }}?v=61" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

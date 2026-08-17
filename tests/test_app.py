@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import io
 import shutil
 import subprocess
+import threading
 import uuid
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 import pytest
 
-from termroom.app import MAX_INLINE_IMAGE_BYTES, create_app
+from termroom.app import MAX_INLINE_IMAGE_BYTES, PACKAGE_ROOT, create_app
+from termroom.assets import TERMINAL_FONT_ASSETS
 from termroom.config import Settings
 from termroom.files import FileEntry, RecentFiles
+from termroom.i18n import messages
+from termroom.pwa_icon import PWA_ICON_VERSION
 from termroom.ssh_backend import SSHBackendError
 
 _TERMINAL_ACTIVITY_EPOCH_SECONDS = 1_700_000_000
@@ -1118,6 +1124,87 @@ async def test_open_workspace_keeps_computer_hub_before_first_remote(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_ssh_only_mode_hides_and_rejects_local_workspaces(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "local-project").mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        allow_local_workspaces=False,
+    )
+    app = create_app(settings)
+    local_workspace = app.state.workspaces.open("local-project")
+    computer = app.state.store.create_computer(
+        name="Build server",
+        ssh_alias="",
+        host="build.example",
+        port=22,
+        username="dev",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    remote_workspace = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/api", "Remote API"
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        home = await client.get("/")
+        hub = await client.get("/open")
+        local_picker = await client.get("/open/local")
+        local_browser = await client.get("/api/local/browse-directories")
+        add_location = await client.post(
+            "/open/local/locations",
+            data={"_csrf": settings.csrf_token, "path": str(root)},
+        )
+        create_project = await client.post(
+            "/open/local/projects",
+            data={
+                "_csrf": settings.csrf_token,
+                "root_id": local_workspace["root_id"],
+                "parent": ".",
+                "name": "blocked-project",
+            },
+        )
+        open_local = await client.post(
+            "/api/workspaces",
+            data={
+                "_csrf": settings.csrf_token,
+                "root_id": local_workspace["root_id"],
+                "path": "local-project",
+            },
+        )
+        local_page = await client.get(f"/w/{local_workspace['id']}")
+        local_usage = await client.get(
+            f"/api/workspaces/{local_workspace['id']}/usage"
+        )
+        remote_page = await client.get(
+            f"/w/{remote_workspace['id']}", follow_redirects=False
+        )
+
+    assert home.status_code == 200
+    assert "local-project" not in home.text
+    assert "Remote API" in home.text
+    assert hub.status_code == 200
+    assert 'href="/open/local"' not in hub.text
+    assert "Build server" in hub.text
+    assert local_picker.status_code == 404
+    assert local_browser.status_code == 404
+    assert add_location.status_code == 404
+    assert create_project.status_code == 404
+    assert open_local.status_code == 404
+    assert local_page.status_code == 404
+    assert local_usage.status_code == 404
+    assert remote_page.status_code == 303
+    assert remote_page.headers["location"] == f"/w/{remote_workspace['id']}/terminal"
+
+
+@pytest.mark.asyncio
 async def test_local_workspace_picker_can_add_another_folder_location(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -1632,6 +1719,81 @@ async def test_file_flows_preserve_special_character_paths(tmp_path: Path) -> No
         assert "path=%EA%B2%B0%EA%B3%BC" in view.text
         assert "%26" in view.text
         assert "%23" in view.text
+
+
+@pytest.mark.asyncio
+async def test_vim_actions_open_the_selected_file_and_save_editor_changes_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "note.txt"
+    target.write_text("before\n", encoding="utf-8")
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    opened: list[tuple[str, str]] = []
+
+    def open_terminal_editor(  # type: ignore[no-untyped-def]
+        selected_workspace, relative_path: str
+    ) -> dict[str, str]:
+        opened.append((str(selected_workspace["id"]), relative_path))
+        return {"id": "vim-terminal"}
+
+    monkeypatch.setattr(
+        app.state.terminals, "open_terminal_editor", open_terminal_editor
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        browser = await client.get(f"/w/{workspace['id']}/files")
+        view = await client.get(f"/w/{workspace['id']}/view/note.txt")
+        editor = await client.get(f"/w/{workspace['id']}/edit/note.txt")
+
+        assert browser.status_code == 200
+        assert f'action="/w/{workspace["id"]}/terminal-editor"' in browser.text
+        assert "Vim" in browser.text
+        assert "Vim에서 열기" in view.text
+        assert 'value="save_and_vim"' in editor.text
+
+        direct = await client.post(
+            f"/w/{workspace['id']}/terminal-editor",
+            data={
+                "_csrf": settings.csrf_token,
+                "path": "note.txt",
+                "parent": ".",
+            },
+            follow_redirects=False,
+        )
+        assert direct.status_code == 303
+        assert direct.headers["location"].endswith(
+            f"/w/{workspace['id']}/terminal?terminal=vim-terminal"
+        )
+
+        snapshot = app.state.files.read_text(project, "note.txt")
+        saved = await client.post(
+            f"/w/{workspace['id']}/edit/note.txt",
+            data={
+                "_csrf": settings.csrf_token,
+                "digest": snapshot.digest,
+                "mtime_ns": str(snapshot.mtime_ns),
+                "newline": "lf",
+                "content": "after\n",
+                "intent": "save_and_vim",
+            },
+            follow_redirects=False,
+        )
+        assert saved.status_code == 303
+        assert target.read_text(encoding="utf-8") == "after\n"
+        assert opened == [
+            (str(workspace["id"]), "note.txt"),
+            (str(workspace["id"]), "note.txt"),
+        ]
 
 
 @pytest.mark.asyncio
@@ -2630,6 +2792,7 @@ async def test_file_browser_hides_dependency_noise_but_keeps_useful_dotfiles(
     project.mkdir(parents=True)
     (project / ".venv").mkdir()
     (project / "__pycache__").mkdir()
+    (project / ".note.txt.swp").write_text("swap", encoding="utf-8")
     (project / ".env").write_text("EXAMPLE=1\n", encoding="utf-8")
     settings = Settings.create(
         root,
@@ -2648,9 +2811,11 @@ async def test_file_browser_hides_dependency_noise_but_keeps_useful_dotfiles(
         assert ".env" in default_view.text
         assert ".venv" not in default_view.text
         assert "__pycache__" not in default_view.text
+        assert ".note.txt.swp" not in default_view.text
         assert ".termroom-state" not in default_view.text
         assert ".venv" in noisy_view.text
         assert "__pycache__" in noisy_view.text
+        assert ".note.txt.swp" in noisy_view.text
         assert ".termroom-state" not in noisy_view.text
 
 
@@ -2698,6 +2863,127 @@ async def test_internal_config_is_not_addressable_through_file_routes(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_remote_connection_status_is_shared_actionable_and_current(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="Build server",
+        ssh_alias="",
+        host="127.0.0.1",
+        port=22,
+        username="builder",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    computer_id = str(computer["id"])
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        client.cookies.set("termroom_locale", "en")
+        unchecked = await client.get("/open")
+        detail = await client.get(f"/computers/{computer_id}")
+
+        app.state.store.update_computer_connection(computer_id)
+        available = await client.get(f"/open/{computer_id}")
+
+        with app.state.store.connect() as db:
+            stale_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat(
+                timespec="seconds"
+            )
+            db.execute(
+                "UPDATE computers SET last_connected_at = ? WHERE id = ?",
+                (stale_time, computer_id),
+            )
+        stale = await client.get(f"/open/{computer_id}")
+
+        app.state.store.update_computer_connection(computer_id, error="connection refused")
+        unavailable = await client.get(f"/computers/{computer_id}")
+        script = await client.get("/static/app.js?v=61")
+
+    assert 'state-chip remote unchecked' in unchecked.text
+    assert "Not checked yet" in unchecked.text
+    assert "data-remote-connection-view" in detail.text
+    assert "data-remote-connection-check" in detail.text
+    assert 'data-remote-connecting-label="Connecting…"' in detail.text
+    assert 'state-chip remote available' in available.text
+    assert "Last successful contact" in available.text
+    assert 'state-chip remote unchecked' in stale.text
+    assert "Last successful contact" in stale.text
+    assert 'state-chip remote unavailable' in unavailable.text
+    assert "Unavailable" in unavailable.text
+    assert 'querySelectorAll("[data-remote-connection-check]")' in script.text
+    assert 'status.classList.add("connecting")' in script.text
+
+
+@pytest.mark.asyncio
+async def test_settings_menu_exposes_click_only_pwa_install_guidance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        korean_page = await client.get("/")
+        client.cookies.set("termroom_locale", "en")
+        english_page = await client.get("/")
+        script = await client.get("/static/app.js?v=61")
+
+    assert korean_page.status_code == 200
+    assert korean_page.text.count("data-pwa-install-action") == 1
+    assert "Termroom 설치" in korean_page.text
+    assert messages("ko")["app.install_edge"] == (
+        "브라우저 메뉴에서 앱 → 이 사이트를 앱으로 설치를 선택하세요."
+    )
+    assert "data-pwa-install-help" in korean_page.text
+    assert 'role="status"' in korean_page.text
+    assert 'aria-live="polite"' in korean_page.text
+    assert "beforeinstallprompt" not in korean_page.text
+    assert "/static/app.js?v=61" in korean_page.text
+
+    assert english_page.status_code == 200
+    assert "Install Termroom" in english_page.text
+    assert messages("en")["app.install_edge"] == (
+        "Open the browser menu, then choose Apps → Install this site as an app."
+    )
+
+    assert script.status_code == 200
+    source = script.text
+    click_handler = source.index('action.addEventListener("click"')
+    prompt_call = source.index("await installPrompt.prompt()")
+    prompt_event = source.index('window.addEventListener("beforeinstallprompt"')
+    assert click_handler < prompt_call < prompt_event
+    assert source.count("installPrompt.prompt()") == 1
+    assert "event.preventDefault()" in source[prompt_event:]
+    assert 'window.addEventListener("appinstalled"' in source
+    assert 'window.matchMedia?.("(display-mode: standalone)")' in source
+    assert "navigator.standalone === true" in source
+    assert "window.isSecureContext" in source
+    assert 'showInstallHelp("app.install_insecure")' in source
+    assert 'return "app.install_ios"' in source
+    assert 'return "app.install_edge"' in source
+    assert 'return "app.install_browser"' in source
+
+
+@pytest.mark.asyncio
 async def test_pwa_public_contract_does_not_cache_workspace_pages(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -2713,8 +2999,13 @@ async def test_pwa_public_contract_does_not_cache_workspace_pages(tmp_path: Path
         worker = await client.get("/sw.js")
         manifest = await client.get("/static/manifest.webmanifest")
         icons = {
-            size: await client.get(f"/icons/termroom-{size}.png") for size in (192, 512)
+            size: await client.get(
+                f"/icons/termroom-{size}.png?v={PWA_ICON_VERSION}"
+            )
+            for size in (180, 192, 512)
         }
+        unversioned_icon = await client.get("/icons/termroom-192.png")
+        wrong_version_icon = await client.get("/icons/termroom-192.png?v=stale")
         missing_icon = await client.get("/icons/termroom-256.png")
         unauthorized_home = await client.get("/")
 
@@ -2723,23 +3014,196 @@ async def test_pwa_public_contract_does_not_cache_workspace_pages(tmp_path: Path
         assert worker.headers["cache-control"] == "no-cache"
         assert "caches.open" not in worker.text
         assert manifest.status_code == 200
+        assert manifest.headers["cache-control"] == "no-cache"
         manifest_payload = manifest.json()
         assert manifest_payload["name"] == "Termroom"
         assert manifest_payload["short_name"] == "Termroom"
         png_icons = {
-            (icon["sizes"], icon["type"], icon["purpose"])
+            (icon["src"], icon["sizes"], icon["type"], icon["purpose"])
             for icon in manifest_payload["icons"]
-            if icon["src"].endswith(".png")
+            if icon["type"] == "image/png"
         }
-        assert ("192x192", "image/png", "any") in png_icons
-        assert ("512x512", "image/png", "any maskable") in png_icons
+        assert (
+            f"/icons/termroom-192.png?v={PWA_ICON_VERSION}",
+            "192x192",
+            "image/png",
+            "any",
+        ) in png_icons
+        assert (
+            f"/icons/termroom-512.png?v={PWA_ICON_VERSION}",
+            "512x512",
+            "image/png",
+            "any maskable",
+        ) in png_icons
         for size, icon in icons.items():
             assert icon.status_code == 200
             assert icon.headers["content-type"] == "image/png"
+            assert icon.headers["cache-control"] == (
+                "public, max-age=31536000, immutable"
+            )
+            assert icon.headers["etag"].startswith('"')
+            assert not icon.headers["etag"].startswith('W/"')
             assert icon.content.startswith(b"\x89PNG\r\n\x1a\n")
             assert int.from_bytes(icon.content[16:20], "big") == size
             assert int.from_bytes(icon.content[20:24], "big") == size
             assert icon.content[24] == 8
             assert icon.content[25] == 2
+        icon_not_modified = await client.get(
+            f"/icons/termroom-192.png?v={PWA_ICON_VERSION}",
+            headers={"If-None-Match": icons[192].headers["etag"]},
+        )
+        assert icon_not_modified.status_code == 304
+        assert icon_not_modified.headers["etag"] == icons[192].headers["etag"]
+        assert icon_not_modified.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        assert unversioned_icon.headers["cache-control"] == "no-cache"
+        assert wrong_version_icon.headers["cache-control"] == "no-cache"
+        assert unversioned_icon.headers["etag"] == icons[192].headers["etag"]
+        assert wrong_version_icon.headers["etag"] == icons[192].headers["etag"]
         assert missing_icon.status_code == 404
         assert unauthorized_home.status_code == 401
+        assert (
+            '<link rel="icon" type="image/svg+xml" '
+            'href="/static/termroom-icon.svg">'
+        ) in unauthorized_home.text
+        assert (
+            '<link rel="apple-touch-icon" sizes="180x180" '
+            f'href="/icons/termroom-180.png?v={PWA_ICON_VERSION}">'
+        ) in unauthorized_home.text
+        assert '<link rel="manifest" href="/static/manifest.webmanifest?v=4">' in (
+            unauthorized_home.text
+        )
+
+
+@pytest.mark.asyncio
+async def test_pwa_icon_generation_runs_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    calling_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def generate_icon(size: int) -> bytes:
+        assert size == 512
+        worker_threads.append(threading.get_ident())
+        return b"test-png"
+
+    monkeypatch.setattr("termroom.app.termroom_png_icon", generate_icon)
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            f"/icons/termroom-512.png?v={PWA_ICON_VERSION}"
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"test-png"
+    assert worker_threads and worker_threads[0] != calling_thread
+
+
+@pytest.mark.asyncio
+async def test_static_assets_use_selective_compression_and_versioned_cache(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream(
+            "GET",
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip"},
+        ) as compressed:
+            raw_content = b"".join([chunk async for chunk in compressed.aiter_raw()])
+            gzip_etag = compressed.headers["etag"]
+            assert compressed.status_code == 200
+            assert compressed.headers["content-encoding"] == "gzip"
+            assert "accept-encoding" in compressed.headers["vary"].casefold()
+            assert compressed.headers["cache-control"] == (
+                "public, max-age=31536000, immutable"
+            )
+            assert gzip.decompress(raw_content) == (PACKAGE_ROOT / "static/app.css").read_bytes()
+
+        identity = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "identity"},
+        )
+        gzip_disabled = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip;q=0, *;q=1"},
+        )
+        gzip_not_modified = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip", "If-None-Match": gzip_etag},
+        )
+        identity_not_modified = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "identity", "If-None-Match": identity.headers["etag"]},
+        )
+        cross_encoding_validator = await client.get(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "identity", "If-None-Match": gzip_etag},
+        )
+        head = await client.head(
+            "/static/app.css?v=25",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        unversioned = await client.get(
+            "/static/app.css", headers={"Accept-Encoding": "identity"}
+        )
+        ranged = await client.get(
+            "/static/app.js?v=61",
+            headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
+        )
+        font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]
+        font = await client.get(
+            f"/static/vendor/{font_filename}?v=3.5.0.1",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        manifest = await client.get("/static/manifest.webmanifest?v=3")
+        static_worker = await client.get("/static/sw.js?v=1")
+        missing = await client.get("/static/missing.js?v=1")
+        private_page = await client.get("/", headers={"Accept-Encoding": "gzip"})
+
+        assert identity.headers["etag"] != gzip_etag
+        assert "accept-encoding" in identity.headers["vary"].casefold()
+        assert "content-encoding" not in gzip_disabled.headers
+        assert gzip_disabled.headers["etag"] == identity.headers["etag"]
+        assert gzip_disabled.content == identity.content
+        assert gzip_not_modified.status_code == 304
+        assert gzip_not_modified.headers["etag"] == gzip_etag
+        assert "accept-encoding" in gzip_not_modified.headers["vary"].casefold()
+        assert gzip_not_modified.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        assert identity_not_modified.status_code == 304
+        assert "accept-encoding" in identity_not_modified.headers["vary"].casefold()
+        assert cross_encoding_validator.status_code == 200
+        assert head.status_code == 200
+        assert head.headers["etag"] == identity.headers["etag"]
+        assert "accept-encoding" in head.headers["vary"].casefold()
+        assert "content-encoding" not in head.headers
+        assert unversioned.headers["cache-control"] == "no-cache"
+        assert ranged.status_code == 206
+        assert "content-encoding" not in ranged.headers
+        assert ranged.content == (PACKAGE_ROOT / "static/app.js").read_bytes()[:32]
+        assert "content-encoding" not in font.headers
+        assert manifest.headers["cache-control"] == "no-cache"
+        assert static_worker.headers["cache-control"] == "no-cache"
+        assert missing.status_code == 404
+        assert missing.headers["cache-control"] == "no-store"
+        assert private_page.status_code == 401
+        assert private_page.headers["cache-control"] == "no-store"
+        assert "content-encoding" not in private_page.headers

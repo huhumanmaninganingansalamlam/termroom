@@ -222,7 +222,6 @@ def main(argv: list[str] | None = None) -> None:
             "Termroom login password is not configured. Add `TERMROOM_PASSWORD=...` "
             f"to {settings.state_dir / '.env'} or the environment."
         )
-
     if not args.foreground:
         _start_background_core(parser, args, settings)
         metadata = _wait_for_core(settings.state_dir, timeout=8.0)
@@ -233,20 +232,31 @@ def main(argv: list[str] | None = None) -> None:
         _open_in_running_core(parser, args, settings, metadata, started_now=True)
         return
 
+    _scrub_runtime_secrets()
     app = create_app(settings)
-    workspace = app.state.workspaces.open(".")
-    app.state.terminals.ensure_workspace(workspace)
     local_base = f"http://127.0.0.1:{settings.port}"
-    browser_url = f"{local_base}/w/{workspace['id']}"
     shown_base = _display_base_url(settings.host, settings.port)
-    shown_url = f"{shown_base}/w/{workspace['id']}"
+    if settings.allow_local_workspaces:
+        workspace = app.state.workspaces.open(".")
+        app.state.terminals.ensure_workspace(workspace)
+        workspace_id = str(workspace["id"])
+        browser_url = f"{local_base}/w/{workspace_id}"
+        shown_url = f"{shown_base}/w/{workspace_id}"
+    else:
+        workspace = None
+        workspace_id = ""
+        browser_url = f"{local_base}/"
+        shown_url = f"{shown_base}/"
 
-    _write_core_metadata(settings, workspace["id"])
+    _write_core_metadata(settings, workspace_id)
     print("Termroom is running", flush=True)
-    print(f"Workspace: {workspace['path']}", flush=True)
-    print(f"Local:     {local_base}/w/{workspace['id']}", flush=True)
+    if workspace is not None:
+        print(f"Workspace: {workspace['path']}", flush=True)
+    else:
+        print("Mode:      SSH / Node Workspaces only", flush=True)
+    print(f"Local:     {browser_url}", flush=True)
     print(f"Open:      {shown_url}", flush=True)
-    print("Login:     TERMROOM_PASSWORD", flush=True)
+    print("Login:     password required", flush=True)
     if settings.host not in {"127.0.0.1", "localhost", "::1"}:
         print(
             "Access is exposed beyond localhost. Prefer a private VPN or HTTPS proxy.",
@@ -265,6 +275,12 @@ def main(argv: list[str] | None = None) -> None:
         )
     finally:
         _remove_core_metadata_if_current(settings.state_dir)
+
+
+def _scrub_runtime_secrets() -> None:
+    """Keep loaded credentials out of the Core's inherited process environment."""
+
+    os.environ.pop("TERMROOM_PASSWORD", None)
 
 
 def _open_in_running_core(
@@ -288,22 +304,29 @@ def _open_in_running_core(
             "Stop it with `termroom stop --core` before changing bind address."
         )
 
-    store = StateStore(settings.database_path)
-    store.initialize()
-    manager = WorkspaceManager(RootManager(settings.root), store)
-    workspace = manager.open(".")
-    TerminalManager(store).ensure_workspace(workspace)
     base = _display_base_url(existing_host, existing_port)
-    url = f"{base}/w/{workspace['id']}"
+    if settings.allow_local_workspaces:
+        store = StateStore(settings.database_path)
+        store.initialize()
+        manager = WorkspaceManager(RootManager(settings.root), store)
+        workspace = manager.open(".")
+        TerminalManager(store).ensure_workspace(workspace)
+        url = f"{base}/w/{workspace['id']}"
+    else:
+        workspace = None
+        url = f"{base}/"
     status = (
         "Termroom Core started in the background"
         if started_now
         else "Termroom Core is already running"
     )
     print(status, flush=True)
-    print(f"Workspace: {workspace['path']}", flush=True)
+    if workspace is not None:
+        print(f"Workspace: {workspace['path']}", flush=True)
+    else:
+        print("Mode:      SSH / Node Workspaces only", flush=True)
     print(f"Open:      {url}", flush=True)
-    print("Login:     TERMROOM_PASSWORD", flush=True)
+    print("Login:     password required", flush=True)
     if existing_host not in {"127.0.0.1", "localhost", "::1"}:
         print(
             "Access is exposed beyond localhost. Prefer a private VPN or HTTPS proxy.",
@@ -636,6 +659,7 @@ def _write_core_metadata(settings: Settings, workspace_id: str) -> None:
         "port": settings.port,
         "secure_cookie": settings.secure_cookie,
         "default_locale": settings.default_locale,
+        "allow_local_workspaces": settings.allow_local_workspaces,
         "workspace_id": workspace_id,
         "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
@@ -679,7 +703,11 @@ def _core_runtime_matches(
 
 
 def _core_settings_match(metadata: dict[str, Any], settings: Settings) -> bool:
-    return str(metadata.get("default_locale", "")) == settings.default_locale
+    return (
+        str(metadata.get("default_locale", "")) == settings.default_locale
+        and bool(metadata.get("allow_local_workspaces", True))
+        == settings.allow_local_workspaces
+    )
 
 
 def _adopt_existing_core_options(args: argparse.Namespace, metadata: dict[str, Any]) -> None:

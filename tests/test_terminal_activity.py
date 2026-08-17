@@ -13,7 +13,7 @@ from termroom.node_core import NodeCore
 from termroom.remote_access import RemoteAccess
 from termroom.ssh_backend import SSHBackend
 from termroom.terminal_control import TerminalControl
-from termroom.terminals import TerminalManager
+from termroom.terminals import TerminalManager, touch_terminal_output_if_present
 from termroom.workspaces import RootManager, WorkspaceManager
 
 _PROVIDER_EPOCH_SECONDS = 1_700_000_000
@@ -535,6 +535,15 @@ def test_touch_terminal_output_updates_timestamp_without_changing_provider_revis
     assert after is not None
     assert after["last_output_at"] is not None
     assert after["activity_at"] == before["activity_at"] == _revision(100)
+
+
+def test_terminal_output_after_window_reconciliation_is_an_expected_noop(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+
+    assert touch_terminal_output_if_present(store, "already-removed") is False
 
 
 @pytest.mark.asyncio

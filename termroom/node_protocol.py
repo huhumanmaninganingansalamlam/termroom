@@ -4,6 +4,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import secrets
 from collections.abc import Mapping
@@ -17,14 +18,22 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-NODE_PROTOCOL_VERSION = 1
+NODE_PROTOCOL_VERSION = 2
 NODE_REMOTE_RUN_VERSION = 1
 NODE_REMOTE_RUN_SOURCE_VERSION = 1
 NODE_WORKSPACE_USAGE_VERSION = 1
 NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW = 8
 NODE_REQUIRED_CAPABILITIES = frozenset({"workspace", "terminal", "files"})
 NODE_OPTIONAL_CAPABILITIES = frozenset(
-    {"file_run", "recent", "remote_run", "remote_run_source", "workspace_usage"}
+    {
+        "file_run",
+        "recent",
+        "remote_run",
+        "remote_run_source",
+        "workspace_command",
+        "workspace_usage",
+        "terminal_editor",
+    }
 )
 NODE_CAPABILITIES = NODE_REQUIRED_CAPABILITIES | NODE_OPTIONAL_CAPABILITIES
 NODE_REQUEST_OPERATIONS = frozenset(
@@ -35,7 +44,9 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "workspace.validate",
         "workspace.ensure",
         "workspace.usage",
+        "workspace.command.run",
         "terminal.create",
+        "terminal.editor.open",
         "terminal.rename",
         "terminal.close",
         "terminal.activity",
@@ -80,6 +91,9 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "remote_run.delete",
     }
 )
+NODE_REQUEST_MAX_TIMEOUT_SECONDS = 5 * 60
+NODE_REQUEST_DEFAULT_BUDGET_MS = 30_000
+NODE_REQUEST_MAX_BUDGET_MS = NODE_REQUEST_MAX_TIMEOUT_SECONDS * 1000
 MAX_NODE_MESSAGE_BYTES = 1024 * 1024
 MAX_NODE_STREAM_CHUNK_BYTES = 64 * 1024
 PAIRING_CODE_TTL_SECONDS = 10 * 60
@@ -208,6 +222,27 @@ def validate_request_operation(value: object) -> str:
     return operation
 
 
+def request_budget_ms(timeout_seconds: float) -> int:
+    if isinstance(timeout_seconds, bool):
+        raise NodeProtocolError("Node request timeout is invalid", code="budget_invalid")
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise NodeProtocolError("Node request timeout is invalid", code="budget_invalid") from exc
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > NODE_REQUEST_MAX_TIMEOUT_SECONDS:
+        raise NodeProtocolError("Node request timeout is invalid", code="budget_invalid")
+    budget_ms = int(timeout * 1000)
+    if budget_ms <= 0:
+        raise NodeProtocolError("Node request timeout is invalid", code="budget_invalid")
+    return budget_ms
+
+
+def validate_request_budget_ms(value: object) -> float:
+    if type(value) is not int or not (1 <= value <= NODE_REQUEST_MAX_BUDGET_MS):
+        raise NodeProtocolError("Node request budget is invalid", code="budget_invalid")
+    return value / 1000
+
+
 def validate_protocol_version(value: object) -> int:
     if isinstance(value, bool):
         raise NodeProtocolError("Node protocol version is invalid", code="version_invalid")
@@ -273,9 +308,7 @@ def normalize_core_url(value: str) -> str:
     if parsed.path not in {"", "/"}:
         raise NodeProtocolError("Core URL must not contain a path", code="core_url_invalid")
     if parsed.scheme == "http" and not _loopback_host(parsed.hostname):
-        raise NodeProtocolError(
-            "A non-loopback Core URL must use HTTPS", code="core_tls_required"
-        )
+        raise NodeProtocolError("A non-loopback Core URL must use HTTPS", code="core_tls_required")
     host = parsed.hostname
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"

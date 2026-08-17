@@ -110,7 +110,36 @@ application cursor mode  ↑ → ESC O A
 왼쪽/오른쪽/아래 방향키도 같은 규칙을 따른다. 그래야 shell과 `vim` 같은 TUI에서
 화면 helper와 실제 키보드가 서로 다른 키처럼 동작하지 않는다.
 
-## 6. Software keyboard layout
+## 6. Vim/Neovim과 tmux 계약
+
+Termroom은 browser IDE를 제공하는 대신 Vim/Neovim과 다른 TUI가 실제 tmux Terminal에서
+자연스럽게 동작하도록 한다.
+
+- Files 목록과 파일 보기의 `Vim에서 열기`는 선택한 파일을 새 shell에 명령어만 채워 넣지
+  않고, 해당 Workspace의 tmux 안에서 바로 연다. 같은 파일의 Vim 창이 살아 있으면 그 창을
+  재사용한다.
+- browser의 작은 텍스트 편집기에서 `Vim에서 열기`를 누르면 CAS 저장이 먼저 성공해야 한다.
+  외부 변경 충돌이 있으면 Vim으로 이동하지 않고 작성 중인 내용을 browser에 유지한다.
+- Local과 SSH는 이 경로를 기본 제공하고, Node는 `terminal_editor` capability와
+  `terminal.editor.open` fixed operation을 사용한다.
+- Vim의 alternate screen은 viewport resize와 reconnect 뒤 현재 tmux 화면으로 다시 그려진다.
+- insert mode의 CJK IME, Esc, Tab, Ctrl 조합과 방향키는 모두 실제 xterm input path를 쓴다.
+- bracketed paste mode가 켜져 있으면 여러 줄 paste도 Vim이 구분할 수 있는 sequence로 보낸다.
+- software keyboard가 열려도 Vim command line과 cursor가 있는 마지막 row를 볼 수 있어야 한다.
+- browser text selection/copy와 tmux copy mode는 PTY input을 뜻하지 않는 동작을 임의로
+  전송하지 않는다.
+- browser reconnect는 editor state를 재구성하지 않는다. Vim process와 buffer의 지속성은
+  tmux session이 소유한다.
+
+모든 연결 화면은 하나의 tmux pane 문자 grid를 공유하며, 가장 최근에 실제 사용자 입력을
+보낸 viewport의 rows와 columns가 크기를 결정한다. 다른 화면의 연결, focus, reload와
+수동적인 viewport resize는 공유 grid를 바꾸지 않는다.
+
+256-color와 bundled Nerd Font glyph를 기본 확인 범위로 둔다. true color는 browser, tmux와
+target terminfo가 함께 지원할 때만 보장할 수 있으므로 실제 end-to-end 검증 없이 완전 지원으로
+표현하지 않는다.
+
+## 7. Software keyboard layout
 
 software keyboard가 올라오는 동안 visual viewport가 크게 줄어든다. Termroom은
 `window.visualViewport`를 기준으로 keyboard-open 상태를 판단한다.
@@ -119,7 +148,7 @@ terminal 직접 입력 중 keyboard가 열리면:
 
 - workspace header와 bottom navigation을 잠시 숨긴다.
 - terminal chrome은 유지한다.
-- terminal 출력 영역을 최대한 보존한다.
+- terminal 출력 영역과 cursor가 있는 마지막 row를 최대한 보존한다.
 - 44px helper-key row는 keyboard 바로 위에 유지한다.
 
 command editor 중 keyboard가 열리면:
@@ -147,31 +176,29 @@ terminal chrome, terminal 본문, composer, bottom navigation의 좌우 padding�
 `safe-area-inset-left/right`를 고려한다. notch가 있는 iPhone landscape에서도 핵심
 터치 컨트롤과 terminal 문자가 safe area 밖에 걸리지 않게 한다.
 
-## 7. Required device matrix
+## 8. Representative device matrix
 
-자동 QA 외에 release 전 다음 실기기 조합을 확인한다.
+자동 QA 외에 release 전 Android와 iOS의 대표 실기기 흐름을 확인한다. 모든 keyboard vendor,
+tablet 크기와 browser version 조합을 매 release gate로 만들지는 않는다.
 
 | 환경 | 필수 검증 |
 |---|---|
-| Android Chrome + Gboard 한국어 2벌식 | 첫 음절, backspace, space, punctuation, Enter |
-| Android Chrome + Samsung Keyboard | 위와 동일 |
-| Android installed PWA | focus/keyboard open-close, rotation |
-| iPhone Safari 한국어 2벌식 | composition, punctuation, copy/paste |
-| iPhone installed PWA | keyboard open-close, safe area |
-| iPad Safari/PWA | portrait/landscape, larger keyboard |
-| Bluetooth/external keyboard | Esc/Tab/Ctrl/arrows, terminal focus |
+| Android Chrome + installed PWA | 대표 한국어 keyboard의 composition, focus, keyboard open-close, rotation |
+| iPhone Safari + installed PWA | composition, punctuation, copy/paste, safe area |
+| Desktop 또는 Bluetooth keyboard | Esc/Tab/Ctrl/arrows, terminal focus와 resize |
 
 각 기기에서 최소 다음 시나리오를 실행한다.
 
 1. shell prompt에 `한글테스트` 입력
 2. interactive CLI/REPL에서 `echo 한글`
-3. `vim` insert mode 한글 입력과 Esc
-4. normal/application cursor mode의 방향키
-5. Ctrl+C / Ctrl+D / Tab
-6. 여러 줄 bracketed paste
-7. command editor에서 한글·여러 줄 편집 후 Run
-8. keyboard open/close와 portrait/landscape rotation
-9. terminal text selection/copy와 Output screen fallback
+3. `vim`/`nvim` insert mode 한글 입력, Esc와 command line visibility
+4. alternate screen 상태의 resize, disconnect와 reconnect redraw
+5. normal/application cursor mode의 방향키
+6. Ctrl+C / Ctrl+D / Tab
+7. 여러 줄 bracketed paste
+8. command editor에서 한글·여러 줄 편집 후 Run
+9. keyboard open/close와 portrait/landscape rotation
+10. browser selection/copy와 tmux copy mode
 
 실기기에서 확인하지 않은 항목을 문서나 release note에서 "완벽 지원"으로 표현하지
 않는다.

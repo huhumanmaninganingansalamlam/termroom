@@ -1380,6 +1380,7 @@ def test_remote_workspace_deep_exclusion_does_not_drop_its_parent_siblings(
         "parent",
         "parent/keep.txt",
     }
+    assert manifest.excluded_prefixes == ("parent/excluded",)
 
 
 def test_git_bootstrap_stores_url_as_argv_metadata_not_tmux_shell_text(

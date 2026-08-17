@@ -33,6 +33,7 @@ class Settings:
     access_token: str = ""
     login_password: str = ""
     default_locale: str = "en"
+    allow_local_workspaces: bool = True
     secure_cookie: bool = False
     max_edit_bytes: int = 1024 * 1024
     max_preview_bytes: int = 512 * 1024
@@ -49,6 +50,7 @@ class Settings:
         access_token: str | None = None,
         login_password: str | None = None,
         default_locale: str | None = None,
+        allow_local_workspaces: bool | None = None,
         secure_cookie: bool = False,
     ) -> Settings:
         root_path = Path(root).expanduser().resolve(strict=True)
@@ -99,6 +101,21 @@ class Settings:
             or "en"
         )
         locale = _normalize_locale_setting(locale_value)
+        if allow_local_workspaces is None:
+            allow_local_workspaces_value = (
+                os.environ.get("TERMROOM_ALLOW_LOCAL_WORKSPACES")
+                or _load_dotenv_value(
+                    config_dotenv_path, "TERMROOM_ALLOW_LOCAL_WORKSPACES"
+                )
+                or _load_dotenv_value(
+                    project_dotenv_path, "TERMROOM_ALLOW_LOCAL_WORKSPACES"
+                )
+                or "true"
+            )
+            allow_local_workspaces = _normalize_boolean_setting(
+                allow_local_workspaces_value,
+                name="TERMROOM_ALLOW_LOCAL_WORKSPACES",
+            )
         return cls(
             root=root_path,
             host=host,
@@ -107,6 +124,7 @@ class Settings:
             access_token=token,
             login_password=password,
             default_locale=locale,
+            allow_local_workspaces=allow_local_workspaces,
             secure_cookie=secure_cookie,
         )
 
@@ -123,11 +141,16 @@ def _load_or_create_token(path: Path) -> str:
     if path.exists():
         token = path.read_text(encoding="utf-8").strip()
         if token:
+            if os.name != "nt":
+                path.chmod(0o600)
             return token
 
     token = secrets.token_urlsafe(32)
-    path.write_text(token + "\n", encoding="utf-8")
-    path.chmod(0o600)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(token + "\n", encoding="utf-8")
+    if os.name != "nt":
+        temporary.chmod(0o600)
+    os.replace(temporary, path)
     return token
 
 
@@ -178,6 +201,15 @@ def _normalize_locale_setting(value: str) -> str:
     if locale not in {"en", "ko"}:
         raise ValueError("TERMROOM_LOCALE must be either 'en' or 'ko'")
     return locale
+
+
+def _normalize_boolean_setting(value: str, *, name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
 
 
 def _validate_password_file_permissions(path: Path) -> None:

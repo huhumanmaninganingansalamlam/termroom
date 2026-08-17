@@ -8,8 +8,9 @@
 터미널은 `tmux`가 유지하므로 브라우저를 닫거나 다른 기기로 옮겨도 실행 중인 작업은
 계속 남아 있습니다.
 
-노트북에서 시작한 빌드나 AI 작업을 휴대폰에서 확인하고, 원격 Linux 서버의 터미널과
-파일도 같은 화면에서 다루는 흐름을 목표로 합니다.
+노트북에서 시작한 빌드나 AI 작업을 휴대폰에서 확인하고, 직접 정한 몇 개의 프로젝트
+명령을 실행하며, 원격 Linux 서버의 터미널과 파일도 같은 화면에서 다루는 흐름을
+목표로 합니다.
 
 > **현재 상태: early release.** Termroom은 Python CLI 패키지로 배포되며 아직 빠르게
 > 발전하는 단계입니다. 초기 버전 사이에는 사용 흐름이나 UI가 조금씩 바뀔 수 있습니다.
@@ -22,9 +23,11 @@
 - 여러 로컬 프로젝트를 한 화면에서 오가고 싶을 때
 - SSH Linux 서버와 outbound 연결만 가능한 Termroom Node를 같은 Workspace 흐름으로
   사용하고 싶을 때
+- Workspace마다 명시적인 명령을 최대 3개 저장하고 root에서 바로 실행하고 싶을 때
 - 현재 Python, JavaScript 또는 Bash 파일을 실행 명령 조합 없이 바로 실행하고 싶을 때
 - Workspace snapshot, 공개 HTTPS Git 저장소 또는 ZIP을 다른 Remote에서 실행하고 나중에
   출력과 결과 파일을 회수하고 싶을 때
+- 원격 실행 결과를 ZIP으로 받거나 충돌 없는 변경만 원래 Workspace로 가져오고 싶을 때
 
 Termroom은 클라우드 IDE가 아닙니다. **내 Linux 컴퓨터 또는 내가 연결한 Remote Linux에서
 실제로 실행되는 터미널과 파일을 브라우저 UI로 연결**합니다.
@@ -78,7 +81,7 @@ Termroom의 의존성을 다른 Python 앱과 분리해주기 때문에 권장�
 
 ```bash
 mkdir -p ~/.config/termroom
-printf '%s\n' 'TERMROOM_PASSWORD=내가-사용할-비밀번호' 'TERMROOM_LOCALE=ko' > ~/.config/termroom/.env
+printf '%s\n' 'TERMROOM_PASSWORD=길고-고유한-비밀번호를-사용하세요' 'TERMROOM_LOCALE=ko' > ~/.config/termroom/.env
 chmod 600 ~/.config/termroom/.env
 ```
 
@@ -109,6 +112,7 @@ termroom .
 - 브라우저를 닫아도 `tmux`에서 작업 유지
 - Workspace마다 여러 터미널 생성·이름 변경·종료
 - 다시 접속했을 때 같은 터미널로 복귀
+- 실제 PTY와 `tmux` 경로에서 Vim/Neovim과 alternate-screen TUI 사용
 - 모바일 한글/일본어/중국어 IME 입력과 터치 보조 키
 - 긴 명령을 편하게 수정하는 명령 편집 모드
 - 터미널 글자 크기 설정
@@ -122,8 +126,18 @@ termroom .
 - 여러 파일 업로드와 덮어쓰기 확인
 - 새 파일/폴더 만들기, 이름 변경, 삭제
 - 작은 텍스트 파일을 브라우저에서 바로 편집
+- 모든 일반 파일을 persistent tmux Vim 세션으로 바로 열기. Neovim, Vim, Vi 순으로
+  선택하며 같은 파일의 살아 있는 편집 세션을 재사용
 - 이미지/PDF, JSON/CSV, 큰 텍스트 일부 미리보기
 - Local, SSH, Termroom Node 프로젝트에서 같은 파일 UI 사용
+
+### Workspace 명령 실행
+
+- 지속 Workspace마다 사용자가 직접 정한 명령을 최대 3개 저장
+- Workspace 상단의 눈에 보이는 실행 action에서 선택하고 Workspace root에서 실행
+- 해당 computer에 이미 있는 tool, runtime, virtual environment와 사용자 권한을 그대로 사용
+- package manifest에서 명령을 자동 추론하거나 argument, environment, task graph, 복잡한
+  Run Recipe 설정은 제공하지 않음
 
 ### 현재 파일 실행
 
@@ -131,7 +145,7 @@ termroom .
 - Workspace마다 관리형 interactive Terminal 하나를 사용하고 정확한 exit status, 중지,
   강제 종료 제공
 - 실행 상태를 저장된 파일과 연결하고 재접속 뒤에도 결과 복구
-- project command를 추론하거나 runtime·환경을 자동 설치하지 않음
+- 좁은 file shortcut이며 runtime이나 environment를 자동 설치하지 않음
 
 ### 원격 실행
 
@@ -140,15 +154,16 @@ termroom .
 - 해당 Remote 사용자의 설치된 도구와 CPU/GPU/RAM으로 명령 하나 실행
 - 브라우저 연결이 끊겨도 원격 전용 `tmux` session에서 실행 유지
 - 준비가 끝나면 별도 로그 화면이 아니라 기존 Workspace Terminal·Files 화면을 그대로 사용
+- command가 실패했더라도 file이 설정된 entry 수·directory 깊이·크기 안전 한도 안에 남아
+  있으면 실행 folder를 결과 ZIP으로 다운로드
+- Workspace Source는 추가·수정·충돌·건너뜀 file을 미리 본 뒤 적용 가능한 변경만 원래
+  Workspace로 가져오기. 적용 대상은 작은 UTF-8 text file이며 새 file은 Source에 이미 있는
+  directory 안에 있어야 함. 각 변경을 반영하기 직전에 현재 Source를 다시 확인하며 기존
+  file은 atomic replace, 새 file은 기존 경로를 덮지 않는 방식으로 생성. Remote의 삭제는
+  전파하지 않음. binary, 크기 초과, non-UTF-8, 새 하위 directory 안의 결과 등은 결과
+  ZIP으로 받아 수동 merge. 이 검사는 외부 editor나 Git을 잠그는 CAS가 아님
 - 완료 파일은 24시간 보관하고 임시 Workspace 상단에서 즉시 삭제 가능
-- 환경 자동 구성, sandbox, 작업 queue, scheduler, Source로 결과 덮어쓰기는 제공하지 않음
-
-### 활동과 Workspace 사용량
-
-- File Run·Remote Run 결과, Remote 연결 변화, 읽지 않은 상태와 안전한 browser 알림을 한
-  Activity 화면에서 확인
-- 대상이 남아 있으면 Activity에서 정확한 Workspace, file, Remote Run 또는 Remote로 이동
-- monitoring dashboard로 확장하지 않고 Workspace CPU·memory·process count의 제한된 추정값 확인
+- 환경 자동 구성, sandbox, 작업 queue, scheduler, 지속 sync와 Source 자동 반영은 제공하지 않음
 
 ### 최근 작업
 
@@ -158,6 +173,10 @@ termroom .
 - dependency/cache/hidden directory는 기본적으로 제외
 - 프로젝트별 `.termroomignore` 지원
 
+Activity는 File Run과 Remote Run 결과로 돌아가기 위한 작은 보조 화면이며 Remote 연결 이력이나
+monitoring dashboard가 아닙니다. Workspace 메뉴에는 확인 가능한 경우 CPU·memory·process
+count의 제한된 추정값도 표시할 수 있지만 resource accounting이나 alert로 사용하지 않습니다.
+
 ## 기본 사용법
 
 Termroom에서는 **Workspace = 하나의 프로젝트 폴더**라고 생각하면 됩니다.
@@ -165,6 +184,7 @@ Termroom에서는 **Workspace = 하나의 프로젝트 폴더**라고 생각하�
 ```text
 Computer
 └─ Workspace (프로젝트 폴더)
+   ├─ Run (명시적인 명령 최대 3개)
    ├─ Terminal
    ├─ Files
    └─ Recent
@@ -234,8 +254,58 @@ Core가 private HTTPS CA를 사용한다면 `node pair`에 `--ca-file /path/to/c
 certificate 검증을 끄는 옵션은 제공하지 않습니다.
 
 pairing이 끝난 compatible Node는 SSH와 같은 Remote picker, Workspace Terminal, Files,
-File Run, Remote Run, Activity와 recovery 흐름을 사용합니다. `/bin/bash`와 `tmux`는
-필요하지만 inbound SSH 연결은 필요하지 않습니다.
+Workspace Run, File Run, Remote Run, 결과 회수와 재접속 흐름을 사용합니다. `/bin/bash`와
+`tmux`는 필요하지만 inbound SSH 연결은 필요하지 않습니다.
+
+#### Docker로 Node 실행
+
+원격 Linux에 Termroom을 직접 설치하지 않으려면 같은 공식 이미지와 `compose.yaml`을
+Node 모드로 실행할 수 있습니다. Node service는 포트를 열지 않고 outbound 연결만 사용하며,
+설정·Node identity는 named volume에, 프로젝트 파일은 명시적인 host bind mount에 둡니다.
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+`.env`의 `TERMROOM_MODE` 하나를 `node`로 바꾸고 원격 컴퓨터의 mount 경로를 지정합니다.
+`COMPOSE_PROFILES`는 이 값을 그대로 사용하므로 따로 바꾸지 않습니다.
+
+```text
+TERMROOM_MODE=node
+TERMROOM_WORKSPACES_HOST_PATH=/home/user/projects
+```
+
+`TERMROOM_MODE=node`이면 같은 이미지가 Core 대신 Node process로 시작됩니다. Core 화면에서
+Node 연결 코드를 만든 뒤 최초 한 번만 pairing 명령을 실행하고, 화면에 표시된 fingerprint를
+확인해 승인합니다.
+
+```bash
+docker compose run --rm termroom-node \
+  node --config-dir /config/node pair \
+  --core https://termroom.example \
+  --code <10분-일회용-code> \
+  --allow-root /workspace \
+  --name build-node
+```
+
+pairing code는 10분 뒤 만료되고 pairing 요청에 사용되는 즉시 소비되는 일회용 값이므로
+`.env`에 저장하지 않습니다. 승인 후에는 named volume에 보존된 Node identity와 설정으로
+상시 Node를 시작합니다.
+
+```bash
+docker compose up -d --remove-orphans
+docker compose logs -f termroom-node
+```
+
+`--remove-orphans`는 같은 directory에서 Core와 Node 모드를 바꿀 때 이전 모드의 container가
+남지 않게 합니다.
+
+Docker에서는 `termroom node install-service`를 사용하지 않습니다. Compose의
+`restart: unless-stopped`가 Node process를 관리합니다. 터미널과 명령은 host가 아니라
+Node container 안에서 실행되므로 Git, Node.js, compiler, CUDA 등 추가 도구가 필요하면
+공식 이미지를 기반으로 Node 전용 이미지를 만들어 설치해야 합니다. Core URL은 container
+내부에서 접근 가능한 HTTPS 주소여야 합니다.
 
 ## 자주 쓰는 명령
 
@@ -261,8 +331,9 @@ termroom /srv/projects --foreground --no-open
 
 기본값은 `127.0.0.1`이라 **Termroom을 실행한 PC에서만 접속할 수 있습니다.**
 
-휴대폰이나 태블릿 등 다른 기기에서 사용할 때는 기존 LAN, VPN/Tailscale, 또는 직접
-운영하는 HTTPS reverse proxy 사용을 권장합니다.
+휴대폰이나 태블릿 등 다른 기기에서 사용할 때는 **Tailscale 같은 사설 VPN 안에서
+운영하는 것을 권장합니다.** 가능하면 필요한 인터페이스에만 bind하세요. `0.0.0.0`은
+접근 가능한 모든 LAN 인터페이스에도 Termroom을 노출합니다.
 
 외부 인터페이스에 직접 열어야 한다면 명시적으로 지정합니다.
 
@@ -270,13 +341,16 @@ termroom /srv/projects --foreground --no-open
 termroom ~/projects --host 0.0.0.0
 ```
 
-HTTPS reverse proxy 뒤에서는 secure cookie도 켭니다.
+Tailscale은 tailnet 기기 사이의 전송을 암호화하지만 일반 LAN의 HTTP는 그렇지 않습니다.
+신뢰할 수 없는 네트워크에서는 HTTPS reverse proxy 뒤에 두고 secure cookie를 켭니다.
 
 ```bash
 termroom ~/projects --host 0.0.0.0 --secure-cookie
 ```
 
-공개 인터넷에 그대로 노출하는 용도로 설계된 서비스는 아닙니다.
+**Termroom을 공개 인터넷에 직접 노출하지 마세요.** 비밀번호 로그인은 마지막 앱 경계일 뿐,
+방화벽·사설 네트워크·HTTPS를 대신하지 않습니다. tailnet 안에서도 길고 고유한 비밀번호를
+권장합니다.
 
 ## 비밀번호와 설정
 
@@ -291,6 +365,17 @@ TERMROOM_LOCALE=ko
 `TERMROOM_LOCALE`은 아직 웹에서 언어를 직접 고르지 않은 브라우저의 초기 UI 언어를
 정합니다. `en` 또는 `ko`를 사용할 수 있고, 웹에서 사용자가 직접 선택한 언어는 해당
 브라우저에 저장되어 이 기본값보다 우선합니다.
+
+로컬 Workspace는 기본적으로 활성화됩니다. Docker Core에서 SSH 또는 Termroom Node
+Workspace만 열게 하려면 `.env`에 설정 하나를 추가합니다.
+
+```text
+TERMROOM_ALLOW_LOCAL_WORKSPACES=false
+```
+
+이 모드에서는 로컬 폴더와 Workspace가 UI에서 사라지고, 관련 탐색·생성·열기·파일·터미널
+경로도 `404`를 반환합니다. SSH와 Termroom Node Workspace에는 영향이 없습니다.
+`compose.yaml`의 `./workspaces:/workspaces` bind mount도 제거할 수 있습니다.
 
 다른 사용자가 읽지 못하도록 권한을 제한합니다.
 
@@ -311,7 +396,7 @@ TERMROOM_MIN_PASSWORD_LENGTH=12
 영속 설정은 기본적으로 `~/.config/termroom/`에 저장됩니다.
 
 ```text
-.env                 # 선택: 전역 비밀번호 / 기본 언어
+.env                 # 선택: 전역 비밀번호 / 기본 언어 / Workspace 정책
 termroom.sqlite3
 access-token
 credential-key
@@ -323,7 +408,11 @@ ssh/
 
 SSH 비밀번호는 프로젝트 파일이나 SQLite DB에 평문으로 저장하지 않고 config directory의
 owner-only encrypted credential 파일에 저장합니다. 이 저장소가 hardware-backed vault를
-대체하는 것은 아닙니다.
+대체하는 것은 아닙니다. 로컬 암호화 키도 같은 owner-only config directory에 있기 때문입니다.
+Termroom 로그인 비밀번호 자체는 `.env`에 평문으로 남습니다. 같은 위치의 키로 이를 다시
+암호화해도 실질적인 보안 경계가 생기지 않습니다. 대신 Termroom은 비밀번호가 든 `.env`가
+group/other 사용자에게 열려 있으면 시작을 거부하고, 로딩한 뒤 Core 프로세스 환경에서
+`TERMROOM_PASSWORD`를 제거합니다.
 
 ## Docker Compose
 
@@ -335,9 +424,9 @@ Docker 이미지 안에서도 해당 버전의 `termroom`을 PyPI에서 설치�
 
 ```bash
 cp .env.example .env
-# TERMROOM_PASSWORD 변경
+# Core는 TERMROOM_MODE=core 유지 후 TERMROOM_PASSWORD 변경
 docker compose pull
-docker compose up -d
+docker compose up -d --remove-orphans
 ```
 
 이미지는 `ghcr.io/huhumanmaninganingansalamlam/termroom:latest`로 제공하고 `0.1.1`,
@@ -345,18 +434,25 @@ docker compose up -d
 `docker compose up -d --build`를 사용할 수 있고, Dockerfile의 `TERMROOM_VERSION` build
 argument로 설치할 버전을 지정할 수 있습니다.
 
-기본 Compose는 다음을 사용합니다.
+기본 `.env`의 `TERMROOM_MODE=core`는 Core service를, `TERMROOM_MODE=node`는 outbound-only
+Node service를 선택합니다. 기본 Compose는 다음을 사용합니다.
 
 - `termroom-config:/config` — DB, SSH 키, credential 등 영속 설정
-- `./workspaces:/workspaces` — Core가 접근할 로컬 폴더
-- `127.0.0.1:8765:8765` — 기본 host publish
+- `${TERMROOM_WORKSPACES_HOST_PATH}:/workspaces` — 선택한 host 프로젝트 폴더
+- Core 모드에서만 `127.0.0.1:8765:8765` — 기본 host publish
 
-운영 환경에 맞게 volume/bind mount를 바꾸면 됩니다.
+Core를 SSH/Node-only로 운영할 때는 `TERMROOM_MODE=core`를 유지하면서
+`TERMROOM_ALLOW_LOCAL_WORKSPACES=false`를 설정합니다. 이것은 Docker Node process를 선택하는
+`TERMROOM_MODE=node`와 다른 Core 정책입니다.
 
 ## PWA와 언어
 
-브라우저에서 설치 가능한 PWA manifest/icon을 제공합니다. Service Worker는 인증된
-Workspace/file/terminal 응답을 offline cache하지 않습니다.
+secure context에서 **설정 → Termroom 설치**를 선택하면 browser install prompt를 사용할 수
+있습니다. iPhone/iPad Safari에서는 설정에서 **공유 → 홈 화면에 추가** 경로를 안내합니다.
+설치 action은 작게 제공하고 이미 설치 앱으로 실행 중일 때는 숨깁니다.
+
+PWA 설치에는 HTTPS 또는 browser가 인정하는 loopback secure context가 필요합니다. Service
+Worker는 인증된 Workspace/file/terminal/Run 응답을 offline cache하지 않습니다.
 
 UI 기본 언어는 영어이며 상단 언어 선택에서 한국어로 바꿀 수 있습니다. locale source는
 `termroom/locales/`에 있습니다.

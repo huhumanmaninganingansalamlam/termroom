@@ -27,8 +27,10 @@ from termroom.files import FileEntry, FileService, TextPreview
 from termroom.node_remote_runs import NodeRemoteRunClient, NodeRemoteRunError
 from termroom.run_sources import (
     LocalWorkspaceSnapshotSource,
+    WorkspaceEntry,
     WorkspaceManifest,
     build_public_git_clone_invocation,
+    build_workspace_manifest,
     materialize_workspace_snapshot,
     normalize_explicit_include_paths,
     normalize_source_relative_path,
@@ -167,6 +169,9 @@ class RemoteRunManager:
         self.spool_root = (state_dir / "remote-run-spool").resolve()
         self.spool_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.spool_root.chmod(0o700)
+        self.collection_root = (state_dir / "remote-run-collection").resolve()
+        self.collection_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.collection_root.chmod(0o700)
         self.files = FileService()
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
@@ -752,6 +757,7 @@ class RemoteRunManager:
                 "size": entry.size,
                 "mtime_ns": entry.mtime_ns,
                 "executable": entry.executable,
+                **({"digest": entry.digest} if entry.digest is not None else {}),
                 **({"link_target": entry.link_target} if entry.link_target else {}),
             }
             for entry in manifest.entries
@@ -763,6 +769,118 @@ class RemoteRunManager:
             "source-manifest.json",
             entries,
         )
+        self._write_collection_manifest(
+            str(run["id"]),
+            entries,
+            excluded_prefixes=manifest.excluded_prefixes,
+        )
+
+    def _write_collection_manifest(
+        self,
+        run_id: str,
+        entries: list[dict[str, Any]],
+        *,
+        excluded_prefixes: tuple[str, ...],
+    ) -> None:
+        target = self._collection_manifest_path(run_id)
+        temporary = target.with_suffix(".tmp")
+        encoded = (
+            json.dumps(
+                {
+                    "version": 2,
+                    "entries": entries,
+                    "excluded_prefixes": list(excluded_prefixes),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, target)
+        directory = os.open(self.collection_root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def collection_manifest(self, run_id: str) -> WorkspaceManifest | None:
+        path = self._collection_manifest_path(run_id)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RemoteRunError(
+                "Remote Run Source baseline is unavailable",
+                code="collection_baseline_invalid",
+            ) from exc
+        if not isinstance(raw, dict) or raw.get("version") not in {1, 2}:
+            raise RemoteRunError(
+                "Remote Run Source baseline is incompatible",
+                code="collection_baseline_invalid",
+            )
+        values = raw.get("entries")
+        if not isinstance(values, list):
+            raise RemoteRunError(
+                "Remote Run Source baseline is invalid",
+                code="collection_baseline_invalid",
+            )
+        entries: list[WorkspaceEntry] = []
+        try:
+            excluded_values = (
+                raw.get("excluded_prefixes") if raw.get("version") == 2 else []
+            )
+            if not isinstance(excluded_values, list) or not all(
+                isinstance(value, str) for value in excluded_values
+            ):
+                raise ValueError("invalid excluded prefixes")
+            for value in values:
+                if not isinstance(value, dict):
+                    raise ValueError("invalid entry")
+                entries.append(
+                    WorkspaceEntry(
+                        relative_path=str(value.get("path") or ""),
+                        kind=str(value.get("kind") or ""),  # type: ignore[arg-type]
+                        size=int(value.get("size") or 0),
+                        mtime_ns=int(value.get("mtime_ns") or 0),
+                        executable=value.get("executable") is True,
+                        link_target=(
+                            str(value["link_target"])
+                            if value.get("link_target") is not None
+                            else None
+                        ),
+                        digest=(
+                            str(value["digest"])
+                            if value.get("digest") is not None
+                            else None
+                        ),
+                    )
+                )
+            manifest = build_workspace_manifest(
+                entries,
+                excluded_prefixes=excluded_values,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RemoteRunError(
+                "Remote Run Source baseline is invalid",
+                code="collection_baseline_invalid",
+            ) from exc
+        if any(entry.kind == "file" and entry.digest is None for entry in manifest.entries):
+            return None
+        return manifest
 
     def _write_zip_manifest(
         self,
@@ -1777,6 +1895,10 @@ class RemoteRunManager:
         archive.unlink(missing_ok=True)
         sidecar.unlink(missing_ok=True)
         part.unlink(missing_ok=True)
+        self._collection_manifest_path(run_id).unlink(missing_ok=True)
+
+    def _collection_manifest_path(self, run_id: str) -> Path:
+        return self.collection_root / f"{validate_remote_run_id(run_id)}.json"
 
     def _run_workspace(self, run: Mapping[str, Any]) -> dict[str, Any]:
         target = self._require_run_target(run)
@@ -1797,7 +1919,7 @@ class RemoteRunManager:
             run = self.get(safe_id)
             if run.get("workspace_id"):
                 return run
-            if run["state"] not in {"finished", "stopped", "lost"}:
+            if run["state"] not in TERMINAL_STATES:
                 return run
             self._ensure_workspace_bridge(run)
             return self.get(safe_id)

@@ -14,7 +14,12 @@
       <small class="truncate">{{ snapshot.relative_path }}</small>
     </span>
     <span class="editor-header-actions">
-      <a class="secondary-button editor-terminal-link" href="/w/{{ workspace.id }}/terminal">{{ t('common.terminal') }}</a>
+      {% if terminal_editor_supported %}
+      <button class="secondary-button editor-terminal-link"
+              type="submit"
+              name="intent"
+              value="save_and_vim">{{ t('terminal_editor.open') }}</button>
+      {% endif %}
       <button class="secondary-button" type="submit" name="intent" value="save">{{ t('common.save') }}</button>
       {% if file_run_supported %}
         {% if active_file_run %}
@@ -51,6 +56,12 @@
   <div class="notice error conflict-notice" role="alert">
     <strong>{{ t('file_run.could_not_start') }}</strong>
     <span>{{ run_error }}</span>
+  </div>
+  {% endif %}
+  {% if terminal_editor_error %}
+  <div class="notice error conflict-notice" role="alert">
+    <strong>{{ t('terminal_editor.could_not_open') }}</strong>
+    <span>{{ terminal_editor_error }}</span>
   </div>
   {% endif %}
   <div class="editor-toolbar" role="toolbar" aria-label="{{ t('editor.tools') }}">

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from termroom.files import FileConflictError, FileService, UnsupportedFileError
+from termroom.security import PathBoundaryError
 
 
 def test_atomic_text_save(tmp_path: Path) -> None:
@@ -40,6 +41,56 @@ def test_external_change_causes_conflict(tmp_path: Path) -> None:
             expected_digest=snapshot.digest,
             expected_mtime_ns=snapshot.mtime_ns,
         )
+
+
+def test_change_during_atomic_save_causes_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "config.txt"
+    target.write_text("before\n", encoding="utf-8")
+    service = FileService()
+    snapshot = service.read_text(tmp_path, "config.txt")
+    real_chmod = __import__("os").chmod
+    raced = False
+
+    def chmod_with_external_edit(path: str, mode: int) -> None:
+        nonlocal raced
+        real_chmod(path, mode)
+        if not raced and Path(path).name.startswith(".config.txt."):
+            raced = True
+            target.write_text("external\n", encoding="utf-8")
+
+    monkeypatch.setattr("termroom.files.os.chmod", chmod_with_external_edit)
+
+    with pytest.raises(FileConflictError):
+        service.write_text(
+            tmp_path,
+            "config.txt",
+            "mine\n",
+            expected_digest=snapshot.digest,
+            expected_mtime_ns=snapshot.mtime_ns,
+        )
+
+    assert raced is True
+    assert target.read_text(encoding="utf-8") == "external\n"
+
+
+def test_file_operations_reject_symlink_components(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "config.txt").write_text("safe\n", encoding="utf-8")
+    (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+    service = FileService()
+
+    for operation in (
+        lambda: service.stat(tmp_path, "linked/config.txt"),
+        lambda: service.read_text(tmp_path, "linked/config.txt"),
+        lambda: service.write_new_text(tmp_path, "linked/new.txt", "new\n"),
+    ):
+        with pytest.raises(PathBoundaryError):
+            operation()
+
+    assert not (real / "new.txt").exists()
 
 
 def test_binary_file_is_not_editable(tmp_path: Path) -> None:

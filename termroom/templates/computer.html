@@ -2,22 +2,24 @@
 {% block body_class %}computer-page{% endblock %}
 {% block content %}
 <section class="computer-detail-shell">
-  <header class="computer-detail-heading">
+  <header class="computer-detail-heading" data-remote-connection-view>
     <div>
       <a class="text-back-link" href="/open/{{ computer.id }}">← {{ t('common.workspace') }}</a>
       <p class="eyebrow">{% if computer.connection_method == 'node' %}Termroom Node{% else %}{{ t('ssh.detail.eyebrow') }}{% endif %}</p>
       <h1>{{ computer.name }}</h1>
-      {% if computer.connection_method == 'node' %}
-      <p><strong>{% if computer.node_revoked_at %}{{ t('node.status.revoked') }}{% elif node_status.online %}{{ t('node.status.online') }}{% else %}{{ t('node.status.offline') }}{% endif %}</strong></p>
-      {% else %}
-      <p><code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code></p>
-      {% endif %}
+      <p class="remote-connection-summary">
+        <span class="state-chip remote {{ remote_status.state }}" data-remote-connection-status><span class="status-dot" aria-hidden="true"></span><span data-remote-connection-label>{{ remote_status.label }}</span></span>
+        {% if remote_status.last_success_label %}<small data-remote-last-success>{{ t('remote.last_success', time=remote_status.last_success_label) }}</small>{% endif %}
+        {% if computer.connection_method == 'ssh' %}<code>{{ computer.username }}@{{ computer.host }}{% if computer.port != 22 %}:{{ computer.port }}{% endif %}</code>{% endif %}
+      </p>
     </div>
-    {% if computer.connection_method != 'node' %}
-    <form method="post" action="/computers/{{ computer.id }}/test">
+    {% if computer.connection_method == 'ssh' %}
+    <form method="post" action="/computers/{{ computer.id }}/test" data-remote-connection-check data-remote-connecting-label="{{ t('remote.status.connecting') }}">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <button class="secondary-button" type="submit">{{ t('ssh.detail.retest') }}</button>
     </form>
+    {% else %}
+    <a class="secondary-button" href="/computers/{{ computer.id }}" data-remote-connection-check data-remote-connecting-label="{{ t('remote.status.connecting') }}">{{ t('remote.check_again') }}</a>
     {% endif %}
   </header>
 

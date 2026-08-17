@@ -276,6 +276,51 @@ def test_settings_rejects_unknown_default_locale(tmp_path: Path) -> None:
         )
 
 
+def test_settings_loads_local_workspace_policy_from_dotenv_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text(
+        "TERMROOM_ALLOW_LOCAL_WORKSPACES=false\n", encoding="utf-8"
+    )
+
+    from_dotenv = Settings.create(
+        root,
+        state_dir=state,
+        access_token="internal-secret",
+        login_password="password",
+    )
+    monkeypatch.setenv("TERMROOM_ALLOW_LOCAL_WORKSPACES", "true")
+    from_environment = Settings.create(
+        root,
+        state_dir=state,
+        access_token="internal-secret",
+        login_password="password",
+    )
+
+    assert from_dotenv.allow_local_workspaces is False
+    assert from_environment.allow_local_workspaces is True
+
+
+def test_settings_rejects_invalid_local_workspace_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("TERMROOM_ALLOW_LOCAL_WORKSPACES", "sometimes")
+
+    with pytest.raises(ValueError, match="TERMROOM_ALLOW_LOCAL_WORKSPACES"):
+        Settings.create(
+            root,
+            state_dir=tmp_path / "state",
+            access_token="internal-secret",
+            login_password="password",
+        )
+
+
 def test_settings_rejects_world_readable_config_password_file(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -304,6 +349,21 @@ def test_settings_database_path_is_termroom_database(tmp_path: Path) -> None:
     state = tmp_path / "state"
     settings = Settings.create(root, state_dir=state, access_token="internal-secret")
     assert settings.database_path == state / "termroom.sqlite3"
+
+
+def test_settings_repairs_existing_access_token_permissions(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    token_path = state / "access-token"
+    token_path.write_text("existing-token\n", encoding="utf-8")
+    token_path.chmod(0o644)
+
+    settings = Settings.create(root, state_dir=state, login_password="local-password")
+
+    assert settings.access_token == "existing-token"
+    assert token_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_settings_accepts_short_operator_password_by_default(tmp_path: Path) -> None:

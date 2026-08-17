@@ -135,6 +135,8 @@ async def test_remote_run_source_lists_only_capable_node_workspaces_and_gates_fi
         form = await client.get("/remote-runs/new")
         capable_files = await client.get(f"/w/{capable_workspace['id']}/files")
         target_only_files = await client.get(f"/w/{target_only_workspace['id']}/files")
+        capable_open = await client.get(f"/open/{capable['id']}")
+        target_only_open = await client.get(f"/open/{target_only['id']}")
 
     assert form.status_code == 200
     assert "Capable Workspace" in form.text
@@ -144,3 +146,12 @@ async def test_remote_run_source_lists_only_capable_node_workspaces_and_gates_fi
     assert "다른 Remote에서 실행" in capable_files.text
     assert target_only_files.status_code == 200
     assert "다른 Remote에서 실행" not in target_only_files.text
+    assert f"target_computer_id={capable['id']}" not in capable_open.text
+    assert (
+        f"/remote-runs/new?target_computer_id={target_only['id']}&source_kind=git"
+        in target_only_open.text
+    )
+    assert (
+        f"/remote-runs/new?target_computer_id={target_only['id']}&source_kind=archive"
+        in target_only_open.text
+    )

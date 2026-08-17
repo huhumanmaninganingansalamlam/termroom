@@ -13,6 +13,7 @@ from starlette.datastructures import UploadFile
 
 from termroom.db import StateStore
 from termroom.files import (
+    DirectoryListingLimitError,
     FileConflictError,
     FileEntry,
     FileService,
@@ -30,7 +31,9 @@ from termroom.terminal_control import TerminalControl
 from termroom.terminals import (
     MAX_TERMINAL_MESSAGE_BYTES,
     TerminalOutputDecoder,
+    terminal_input_claims_grid,
     terminal_size,
+    touch_terminal_output_if_present,
 )
 from termroom.workspace_usage import (
     RawWorkspaceUsage,
@@ -86,6 +89,7 @@ class RemoteAccess:
         self._terminal_activity_concurrency = asyncio.Semaphore(
             self.TERMINAL_ACTIVITY_MAX_CONCURRENT_COMPUTERS
         )
+        self._node_terminal_resize_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def is_node(value: Mapping[str, Any]) -> bool:
@@ -98,9 +102,7 @@ class RemoteAccess:
         status = self.nodes.status(str(computer["id"]))
         return {"online": status.online, "capabilities": status.capabilities}
 
-    def supports_capability(
-        self, value: Mapping[str, Any], capability: str
-    ) -> bool:
+    def supports_capability(self, value: Mapping[str, Any], capability: str) -> bool:
         if not self.is_node(value):
             return True
         computer = value.get("computer") if "computer" in value else value
@@ -165,19 +167,13 @@ class RemoteAccess:
         )
         return self._absolute_path(result.get("path"))
 
-    async def validate_workspace_path(
-        self, computer: dict[str, Any], path: str
-    ) -> str:
+    async def validate_workspace_path(self, computer: dict[str, Any], path: str) -> str:
         if not self.is_node(computer):
             return await asyncio.to_thread(self.ssh.validate_workspace_path, computer, path)
-        result = await self._node_request(
-            computer, "workspace.validate", {"path": path}
-        )
+        result = await self._node_request(computer, "workspace.validate", {"path": path})
         return self._absolute_path(result.get("path"))
 
-    async def ensure_workspace(
-        self, workspace: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    async def ensure_workspace(self, workspace: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.is_node(workspace):
             return await asyncio.to_thread(self.ssh.ensure_workspace, workspace)
         result = await self._workspace_request(workspace, "workspace.ensure", {})
@@ -199,6 +195,7 @@ class RemoteAccess:
             for computer_workspaces in grouped.values()
             for workspace in computer_workspaces
         )
+
         async def refresh_computer(
             computer_workspaces: list[dict[str, Any]],
         ) -> dict[str, list[dict[str, Any]]]:
@@ -218,9 +215,7 @@ class RemoteAccess:
                         if not windows:
                             continue
                         if session in by_session:
-                            raise RemoteAccessError(
-                                "Node Terminal activity batch is ambiguous"
-                            )
+                            raise RemoteAccessError("Node Terminal activity batch is ambiguous")
                         by_session[session] = workspace
                         requested_windows[session] = set(windows)
                         request_workspaces.append(
@@ -237,18 +232,14 @@ class RemoteAccess:
                         {"workspaces": request_workspaces},
                     )
                     raw_workspaces = result.get("workspaces")
-                    if not isinstance(raw_workspaces, list) or len(
-                        raw_workspaces
-                    ) != len(request_workspaces):
+                    if not isinstance(raw_workspaces, list) or len(raw_workspaces) != len(
+                        request_workspaces
+                    ):
                         raise RemoteAccessError("Node returned invalid Terminal activity")
-                    parsed: dict[
-                        str, tuple[dict[str, Any], list[dict[str, Any]]]
-                    ] = {}
+                    parsed: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
                     for raw in raw_workspaces:
                         if not isinstance(raw, Mapping):
-                            raise RemoteAccessError(
-                                "Node returned invalid Terminal activity"
-                            )
+                            raise RemoteAccessError("Node returned invalid Terminal activity")
                         session = str(raw.get("tmux_session") or "")
                         workspace = by_session.get(session)
                         terminals = raw.get("terminals")
@@ -258,55 +249,36 @@ class RemoteAccess:
                             or not isinstance(terminals, list)
                             or len(terminals) > len(requested_windows[session])
                         ):
-                            raise RemoteAccessError(
-                                "Node returned invalid Terminal activity"
-                            )
+                            raise RemoteAccessError("Node returned invalid Terminal activity")
                         records = [self._terminal_record(item) for item in terminals]
-                        returned_windows = [
-                            str(item["tmux_window"]) for item in records
-                        ]
-                        if len(set(returned_windows)) != len(
+                        returned_windows = [str(item["tmux_window"]) for item in records]
+                        if len(set(returned_windows)) != len(returned_windows) or not set(
                             returned_windows
-                        ) or not set(returned_windows).issubset(
-                            requested_windows[session]
-                        ):
-                            raise RemoteAccessError(
-                                "Node returned invalid Terminal activity"
-                            )
+                        ).issubset(requested_windows[session]):
+                            raise RemoteAccessError("Node returned invalid Terminal activity")
                         parsed[session] = (workspace, records)
                     if set(parsed) != set(by_session):
-                        raise RemoteAccessError(
-                            "Node returned incomplete Terminal activity"
-                        )
+                        raise RemoteAccessError("Node returned incomplete Terminal activity")
                     return self.store.observe_terminal_activity_batch(
-                        {
-                            str(workspace["id"]): records
-                            for workspace, records in parsed.values()
-                        }
+                        {str(workspace["id"]): records for workspace, records in parsed.values()}
                     )
                 except (OSError, RuntimeError, ValueError):
                     return {}
 
-        batches = await asyncio.gather(
-            *(refresh_computer(items) for items in grouped.values())
-        )
+        batches = await asyncio.gather(*(refresh_computer(items) for items in grouped.values()))
         refreshed: dict[str, list[dict[str, Any]]] = {}
         for batch in batches:
             refreshed.update(batch)
         return refreshed
 
-    async def workspace_usage(
-        self, workspace: dict[str, Any]
-    ) -> RawWorkspaceUsage:
+    async def workspace_usage(self, workspace: dict[str, Any]) -> RawWorkspaceUsage:
         if not self.is_node(workspace):
             return await asyncio.to_thread(self.ssh.workspace_usage, workspace)
         computer = workspace.get("computer")
         if not isinstance(computer, Mapping):
             raise WorkspaceUsageUnavailable("Remote Workspace computer is missing")
         if computer.get("node_revoked_at") is not None:
-            raise WorkspaceUsageUnavailable(
-                "Node connection has been revoked", code="node_revoked"
-            )
+            raise WorkspaceUsageUnavailable("Node connection has been revoked", code="node_revoked")
         status = self.nodes.status(str(computer["id"]))
         if not status.online:
             raise WorkspaceUsageOffline()
@@ -337,26 +309,85 @@ class RemoteAccess:
             )
         return parse_raw_workspace_usage(result.get("usage"))
 
-    async def create_terminal(
-        self, workspace: dict[str, Any], name: str
-    ) -> dict[str, Any]:
+    async def create_terminal(self, workspace: dict[str, Any], name: str) -> dict[str, Any]:
         if not self.is_node(workspace):
             return await asyncio.to_thread(self.ssh.create_terminal, workspace, name)
-        result = await self._workspace_request(
-            workspace, "terminal.create", {"name": name}
-        )
+        result = await self._workspace_request(workspace, "terminal.create", {"name": name})
         terminal_record = self._terminal_record(result.get("terminal"))
         terminals = await self.ensure_workspace(workspace)
         terminal = next(
-            (
-                item
-                for item in terminals
-                if item["tmux_window"] == terminal_record["tmux_window"]
-            ),
+            (item for item in terminals if item["tmux_window"] == terminal_record["tmux_window"]),
             None,
         )
         if terminal is None:
             raise RemoteAccessError("Node Terminal disappeared while creating it")
+        return terminal
+
+    async def open_terminal_editor(
+        self, workspace: dict[str, Any], relative_path: str
+    ) -> dict[str, Any]:
+        if not self.is_node(workspace):
+            return await asyncio.to_thread(
+                self.ssh.open_terminal_editor, workspace, relative_path
+            )
+        if not self.supports_capability(workspace, "terminal_editor"):
+            raise RemoteAccessError(
+                "This Node does not support Vim file editing; update Termroom Node",
+                code="capability_unsupported",
+            )
+        result = await self._workspace_request(
+            workspace,
+            "terminal.editor.open",
+            {"path": relative_path},
+        )
+        expected = self._terminal_record(result.get("terminal"))
+        terminals = self._reconcile_terminals(workspace, result.get("terminals"))
+        terminal = next(
+            (
+                item
+                for item in terminals
+                if item["tmux_window"] == expected["tmux_window"]
+            ),
+            None,
+        )
+        if terminal is None:
+            raise RemoteAccessError("Node Vim Terminal disappeared while starting")
+        return terminal
+
+    async def run_workspace_command(
+        self,
+        workspace: dict[str, Any],
+        *,
+        slot: int,
+        command: str,
+        launch_id: str,
+    ) -> dict[str, Any]:
+        if not self.is_node(workspace):
+            return await asyncio.to_thread(
+                self.ssh.run_workspace_command,
+                workspace,
+                slot=slot,
+                command=command,
+                launch_id=launch_id,
+            )
+        if not self.supports_capability(workspace, "workspace_command"):
+            raise RemoteAccessError(
+                "This Node does not support Workspace commands; update Termroom Node",
+                code="capability_unsupported",
+            )
+        result = await self._workspace_request(
+            workspace,
+            "workspace.command.run",
+            {"slot": slot, "command": command, "launch_id": launch_id},
+        )
+        expected = self._terminal_record(result.get("terminal"))
+        terminals = self._reconcile_terminals(workspace, result.get("terminals"))
+        terminal = next(
+            (item for item in terminals if item["tmux_window"] == expected["tmux_window"]),
+            None,
+        )
+        if terminal is None:
+            raise RemoteAccessError("Node Workspace command Terminal disappeared while starting")
         return terminal
 
     async def rename_terminal(
@@ -366,18 +397,14 @@ class RemoteAccess:
         name: str,
     ) -> dict[str, Any]:
         if not self.is_node(workspace):
-            return await asyncio.to_thread(
-                self.ssh.rename_terminal, workspace, terminal, name
-            )
+            return await asyncio.to_thread(self.ssh.rename_terminal, workspace, terminal, name)
         await self._workspace_request(
             workspace,
             "terminal.rename",
             {"tmux_window": terminal["tmux_window"], "name": name},
         )
         terminals = await self.ensure_workspace(workspace)
-        updated = next(
-            (item for item in terminals if item["id"] == terminal["id"]), None
-        )
+        updated = next((item for item in terminals if item["id"] == terminal["id"]), None)
         if updated is None:
             raise RemoteAccessError("Node Terminal disappeared while renaming it")
         return updated
@@ -401,9 +428,7 @@ class RemoteAccess:
         lines: int,
     ) -> str:
         if not self.is_node(workspace):
-            return await asyncio.to_thread(
-                self.ssh.capture_scrollback, workspace, terminal, lines
-            )
+            return await asyncio.to_thread(self.ssh.capture_scrollback, workspace, terminal, lines)
         result = await self._workspace_request(
             workspace,
             "terminal.scrollback",
@@ -415,13 +440,27 @@ class RemoteAccess:
         return output
 
     async def list_dir(
-        self, workspace: dict[str, Any], relative_path: str
+        self,
+        workspace: dict[str, Any],
+        relative_path: str,
+        *,
+        max_entries: int | None = None,
+        max_metadata_bytes: int | None = None,
     ) -> tuple[str, list[FileEntry]]:
         if not self.is_node(workspace):
-            return await asyncio.to_thread(self.ssh.list_dir, workspace, relative_path)
-        result = await self._workspace_request(
-            workspace, "files.list", {"path": relative_path}
-        )
+            return await asyncio.to_thread(
+                self.ssh.list_dir,
+                workspace,
+                relative_path,
+                max_entries=max_entries,
+                max_metadata_bytes=max_metadata_bytes,
+            )
+        payload: dict[str, Any] = {"path": relative_path}
+        if max_entries is not None:
+            payload["max_entries"] = max_entries
+        if max_metadata_bytes is not None:
+            payload["max_metadata_bytes"] = max_metadata_bytes
+        result = await self._workspace_request(workspace, "files.list", payload)
         directory = str(result.get("directory") or ".")
         entries = self._file_entries(result.get("entries"))
         return directory, entries
@@ -429,9 +468,7 @@ class RemoteAccess:
     async def stat(self, workspace: dict[str, Any], relative_path: str) -> FileEntry:
         if not self.is_node(workspace):
             return await asyncio.to_thread(self.ssh.stat, workspace, relative_path)
-        result = await self._workspace_request(
-            workspace, "files.stat", {"path": relative_path}
-        )
+        result = await self._workspace_request(workspace, "files.stat", {"path": relative_path})
         entries = self._file_entries([result.get("entry")])
         return entries[0]
 
@@ -439,9 +476,7 @@ class RemoteAccess:
         self, workspace: dict[str, Any], relative_path: str, max_bytes: int
     ) -> FileSnapshot:
         if not self.is_node(workspace):
-            return await asyncio.to_thread(
-                self.ssh.read_text, workspace, relative_path, max_bytes
-            )
+            return await asyncio.to_thread(self.ssh.read_text, workspace, relative_path, max_bytes)
         stream = None
         try:
             connection = self.nodes.connection(str(workspace["computer"]["id"]))
@@ -469,9 +504,7 @@ class RemoteAccess:
             snapshot = result.get("snapshot")
             if not isinstance(snapshot, dict):
                 raise RemoteAccessError("Node returned an invalid file snapshot")
-            return self._file_snapshot(
-                {**snapshot, "content": content}, max_bytes=max_bytes
-            )
+            return self._file_snapshot({**snapshot, "content": content}, max_bytes=max_bytes)
         except NodeCoreError as exc:
             self._raise_node_error(exc)
         finally:
@@ -518,9 +551,7 @@ class RemoteAccess:
             snapshot = result.get("snapshot")
             if not isinstance(snapshot, dict):
                 raise RemoteAccessError("Node returned an invalid saved file snapshot")
-            return self._file_snapshot(
-                {**snapshot, "content": content}, max_bytes=max_bytes
-            )
+            return self._file_snapshot({**snapshot, "content": content}, max_bytes=max_bytes)
         except NodeCoreError as exc:
             if stream is not None:
                 await stream.abort()
@@ -729,9 +760,7 @@ class RemoteAccess:
             raise RemoteAccessError("Node returned an invalid File Run control result")
         return sent
 
-    async def recent_files(
-        self, workspace: dict[str, Any], *, limit: int = 50
-    ) -> RecentFiles:
+    async def recent_files(self, workspace: dict[str, Any], *, limit: int = 50) -> RecentFiles:
         if self.is_node(workspace):
             if not self.supports_capability(workspace, "recent"):
                 raise RemoteAccessError(
@@ -769,9 +798,7 @@ class RemoteAccess:
         directory: bool,
     ) -> None:
         if not self.is_node(workspace):
-            await asyncio.to_thread(
-                self.ssh.create, workspace, parent, name, directory=directory
-            )
+            await asyncio.to_thread(self.ssh.create, workspace, parent, name, directory=directory)
             return
         await self._workspace_request(
             workspace,
@@ -779,13 +806,9 @@ class RemoteAccess:
             {"parent": parent, "name": name, "directory": directory},
         )
 
-    async def rename(
-        self, workspace: dict[str, Any], relative_path: str, new_name: str
-    ) -> None:
+    async def rename(self, workspace: dict[str, Any], relative_path: str, new_name: str) -> None:
         if not self.is_node(workspace):
-            await asyncio.to_thread(
-                self.ssh.rename, workspace, relative_path, new_name
-            )
+            await asyncio.to_thread(self.ssh.rename, workspace, relative_path, new_name)
             return
         await self._workspace_request(
             workspace,
@@ -797,9 +820,7 @@ class RemoteAccess:
         if not self.is_node(workspace):
             await asyncio.to_thread(self.ssh.delete, workspace, relative_path)
             return
-        await self._workspace_request(
-            workspace, "files.delete", {"path": relative_path}
-        )
+        await self._workspace_request(workspace, "files.delete", {"path": relative_path})
 
     async def upload(
         self,
@@ -932,14 +953,16 @@ class RemoteAccess:
         device_id: str,
     ) -> None:
         if not self.is_node(workspace):
-            await self.ssh.bridge(
-                websocket, workspace, terminal, device_id=device_id
-            )
+            await self.ssh.bridge(websocket, workspace, terminal, device_id=device_id)
             return
         await self.ensure_workspace(workspace)
         self.store.touch_terminal(str(terminal["id"]))
         terminal_id = str(terminal["id"])
         client_id = self.control.register(terminal_id)
+        resize_lock = self._node_terminal_resize_locks.setdefault(
+            terminal_id,
+            asyncio.Lock(),
+        )
         stream = None
         output_task: asyncio.Task[None] | None = None
         input_task: asyncio.Task[None] | None = None
@@ -954,6 +977,8 @@ class RemoteAccess:
                     "cols": 80,
                 },
             )
+            grid_active = False
+            last_viewport: tuple[int, int] | None = None
 
             async def output_to_browser() -> None:
                 decoder = TerminalOutputDecoder()
@@ -961,15 +986,54 @@ class RemoteAccess:
                     decoded = decoder.feed(chunk)
                     if decoded:
                         await asyncio.to_thread(
-                            self.store.touch_terminal_output, terminal_id
+                            touch_terminal_output_if_present, self.store, terminal_id
                         )
                         await websocket.send_text(decoded)
                 tail = decoder.feed(b"", final=True)
                 if tail:
                     await asyncio.to_thread(
-                        self.store.touch_terminal_output, terminal_id
+                        touch_terminal_output_if_present, self.store, terminal_id
                     )
                     await websocket.send_text(tail)
+
+            async def resize_browser_view(payload: dict[str, Any]) -> None:
+                nonlocal grid_active, last_viewport
+                if "rows" not in payload or "cols" not in payload:
+                    return
+                size = terminal_size(payload)
+                if size is None:
+                    return
+                rows, cols = size
+                async with resize_lock:
+                    controls_grid, grid_resize = self.control.resize_plan(
+                        terminal_id, client_id, rows=rows, cols=cols
+                    )
+                    viewport = (rows, cols)
+                    if (
+                        controls_grid == grid_active
+                        and viewport == last_viewport
+                        and not grid_resize
+                    ):
+                        return
+                    await stream.control(
+                        "resize",
+                        rows=rows,
+                        cols=cols,
+                        affects_grid=controls_grid,
+                    )
+                    grid_active = controls_grid
+                    last_viewport = viewport
+                    if controls_grid and not self.control.can_resize(
+                        terminal_id,
+                        client_id,
+                    ):
+                        await stream.control(
+                            "resize",
+                            rows=rows,
+                            cols=cols,
+                            affects_grid=False,
+                        )
+                        grid_active = False
 
             async def browser_to_input() -> None:
                 while True:
@@ -982,6 +1046,10 @@ class RemoteAccess:
                             await websocket.close(code=1009, reason="Terminal input is too large")
                             return
                         self.control.mark_input(terminal_id, client_id, device_id)
+                        if last_viewport is not None:
+                            await resize_browser_view(
+                                {"rows": last_viewport[0], "cols": last_viewport[1]}
+                            )
                         await stream.send(value)
                         continue
                     raw = message.get("text") or ""
@@ -991,15 +1059,12 @@ class RemoteAccess:
                     try:
                         payload = json.loads(raw)
                     except json.JSONDecodeError:
-                        self.control.mark_input(terminal_id, client_id, device_id)
                         await stream.send(raw.encode())
                         continue
                     if not isinstance(payload, dict):
                         continue
                     kind = payload.get("kind")
-                    if kind == "claim":
-                        self.control.claim_view(terminal_id, client_id)
-                    elif kind == "activity_ack":
+                    if kind == "activity_ack":
                         revision = payload.get("activity_at")
                         if isinstance(revision, bool) or not isinstance(revision, int):
                             continue
@@ -1013,18 +1078,14 @@ class RemoteAccess:
                         except (KeyError, ValueError):
                             continue
                     elif kind == "resize":
-                        if self.control.can_resize(terminal_id, client_id):
-                            size = terminal_size(payload)
-                            if size is not None:
-                                rows, cols = size
-                                await stream.control("resize", rows=rows, cols=cols)
+                        await resize_browser_view(payload)
                     elif kind in {"input", "command"}:
-                        self.control.mark_input(terminal_id, client_id, device_id)
+                        if kind == "command" or terminal_input_claims_grid(payload):
+                            self.control.mark_input(terminal_id, client_id, device_id)
+                        await resize_browser_view(payload)
                         data = str(payload.get("data") or "")
                         if kind == "command":
-                            self.store.add_command(
-                                str(workspace["id"]), terminal_id, data
-                            )
+                            self.store.add_command(str(workspace["id"]), terminal_id, data)
                             data += "\r"
                         await stream.send(data.encode())
 
@@ -1041,6 +1102,8 @@ class RemoteAccess:
                 task for task in (output_task, input_task) if task is not None
             )
             self.control.unregister(terminal_id, client_id)
+            if self.control.client_count(terminal_id) == 0:
+                self._node_terminal_resize_locks.pop(terminal_id, None)
             if stream is not None:
                 await stream.close()
 
@@ -1054,13 +1117,9 @@ class RemoteAccess:
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         if computer.get("node_revoked_at") is not None:
-            raise RemoteAccessError(
-                "Node connection has been revoked", code="node_revoked"
-            )
+            raise RemoteAccessError("Node connection has been revoked", code="node_revoked")
         try:
-            return await self.nodes.connection(str(computer["id"])).request(
-                operation, payload
-            )
+            return await self.nodes.connection(str(computer["id"])).request(operation, payload)
         except NodeCoreError as exc:
             self._raise_node_error(exc)
 
@@ -1097,6 +1156,8 @@ class RemoteAccess:
             raise FileExistsError(message) from exc
         if exc.code == "permission_denied":
             raise PermissionError(message) from exc
+        if exc.code == "directory_listing_limit":
+            raise DirectoryListingLimitError(message) from exc
         raise RemoteAccessError(message, code=exc.code) from exc
 
     async def _workspace_request(
@@ -1159,9 +1220,7 @@ class RemoteAccess:
                     "Node returned an invalid managed Terminal identity"
                 ) from exc
             if parsed.version != 4 or str(parsed) != managed:
-                raise RemoteAccessError(
-                    "Node returned an invalid managed Terminal identity"
-                )
+                raise RemoteAccessError("Node returned an invalid managed Terminal identity")
         else:
             raise RemoteAccessError("Node returned an invalid Terminal role")
         return {
@@ -1212,9 +1271,7 @@ class RemoteAccess:
             item = value.get(field)
             if item is not None:
                 if not isinstance(item, str) or not item or len(item) > 80:
-                    raise RemoteAccessError(
-                        "Node returned an invalid File Run timestamp"
-                    )
+                    raise RemoteAccessError("Node returned an invalid File Run timestamp")
                 result[field] = item
         exit_code = value.get("exit_code")
         if exit_code is not None:
