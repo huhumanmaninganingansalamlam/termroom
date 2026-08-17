@@ -2,6 +2,18 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.3] - 2026-08-18
+
+### Fixed
+
+- Skip unreadable directories while loading recent remote paths instead of failing the entire list.
+- Preserve fast File Run output across tmux versions and explain rejected Remote Run snapshots.
+- Preserve system TLS defaults for anonymous HTTPS Git clones used by Remote Runs.
+
+### Tests
+
+- Stabilize Remote Run observer timing and align regression coverage with the shipped behavior.
+
 ## [0.3.2] - 2026-08-17
 
 ### Fixed
