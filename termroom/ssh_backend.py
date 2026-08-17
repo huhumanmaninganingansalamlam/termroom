@@ -3465,6 +3465,8 @@ class SSHBackend:
                 f"tmux set-window-option -t {quoted_target} "
                 "remain-on-exit on; "
                 f"tmux set-window-option -t {quoted_target} "
+                "remain-on-exit-format '' >/dev/null 2>&1 || true; "
+                f"tmux set-window-option -t {quoted_target} "
                 f"{TMUX_TERMINAL_ROLE_OPTION} file_run; "
                 f"tmux set-window-option -t {quoted_target} "
                 f"{TMUX_MANAGED_RUN_OPTION} {shlex.quote(run_id)}; "

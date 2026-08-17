@@ -815,6 +815,14 @@ class TerminalManager:
         previous_run_id = str(terminal.get("managed_run_id") or "") or None
         try:
             self._run_tmux("set-window-option", "-t", tmux_window, "remain-on-exit", "on")
+            self._run_tmux(
+                "set-window-option",
+                "-t",
+                tmux_window,
+                "remain-on-exit-format",
+                "",
+                check=False,
+            )
             terminal = self.set_managed_identity(
                 workspace,
                 tmux_window,
