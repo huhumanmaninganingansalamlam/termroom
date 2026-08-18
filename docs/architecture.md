@@ -417,6 +417,12 @@ PyPI package rather than copying the repository source. The release workflow the
 publishes multi-architecture images to GHCR so Python and container artifacts share
 one versioned source of truth.
 
+The official image provides the product runtime plus Bash, Python 3, tmux, and Neovim. Project
+runtimes and dependencies belong to an operator-built derived image or host environment; Node
+pairing must not infer manifests, install packages, or run arbitrary initialization commands.
+A future devcontainer-style integration should place the Termroom Node agent inside or alongside
+the selected execution environment instead of mutating that environment after pairing.
+
 ## Localization
 
 Locale JSON lives under `termroom/locales/`. User-facing cookies and product copy

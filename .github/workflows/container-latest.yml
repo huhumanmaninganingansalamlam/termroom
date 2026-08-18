@@ -83,7 +83,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           docker run --rm --entrypoint python termroom-latest-smoke -c \
-            "import importlib.metadata as m; assert m.version('termroom') == '${VERSION}'"
+            "import importlib.metadata as m, pwd; assert m.version('termroom') == '${VERSION}'; assert pwd.getpwnam('termroom').pw_shell == '/bin/bash'"
           docker run --rm --entrypoint termroom termroom-latest-smoke --help >/dev/null
           docker run --rm --entrypoint nvim termroom-latest-smoke \
             --headless --clean '+quit'

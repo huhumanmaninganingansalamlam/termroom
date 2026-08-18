@@ -20,7 +20,7 @@ RUN if [ -n "$TERMROOM_VERSION" ]; then \
       pip install --no-cache-dir termroom; \
     fi \
     && groupadd --gid 1000 termroom \
-    && useradd --create-home --uid 1000 --gid 1000 termroom \
+    && useradd --create-home --shell /bin/bash --uid 1000 --gid 1000 termroom \
     && mkdir -p /config /workspaces \
     && chmod 700 /config \
     && chown -R termroom:termroom /config /workspaces \

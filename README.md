@@ -333,6 +333,20 @@ directly on the host. Build a Node-specific image from the official image when t
 needs Git, Node.js, compilers, CUDA, or other additional tools. The Core URL must be reachable
 from inside the container; HTTP is supported on an encrypted private network such as Tailscale.
 
+The official image includes Bash, Python 3, tmux, and Neovim, and uses Bash as the interactive
+shell. It intentionally does not install zsh, the JavaScript Node.js runtime, or project
+dependencies. Pairing initializes only the Termroom Node identity and allowed roots; it does not
+run project bootstrap commands. Add runtimes and dependencies in a derived image so the setup is
+reproducible and can later map cleanly to a devcontainer-style execution environment:
+
+```dockerfile
+FROM ghcr.io/huhumanmaninganingansalamlam/termroom:latest
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+```
+
 ## Common commands
 
 ```bash
