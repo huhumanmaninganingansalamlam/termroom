@@ -57,7 +57,10 @@
       {% endfor %}
     </div>
     <details class="workspace-run-config">
-      <summary>{{ t('workspace.run.configure') }}</summary>
+      <summary aria-label="{{ t('workspace.run.configure') }}" title="{{ t('workspace.run.configure') }}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
+        <span>{{ t('workspace.run.configure') }}</span>
+      </summary>
       <form method="post" action="/w/{{ workspace.id }}/run-commands">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <p>{{ t('workspace.run.configure_copy') }}</p>

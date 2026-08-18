@@ -188,7 +188,7 @@
   "workspace.run.starting": "Terminal 시작 중…",
   "workspace.run.empty": "이 Workspace에 저장한 명령이 없습니다.",
   "workspace.run.unsupported_node": "Workspace 명령을 실행하려면 이 computer의 Termroom Node를 업데이트하세요.",
-  "workspace.run.configure": "명령 설정",
+  "workspace.run.configure": "편집",
   "workspace.run.configure_copy": "명시적인 한 줄 Bash 명령을 최대 3개 저장합니다. 모두 비우면 명령을 제거합니다.",
   "workspace.run.slot": "명령 {number}",
   "workspace.run.placeholder": "uv run pytest",

@@ -188,7 +188,7 @@
   "workspace.run.starting": "Starting Terminal…",
   "workspace.run.empty": "No commands are configured for this Workspace.",
   "workspace.run.unsupported_node": "Update Termroom Node on this computer to run Workspace commands.",
-  "workspace.run.configure": "Configure commands",
+  "workspace.run.configure": "Edit",
   "workspace.run.configure_copy": "Save up to three explicit one-line Bash commands. Leave every field empty to remove them.",
   "workspace.run.slot": "Command {number}",
   "workspace.run.placeholder": "uv run pytest",
