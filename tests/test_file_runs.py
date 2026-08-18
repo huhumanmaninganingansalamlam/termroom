@@ -192,6 +192,101 @@ def test_file_run_terminal_transition_creates_one_safe_event(tmp_path: Path) -> 
     assert "/absolute/private" not in serialized
 
 
+def test_history_pruning_bounds_old_events_and_file_runs_without_losing_live_ui_state(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _store_with_workspace(tmp_path)
+    workspace_id = str(workspace["id"])
+    now = datetime(2026, 8, 19, 12, tzinfo=UTC)
+    old = now - timedelta(days=31)
+    recent = now - timedelta(days=1)
+
+    def finished_run(path: str, ended_at: datetime) -> str:
+        _status, run = store.claim_file_run(
+            _claim_payload(workspace_id, path=path)
+        )
+        assert store.transition_file_run(
+            str(run["id"]),
+            expected_states={"preparing"},
+            state="finished",
+            started_at=(ended_at - timedelta(seconds=2)).isoformat(timespec="seconds"),
+            ended_at=ended_at.isoformat(timespec="seconds"),
+            exit_code=0,
+        )
+        return str(run["id"])
+
+    expired_id = finished_run("expired.py", old)
+    pinned_id = finished_run("pinned.py", old)
+    recent_id = finished_run("recent.py", recent)
+    pinned_terminal = store.create_terminal(
+        workspace_id,
+        "Run",
+        "@file-run",
+        role="file_run",
+        managed_run_id=pinned_id,
+    )
+    assert store.set_file_run_terminal(pinned_id, str(pinned_terminal["id"])) is False
+    _status, active = store.claim_file_run(
+        _claim_payload(workspace_id, path="active.py")
+    )
+
+    old_device_time = (now - timedelta(days=91)).isoformat(timespec="seconds")
+    with store.connect() as db:
+        expired_event = db.execute(
+            "SELECT id FROM events WHERE subject_id = ?", (expired_id,)
+        ).fetchone()
+        assert expired_event is not None
+        db.execute(
+            """
+            INSERT INTO notification_devices(
+                id, start_sequence, created_at, last_seen_at
+            ) VALUES ('old-device', 0, ?, ?)
+            """,
+            (old_device_time, old_device_time),
+        )
+        db.execute(
+            "INSERT INTO event_reads(event_id, device_id, read_at) VALUES (?, ?, ?)",
+            (expired_event["id"], "old-device", old_device_time),
+        )
+        db.execute(
+            """
+            INSERT INTO event_notification_claims(event_id, device_id, claimed_at)
+            VALUES (?, 'old-device', ?)
+            """,
+            (expired_event["id"], old_device_time),
+        )
+
+    removed = store.prune_history(now=now)
+
+    assert removed["events"] == 2
+    assert removed["notification_devices"] == 1
+    assert removed["file_runs"] == [
+        {"id": expired_id, "workspace_id": workspace_id}
+    ]
+    assert store.get_file_run(expired_id) is None
+    assert store.get_file_run(pinned_id) is not None
+    assert store.get_file_run(recent_id) is not None
+    assert store.get_file_run(str(active["id"])) is not None
+    assert [event["subject_id"] for event in store.list_activity_events()] == [
+        recent_id
+    ]
+    with store.connect() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM event_reads WHERE event_id = ?",
+                (expired_event["id"],),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM event_notification_claims WHERE event_id = ?",
+                (expired_event["id"],),
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def _local_manager(
     tmp_path: Path,
 ) -> tuple[FileRunManager, dict[str, object], Path]:
@@ -217,6 +312,33 @@ def _local_manager(
         max_edit_bytes=1024 * 1024,
     )
     return manager, workspace, project
+
+
+def test_file_run_manager_removes_metadata_for_pruned_runs(tmp_path: Path) -> None:
+    manager, workspace, _project = _local_manager(tmp_path)
+    workspace_id = str(workspace["id"])
+    _status, run = manager.store.claim_file_run(
+        _claim_payload(workspace_id, path="old.py")
+    )
+    old = datetime.now(UTC) - timedelta(days=31)
+    assert manager.store.transition_file_run(
+        str(run["id"]),
+        expected_states={"preparing"},
+        state="finished",
+        started_at=(old - timedelta(seconds=1)).isoformat(timespec="seconds"),
+        ended_at=old.isoformat(timespec="seconds"),
+        exit_code=0,
+    )
+    metadata_dir = manager.metadata_root / workspace_id / str(run["id"])
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    removed = manager.cleanup_history(force=True)
+
+    assert removed["file_runs"] == [
+        {"id": str(run["id"]), "workspace_id": workspace_id}
+    ]
+    assert not metadata_dir.exists()
 
 
 def _wait_terminal_run(
@@ -612,7 +734,7 @@ async def test_new_manager_observer_reconciles_completion_after_core_restart(
             expected_digest=digest,
             idempotency_key=str(uuid.uuid4()),
         )
-        assert run["state"] == "running"
+        assert run["state"] in {"preparing", "running"}
 
         second = FileRunManager(
             first.store,

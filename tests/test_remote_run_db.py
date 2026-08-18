@@ -104,6 +104,38 @@ def test_terminal_remote_run_expiry_and_target_registration_are_preserved(
     assert store.remove_computer_registration(str(computer["id"])) == []
 
 
+def test_source_workspace_delete_is_blocked_while_remote_run_is_linked(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    root = tmp_path / "root"
+    root.mkdir()
+    root_row = store.ensure_root(root)
+    workspace = store.create_workspace(
+        str(root_row["id"]), ".", "Source Workspace"
+    )
+    computer = _computer(store)
+    values = _remote_run_values(str(computer["id"]))
+    values.update(
+        source_kind="workspace",
+        source_workspace_id=str(workspace["id"]),
+        source_path=".",
+        source_url=None,
+        source_label="Source Workspace",
+    )
+    store.create_remote_run(values)
+
+    with pytest.raises(RuntimeError, match="Remote Runs"):
+        store.delete_workspace(str(workspace["id"]))
+
+    assert store.get_workspace(str(workspace["id"])) is not None
+    assert store.get_remote_run(str(values["id"]))["source_workspace_id"] == workspace["id"]  # type: ignore[index]
+
+    store.delete_remote_run(str(values["id"]))
+    store.delete_workspace(str(workspace["id"]))
+    assert store.get_workspace(str(workspace["id"])) is None
+
+
 def test_waiting_zip_upload_expiry_is_persisted_and_queryable(tmp_path: Path) -> None:
     store = _store(tmp_path)
     computer = _computer(store)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import shutil
 import threading
 import time
 import uuid
@@ -27,6 +28,7 @@ RUNNER_REGISTRY_VERSION = 1
 FILE_RUN_OBSERVER_INTERVAL = 1.0
 FILE_RUN_OBSERVER_MAX_BACKOFF = 30.0
 NODE_FILE_RUN_BRIDGE_TIMEOUT = 35.0
+FILE_RUN_HISTORY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 class FileRunError(RuntimeError):
@@ -145,6 +147,7 @@ class FileRunManager:
         self._observer_task: asyncio.Task[None] | None = None
         self._observer_wakeup = asyncio.Event()
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._history_cleanup_at = 0.0
 
     def lock_for_workspace(self, workspace_id: str) -> threading.RLock:
         safe_id = self._validate_workspace_id(workspace_id)
@@ -232,6 +235,33 @@ class FileRunManager:
         target.relative_to(self.metadata_root)
         return target
 
+    def cleanup_history(self, *, force: bool = False) -> dict[str, Any]:
+        monotonic_now = time.monotonic()
+        if not force and monotonic_now < self._history_cleanup_at:
+            return {"events": 0, "notification_devices": 0, "file_runs": []}
+        self._history_cleanup_at = (
+            monotonic_now + FILE_RUN_HISTORY_CLEANUP_INTERVAL_SECONDS
+        )
+        result = self.store.prune_history()
+        for run in result["file_runs"]:
+            metadata_dir = self._metadata_dir(
+                str(run["workspace_id"]), str(run["id"])
+            )
+            if metadata_dir.is_symlink():
+                metadata_dir.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(metadata_dir, ignore_errors=True)
+        return result
+
+    def cleanup_workspace_metadata(self, workspace_id: str) -> None:
+        safe_workspace_id = self._validate_workspace_id(workspace_id)
+        target = self.metadata_root / safe_workspace_id
+        target.relative_to(self.metadata_root)
+        if target.is_symlink():
+            target.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(target, ignore_errors=True)
+
     def _inspect(
         self,
         workspace: dict[str, Any],
@@ -311,6 +341,7 @@ class FileRunManager:
         idempotency_key: str,
     ) -> dict[str, Any]:
         self._eligible_workspace(workspace)
+        self.cleanup_history()
         safe_key = self._validate_uuid(idempotency_key, "Idempotency key")
         runnable = self._inspect(
             workspace, relative_path, expected_digest=expected_digest
@@ -609,6 +640,7 @@ class FileRunManager:
 
     async def startup(self) -> None:
         self._event_loop = asyncio.get_running_loop()
+        await asyncio.to_thread(self.cleanup_history, force=True)
         if not self._startup_task or self._startup_task.done():
             self._startup_task = asyncio.create_task(self._reconcile_startup())
         if not self._observer_task or self._observer_task.done():

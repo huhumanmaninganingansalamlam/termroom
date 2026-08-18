@@ -214,7 +214,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"49"}
+    assert versions["app.css"] == {"51"}
     assert versions["app.js"] == {"61"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
@@ -227,6 +227,27 @@ def test_mobile_editor_toolbar_uses_balanced_rows() -> None:
   .editor-toolbar {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+""" in stylesheet
+
+
+def test_mobile_terminal_more_keys_panel_is_anchored_to_the_viewport() -> None:
+    stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
+    assert """@media (max-width: 520px) {
+  .quick-keys {
+    position: relative;
+  }
+
+  .more-keys {
+    position: static;
+  }
+
+  .more-keys-panel {
+    right: 12px;
+    left: 12px;
+    width: auto;
+    min-width: 0;
+  }
+}
 """ in stylesheet
 
 

@@ -61,6 +61,7 @@
 </header>
 
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+{% if location_removed %}<p class="notice success">{{ t('open.location_removed') }}</p>{% endif %}
 {% if project_error and project_created %}
 <section class="notice error project-result-notice">
   <strong>{{ project_error }}</strong>
@@ -225,12 +226,23 @@
   </header>
   <div class="open-location-list">
     {% for item in roots %}
-    <a class="open-location-chip {% if item.id == selected_root_id %}active{% endif %}"
-       href="/open/local?root={{ item.id }}">
-      <strong>{{ item.label }}</strong>
-      <small>{{ item.path }}</small>
-      <span>{{ t('open.workspace_count', count=item.workspace_count) }}</span>
-    </a>
+    <div class="open-location-entry {% if item.id == selected_root_id %}active{% endif %}">
+      <a class="open-location-chip"
+         href="/open/local?root={{ item.id }}#folder-browser"{% if item.id == selected_root_id %} aria-current="location"{% endif %}>
+        <strong>{{ item.label }}</strong>
+        <small>{{ item.path }}</small>
+        <span>{% if not item.available %}{{ t('open.location_unavailable_short') }}{% else %}{{ t('open.workspace_count', count=item.workspace_count) }}{% endif %}</span>
+      </a>
+      {% if item.removable %}
+      <form method="post"
+            action="/open/local/locations/{{ item.id }}/remove"
+            class="open-location-remove"
+            data-confirm="{{ t('open.location_remove_confirm', name=item.label) }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button class="quiet-action" type="submit">{{ t('open.location_remove') }}</button>
+      </form>
+      {% endif %}
+    </div>
     {% endfor %}
   </div>
 </section>
@@ -243,17 +255,32 @@
   </header>
   <div class="open-workspace-list">
     {% for workspace in local_workspaces %}
+    {% if workspace.available %}
     <a class="open-workspace-row" href="/w/{{ workspace.id }}">
       <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
       <span><strong>{{ workspace.display_name }}</strong><small>{{ workspace.relative_path }}</small></span>
       <span class="row-arrow" aria-hidden="true">→</span>
     </a>
+    {% else %}
+    <div class="open-workspace-row unavailable">
+      <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
+      <span><strong>{{ workspace.display_name }}</strong><small>{{ workspace.relative_path }} · {{ t('open.workspace_unavailable') }}</small></span>
+      <form method="post"
+            action="/w/{{ workspace.id }}/remove"
+            data-confirm="{{ t('workspace.remove.confirm', name=workspace.display_name) }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="return_root_id" value="{{ selected_root_id }}">
+        <button class="quiet-action" type="submit">{{ t('workspace.remove.action') }}</button>
+      </form>
+    </div>
+    {% endif %}
     {% endfor %}
   </div>
 </section>
 {% endif %}
 
-<section class="folder-browser open-folder-browser" aria-label="{{ t('browse.heading') }}">
+{% if not root_unavailable %}
+<section id="folder-browser" class="folder-browser open-folder-browser" aria-label="{{ t('browse.heading') }}">
   <header class="folder-browser-header">
     <div class="folder-browser-navigation">
       {% for crumb in breadcrumbs %}
@@ -265,8 +292,12 @@
         <span class="path-label">{{ t('browse.current') }}</span>
         <nav class="breadcrumbs" aria-label="{{ t('browse.current') }}">
           {% for crumb in breadcrumbs %}
+            {% if loop.last %}
+            <span class="breadcrumb-current" aria-current="location">{% if loop.first %}{{ selected_root_label }}{% else %}{{ crumb.name }}{% endif %}</span>
+            {% else %}
             <a href="/open/local?root={{ selected_root_id }}&path={{ crumb.path | urlencode }}{% if show_hidden %}&hidden=1{% endif %}">{% if loop.first %}{{ selected_root_label }}{% else %}{{ crumb.name }}{% endif %}</a>
-            {% if not loop.last %}<span>/</span>{% endif %}
+            <span>/</span>
+            {% endif %}
           {% endfor %}
         </nav>
       </div>
@@ -280,6 +311,18 @@
       {% endif %}
     </div>
   </header>
+  <div class="folder-browser-selection">
+    <span class="folder-browser-selection-copy"><small>{{ t('browse.selected_location') }}</small><code>{{ current_path_display }}</code></span>
+    <div class="folder-browser-actions">
+      <button class="secondary-button" type="button" data-new-project data-project-parent="{{ path }}" data-project-parent-display="{{ current_path_display }}">＋ {{ t('project.new_here') }}</button>
+      <form method="post" action="/api/workspaces" class="browse-open-form">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="root_id" value="{{ selected_root_id }}">
+        <input type="hidden" name="path" value="{{ path }}">
+        <button class="primary-button" type="submit">{{ t('browse.open_current') }}</button>
+      </form>
+    </div>
+  </div>
   <div class="folder-browser-list">
     {% for entry in entries %}
     <a class="folder-browser-row"
@@ -292,19 +335,8 @@
     <div class="empty-state quiet-empty"><strong>{{ t('browse.empty') }}</strong><p>{{ t('browse.empty_copy') }}</p></div>
     {% endfor %}
   </div>
-  <footer class="folder-browser-selection">
-    <span class="folder-browser-selection-copy"><small>{{ t('browse.selected_location') }}</small><code>{{ current_path_display }}</code></span>
-    <div class="folder-browser-actions">
-      <button class="secondary-button" type="button" data-new-project data-project-parent="{{ path }}" data-project-parent-display="{{ current_path_display }}">＋ {{ t('project.new_here') }}</button>
-      <form method="post" action="/api/workspaces" class="browse-open-form">
-        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <input type="hidden" name="root_id" value="{{ selected_root_id }}">
-        <input type="hidden" name="path" value="{{ path }}">
-        <button class="primary-button" type="submit">{{ t('browse.open_current') }}</button>
-      </form>
-    </div>
-  </footer>
 </section>
+{% endif %}
 
 {% if project_existing and not project_created %}
 <form id="open-existing-local-project" method="post" action="/api/workspaces" hidden>

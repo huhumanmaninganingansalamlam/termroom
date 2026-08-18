@@ -23,6 +23,9 @@ SQLITE_MAX_INTEGER = (1 << 63) - 1
 TERMINAL_ACTIVITY_READ_RETENTION = timedelta(days=30)
 TERMINAL_ACTIVITY_CLOCK_SKEW_ALLOWANCE = timedelta(days=1)
 TERMINAL_ACTIVITY_READ_CLEANUP_INTERVAL_SECONDS = 60 * 60
+ACTIVITY_EVENT_RETENTION = timedelta(days=30)
+NOTIFICATION_DEVICE_RETENTION = timedelta(days=90)
+HISTORY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 MAX_WORKSPACE_COMMANDS = 3
 MAX_WORKSPACE_COMMAND_BYTES = 4096
 
@@ -153,6 +156,7 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._terminal_activity_cleanup_at = 0.0
+        self._history_cleanup_at = 0.0
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -696,6 +700,23 @@ class StateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def remove_local_root(self, root_id: str) -> None:
+        """Forget an empty local folder location without touching its contents."""
+
+        with self.connect() as db:
+            root = db.execute(
+                "SELECT path FROM roots WHERE id = ?", (root_id,)
+            ).fetchone()
+            if root is None or str(root["path"]).startswith(("ssh://", "node://")):
+                raise KeyError(f"Unknown local folder location: {root_id}")
+            workspace_count = db.execute(
+                "SELECT COUNT(*) AS count FROM workspaces WHERE root_id = ?",
+                (root_id,),
+            ).fetchone()["count"]
+            if workspace_count:
+                raise RuntimeError("Unregister this location's Workspaces first")
+            db.execute("DELETE FROM roots WHERE id = ?", (root_id,))
+
     def workspace_location_counts(self) -> tuple[dict[str, int], dict[str, int]]:
         """Count user-visible Workspaces per Local root and computer in one query."""
 
@@ -1058,8 +1079,25 @@ class StateStore:
                 raise KeyError(f"Unknown Workspace: {workspace_id}")
 
     def delete_workspace(self, workspace_id: str) -> None:
+        self.remove_workspace_registration(workspace_id)
+
+    def remove_workspace_registration(self, workspace_id: str) -> None:
+        """Forget a persistent Workspace while preserving linked Run actions."""
+
         with self.connect() as db:
-            db.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+            linked_runs = db.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM remote_runs
+                WHERE source_workspace_id = ?
+                """,
+                (workspace_id,),
+            ).fetchone()["count"]
+            if linked_runs:
+                raise RuntimeError("Delete this Workspace's Remote Runs first")
+            cursor = db.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown Workspace: {workspace_id}")
 
     def list_terminals(self, workspace_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -2483,6 +2521,93 @@ class StateStore:
               ON file_terminals.id = file_runs.terminal_id
         """
 
+    def _cleanup_activity_history(
+        self,
+        db: sqlite3.Connection,
+        *,
+        now: datetime | None = None,
+        force: bool = False,
+    ) -> dict[str, int]:
+        monotonic_now = time.monotonic()
+        if not force and monotonic_now < self._history_cleanup_at:
+            return {"events": 0, "notification_devices": 0}
+        self._history_cleanup_at = monotonic_now + HISTORY_CLEANUP_INTERVAL_SECONDS
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            raise ValueError("History cleanup time must include a timezone")
+        event_cutoff = (current - ACTIVITY_EVENT_RETENTION).isoformat(
+            timespec="seconds"
+        )
+        device_cutoff = (current - NOTIFICATION_DEVICE_RETENTION).isoformat(
+            timespec="seconds"
+        )
+        events = db.execute(
+            "DELETE FROM events WHERE occurred_at < ?", (event_cutoff,)
+        ).rowcount
+        devices = db.execute(
+            "DELETE FROM notification_devices WHERE last_seen_at < ?",
+            (device_cutoff,),
+        ).rowcount
+        return {
+            "events": max(0, events),
+            "notification_devices": max(0, devices),
+        }
+
+    def prune_history(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Bound Activity and completed File Run metadata by age.
+
+        Active runs and the run currently attached to a managed Terminal are never
+        removed. A completed run also remains while its Activity event is retained,
+        so every visible action continues to open its exact result.
+        """
+
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            raise ValueError("History cleanup time must include a timezone")
+        run_cutoff = (current - ACTIVITY_EVENT_RETENTION).isoformat(
+            timespec="seconds"
+        )
+        with self.connect() as db:
+            removed = self._cleanup_activity_history(
+                db,
+                now=current,
+                force=True,
+            )
+            rows = db.execute(
+                """
+                SELECT file_runs.id, file_runs.workspace_id
+                FROM file_runs
+                WHERE file_runs.state IN ('finished', 'stopped', 'failed', 'lost')
+                  AND COALESCE(file_runs.ended_at, file_runs.created_at) < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM terminals
+                      WHERE terminals.managed_run_id = file_runs.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.subject_type = 'file_run'
+                        AND events.subject_id = file_runs.id
+                  )
+                """,
+                (run_cutoff,),
+            ).fetchall()
+            if rows:
+                placeholders = ",".join("?" for _ in rows)
+                db.execute(
+                    f"DELETE FROM file_runs WHERE id IN ({placeholders})",
+                    tuple(str(row["id"]) for row in rows),
+                )
+            return {
+                **removed,
+                "file_runs": [
+                    {
+                        "id": str(row["id"]),
+                        "workspace_id": str(row["workspace_id"]),
+                    }
+                    for row in rows
+                ],
+            }
+
     def list_activity_events(
         self,
         limit: int = 100,
@@ -2494,6 +2619,7 @@ class StateStore:
             (device_id, safe_limit) if device_id is not None else (safe_limit,)
         )
         with self.connect() as db:
+            self._cleanup_activity_history(db)
             rows = db.execute(
                 f"{self._activity_select(device_id)} ORDER BY events.sequence DESC LIMIT ?",
                 parameters,
@@ -2518,6 +2644,7 @@ class StateStore:
 
     def count_unread_events(self, *, device_id: str | None = None) -> int:
         with self.connect() as db:
+            self._cleanup_activity_history(db)
             if device_id is None:
                 row = db.execute(
                     "SELECT COUNT(*) AS count FROM events WHERE read_at IS NULL"
@@ -2593,6 +2720,7 @@ class StateStore:
         now = utc_now()
         claimed_ids: list[str] = []
         with self.connect() as db:
+            self._cleanup_activity_history(db)
             device = db.execute(
                 "SELECT * FROM notification_devices WHERE id = ?",
                 (device_id,),
