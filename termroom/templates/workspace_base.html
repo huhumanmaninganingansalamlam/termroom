@@ -38,43 +38,57 @@
       </button>
     </header>
     {% if workspace_commands_supported %}
+    <form id="workspace-run-command-config-{{ placement }}"
+          method="post"
+          action="/w/{{ workspace.id }}/run-commands">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    </form>
     <div class="workspace-run-command-list">
-      {% for item in workspace_commands %}
-      <form method="post"
-            action="/w/{{ workspace.id }}/run-commands/{{ item.slot }}"
-            data-workspace-command-run
-            data-workspace-command-starting-label="{{ t('workspace.run.starting') }}">
-        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <input type="hidden" name="launch_id" value="{{ item.launch_id }}">
-        <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
-        <button type="submit" title="{{ item.command }}">
-          <code>{{ item.command }}</code>
-          <span data-workspace-command-label>{{ t('workspace.run.command') }}</span>
-        </button>
-      </form>
-      {% else %}
-      <p class="workspace-run-empty">{{ t('workspace.run.empty') }}</p>
+      {% for index in range(3) %}
+      {% set item = workspace_commands[index] if workspace_commands | length > index else none %}
+      <article class="workspace-run-command-card{% if not item %} is-empty{% endif %}">
+        <details class="workspace-run-command-editor">
+          <summary aria-label="{{ t('workspace.run.configure') }} · {{ t('workspace.run.slot', number=index + 1) }}"
+                   title="{{ t('workspace.run.configure') }}">
+            <code>{{ item.command if item else t('workspace.run.slot', number=index + 1) }}</code>
+            <span class="workspace-run-command-edit-action">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
+              <span>{{ t('workspace.run.configure') }}</span>
+            </span>
+          </summary>
+          <div class="workspace-run-command-fields">
+            <label>
+              <span>{{ t('workspace.run.slot', number=index + 1) }}</span>
+              <input name="commands"
+                     value="{{ item.command if item else '' }}"
+                     form="workspace-run-command-config-{{ placement }}"
+                     maxlength="4096"
+                     autocomplete="off"
+                     spellcheck="false"
+                     placeholder="{{ t('workspace.run.placeholder') }}">
+            </label>
+            <button class="primary-button"
+                    type="submit"
+                    form="workspace-run-command-config-{{ placement }}">{{ t('workspace.run.save') }}</button>
+          </div>
+        </details>
+        {% if item %}
+        <form class="workspace-run-command-launch"
+              method="post"
+              action="/w/{{ workspace.id }}/run-commands/{{ item.slot }}"
+              data-workspace-command-run
+              data-workspace-command-starting-label="{{ t('workspace.run.starting') }}">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <input type="hidden" name="launch_id" value="{{ item.launch_id }}">
+          <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
+          <button type="submit" title="{{ item.command }}">
+            <span data-workspace-command-label>{{ t('workspace.run.command') }}</span>
+          </button>
+        </form>
+        {% endif %}
+      </article>
       {% endfor %}
     </div>
-    <details class="workspace-run-config">
-      <summary>{{ t('workspace.run.configure') }}</summary>
-      <form method="post" action="/w/{{ workspace.id }}/run-commands">
-        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <p>{{ t('workspace.run.configure_copy') }}</p>
-        {% for index in range(3) %}
-        <label>
-          <span>{{ t('workspace.run.slot', number=index + 1) }}</span>
-          <input name="commands"
-                 value="{{ workspace_commands[index].command if workspace_commands | length > index else '' }}"
-                 maxlength="4096"
-                 autocomplete="off"
-                 spellcheck="false"
-                 placeholder="{{ t('workspace.run.placeholder') }}">
-        </label>
-        {% endfor %}
-        <button class="primary-button" type="submit">{{ t('workspace.run.save') }}</button>
-      </form>
-    </details>
     {% else %}
     <p class="workspace-run-empty">{{ t('workspace.run.unsupported_node') }}</p>
     {% endif %}

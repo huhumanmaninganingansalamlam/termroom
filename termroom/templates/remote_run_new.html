@@ -36,20 +36,20 @@
     <input type="hidden" name="source_kind" value="workspace">
     <input type="hidden" name="source_workspace_id" value="{{ source_workspace.id }}">
     <input type="hidden" name="source_path" value="{{ selected_source_path }}">
-    <div class="open-workspace-list" data-source-panel="workspace">
+    <div class="open-workspace-list remote-run-selected-source" data-source-panel="workspace">
       <div class="open-workspace-row">
         <span class="project-avatar" aria-hidden="true">{{ source_workspace.display_name[:1] | upper }}</span>
         <span>
           <strong>{{ source_workspace.display_name }}</strong>
           <small>{{ source_path_display }}</small>
         </span>
-        <span class="row-arrow" aria-hidden="true">✓</span>
+        <span class="remote-run-source-badge">{{ t('remote_run.source_original') }}</span>
       </div>
     </div>
-    <p class="form-help">
-      {{ t('remote_run.workspace_snapshot_copy') }}
-      <a class="text-action" href="{{ change_source_url }}">{{ t('remote_run.change') }}</a>
-    </p>
+    <div class="remote-run-source-summary">
+      <p class="form-help">{{ t('remote_run.workspace_snapshot_copy') }}</p>
+      <a class="secondary-button remote-run-change-source" href="{{ change_source_url }}">{{ t('remote_run.change') }}</a>
+    </div>
     <details class="remote-run-exclusions">
       <summary>{{ t('remote_run.exclusions_heading') }}</summary>
       <p>{{ t('remote_run.exclusions_copy') }}</p>

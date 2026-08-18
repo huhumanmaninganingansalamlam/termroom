@@ -2,6 +2,12 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.4] - 2026-08-18
+
+### Fixed
+
+- Preserve a confirmed File Run program exit of 127 when its completion record is not observable after runtime preparation.
+
 ## [0.3.3] - 2026-08-18
 
 ### Fixed

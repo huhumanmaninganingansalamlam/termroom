@@ -25,7 +25,11 @@ from termroom.file_runs import (
 from termroom.files import FileService, RunnableFile, UnsupportedFileError
 from termroom.security import PathBoundaryError
 from termroom.ssh_backend import SSHBackend, SSHBackendError
-from termroom.terminals import TerminalError, TerminalManager
+from termroom.terminals import (
+    TerminalError,
+    TerminalManager,
+    file_run_exit_127_fallback,
+)
 from termroom.workspaces import RootManager, WorkspaceManager
 
 
@@ -357,6 +361,22 @@ def test_completion_requires_an_observed_stop_signal_to_be_stopped(
         workspace, run_id=run_id, metadata_dir=metadata
     )
     assert interrupted["state"] == "stopped"
+
+
+def test_exit_127_fallback_requires_successful_runtime_preparation() -> None:
+    state = {
+        "state": "running",
+        "started_at": "2026-08-18T00:00:00Z",
+    }
+
+    assert file_run_exit_127_fallback(state, {"exit_code": 127}) == {
+        "state": "finished",
+        "started_at": "2026-08-18T00:00:00Z",
+        "ended_at": None,
+        "exit_code": 127,
+    }
+    assert file_run_exit_127_fallback(None, {"exit_code": 127}) is None
+    assert file_run_exit_127_fallback(state, {"exit_code": 126}) is None
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")

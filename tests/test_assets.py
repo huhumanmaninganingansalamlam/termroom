@@ -214,11 +214,20 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"41"}
+    assert versions["app.css"] == {"49"}
     assert versions["app.js"] == {"61"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["terminal.js"] == {"45"}
+
+
+def test_mobile_editor_toolbar_uses_balanced_rows() -> None:
+    stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
+    assert """@media (max-width: 520px) {
+  .editor-toolbar {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+""" in stylesheet
 
 
 def test_global_header_layers_settings_menu_above_transformed_page_actions() -> None:

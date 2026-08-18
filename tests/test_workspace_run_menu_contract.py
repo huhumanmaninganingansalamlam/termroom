@@ -46,5 +46,24 @@ def test_workspace_run_menu_dismissal_preserves_terminal_focus_contract() -> Non
 def test_workspace_run_menu_asset_versions_are_bumped() -> None:
     base = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
 
-    assert "app.css') }}?v=41" in base
+    assert "app.css') }}?v=49" in base
     assert "app.js') }}?v=61" in base
+
+
+def test_workspace_command_editing_stays_inside_each_command_card() -> None:
+    template = (ROOT / "termroom/templates/workspace_base.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'class="workspace-run-command-card' in template
+    assert 'class="workspace-run-command-editor"' in template
+    assert 'class="workspace-run-command-edit-action"' in template
+    assert 'class="workspace-run-command-launch"' in template
+    assert template.index('class="workspace-run-command-edit-action"') < template.index(
+        'class="workspace-run-command-launch"'
+    )
+    assert 'class="workspace-run-config"' not in template
+
+    stylesheet = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
+    heading = stylesheet[stylesheet.index(".workspace-run-heading {") :]
+    assert "padding-right" not in heading.split("}", 1)[0]
