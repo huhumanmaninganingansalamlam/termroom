@@ -103,6 +103,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER,
     file_run_completion_was_stopped,
+    file_run_exit_127_fallback,
     normalize_terminal_editor_path,
     normalize_terminal_name,
     normalize_workspace_command,
@@ -1905,6 +1906,9 @@ class NodeRuntime:
                 },
                 windows,
             )
+        fallback = file_run_exit_127_fallback(state, pane)
+        if fallback is not None:
+            return fallback, windows
         return (
             {
                 "state": "lost",

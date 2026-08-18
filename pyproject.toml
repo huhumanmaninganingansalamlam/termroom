@@ -1,6 +1,6 @@
 [project]
 name = "termroom"
-version = "0.3.3"
+version = "0.3.4"
 description = "Self-hosted Linux workspace for persistent tmux terminals and files"
 readme = "README.md"
 requires-python = ">=3.12"
