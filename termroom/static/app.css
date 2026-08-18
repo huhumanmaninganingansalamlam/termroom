@@ -3100,7 +3100,7 @@ details:not([open]) > :not(summary) {
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 6px;
-  padding: 7px 8px 0;
+  padding: 6px 8px;
 }
 
 .terminal-key-rail {
