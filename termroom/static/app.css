@@ -7528,6 +7528,41 @@ details:not([open]) > :not(summary) {
   font-family: var(--font-mono);
 }
 
+.remote-run-selected-source .open-workspace-row {
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+}
+
+.remote-run-selected-source .open-workspace-row:hover {
+  background: transparent;
+}
+
+.remote-run-source-badge {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  align-self: center;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 0.66rem;
+  font-weight: 650;
+}
+
+.remote-run-source-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-run-change-source {
+  display: inline-flex;
+  min-height: 44px;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
 .remote-run-source-tabs {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -7691,6 +7726,12 @@ details:not([open]) > :not(summary) {
 
   .remote-run-form-section {
     padding: 18px 15px;
+  }
+
+  .remote-run-source-summary {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0;
   }
 
   .remote-run-form-actions {
