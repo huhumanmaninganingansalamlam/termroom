@@ -4489,9 +4489,13 @@ details:not([open]) > :not(summary) {
   }
 
   .workspace-run-menu-navigation .workspace-run-popover {
-    top: 10px;
+    top: auto;
     right: auto;
+    bottom: 0;
     left: calc(100% + 10px);
+    max-height: min(360px, calc(100dvh - 24px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .workspace-sidebar-footer.workspace-sidebar-usage-menu {
