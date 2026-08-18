@@ -98,7 +98,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=43'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=44'
     script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=61'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text

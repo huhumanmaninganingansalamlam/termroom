@@ -957,7 +957,7 @@ body:has(.remote-workspace-form .remote-folder-browser:not([hidden])) {
   font-size: 0.64rem;
 }
 
-.open-folder-browser {
+.folder-browser.open-folder-browser {
   max-width: none;
 }
 
