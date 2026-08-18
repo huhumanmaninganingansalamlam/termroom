@@ -1071,7 +1071,9 @@ body:has(.remote-workspace-form .remote-folder-browser:not([hidden])) {
 @media (max-width: 760px) {
   .open-page-heading {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     align-items: start;
+    justify-content: stretch;
     gap: 14px;
     margin-bottom: 14px;
   }
