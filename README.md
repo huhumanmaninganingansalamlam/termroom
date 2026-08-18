@@ -295,13 +295,20 @@ TERMROOM_MODE=node
 TERMROOM_WORKSPACES_HOST_PATH=/home/user/projects
 ```
 
-With `TERMROOM_MODE=node`, the same image starts the Node process instead of the Core. Create a
-Node pairing code in the Core, run the pairing command once, then verify and approve the
-fingerprint shown in the Core:
+With `TERMROOM_MODE=node`, the same image starts the Node process instead of the Core. Start the
+long-running container first. An unpaired container stays running and waits for its configuration
+instead of entering a restart loop:
 
 ```bash
-docker compose run --rm termroom-node \
-  node --config-dir /config/node pair \
+docker compose up -d --remove-orphans
+docker compose logs termroom-node
+```
+
+Create a Node pairing code in the Core, then pair from inside that same container:
+
+```bash
+docker compose exec -u termroom termroom-node \
+  termroom node --config-dir /config/node pair \
   --core https://termroom.example \
   --code <10-minute-one-time-code> \
   --allow-root /workspaces \
@@ -309,11 +316,11 @@ docker compose run --rm termroom-node \
 ```
 
 The pairing code expires after 10 minutes and is consumed when the pairing request is submitted,
-so do not store it in `.env`. After approval, start the long-running Node with the identity
-and configuration preserved in the named volume:
+so do not store it in `.env`. Pairing writes the identity and configuration to the named volume;
+the waiting entrypoint detects it and starts the Node automatically without a restart. Verify and
+approve the fingerprint shown in the Core, then follow the logs with:
 
 ```bash
-docker compose up -d --remove-orphans
 docker compose logs -f termroom-node
 ```
 
@@ -439,9 +446,10 @@ and removes `TERMROOM_PASSWORD` from the Core process environment after loading 
 
 ## Docker Compose
 
-Release images are published to GHCR after the matching PyPI release succeeds. The
-image itself installs that exact `termroom` version from PyPI, so the Python package
-and container release stay aligned.
+Versioned release images are published to GHCR after the matching PyPI release succeeds. The
+image itself installs that exact `termroom` version from PyPI, so the Python package and
+container release stay aligned. Docker-only fixes may update `latest` from `main` without
+overwriting immutable version tags or publishing a new Python package.
 
 To run the published image:
 

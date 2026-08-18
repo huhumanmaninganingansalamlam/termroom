@@ -50,7 +50,25 @@ export HOME=/config/home
 umask 077
 
 if [ "$TERMROOM_MODE" = "node" ] && [ "${1:-}" != "node" ]; then
-  set -- node --config-dir "${TERMROOM_NODE_CONFIG_DIR:-/config/node}"
+  node_config_dir="${TERMROOM_NODE_CONFIG_DIR:-/config/node}"
+  node_config_file="${node_config_dir}/node.json"
+  if [ ! -f "$node_config_file" ]; then
+    echo "Termroom Node is not paired. Waiting for pairing configuration in ${node_config_file}."
+    echo "Pair this running container with:"
+    echo "  docker exec -it -u termroom <container> termroom node --config-dir ${node_config_dir} pair ..."
+    stop_pairing_wait=0
+    trap 'stop_pairing_wait=1' TERM INT
+    while [ ! -f "$node_config_file" ] && [ "$stop_pairing_wait" -eq 0 ]; do
+      sleep 2 &
+      wait "$!" || true
+    done
+    trap - TERM INT
+    if [ "$stop_pairing_wait" -ne 0 ]; then
+      exit 0
+    fi
+    echo "Pairing configuration found. Starting Termroom Node."
+  fi
+  set -- node --config-dir "$node_config_dir"
 fi
 
 if [ "$TERMROOM_MODE" = "core" ]; then

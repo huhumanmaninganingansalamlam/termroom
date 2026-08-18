@@ -281,13 +281,20 @@ TERMROOM_MODE=node
 TERMROOM_WORKSPACES_HOST_PATH=/home/user/projects
 ```
 
-`TERMROOM_MODE=node`이면 같은 이미지가 Core 대신 Node process로 시작됩니다. Core 화면에서
-Node 연결 코드를 만든 뒤 최초 한 번만 pairing 명령을 실행하고, 화면에 표시된 fingerprint를
-확인해 승인합니다.
+`TERMROOM_MODE=node`이면 같은 이미지가 Core 대신 Node process로 시작됩니다. 먼저 상시
+container를 시작합니다. 아직 pairing되지 않은 container는 재시작 loop에 빠지지 않고 설정이
+생길 때까지 실행 상태로 기다립니다.
 
 ```bash
-docker compose run --rm termroom-node \
-  node --config-dir /config/node pair \
+docker compose up -d --remove-orphans
+docker compose logs termroom-node
+```
+
+Core 화면에서 Node 연결 코드를 만든 뒤 같은 container 안에서 pairing합니다.
+
+```bash
+docker compose exec -u termroom termroom-node \
+  termroom node --config-dir /config/node pair \
   --core https://termroom.example \
   --code <10분-일회용-code> \
   --allow-root /workspaces \
@@ -295,11 +302,11 @@ docker compose run --rm termroom-node \
 ```
 
 pairing code는 10분 뒤 만료되고 pairing 요청에 사용되는 즉시 소비되는 일회용 값이므로
-`.env`에 저장하지 않습니다. 승인 후에는 named volume에 보존된 Node identity와 설정으로
-상시 Node를 시작합니다.
+`.env`에 저장하지 않습니다. pairing은 Node identity와 설정을 named volume에 기록하며,
+대기 중인 entrypoint가 이를 감지해 container restart 없이 Node를 자동으로 시작합니다.
+Core에 표시된 fingerprint를 확인해 승인한 뒤 log를 확인합니다.
 
 ```bash
-docker compose up -d --remove-orphans
 docker compose logs -f termroom-node
 ```
 
@@ -423,7 +430,8 @@ group/other 사용자에게 열려 있으면 시작을 거부하고, 로딩한 �
 
 PyPI 릴리스가 성공하면 같은 버전의 Docker 이미지를 GHCR에도 자동으로 배포합니다.
 Docker 이미지 안에서도 해당 버전의 `termroom`을 PyPI에서 설치하므로 Python 패키지와
-컨테이너 버전이 서로 어긋나지 않습니다.
+컨테이너 버전이 서로 어긋나지 않습니다. Docker 전용 수정은 Python package를 새로 배포하거나
+기존 version tag를 덮어쓰지 않고 `main`에서 `latest`만 갱신할 수 있습니다.
 
 배포된 이미지를 사용하려면:
 
