@@ -1025,7 +1025,7 @@ async def test_result_routes_download_review_recheck_and_apply(
 
         reviewed = await client.get(f"/remote-runs/{RUN_ID}/collect")
         assert reviewed.status_code == 200
-        assert "Review Source changes" in reviewed.text
+        assert "Bring changes to original" in reviewed.text
         assert "main.py" in reviewed.text
         assert "model.bin" in reviewed.text
         assert "Recover this file from the result ZIP." in reviewed.text
@@ -1042,7 +1042,7 @@ async def test_result_routes_download_review_recheck_and_apply(
             data={"_csrf": settings.csrf_token, "revision": "stale"},
         )
         assert stale.status_code == 409
-        assert "The Source or result changed after review" in stale.text
+        assert "The original or result changed after review" in stale.text
         assert "review-revision" in stale.text
 
         applied = await client.post(
@@ -1061,7 +1061,7 @@ async def test_result_routes_download_review_recheck_and_apply(
         assert "Finished: 1 applied, 0 conflicts, 0 already present, 1 ZIP only" in (
             completed.text
         )
-        assert "Review Source changes" in completed.text
+        assert "Bring changes to original" in completed.text
         assert "main.py" in completed.text
 
         refreshed = await client.get(applied.headers["location"])
