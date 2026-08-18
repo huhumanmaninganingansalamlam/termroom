@@ -5477,6 +5477,13 @@ details:not([open]) > :not(summary) {
   margin-left: auto;
 }
 
+.scrollback-heading .page-copy {
+  max-width: 680px;
+  margin: 8px 0 0;
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
+
 .scrollback-tools {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -5501,8 +5508,11 @@ details:not([open]) > :not(summary) {
   border-radius: var(--radius);
   background: var(--terminal-bg);
   color: var(--terminal-text);
-  font-family: var(--font-mono);
+  font-family: "Termroom D2Koding Nerd Mono", var(--font-mono);
   font-size: 0.72rem;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  font-synthesis: weight style;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
