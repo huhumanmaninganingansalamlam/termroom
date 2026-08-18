@@ -3854,6 +3854,22 @@ details:not([open]) > :not(summary) {
   color: var(--text-secondary);
 }
 
+@media (max-width: 520px) {
+  .editor-toolbar {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 2px;
+    padding: 4px 8px;
+  }
+
+  .editor-toolbar button {
+    width: 100%;
+    min-width: 0;
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+}
+
 .find-bar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -4181,7 +4197,7 @@ details:not([open]) > :not(summary) {
 }
 
 .workspace-run-menu > summary::-webkit-details-marker,
-.workspace-run-config > summary::-webkit-details-marker {
+.workspace-run-command-editor > summary::-webkit-details-marker {
   display: none;
 }
 
@@ -4223,7 +4239,6 @@ details:not([open]) > :not(summary) {
   display: grid;
   min-width: 0;
   gap: 4px;
-  padding-right: 70px;
 }
 
 .workspace-run-popover > header strong {
@@ -4265,8 +4280,7 @@ details:not([open]) > :not(summary) {
 }
 
 .workspace-run-popover > header small,
-.workspace-run-empty,
-.workspace-run-config p {
+.workspace-run-empty {
   margin: 0;
   color: var(--text-tertiary);
   font-size: 0.64rem;
@@ -4278,37 +4292,41 @@ details:not([open]) > :not(summary) {
   gap: 7px;
 }
 
-.workspace-run-command-list form {
-  margin: 0;
-}
-
-.workspace-run-command-list button {
-  display: grid;
-  width: 100%;
-  min-height: 42px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 10px;
+.workspace-run-command-card {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
   border: 1px solid var(--border-subtle);
   border-radius: 7px;
   background: var(--surface);
-  color: var(--text-secondary);
-  text-align: left;
 }
 
-.workspace-run-command-list button:hover {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+.workspace-run-command-editor > summary {
+  display: grid;
+  width: 100%;
+  min-height: 44px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 54px 6px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.workspace-run-command-editor > summary:hover,
+.workspace-run-command-editor > summary:focus-visible {
   background: var(--surface-hover);
 }
 
-.workspace-run-command-list button[aria-busy="true"] {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  opacity: 0.78;
-  cursor: wait;
+.workspace-run-command-editor[open] > summary {
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-hover);
 }
 
-.workspace-run-command-list code {
+.workspace-run-command-editor > summary code {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
@@ -4317,48 +4335,30 @@ details:not([open]) > :not(summary) {
   white-space: nowrap;
 }
 
-.workspace-run-command-list button span {
-  color: var(--accent-hover);
-  font-size: 0.64rem;
-  font-weight: 700;
+.workspace-run-command-card.is-empty .workspace-run-command-editor > summary {
+  padding-right: 10px;
 }
 
-.workspace-run-empty {
-  padding: 9px 0;
+.workspace-run-command-card.is-empty .workspace-run-command-editor > summary code {
+  color: var(--text-tertiary);
 }
 
-.workspace-run-config {
-  min-height: 0;
-}
-
-.workspace-run-config > summary {
-  position: absolute;
-  top: 8px;
-  right: 64px;
+.workspace-run-command-edit-action {
   display: inline-flex;
-  min-height: 40px;
+  min-height: 32px;
   align-items: center;
-  gap: 6px;
-  padding: 0 10px;
+  gap: 5px;
+  padding: 0 8px;
   border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
+  border-radius: 6px;
   color: var(--text-secondary);
-  font-size: 0.68rem;
+  font-size: 0.64rem;
   font-weight: 680;
-  cursor: pointer;
-  list-style: none;
 }
 
-@media (max-width: 1023px) {
-  .workspace-run-config > summary {
-    min-height: 44px;
-  }
-}
-
-.workspace-run-config > summary svg {
-  width: 14px;
-  height: 14px;
+.workspace-run-command-edit-action svg {
+  width: 13px;
+  height: 13px;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
@@ -4366,41 +4366,79 @@ details:not([open]) > :not(summary) {
   stroke-width: 1.8;
 }
 
-.workspace-run-config > summary:hover,
-.workspace-run-config > summary:focus-visible,
-.workspace-run-config[open] > summary {
+.workspace-run-command-editor > summary:hover .workspace-run-command-edit-action,
+.workspace-run-command-editor > summary:focus-visible .workspace-run-command-edit-action,
+.workspace-run-command-editor[open] > summary .workspace-run-command-edit-action {
   border-color: color-mix(in srgb, var(--accent) 30%, transparent);
   background: var(--accent-muted);
   color: var(--accent-hover);
 }
 
-.workspace-run-config form {
+.workspace-run-command-fields {
   display: grid;
-  gap: 9px;
-  margin-top: 0;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-subtle);
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  margin: 0;
+  padding: 10px;
 }
 
-.workspace-run-config label {
+.workspace-run-command-fields label {
   display: grid;
+  min-width: 0;
   gap: 4px;
 }
 
-.workspace-run-config label span {
+.workspace-run-command-fields label span {
   color: var(--text-tertiary);
   font-size: 0.6rem;
 }
 
-.workspace-run-config input {
+.workspace-run-command-fields input {
   width: 100%;
   min-width: 0;
   font-family: var(--font-mono);
   font-size: 0.67rem;
 }
 
-.workspace-run-config .primary-button {
-  justify-self: end;
+.workspace-run-command-fields .primary-button {
+  min-height: 40px;
+}
+
+.workspace-run-command-launch {
+  position: absolute;
+  top: 0;
+  right: 0;
+  margin: 0;
+}
+
+.workspace-run-command-launch button {
+  display: grid;
+  min-width: 52px;
+  min-height: 44px;
+  padding: 0 10px;
+  place-items: center;
+  border: 0;
+  border-left: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
+  color: var(--accent-hover);
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
+.workspace-run-command-launch button:hover,
+.workspace-run-command-launch button:focus-visible {
+  background: var(--accent-muted);
+}
+
+.workspace-run-command-launch button[aria-busy="true"] {
+  opacity: 0.78;
+  cursor: wait;
+}
+
+.workspace-run-empty {
+  padding: 9px 0;
 }
 
 .workspace-usage-menu {
