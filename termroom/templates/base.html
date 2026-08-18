@@ -21,6 +21,18 @@
       <small>{{ t('workspace.name.fallback') }}</small>
       <button class="secondary-button" type="submit">{{ t('common.save') }}</button>
     </form>
+    <form class="user-menu-logout user-menu-workspace-remove"
+          method="post"
+          action="/w/{{ workspace.id }}/remove"
+          data-confirm="{{ t('workspace.remove.confirm', name=workspace.display_name) }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="user-menu-action" type="submit">
+        <span class="user-menu-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M9 8 6 5a3 3 0 0 0-4 4l3 3M15 16l3 3a3 3 0 0 0 4-4l-3-3M8 16l8-8"/></svg>
+        </span>
+        <span>{{ t('workspace.remove.action') }}</span>
+      </button>
+    </form>
     {% endif %}
     <button class="user-menu-action"
             type="button"
@@ -109,7 +121,7 @@
   <link rel="icon" type="image/svg+xml" href="/static/termroom-icon.svg">
   <link rel="apple-touch-icon" sizes="180x180" href="/icons/termroom-180.png?v={{ pwa_icon_version }}">
   <link rel="manifest" href="/static/manifest.webmanifest?v=4">
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=49">
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=51">
   <script>
     window.TermroomLocale = {{ locale | tojson }};
     window.TermroomI18n = {{ i18n_messages | tojson }};
@@ -149,6 +161,9 @@
     </div>
   </header>
   <main class="page-shell">
+    {% if request.query_params.get('workspace_removed') %}
+    <p class="notice success">{{ t('workspace.remove.success') }}</p>
+    {% endif %}
     {% block content %}{% endblock %}
   </main>
   {% endblock %}

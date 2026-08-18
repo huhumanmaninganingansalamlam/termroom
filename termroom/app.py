@@ -1763,6 +1763,7 @@ def create_app(settings: Settings) -> FastAPI:
         project_created: str | None = None,
         project_workspace: str | None = None,
         project_name: str | None = None,
+        location_removed: bool = False,
     ) -> HTMLResponse:
         require_local_workspaces()
         locale = locale_from_request(request)
@@ -1775,15 +1776,23 @@ def create_app(settings: Settings) -> FastAPI:
             selected_root = store.ensure_root(settings.root)
             local_roots = store.list_local_roots()
         selected_root_id = str(selected_root["id"])
-        root_manager = RootManager(Path(str(selected_root["path"])))
-        directory, all_entries = root_manager.list_directories(path)
+        selected_root_path = Path(str(selected_root["path"]))
+        root_unavailable = False
+        try:
+            root_manager = RootManager(selected_root_path)
+            directory, all_entries = root_manager.list_directories(path)
+            relative = root_manager.relative(directory)
+        except OSError:
+            root_unavailable = True
+            directory = selected_root_path
+            all_entries = []
+            relative = "."
         hidden_count = sum(entry.name.startswith(".") for entry in all_entries)
         entries = (
             all_entries
             if hidden
             else [entry for entry in all_entries if not entry.name.startswith(".")]
         )
-        relative = root_manager.relative(directory)
         location_close_url = _url_with_query(
             "/open/local",
             root=selected_root_id,
@@ -1793,20 +1802,36 @@ def create_app(settings: Settings) -> FastAPI:
         local_workspaces: list[dict[str, Any]] = []
         for item in store.list_workspaces_for_root(selected_root_id):
             try:
-                local_workspaces.append(workspaces.require(str(item["id"])))
+                hydrated = workspaces.require(str(item["id"]))
             except (KeyError, OSError):
-                continue
+                hydrated = {
+                    **item,
+                    "available": False,
+                }
+            else:
+                hydrated["available"] = True
+            local_workspaces.append(hydrated)
         root_workspace_counts, _computer_workspace_counts = (
             store.workspace_location_counts()
         )
         root_rows = []
         for item in local_roots:
             value = str(item["path"])
+            try:
+                available = Path(value).resolve(strict=True).is_dir()
+            except OSError:
+                available = False
+            workspace_count = root_workspace_counts.get(str(item["id"]), 0)
             root_rows.append(
                 {
                     **item,
                     "label": Path(value).name or value,
-                    "workspace_count": root_workspace_counts.get(str(item["id"]), 0),
+                    "workspace_count": workspace_count,
+                    "available": available,
+                    "removable": (
+                        str(item["id"]) != str(workspaces.root_record["id"])
+                        and workspace_count == 0
+                    ),
                 }
             )
         location_picker = None
@@ -1881,6 +1906,8 @@ def create_app(settings: Settings) -> FastAPI:
                 location_picker=location_picker,
                 location_error=location_error,
                 location_close_url=location_close_url,
+                location_removed=location_removed,
+                root_unavailable=root_unavailable,
                 has_remote_computers=bool(store.list_computers()),
             ),
         )
@@ -1910,6 +1937,32 @@ def create_app(settings: Settings) -> FastAPI:
         return RedirectResponse(
             _url_with_query("/open/local", root=root_record["id"]),
             status_code=303,
+        )
+
+    @app.post("/open/local/locations/{root_id}/remove")
+    async def remove_local_location(
+        request: Request, root_id: str
+    ) -> RedirectResponse:
+        require_local_workspaces()
+        locale = locale_from_request(request)
+        await _verified_form(request, settings)
+        if root_id == str(workspaces.root_record["id"]):
+            raise HTTPException(status_code=400, detail="Primary folder location is required")
+        try:
+            store.remove_local_root(root_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Folder location not found") from exc
+        except RuntimeError:
+            return RedirectResponse(
+                _url_with_query(
+                    "/open/local",
+                    root=root_id,
+                    error=translate(locale, "open.location_remove_workspaces_first"),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _url_with_query("/open/local", location_removed=1), status_code=303
         )
 
     @app.post("/open/local/projects")
@@ -2938,6 +2991,57 @@ def create_app(settings: Settings) -> FastAPI:
                 detail=translate(locale, "workspace.name.invalid"),
             ) from exc
         return RedirectResponse(f"/w/{workspace_id}", status_code=303)
+
+    @app.post("/w/{workspace_id}/remove")
+    async def remove_workspace_registration(
+        request: Request, workspace_id: str
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        workspace = store.get_workspace(workspace_id)
+        if (
+            workspace is None
+            or workspace.get("workspace_kind") != "workspace"
+            or store.get_remote_run_for_workspace(workspace_id) is not None
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+        terminal_ids = [
+            str(terminal["id"]) for terminal in store.list_terminals(workspace_id)
+        ]
+        return_root_id = str(form.get("return_root_id") or "")
+        return_to_local = return_root_id == str(workspace["root_id"])
+        try:
+            store.remove_workspace_registration(workspace_id)
+        except RuntimeError:
+            destination = (
+                _url_with_query(
+                    "/open/local",
+                    root=return_root_id,
+                    error=translate(locale, "workspace.remove.remote_runs_first"),
+                )
+                if return_to_local
+                else _url_with_query(
+                    f"/w/{workspace_id}/{workspace.get('last_tab') or 'terminal'}",
+                    error=translate(locale, "workspace.remove.remote_runs_first"),
+                )
+            )
+            return RedirectResponse(destination, status_code=303)
+        for terminal_id in terminal_ids:
+            for socket in active_terminal_websockets.pop(terminal_id, []):
+                with contextlib.suppress(RuntimeError):
+                    await socket.close(code=4404, reason="Workspace registration removed")
+        file_runs.cleanup_workspace_metadata(workspace_id)
+        recent_file_snapshots.pop(workspace_id, None)
+        recent_file_cache.pop(workspace_id, None)
+        destination = (
+            _url_with_query(
+                "/open/local", root=return_root_id, workspace_removed=1
+            )
+            if return_to_local
+            else "/?workspace_removed=1"
+        )
+        return RedirectResponse(destination, status_code=303)
 
     @app.post("/w/{workspace_id}/run-commands")
     async def replace_workspace_run_commands(

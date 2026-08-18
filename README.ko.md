@@ -192,6 +192,12 @@ Computer
 
 `Computer`는 이 PC 또는 SSH나 Termroom Node로 연결한 Remote Linux입니다.
 
+Workspace 설정 메뉴에서 등록을 해제해도 실제 프로젝트 폴더, 파일, tmux 세션과 실행 중인
+프로세스는 삭제되지 않습니다.
+
+활동과 완료된 현재 파일 실행 기록은 30일간 보관합니다. 실행 중인 항목과 현재 실행
+터미널에 연결된 항목은 사용이 끝날 때까지 유지합니다.
+
 **원격 실행은 지속 프로젝트가 아닌 임시 Workspace shell입니다.** Source를 SSH 또는
 compatible Node Remote로 복사한 뒤 기존 Terminal·Files UI를 재사용하지만 관리 폴더는
 휘발성이며 최근 Workspace 목록에는 표시되지 않습니다.

@@ -98,7 +98,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=49'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=51'
     script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=61'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
@@ -163,6 +163,191 @@ async def test_workspace_display_name_updates_header_and_home_without_renaming_f
 
     refreshed = app.state.workspaces.require(workspace_id)
     assert refreshed["path"] == original_path
+    assert project.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_workspace_registration_can_be_removed_without_deleting_project_or_tmux(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project-folder"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project-folder")
+    workspace_id = str(workspace["id"])
+    terminal = app.state.terminals.ensure_workspace(workspace)[0]
+    app.state.store.replace_workspace_commands(workspace_id, ["printf keep-running"])
+    app.state.store.add_command(workspace_id, terminal["id"], "printf keep-running")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            await _login(client)
+            page = await client.get(f"/w/{workspace_id}/terminal")
+            assert page.status_code == 200
+            assert f'action="/w/{workspace_id}/remove"' in page.text
+            assert "작업공간 등록 해제" in page.text
+
+            removed = await client.post(
+                f"/w/{workspace_id}/remove",
+                data={"_csrf": settings.csrf_token},
+                follow_redirects=False,
+            )
+            assert removed.status_code == 303
+            assert removed.headers["location"] == "/?workspace_removed=1"
+
+            home = await client.get(removed.headers["location"])
+            assert "작업공간 등록을 해제했습니다" in home.text
+            assert "project-folder" not in home.text
+
+        assert app.state.store.get_workspace(workspace_id) is None
+        assert app.state.store.get_terminal(str(terminal["id"])) is None
+        assert project.is_dir()
+        assert (
+            subprocess.run(
+                ["tmux", "has-session", "-t", str(workspace["tmux_session"])],
+                check=False,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+        reopened = app.state.workspaces.open("project-folder")
+        assert reopened["id"] != workspace_id
+        assert reopened["path"] == project
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_remote_workspace_registration_removal_keeps_computer(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="Remote QA",
+        ssh_alias="",
+        host="127.0.0.1",
+        port=22,
+        username="qa",
+        identity_file="",
+        auth_kind="existing_key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    workspace = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/project", "remote-project"
+    )
+    terminal = app.state.store.create_terminal(workspace["id"], "shell", "@qa")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        removed = await client.post(
+            f"/w/{workspace['id']}/remove",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=False,
+        )
+
+    assert removed.status_code == 303
+    assert app.state.store.get_workspace(str(workspace["id"])) is None
+    assert app.state.store.get_terminal(str(terminal["id"])) is None
+    assert app.state.store.get_computer(str(computer["id"])) is not None
+
+
+@pytest.mark.asyncio
+async def test_workspace_with_remote_run_source_cannot_be_unregistered(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    computer = app.state.store.create_computer(
+        name="Runner",
+        ssh_alias="",
+        host="runner.example.test",
+        port=22,
+        username="runner",
+        identity_file="",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAA",
+        host_fingerprint="SHA256:test",
+    )
+    run_id = str(uuid.uuid4())
+    app.state.store.create_remote_run(
+        {
+            "id": run_id,
+            "source_kind": "workspace",
+            "source_workspace_id": str(workspace["id"]),
+            "source_path": ".",
+            "source_label": "project",
+            "source_url": None,
+            "source_options_json": "{}",
+            "source_revision": None,
+            "source_size": None,
+            "target_computer_id": str(computer["id"]),
+            "command": "python main.py",
+            "run_base": "/tmp/termroom-runs",
+            "state": "preparing",
+            "phase": "copying",
+            "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        blocked = await client.post(
+            f"/w/{workspace['id']}/remove",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=False,
+        )
+        assert blocked.status_code == 303
+        assert "error=" in blocked.headers["location"]
+        assert app.state.store.get_workspace(str(workspace["id"])) is not None
+
+        app.state.store.delete_remote_run(run_id)
+        removed = await client.post(
+            f"/w/{workspace['id']}/remove",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=False,
+        )
+
+    assert removed.status_code == 303
+    assert app.state.store.get_workspace(str(workspace["id"])) is None
     assert project.is_dir()
 
 
@@ -880,7 +1065,41 @@ async def test_workspace_picker_hides_dot_directories_by_default(tmp_path: Path)
 
         assert "project" in default_view.text
         assert ".venv" not in default_view.text
-        assert ".venv" in hidden_view.text
+    assert ".venv" in hidden_view.text
+
+
+@pytest.mark.asyncio
+async def test_local_workspace_picker_makes_empty_root_selection_action_obvious(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    root_id = str(app.state.store.ensure_root(selected)["id"])
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        response = await client.get(f"/open/local?root={root_id}")
+
+    assert response.status_code == 200
+    assert f'href="/open/local?root={root_id}#folder-browser"' in response.text
+    assert 'id="folder-browser"' in response.text
+    assert '<span class="breadcrumb-current" aria-current="location">selected</span>' in (
+        response.text
+    )
+    assert response.text.index('class="folder-browser-selection"') < response.text.index(
+        'class="folder-browser-list"'
+    )
 
 
 @pytest.mark.asyncio
@@ -1282,6 +1501,65 @@ async def test_local_workspace_picker_can_add_another_folder_location(tmp_path: 
         workspace_id = opened.headers["location"].split("/")[2]
         workspace = app.state.workspaces.require(workspace_id)
         assert workspace["path"] == project
+
+
+@pytest.mark.asyncio
+async def test_unavailable_local_workspace_and_empty_location_can_be_unregistered(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    other = tmp_path / "detached"
+    project = other / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+        default_locale="ko",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open_local(other, "project")
+    root_id = str(workspace["root_id"])
+    workspace_id = str(workspace["id"])
+    project.rmdir()
+    other.rmdir()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        unavailable = await client.get(f"/open/local?root={root_id}")
+        assert unavailable.status_code == 200
+        assert "사용할 수 없음" in unavailable.text
+        assert "project · 사용할 수 없음" in unavailable.text
+        assert f'action="/w/{workspace_id}/remove"' in unavailable.text
+
+        removed_workspace = await client.post(
+            f"/w/{workspace_id}/remove",
+            data={
+                "_csrf": settings.csrf_token,
+                "return_root_id": root_id,
+            },
+            follow_redirects=False,
+        )
+        assert removed_workspace.status_code == 303
+        assert f"root={root_id}" in removed_workspace.headers["location"]
+        assert "workspace_removed=1" in removed_workspace.headers["location"]
+
+        empty_location = await client.get(f"/open/local?root={root_id}")
+        assert f'action="/open/local/locations/{root_id}/remove"' in empty_location.text
+        removed_location = await client.post(
+            f"/open/local/locations/{root_id}/remove",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=False,
+        )
+        assert removed_location.status_code == 303
+        assert removed_location.headers["location"] == "/open/local?location_removed=1"
+
+    assert app.state.store.get_workspace(workspace_id) is None
+    assert app.state.store.get_root(root_id) is None
 
 
 @pytest.mark.asyncio

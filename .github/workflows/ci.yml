@@ -47,7 +47,12 @@ jobs:
         run: uv run --frozen ruff check termroom tests
 
       - name: Run tests
-        run: env -u TMUX -u TMUX_PANE uv run --frozen pytest
+        run: env -u TMUX -u TMUX_PANE uv run --frozen pytest --ignore=tests/test_websocket.py
+
+      - name: Run WebSocket integration tests
+        # These tests own real tmux PTYs and Starlette TestClient event-loop threads.
+        # A separate process gives their teardown a clean lifecycle without retries.
+        run: env -u TMUX -u TMUX_PANE uv run --frozen pytest tests/test_websocket.py
 
       - name: Check all browser JavaScript syntax
         shell: bash

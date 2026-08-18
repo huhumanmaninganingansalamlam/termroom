@@ -203,6 +203,12 @@ Computer
 A `Computer` is either this Linux machine or a Remote Linux computer connected through SSH
 or Termroom Node.
 
+The Workspace settings menu can unregister a Workspace from Termroom without deleting its
+project folder, files, tmux session, or running processes.
+
+Activity and completed current-file Run history are retained for 30 days. Active Runs and
+the Run attached to the current Run Terminal are retained until they are no longer in use.
+
 **Remote Run is a temporary Workspace shell, not a persistent project.** Its Source is copied
 to an SSH or compatible Node Remote, its Terminal and Files reuse the normal Workspace UI,
 and its managed folder is disposable. It does not appear in Recent Workspaces.

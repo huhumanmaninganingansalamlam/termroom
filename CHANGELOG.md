@@ -2,6 +2,22 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.9] - 2026-08-19
+
+### Added
+
+- Unregister Workspaces and unused local folder locations without deleting their folders or tmux sessions.
+
+### Changed
+
+- Keep Activity, File Run, and notification history bounded with periodic retention cleanup.
+- Make local folder selection and mobile terminal helper keys fit their available screen space more naturally.
+
+### Fixed
+
+- Keep unavailable registered folders visible and recoverable instead of failing the Workspace browser.
+- Prevent Workspace removal while Remote Runs still depend on it, and clean up detached runtime metadata safely.
+
 ## [0.3.4] - 2026-08-18
 
 ### Fixed
