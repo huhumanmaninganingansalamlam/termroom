@@ -72,7 +72,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_WRAPPER,
     TerminalOutputDecoder,
     file_run_completion_was_stopped,
-    file_run_exit_127_fallback,
+    file_run_dead_pane_fallback,
     normalize_terminal_editor_path,
     normalize_terminal_name,
     normalize_workspace_command,
@@ -3552,7 +3552,7 @@ class SSHBackend:
                     "state": "running" if state else "preparing",
                     "started_at": state.get("started_at") if state else None,
                 }
-            fallback = file_run_exit_127_fallback(state, pane)
+            fallback = file_run_dead_pane_fallback(state, pane)
             if fallback is not None:
                 return fallback
             return {
