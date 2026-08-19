@@ -46,7 +46,7 @@ def test_workspace_run_menu_dismissal_preserves_terminal_focus_contract() -> Non
 def test_workspace_run_menu_asset_versions_are_bumped() -> None:
     base = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
 
-    assert "app.css') }}?v=51" in base
+    assert "app.css') }}?v=52" in base
     assert "app.js') }}?v=61" in base
 
 

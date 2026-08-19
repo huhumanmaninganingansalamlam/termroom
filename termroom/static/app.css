@@ -4596,6 +4596,19 @@ details:not([open]) > :not(summary) {
   line-height: 1.45;
 }
 
+@media (max-width: 1023px) {
+  .workspace-mobile-actions .workspace-usage-popover {
+    position: fixed;
+    top: calc(var(--topbar-height) + env(safe-area-inset-top) + 8px);
+    right: auto;
+    left: 50%;
+    max-height: calc(100dvh - var(--topbar-height) - env(safe-area-inset-top) - 20px);
+    overflow-y: auto;
+    transform: translateX(-50%);
+    overscroll-behavior: contain;
+  }
+}
+
 @media (min-width: 1024px) {
   .workspace-run-menu-navigation {
     margin-top: 10px;
