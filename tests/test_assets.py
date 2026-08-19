@@ -214,7 +214,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"51"}
+    assert versions["app.css"] == {"52"}
     assert versions["app.js"] == {"61"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
@@ -249,6 +249,22 @@ def test_mobile_terminal_more_keys_panel_is_anchored_to_the_viewport() -> None:
   }
 }
 """ in stylesheet
+
+
+def test_mobile_workspace_usage_popover_is_anchored_to_the_viewport() -> None:
+    stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
+    assert """@media (max-width: 1023px) {
+  .workspace-mobile-actions .workspace-usage-popover {
+    position: fixed;
+    top: calc(var(--topbar-height) + env(safe-area-inset-top) + 8px);
+    right: auto;
+    left: 50%;
+    max-height: calc(100dvh - var(--topbar-height) - env(safe-area-inset-top) - 20px);
+    overflow-y: auto;
+    transform: translateX(-50%);
+    overscroll-behavior: contain;
+  }
+}""" in stylesheet
 
 
 def test_global_header_layers_settings_menu_above_transformed_page_actions() -> None:

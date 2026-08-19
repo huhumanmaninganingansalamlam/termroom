@@ -438,30 +438,32 @@ def file_run_completion_was_stopped(record: dict[str, Any]) -> bool:
     }
 
 
-def file_run_exit_127_fallback(
+def file_run_dead_pane_fallback(
     state: dict[str, Any] | None,
     pane: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Recover a confirmed program exit after runtime preparation succeeded.
 
-    Exit 127 is ambiguous before the managed wrapper starts the program, so a
-    missing runtime is recorded as ``prepare.json`` and handled first. Once a
-    valid running record exists, tmux's dead-pane status can safely distinguish
-    a program that deliberately returned 127 even if its completion record was
-    not observable before the completion grace period expired.
+    A valid running record proves the wrapper reached the program. If its atomic
+    completion record is still unavailable after the dead-pane grace period,
+    tmux's exit status remains authoritative for every program exit code. Stop
+    requests are handled before this fallback by the force-stopped marker.
     """
+    exit_code = pane.get("exit_code") if pane is not None else None
     if (
         state is None
         or state.get("state") != "running"
         or pane is None
-        or pane.get("exit_code") != 127
+        or pane.get("dead") is not True
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
     ):
         return None
     return {
         "state": "finished",
         "started_at": state.get("started_at"),
         "ended_at": None,
-        "exit_code": 127,
+        "exit_code": exit_code,
     }
 
 
@@ -950,7 +952,7 @@ class TerminalManager:
                 "state": "running" if state else "preparing",
                 "started_at": state.get("started_at") if state else None,
             }
-        fallback = file_run_exit_127_fallback(state, pane)
+        fallback = file_run_dead_pane_fallback(state, pane)
         if fallback is not None:
             return fallback
         return {

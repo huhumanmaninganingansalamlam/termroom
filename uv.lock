@@ -763,7 +763,7 @@ wheels = [
 
 [[package]]
 name = "termroom"
-version = "0.3.9"
+version = "0.3.10"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

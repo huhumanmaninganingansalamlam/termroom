@@ -28,7 +28,7 @@ from termroom.ssh_backend import SSHBackend, SSHBackendError
 from termroom.terminals import (
     TerminalError,
     TerminalManager,
-    file_run_exit_127_fallback,
+    file_run_dead_pane_fallback,
 )
 from termroom.workspaces import RootManager, WorkspaceManager
 
@@ -485,20 +485,25 @@ def test_completion_requires_an_observed_stop_signal_to_be_stopped(
     assert interrupted["state"] == "stopped"
 
 
-def test_exit_127_fallback_requires_successful_runtime_preparation() -> None:
+@pytest.mark.parametrize("exit_code", [0, 1, 126, 127, 130])
+def test_dead_pane_fallback_requires_successful_runtime_preparation(
+    exit_code: int,
+) -> None:
     state = {
         "state": "running",
         "started_at": "2026-08-18T00:00:00Z",
     }
 
-    assert file_run_exit_127_fallback(state, {"exit_code": 127}) == {
+    pane = {"dead": True, "exit_code": exit_code}
+    assert file_run_dead_pane_fallback(state, pane) == {
         "state": "finished",
         "started_at": "2026-08-18T00:00:00Z",
         "ended_at": None,
-        "exit_code": 127,
+        "exit_code": exit_code,
     }
-    assert file_run_exit_127_fallback(None, {"exit_code": 127}) is None
-    assert file_run_exit_127_fallback(state, {"exit_code": 126}) is None
+    assert file_run_dead_pane_fallback(None, pane) is None
+    assert file_run_dead_pane_fallback(state, {"dead": False, "exit_code": exit_code}) is None
+    assert file_run_dead_pane_fallback(state, {"dead": True, "exit_code": None}) is None
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -573,7 +578,7 @@ def test_local_file_run_registry_executes_each_builtin_runner_and_reuses_slot(
                 idempotency_key=str(uuid.uuid4()),
             )
             finished = _wait_terminal_run(manager, str(run["id"]))
-            assert finished["state"] == "finished"
+            assert finished["state"] == "finished", finished
             assert finished["exit_code"] == 0
             assert finished["runner_id"] == expected_runner
             terminal = manager.store.get_managed_terminal(

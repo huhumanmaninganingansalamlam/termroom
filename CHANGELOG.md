@@ -2,6 +2,13 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.10] - 2026-08-19
+
+### Fixed
+
+- Keep the mobile Workspace CPU usage popover centered within the viewport at every supported screen width.
+- Preserve confirmed fast File Run exits when the atomic completion record is not yet observable.
+
 ## [0.3.9] - 2026-08-19
 
 ### Added
