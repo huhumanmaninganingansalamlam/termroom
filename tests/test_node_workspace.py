@@ -546,6 +546,8 @@ def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Pa
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> None:
+    old_marker = "NODE_HISTORY_OLD"
+    live_marker = "NODE_HISTORY_LIVE"
     workspace = tmp_path / "project"
     workspace.mkdir()
     runtime = NodeRuntime([tmp_path])
@@ -562,7 +564,7 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
             (
                 "printf 'NODE_HISTORY_OLD\\n'; "
                 "seq -f 'NODE_HISTORY_%02g' 1 24; "
-                "printf 'NODE_HISTORY_LIVE\\n'"
+                "printf 'NODE_HISTORY_%s\\n' LIVE"
             ),
             "Enter",
         )
@@ -573,7 +575,7 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
                 "terminal.scrollback",
                 {**payload, "tmux_window": window, "lines": 200},
             )["output"]
-            if "NODE_HISTORY_LIVE" in full:
+            if live_marker in full.splitlines():
                 break
             time.sleep(0.05)
 
@@ -586,9 +588,9 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
                 "history_only": True,
             },
         )["output"]
-        assert "NODE_HISTORY_OLD" in history
-        assert "NODE_HISTORY_LIVE" in full
-        assert "NODE_HISTORY_LIVE" not in history
+        assert old_marker in history.splitlines()
+        assert live_marker in full.splitlines()
+        assert live_marker not in history.splitlines()
         with pytest.raises(NodeAgentError) as invalid:
             runtime._handle_sync(
                 "terminal.scrollback",

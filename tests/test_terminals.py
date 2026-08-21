@@ -372,6 +372,8 @@ def test_tmux_session_survives_detached_commands(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path) -> None:
+    old_marker = "HISTORY_ONLY_OLD"
+    live_marker = "HISTORY_ONLY_LIVE"
     project = tmp_path / "project"
     project.mkdir()
     store = StateStore(tmp_path / "state.sqlite3")
@@ -403,7 +405,7 @@ def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path)
                 (
                     "printf 'HISTORY_ONLY_OLD\\n'; "
                     "seq -f 'HISTORY_ONLY_%02g' 1 24; "
-                    "printf 'HISTORY_ONLY_LIVE\\n'"
+                    "printf 'HISTORY_ONLY_%s\\n' LIVE"
                 ),
                 "Enter",
             ],
@@ -413,7 +415,7 @@ def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path)
         full = ""
         while time.monotonic() < deadline:
             full = manager.capture_scrollback(workspace, terminal)
-            if "HISTORY_ONLY_LIVE" in full:
+            if live_marker in full.splitlines():
                 break
             time.sleep(0.05)
 
@@ -422,9 +424,9 @@ def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path)
             terminal,
             history_only=True,
         )
-        assert "HISTORY_ONLY_OLD" in history
-        assert "HISTORY_ONLY_LIVE" in full
-        assert "HISTORY_ONLY_LIVE" not in history
+        assert old_marker in history.splitlines()
+        assert live_marker in full.splitlines()
+        assert live_marker not in history.splitlines()
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", workspace["tmux_session"]],

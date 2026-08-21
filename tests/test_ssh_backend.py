@@ -952,6 +952,8 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             assert "unreadable/private.txt" not in recent_paths
 
             browser_terminal = backend.create_terminal(workspace, "browser-view")
+            old_history_marker = "SSH_HISTORY_OLD"
+            live_history_marker = "SSH_HISTORY_LIVE"
             backend._exec(
                 computer,
                 "tmux send-keys -t "
@@ -959,7 +961,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 + shlex.quote(
                     "printf 'SSH_HISTORY_OLD\\n'; "
                     "seq -f 'SSH_HISTORY_%02g' 1 80; "
-                    "printf 'SSH_HISTORY_LIVE\\n'"
+                    "printf 'SSH_HISTORY_%s\\n' LIVE"
                 )
                 + " Enter",
             )
@@ -967,7 +969,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             full_scrollback = ""
             while time.monotonic() < deadline:
                 full_scrollback = backend.capture_scrollback(workspace, browser_terminal)
-                if "SSH_HISTORY_LIVE" in full_scrollback:
+                if live_history_marker in full_scrollback.splitlines():
                     break
                 time.sleep(0.05)
             history_scrollback = backend.capture_scrollback(
@@ -975,9 +977,9 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 browser_terminal,
                 history_only=True,
             )
-            assert "SSH_HISTORY_OLD" in history_scrollback
-            assert "SSH_HISTORY_LIVE" in full_scrollback
-            assert "SSH_HISTORY_LIVE" not in history_scrollback
+            assert old_history_marker in history_scrollback.splitlines()
+            assert live_history_marker in full_scrollback.splitlines()
+            assert live_history_marker not in history_scrollback.splitlines()
 
             view_session = tmux_browser_view_session(uuid.uuid4().hex)
             process_pid, master_fd = backend._spawn_ssh_tmux_client(
