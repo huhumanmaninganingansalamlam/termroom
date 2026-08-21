@@ -1247,7 +1247,17 @@ class NodeRuntime:
         session = self._session(payload)
         window = self._window(payload, session)
         lines = max(100, min(int(payload.get("lines") or 2000), 10_000))
-        return self._tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", window).stdout
+        history_only = payload.get("history_only", False)
+        if type(history_only) is not bool:
+            raise NodeAgentError(
+                "Terminal scrollback history mode is invalid",
+                code="request_invalid",
+            )
+        args = ["capture-pane", "-p", "-J", "-S", f"-{lines}"]
+        if history_only:
+            args.extend(("-E", "-1"))
+        args.extend(("-t", window))
+        return self._tmux(*args).stdout
 
     def _terminal_activity(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Read activity for an explicit, bounded set of tmux sessions."""

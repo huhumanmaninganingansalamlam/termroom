@@ -122,6 +122,7 @@
   <link rel="apple-touch-icon" sizes="180x180" href="/icons/termroom-180.png?v={{ pwa_icon_version }}">
   <link rel="manifest" href="/static/manifest.webmanifest?v=4">
   <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=52">
+  <link rel="stylesheet" href="{{ url_for('static', path='mobile_scrollback.css') }}?v=11">
   <script>
     window.TermroomLocale = {{ locale | tojson }};
     window.TermroomI18n = {{ i18n_messages | tojson }};
@@ -168,6 +169,7 @@
   </main>
   {% endblock %}
   <script src="{{ url_for('static', path='app.js') }}?v=61" defer></script>
+  <script src="{{ url_for('static', path='mobile_scrollback.js') }}?v=23" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

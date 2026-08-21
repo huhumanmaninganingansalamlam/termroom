@@ -371,6 +371,69 @@ def test_tmux_session_survives_detached_commands(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+
+    try:
+        terminal = manager.ensure_workspace(workspace)[0]
+        subprocess.run(
+            [
+                "tmux",
+                "resize-window",
+                "-t",
+                terminal["tmux_window"],
+                "-x",
+                "80",
+                "-y",
+                "6",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                terminal["tmux_window"],
+                (
+                    "printf 'HISTORY_ONLY_OLD\\n'; "
+                    "seq -f 'HISTORY_ONLY_%02g' 1 24; "
+                    "printf 'HISTORY_ONLY_LIVE\\n'"
+                ),
+                "Enter",
+            ],
+            check=True,
+        )
+        deadline = time.monotonic() + 2
+        full = ""
+        while time.monotonic() < deadline:
+            full = manager.capture_scrollback(workspace, terminal)
+            if "HISTORY_ONLY_LIVE" in full:
+                break
+            time.sleep(0.05)
+
+        history = manager.capture_scrollback(
+            workspace,
+            terminal,
+            history_only=True,
+        )
+        assert "HISTORY_ONLY_OLD" in history
+        assert "HISTORY_ONLY_LIVE" in full
+        assert "HISTORY_ONLY_LIVE" not in history
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", workspace["tmux_session"]],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_local_workspace_usage_tracks_tmux_descendants(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

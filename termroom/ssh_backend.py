@@ -3896,12 +3896,19 @@ class SSHBackend:
         return self.ensure_workspace(workspace)
 
     def capture_scrollback(
-        self, workspace: dict[str, Any], terminal: dict[str, Any], lines: int = 2000
+        self,
+        workspace: dict[str, Any],
+        terminal: dict[str, Any],
+        lines: int = 2000,
+        *,
+        history_only: bool = False,
     ) -> str:
         self.ensure_workspace(workspace)
+        history_end = "-E -1 " if history_only else ""
         command = (
             "tmux capture-pane -p -J "
-            f"-S -{max(100, min(lines, 10000))} -t {shlex.quote(str(terminal['tmux_window']))}"
+            f"-S -{max(100, min(lines, 10000))} {history_end}"
+            f"-t {shlex.quote(str(terminal['tmux_window']))}"
         )
         return self._exec(self._computer(workspace), command)
 

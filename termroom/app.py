@@ -3284,14 +3284,44 @@ def create_app(settings: Settings) -> FastAPI:
         "/w/{workspace_id}/terminal/{terminal_id}/scrollback", response_class=HTMLResponse
     )
     async def terminal_scrollback(
-        request: Request, workspace_id: str, terminal_id: str, recent: int = 2000
-    ) -> HTMLResponse:
+        request: Request,
+        workspace_id: str,
+        terminal_id: str,
+        recent: int = 2000,
+        history_only: bool = False,
+    ) -> Response:
         workspace = _require_workspace(workspaces, workspace_id)
         terminal = _require_terminal(store, workspace_id, terminal_id)
         if is_remote(workspace):
-            output = await remote.capture_scrollback(workspace, terminal, recent)
+            output = await remote.capture_scrollback(
+                workspace,
+                terminal,
+                recent,
+                history_only=history_only,
+            )
         else:
-            output = terminals.capture_scrollback(workspace, terminal, recent)
+            output = terminals.capture_scrollback(
+                workspace,
+                terminal,
+                recent,
+                history_only=history_only,
+            )
+        if "text/plain" in request.headers.get("accept", ""):
+            response_headers: dict[str, str] = {}
+            if history_only:
+                etag = f'"{hashlib.sha256(output.encode()).hexdigest()}"'
+                response_headers = {
+                    "Cache-Control": "private, no-cache",
+                    "ETag": etag,
+                    "Vary": "Accept",
+                }
+                if_none_match = request.headers.get("if-none-match", "")
+                if any(
+                    candidate.strip().removeprefix("W/") in {"*", etag}
+                    for candidate in if_none_match.split(",")
+                ):
+                    return Response(status_code=304, headers=response_headers)
+            return PlainTextResponse(output, headers=response_headers)
         return templates.TemplateResponse(
             request=request,
             name="scrollback.html",

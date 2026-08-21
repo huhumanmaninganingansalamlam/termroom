@@ -1,0 +1,103 @@
+.terminal-scroll-surface {
+  position: relative;
+  min-width: 0;
+  min-height: 72px;
+  flex: 1 1 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-color: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+  background: var(--terminal-bg);
+  color: var(--terminal-text);
+  -webkit-overflow-scrolling: touch;
+}
+
+.terminal-scroll-surface::-webkit-scrollbar {
+  width: revert;
+  height: revert;
+}
+
+.terminal-scroll-surface::-webkit-scrollbar-thumb {
+  border: revert;
+  border-radius: revert;
+  background: revert;
+  background-clip: revert;
+}
+
+.terminal-scroll-history {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding-top: 0;
+  padding-bottom: 2px;
+  border: 0;
+  background: var(--terminal-bg);
+  color: var(--terminal-text);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  font-synthesis: weight style;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-scroll-history[hidden] {
+  display: none;
+}
+
+.terminal-scroll-surface > .terminal-host {
+  width: 100%;
+  min-height: 72px;
+  flex: none;
+  overflow: hidden;
+  background: var(--terminal-bg);
+}
+
+.terminal-scroll-live {
+  position: sticky;
+  z-index: 14;
+  right: 12px;
+  bottom: 10px;
+  float: right;
+  min-height: 34px;
+  margin-top: -44px;
+  margin-right: 12px;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--terminal-text) 22%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--terminal-bg) 88%, white 12%);
+  box-shadow: 0 4px 18px color-mix(in srgb, black 28%, transparent);
+  color: var(--terminal-text);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.terminal-scroll-live[hidden] {
+  display: none;
+}
+
+.terminal-scroll-surface[data-history-loading="true"] .terminal-scroll-history {
+  opacity: 0.7;
+}
+
+@media (max-width: 1023px), (pointer: coarse) {
+  .terminal-scroll-surface {
+    scrollbar-gutter: auto;
+  }
+
+  .terminal-scroll-live {
+    right: max(10px, env(safe-area-inset-right, 0px));
+    bottom: 10px;
+    min-height: 44px;
+    margin-right: max(10px, env(safe-area-inset-right, 0px));
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+}

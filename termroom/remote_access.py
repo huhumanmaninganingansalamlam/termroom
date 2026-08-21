@@ -426,13 +426,25 @@ class RemoteAccess:
         workspace: dict[str, Any],
         terminal: dict[str, Any],
         lines: int,
+        *,
+        history_only: bool = False,
     ) -> str:
         if not self.is_node(workspace):
-            return await asyncio.to_thread(self.ssh.capture_scrollback, workspace, terminal, lines)
+            return await asyncio.to_thread(
+                self.ssh.capture_scrollback,
+                workspace,
+                terminal,
+                lines,
+                history_only=history_only,
+            )
         result = await self._workspace_request(
             workspace,
             "terminal.scrollback",
-            {"tmux_window": terminal["tmux_window"], "lines": lines},
+            {
+                "tmux_window": terminal["tmux_window"],
+                "lines": lines,
+                "history_only": history_only,
+            },
         )
         output = result.get("output")
         if not isinstance(output, str):

@@ -544,6 +544,107 @@ def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Pa
         subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
 
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    runtime = NodeRuntime([tmp_path])
+    payload = _payload(workspace)
+    session = str(payload["tmux_session"])
+    try:
+        terminal = runtime._handle_sync("workspace.ensure", payload)["terminals"][0]
+        window = str(terminal["tmux_window"])
+        runtime._tmux("resize-window", "-t", window, "-x", "80", "-y", "6")
+        runtime._tmux(
+            "send-keys",
+            "-t",
+            window,
+            (
+                "printf 'NODE_HISTORY_OLD\\n'; "
+                "seq -f 'NODE_HISTORY_%02g' 1 24; "
+                "printf 'NODE_HISTORY_LIVE\\n'"
+            ),
+            "Enter",
+        )
+        deadline = time.monotonic() + 2
+        full = ""
+        while time.monotonic() < deadline:
+            full = runtime._handle_sync(
+                "terminal.scrollback",
+                {**payload, "tmux_window": window, "lines": 200},
+            )["output"]
+            if "NODE_HISTORY_LIVE" in full:
+                break
+            time.sleep(0.05)
+
+        history = runtime._handle_sync(
+            "terminal.scrollback",
+            {
+                **payload,
+                "tmux_window": window,
+                "lines": 200,
+                "history_only": True,
+            },
+        )["output"]
+        assert "NODE_HISTORY_OLD" in history
+        assert "NODE_HISTORY_LIVE" in full
+        assert "NODE_HISTORY_LIVE" not in history
+        with pytest.raises(NodeAgentError) as invalid:
+            runtime._handle_sync(
+                "terminal.scrollback",
+                {
+                    **payload,
+                    "tmux_window": window,
+                    "history_only": "true",
+                },
+            )
+        assert invalid.value.code == "request_invalid"
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_remote_access_forwards_history_only_to_node() -> None:
+    access = RemoteAccess(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        TerminalControl(),
+    )
+    workspace = {
+        "id": "workspace",
+        "computer": {"id": "node", "connection_method": "node"},
+    }
+    terminal = {"id": "terminal", "tmux_window": "@7"}
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    access.is_node = lambda _workspace: True  # type: ignore[method-assign]
+
+    async def request(  # type: ignore[no-untyped-def]
+        _workspace,
+        operation,
+        payload,
+    ) -> dict[str, str]:
+        calls.append((str(operation), dict(payload)))
+        return {"output": "node-history"}
+
+    access._workspace_request = request  # type: ignore[method-assign]
+    output = await access.capture_scrollback(
+        workspace,
+        terminal,
+        321,
+        history_only=True,
+    )
+
+    assert output == "node-history"
+    assert calls == [
+        (
+            "terminal.scrollback",
+            {"tmux_window": "@7", "lines": 321, "history_only": True},
+        )
+    ]
+
+
 @pytest.mark.skipif(
     shutil.which("tmux") is None
     or not any(shutil.which(editor) for editor in ("nvim", "vim", "vi")),

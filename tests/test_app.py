@@ -561,6 +561,102 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_terminal_scrollback_route_forwards_history_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    terminal = app.state.terminals.ensure_workspace(workspace)[0]
+    calls: list[tuple[int, bool]] = []
+    history_output = {"value": "history-only"}
+
+    def capture_scrollback(  # type: ignore[no-untyped-def]
+        selected_workspace,
+        selected_terminal,
+        lines=2000,
+        *,
+        history_only=False,
+    ) -> str:
+        assert selected_workspace["id"] == workspace["id"]
+        assert selected_terminal["id"] == terminal["id"]
+        calls.append((int(lines), bool(history_only)))
+        return history_output["value"] if history_only else "full-output"
+
+    monkeypatch.setattr(app.state.terminals, "capture_scrollback", capture_scrollback)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            full = await client.get(
+                f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback?recent=321"
+            )
+            history = await client.get(
+                f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback"
+                "?recent=654&history_only=1"
+            )
+            plain_history = await client.get(
+                f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback"
+                "?recent=987&history_only=1",
+                headers={"Accept": "text/plain"},
+            )
+            not_modified = await client.get(
+                f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback"
+                "?recent=987&history_only=1",
+                headers={
+                    "Accept": "text/plain",
+                    "If-None-Match": plain_history.headers["etag"],
+                },
+            )
+            history_output["value"] = "history-new"
+            modified = await client.get(
+                f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback"
+                "?recent=987&history_only=1",
+                headers={
+                    "Accept": "text/plain",
+                    "If-None-Match": plain_history.headers["etag"],
+                },
+            )
+
+        assert full.status_code == 200
+        assert "full-output" in full.text
+        assert history.status_code == 200
+        assert "history-only" in history.text
+        assert plain_history.status_code == 200
+        assert plain_history.headers["content-type"].startswith("text/plain")
+        assert plain_history.headers["cache-control"] == "private, no-cache"
+        assert plain_history.headers["etag"].startswith('"')
+        assert plain_history.text == "history-only"
+        assert not_modified.status_code == 304
+        assert not_modified.text == ""
+        assert not_modified.headers["etag"] == plain_history.headers["etag"]
+        assert modified.status_code == 200
+        assert modified.text == "history-new"
+        assert modified.headers["etag"] != plain_history.headers["etag"]
+        assert calls == [
+            (321, False),
+            (654, True),
+            (987, True),
+            (987, True),
+            (987, True),
+        ]
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_local_project_route_keeps_created_folder_when_tmux_open_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

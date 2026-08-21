@@ -1293,18 +1293,25 @@ class TerminalManager:
         return self.ensure_workspace(workspace)
 
     def capture_scrollback(
-        self, workspace: dict[str, Any], terminal: dict[str, Any], lines: int = 2000
+        self,
+        workspace: dict[str, Any],
+        terminal: dict[str, Any],
+        lines: int = 2000,
+        *,
+        history_only: bool = False,
     ) -> str:
         self.ensure_workspace(workspace)
-        result = self._run_tmux(
+        args = [
             "capture-pane",
             "-p",
             "-J",
             "-S",
             f"-{max(100, min(lines, 10000))}",
-            "-t",
-            terminal["tmux_window"],
-        )
+        ]
+        if history_only:
+            args.extend(("-E", "-1"))
+        args.extend(("-t", terminal["tmux_window"]))
+        result = self._run_tmux(*args)
         return result.stdout
 
     async def bridge(

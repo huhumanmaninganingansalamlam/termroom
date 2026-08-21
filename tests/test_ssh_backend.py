@@ -935,6 +935,33 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             assert "unreadable/private.txt" not in recent_paths
 
             browser_terminal = backend.create_terminal(workspace, "browser-view")
+            backend._exec(
+                computer,
+                "tmux send-keys -t "
+                f"{shlex.quote(str(browser_terminal['tmux_window']))} "
+                + shlex.quote(
+                    "printf 'SSH_HISTORY_OLD\\n'; "
+                    "seq -f 'SSH_HISTORY_%02g' 1 80; "
+                    "printf 'SSH_HISTORY_LIVE\\n'"
+                )
+                + " Enter",
+            )
+            deadline = time.monotonic() + 2
+            full_scrollback = ""
+            while time.monotonic() < deadline:
+                full_scrollback = backend.capture_scrollback(workspace, browser_terminal)
+                if "SSH_HISTORY_LIVE" in full_scrollback:
+                    break
+                time.sleep(0.05)
+            history_scrollback = backend.capture_scrollback(
+                workspace,
+                browser_terminal,
+                history_only=True,
+            )
+            assert "SSH_HISTORY_OLD" in history_scrollback
+            assert "SSH_HISTORY_LIVE" in full_scrollback
+            assert "SSH_HISTORY_LIVE" not in history_scrollback
+
             view_session = tmux_browser_view_session(uuid.uuid4().hex)
             process_pid, master_fd = backend._spawn_ssh_tmux_client(
                 workspace,
