@@ -504,6 +504,14 @@ header and proxy WebSocket upgrades; their standard reverse-proxy configuration 
 both. Native HTTP remains behind the proxy while the browser and HTTPS/WSS Nodes use the proxy
 URL.
 
+Termroom itself emits Content Security Policy, frame, content-type, and referrer headers, and
+compresses eligible dynamic text responses when the client accepts gzip. Let the proxy forward
+`Content-Encoding` and `Vary` unchanged. Do not add a second copy of
+`Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, or `Referrer-Policy` for
+this host; disable those shared proxy directives or deliberately replace the upstream value in
+one place. The application policy deliberately supports both direct local HTTP and HTTPS/WSS
+reverse-proxy operation and does not force an insecure local URL to upgrade itself.
+
 For an SSH/Node-only Core, keep `TERMROOM_MODE=core` and set
 `TERMROOM_ALLOW_LOCAL_WORKSPACES=false`. That Core policy is separate from
 `TERMROOM_MODE=node`, which runs this container as a Node process.

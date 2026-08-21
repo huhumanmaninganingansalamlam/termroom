@@ -1032,8 +1032,28 @@
   const liveSearchInput = liveSearchForm?.querySelector("#file-search-input");
   const liveSearchClear = liveSearchForm?.querySelector("#file-search-clear");
   const liveSearchResults = document.querySelector("#file-results");
+  const fileVisibilityForm = document.querySelector("[data-file-visibility-form]");
+  const fileVisibilityQuery = fileVisibilityForm?.querySelector(
+    "[data-file-visibility-query]",
+  );
+  const fileVisibilityToggle = fileVisibilityForm?.querySelector(
+    "[data-file-visibility-toggle]",
+  );
   let liveSearchTimer = 0;
   let liveSearchRequest = null;
+
+  const syncFileVisibility = () => {
+    if (!liveSearchResults || !fileVisibilityForm || !fileVisibilityToggle) return;
+    const metadata = liveSearchResults.querySelector("[data-file-search-metadata]");
+    if (!metadata) return;
+    const noiseCount = Number.parseInt(metadata.dataset.noiseCount || "0", 10) || 0;
+    const showNoise = fileVisibilityForm.querySelector('input[name="noise"]')?.value === "0";
+    if (fileVisibilityQuery) fileVisibilityQuery.value = metadata.dataset.query || "";
+    fileVisibilityForm.hidden = !showNoise && noiseCount === 0;
+    fileVisibilityToggle.textContent = showNoise
+      ? tr("files.hide_noise")
+      : tr("files.show_noise", { count: noiseCount });
+  };
 
   const runLiveFileSearch = async () => {
     if (!liveSearchForm || !liveSearchInput || !liveSearchResults) return;
@@ -1054,6 +1074,7 @@
       liveSearchResults.innerHTML = await response.text();
       history.replaceState({}, "", url);
       if (liveSearchClear) liveSearchClear.hidden = !liveSearchInput.value.trim();
+      syncFileVisibility();
       syncFileSelection();
     } catch (error) {
       if (error?.name !== "AbortError") {

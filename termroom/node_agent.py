@@ -32,6 +32,9 @@ from websockets.exceptions import ConnectionClosed
 
 from termroom.file_runs import RUNNER_REGISTRY_VERSION, resolve_runner
 from termroom.files import (
+    DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+    DEFAULT_FILE_SEARCH_MAX_MATCHES,
+    DEFAULT_FILE_SEARCH_MAX_SECONDS,
     DirectoryListingLimitError,
     FileConflictError,
     FileService,
@@ -534,6 +537,29 @@ class NodeRuntime:
             return {
                 "directory": self._relative(root, directory),
                 "entries": [asdict(entry) for entry in entries],
+            }
+        if operation == "files.search":
+            root = self._workspace_path(payload)
+            raw_query = payload.get("query")
+            if not isinstance(raw_query, str) or not raw_query.strip() or len(raw_query) > 256:
+                raise NodeAgentError("File search query is invalid", code="request_invalid")
+            raw_include_noise = payload.get("include_noise", False)
+            if not isinstance(raw_include_noise, bool):
+                raise NodeAgentError("File search visibility is invalid", code="request_invalid")
+            search = self.files.search_files(
+                root,
+                str(payload.get("path") or "."),
+                raw_query,
+                include_noise=raw_include_noise,
+                max_matches=DEFAULT_FILE_SEARCH_MAX_MATCHES,
+                max_entries=DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+                max_seconds=DEFAULT_FILE_SEARCH_MAX_SECONDS,
+            )
+            return {
+                "entries": [asdict(entry) for entry in search.entries],
+                "scanned_entries": search.scanned_entries,
+                "skipped_noise": search.skipped_noise,
+                "truncated": search.truncated,
             }
         if operation == "files.recent":
             root = self._workspace_path(payload)

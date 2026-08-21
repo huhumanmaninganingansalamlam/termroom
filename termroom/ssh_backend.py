@@ -35,18 +35,23 @@ from starlette.datastructures import UploadFile
 
 from termroom.db import StateStore
 from termroom.files import (
+    DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+    DEFAULT_FILE_SEARCH_MAX_MATCHES,
+    DEFAULT_FILE_SEARCH_MAX_SECONDS,
     DEFAULT_RECENT_EXCLUDES,
     MAX_RECENT_IGNORE_BYTES,
     RECENT_IGNORE_FILE,
     DirectoryListingLimitError,
     FileConflictError,
     FileEntry,
+    FileSearch,
     FileSnapshot,
     RecentFiles,
     RunnableFile,
     TextPreview,
     UnsupportedFileError,
     decode_utf8_preview,
+    file_browser_entry_is_noise,
     parse_recent_ignore_patterns,
     recent_path_ignored,
 )
@@ -4148,6 +4153,91 @@ class SSHBackend:
                 )
             entries.sort(key=lambda item: (not item.is_dir, item.name.casefold()))
             return remote, entries
+        finally:
+            sftp.close()
+            client.close()
+
+    def search_files(
+        self,
+        workspace: dict[str, Any],
+        relative_path: str,
+        query: str,
+        *,
+        include_noise: bool = False,
+        max_matches: int = DEFAULT_FILE_SEARCH_MAX_MATCHES,
+        max_entries: int = DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+        max_seconds: float = DEFAULT_FILE_SEARCH_MAX_SECONDS,
+    ) -> FileSearch:
+        if type(max_matches) is not int or max_matches < 1:
+            raise ValueError("File search result limit is invalid")
+        if type(max_entries) is not int or max_entries < 1:
+            raise ValueError("File search scan limit is invalid")
+        if not isinstance(max_seconds, (int, float)) or isinstance(max_seconds, bool):
+            raise ValueError("File search time limit is invalid")
+        needle = str(query).strip().casefold()
+        if not needle:
+            return FileSearch(entries=[], scanned_entries=0, skipped_noise=0, truncated=False)
+
+        client, sftp = self._sftp(workspace)
+        try:
+            remote, directory_attr = self._existing_sftp_path(sftp, workspace, relative_path)
+            if not stat_module.S_ISDIR(directory_attr.st_mode):
+                raise NotADirectoryError(remote)
+            deadline = time.monotonic() + max(0.05, min(float(max_seconds), 10.0))
+            scan_limit = min(max_entries, 100_000)
+            match_limit = min(max_matches, 10_000)
+            pending = [remote]
+            matches: list[FileEntry] = []
+            scanned = 0
+            skipped_noise = 0
+            truncated = False
+            stop = False
+
+            while pending and not stop:
+                if scanned >= scan_limit or time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                directory = pending.pop()
+                try:
+                    children = sftp.listdir_iter(directory, read_aheads=1)
+                    for attr in children:
+                        if scanned >= scan_limit or time.monotonic() >= deadline:
+                            truncated = True
+                            stop = True
+                            break
+                        scanned += 1
+                        if stat_module.S_ISLNK(attr.st_mode):
+                            continue
+                        is_dir = stat_module.S_ISDIR(attr.st_mode)
+                        child = posixpath.join(directory, attr.filename)
+                        entry = FileEntry(
+                            name=attr.filename,
+                            relative_path=self._relative_remote(workspace, child),
+                            is_dir=is_dir,
+                            size=int(attr.st_size or 0),
+                            mtime_ns=int(attr.st_mtime or 0) * 1_000_000_000,
+                        )
+                        if file_browser_entry_is_noise(entry) and not include_noise:
+                            skipped_noise += 1
+                            continue
+                        if needle in entry.name.casefold():
+                            if len(matches) >= match_limit:
+                                truncated = True
+                                stop = True
+                                break
+                            matches.append(entry)
+                        if entry.is_dir:
+                            pending.append(child)
+                except OSError:
+                    continue
+
+            matches.sort(key=lambda item: (not item.is_dir, item.relative_path.casefold()))
+            return FileSearch(
+                entries=matches,
+                scanned_entries=scanned,
+                skipped_noise=skipped_noise,
+                truncated=truncated,
+            )
         finally:
             sftp.close()
             client.close()

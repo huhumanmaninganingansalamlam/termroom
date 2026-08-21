@@ -1,9 +1,23 @@
+<span data-file-search-metadata
+      data-noise-count="{{ noise_count }}"
+      data-query="{{ query }}"
+      hidden></span>
+{% if query %}
+<p class="file-search-summary">
+  <span>{{ t('files.search_scope', count=total_entries) }}</span>
+  {% if search_truncated %}<strong>{{ t('files.search_truncated', count=search_scanned_entries) }}</strong>{% endif %}
+</p>
+{% endif %}
 <section class="workspace-file-list">
-  <div class="file-table-head">
+  <div class="file-table-head{% if query %} search-results-head{% endif %}">
+    {% if query %}
+    <span class="file-select-placeholder" aria-hidden="true"></span>
+    {% else %}
     <label class="file-select-control file-select-all-control" aria-label="{{ t('files.select_all') }}">
       <input id="file-select-all" type="checkbox">
       <span class="file-select-all-label">{{ t('files.select_all') }}</span>
     </label>
+    {% endif %}
     <span>{{ t('common.name') }}</span><span>{{ t('common.size') }}</span><span>{{ t('common.modified') }}</span><span></span>
   </div>
   {% if path != '.' %}
@@ -13,6 +27,9 @@
   {% endif %}
   {% for entry in entries %}
   <div class="file-browser-row file-row-with-actions">
+    {% if query %}
+    <span class="file-select-placeholder" aria-hidden="true"></span>
+    {% else %}
     <label class="file-select-control" aria-label="{{ t('files.select_item', name=entry.name) }}">
       <input type="checkbox"
              name="paths"
@@ -20,14 +37,15 @@
              form="file-bulk-form"
              data-file-select>
     </label>
+    {% endif %}
     {% if entry.is_dir %}
     <a class="file-primary" href="/w/{{ workspace.id }}/files?path={{ entry.relative_path | urlencode }}{% if show_noise %}&noise=1{% endif %}">
-      <span class="file-glyph folder" aria-hidden="true"></span><span class="file-name">{{ entry.name }}</span><span class="file-size">{{ t('common.folder') }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
+      <span class="file-glyph folder" aria-hidden="true"></span><span class="file-name"><span>{{ entry.name }}</span>{% if query and '/' in entry.relative_path %}<small>{{ entry.relative_path.rsplit('/', 1)[0] }}</small>{% endif %}</span><span class="file-size">{{ t('common.folder') }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
     </a>
     {% else %}
     <a class="file-primary" href="/w/{{ workspace.id }}/view/{{ entry.relative_path | urlencode }}">
       <span class="file-glyph document" aria-hidden="true"></span>
-      <span class="file-name">{{ entry.name }}</span><span class="file-size">{{ format_size(entry.size) }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
+      <span class="file-name"><span>{{ entry.name }}</span>{% if query and '/' in entry.relative_path %}<small>{{ entry.relative_path.rsplit('/', 1)[0] }}</small>{% endif %}</span><span class="file-size">{{ format_size(entry.size) }}</span><span class="file-mtime">{{ format_time_ns(entry.mtime_ns) }}</span>
     </a>
     {% endif %}
     <span class="file-inline-actions">

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping
 from pathlib import Path, PurePosixPath
@@ -13,15 +14,20 @@ from starlette.datastructures import UploadFile
 
 from termroom.db import StateStore
 from termroom.files import (
+    DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+    DEFAULT_FILE_SEARCH_MAX_MATCHES,
+    DEFAULT_FILE_SEARCH_MAX_SECONDS,
     DirectoryListingLimitError,
     FileConflictError,
     FileEntry,
+    FileSearch,
     FileService,
     FileSnapshot,
     RecentFiles,
     RunnableFile,
     TextPreview,
     UnsupportedFileError,
+    file_browser_entry_is_noise,
 )
 from termroom.node_core import NodeCore, NodeCoreError
 from termroom.node_protocol import NODE_WORKSPACE_USAGE_VERSION
@@ -476,6 +482,126 @@ class RemoteAccess:
         directory = str(result.get("directory") or ".")
         entries = self._file_entries(result.get("entries"))
         return directory, entries
+
+    async def search_files(
+        self,
+        workspace: dict[str, Any],
+        relative_path: str,
+        query: str,
+        *,
+        include_noise: bool = False,
+    ) -> FileSearch:
+        if not self.is_node(workspace):
+            return await asyncio.to_thread(
+                self.ssh.search_files,
+                workspace,
+                relative_path,
+                query,
+                include_noise=include_noise,
+            )
+        try:
+            result = await self._workspace_request(
+                workspace,
+                "files.search",
+                {
+                    "path": relative_path,
+                    "query": query,
+                    "include_noise": include_noise,
+                },
+            )
+        except RemoteAccessError as exc:
+            if exc.code != "operation_unsupported":
+                raise
+            return await self._search_files_via_listing(
+                workspace,
+                relative_path,
+                query,
+                include_noise=include_noise,
+            )
+
+        scanned_entries = result.get("scanned_entries")
+        skipped_noise = result.get("skipped_noise")
+        truncated = result.get("truncated")
+        if (
+            isinstance(scanned_entries, bool)
+            or not isinstance(scanned_entries, int)
+            or not 0 <= scanned_entries <= DEFAULT_FILE_SEARCH_MAX_ENTRIES
+            or isinstance(skipped_noise, bool)
+            or not isinstance(skipped_noise, int)
+            or not 0 <= skipped_noise <= scanned_entries
+            or not isinstance(truncated, bool)
+        ):
+            raise RemoteAccessError("Node returned an invalid file search result")
+        entries = self._file_entries(result.get("entries"))
+        if len(entries) > DEFAULT_FILE_SEARCH_MAX_MATCHES:
+            raise RemoteAccessError("Node returned too many file search results")
+        return FileSearch(
+            entries=entries,
+            scanned_entries=scanned_entries,
+            skipped_noise=skipped_noise,
+            truncated=truncated,
+        )
+
+    async def _search_files_via_listing(
+        self,
+        workspace: dict[str, Any],
+        relative_path: str,
+        query: str,
+        *,
+        include_noise: bool,
+    ) -> FileSearch:
+        needle = str(query).strip().casefold()
+        if not needle:
+            return FileSearch(entries=[], scanned_entries=0, skipped_noise=0, truncated=False)
+        deadline = time.monotonic() + DEFAULT_FILE_SEARCH_MAX_SECONDS
+        pending = [relative_path]
+        matches: list[FileEntry] = []
+        scanned = 0
+        skipped_noise = 0
+        truncated = False
+        stop = False
+
+        while pending and not stop:
+            if scanned >= DEFAULT_FILE_SEARCH_MAX_ENTRIES or time.monotonic() >= deadline:
+                truncated = True
+                break
+            directory = pending.pop()
+            remaining = DEFAULT_FILE_SEARCH_MAX_ENTRIES - scanned
+            try:
+                _, children = await self.list_dir(
+                    workspace,
+                    directory,
+                    max_entries=min(remaining, 10_000),
+                    max_metadata_bytes=768 * 1024,
+                )
+            except DirectoryListingLimitError:
+                truncated = True
+                continue
+            for entry in children:
+                if scanned >= DEFAULT_FILE_SEARCH_MAX_ENTRIES or time.monotonic() >= deadline:
+                    truncated = True
+                    stop = True
+                    break
+                scanned += 1
+                if file_browser_entry_is_noise(entry) and not include_noise:
+                    skipped_noise += 1
+                    continue
+                if needle in entry.name.casefold():
+                    if len(matches) >= DEFAULT_FILE_SEARCH_MAX_MATCHES:
+                        truncated = True
+                        stop = True
+                        break
+                    matches.append(entry)
+                if entry.is_dir:
+                    pending.append(entry.relative_path)
+
+        matches.sort(key=lambda item: (not item.is_dir, item.relative_path.casefold()))
+        return FileSearch(
+            entries=matches,
+            scanned_entries=scanned,
+            skipped_noise=skipped_noise,
+            truncated=truncated,
+        )
 
     async def stat(self, workspace: dict[str, Any], relative_path: str) -> FileEntry:
         if not self.is_node(workspace):

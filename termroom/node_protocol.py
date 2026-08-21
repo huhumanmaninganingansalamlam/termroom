@@ -52,6 +52,7 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "terminal.scrollback",
         "terminal.attach",
         "files.list",
+        "files.search",
         "files.recent",
         "files.stat",
         "files.read_text.open",

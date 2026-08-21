@@ -298,12 +298,29 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"53"}
-    assert versions["app.js"] == {"61"}
+    assert versions["app.css"] == {"54"}
+    assert versions["app.js"] == {"62"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
     assert versions["terminal.js"] == {"50"}
+
+
+def test_recursive_file_search_keeps_live_controls_consistent() -> None:
+    templates_dir = VENDOR_DIR.parents[1] / "templates"
+    files_template = (templates_dir / "files.html").read_text(encoding="utf-8")
+    results_template = (templates_dir / "_file_results.html").read_text(
+        encoding="utf-8"
+    )
+    app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
+
+    assert "data-file-visibility-form" in files_template
+    assert "data-file-visibility-query" in files_template
+    assert '<form id="file-bulk-form"' in files_template
+    assert "data-file-search-metadata" in results_template
+    assert "const syncFileVisibility = () =>" in app_script
+    assert "fileVisibilityQuery.value = metadata.dataset.query" in app_script
+    assert "syncFileVisibility();" in app_script
 
 
 def test_mobile_editor_toolbar_uses_balanced_rows() -> None:

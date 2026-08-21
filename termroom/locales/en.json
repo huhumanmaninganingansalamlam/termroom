@@ -667,8 +667,8 @@
   "files.kind": "Type",
   "files.current": "Current location",
   "files.search": "Search",
-  "files.search_placeholder": "Search names in this folder",
-  "files.no_search_results": "No items match ‘{query}’.",
+  "files.search_placeholder": "Search names in this folder and subfolders",
+  "files.no_search_results": "No items in this folder or its subfolders match ‘{query}’.",
   "files.parent": "Parent folder",
   "files.empty": "This folder is empty.",
   "files.actions": "File actions",
@@ -856,5 +856,7 @@
   "js.share_preparing": "Preparing…",
   "js.share_failed": "Share failed",
   "js.diff_loading": "Calculating…",
-  "js.diff_failed": "Could not load diff: {error}"
+  "js.diff_failed": "Could not load diff: {error}",
+  "files.search_scope": "This folder and all subfolders · {count} results",
+  "files.search_truncated": "Search stopped at the safety limit after scanning {count} items. Narrow the folder or query."
 }

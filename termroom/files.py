@@ -66,6 +66,14 @@ class RecentFiles:
 
 
 @dataclass(frozen=True, slots=True)
+class FileSearch:
+    entries: list[FileEntry]
+    scanned_entries: int
+    skipped_noise: int
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
 class TextPreview:
     relative_path: str
     content: str
@@ -130,6 +138,9 @@ DEFAULT_FILE_BROWSER_NOISE = frozenset(
         ".termroom-state",
     }
 )
+DEFAULT_FILE_SEARCH_MAX_MATCHES = 2_000
+DEFAULT_FILE_SEARCH_MAX_ENTRIES = 50_000
+DEFAULT_FILE_SEARCH_MAX_SECONDS = 2.0
 
 DEFAULT_RECENT_EXCLUDES = DEFAULT_FILE_BROWSER_NOISE | frozenset(
     {
@@ -163,6 +174,26 @@ def recent_path_ignored(relative_path: str, patterns: tuple[str, ...]) -> bool:
     return any(
         fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(name, pattern)
         for pattern in patterns
+    )
+
+
+def file_browser_entry_is_noise(entry: FileEntry) -> bool:
+    name = str(entry.name)
+    return (
+        name in DEFAULT_FILE_BROWSER_NOISE
+        or (entry.is_dir and name.startswith("."))
+        or (
+            not entry.is_dir
+            and name.startswith(".")
+            and name.endswith((".swp", ".swo", ".swn", ".swm", ".swl", ".swk"))
+        )
+    )
+
+
+def _file_search_path_is_excluded(relative_path: str, excluded_paths: frozenset[str]) -> bool:
+    return any(
+        relative_path == excluded or relative_path.startswith(f"{excluded}/")
+        for excluded in excluded_paths
     )
 
 
@@ -226,6 +257,101 @@ class FileService:
                     continue
         entries.sort(key=lambda item: (not item.is_dir, item.name.casefold()))
         return directory, entries
+
+    def search_files(
+        self,
+        workspace_path: Path,
+        relative_path: str,
+        query: str,
+        *,
+        include_noise: bool = False,
+        max_matches: int = DEFAULT_FILE_SEARCH_MAX_MATCHES,
+        max_entries: int = DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+        max_seconds: float = DEFAULT_FILE_SEARCH_MAX_SECONDS,
+        excluded_paths: frozenset[str] = frozenset(),
+    ) -> FileSearch:
+        if type(max_matches) is not int or max_matches < 1:
+            raise ValueError("File search result limit is invalid")
+        if type(max_entries) is not int or max_entries < 1:
+            raise ValueError("File search scan limit is invalid")
+        if not isinstance(max_seconds, (int, float)) or isinstance(max_seconds, bool):
+            raise ValueError("File search time limit is invalid")
+        needle = str(query).strip().casefold()
+        if not needle:
+            return FileSearch(entries=[], scanned_entries=0, skipped_noise=0, truncated=False)
+
+        root = workspace_path.resolve(strict=True)
+        start = self._resolve_existing(root, relative_path)
+        if not start.is_dir():
+            raise NotADirectoryError(start)
+        normalized_excluded = frozenset(
+            value.removeprefix("./").strip("/")
+            for value in excluded_paths
+            if value not in {"", "."}
+        )
+        deadline = monotonic() + max(0.05, min(float(max_seconds), 10.0))
+        scan_limit = min(max_entries, 100_000)
+        match_limit = min(max_matches, 10_000)
+        pending = [start]
+        matches: list[FileEntry] = []
+        scanned = 0
+        skipped_noise = 0
+        truncated = False
+        stop = False
+
+        while pending and not stop:
+            if scanned >= scan_limit or monotonic() >= deadline:
+                truncated = True
+                break
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as children:
+                    for child in children:
+                        if scanned >= scan_limit or monotonic() >= deadline:
+                            truncated = True
+                            stop = True
+                            break
+                        scanned += 1
+                        try:
+                            if child.is_symlink():
+                                continue
+                            info = child.stat(follow_symlinks=False)
+                            target = Path(child.path)
+                            relative = target.relative_to(root).as_posix()
+                            if _file_search_path_is_excluded(relative, normalized_excluded):
+                                continue
+                            is_dir = child.is_dir(follow_symlinks=False)
+                            entry = FileEntry(
+                                name=child.name,
+                                relative_path=relative,
+                                is_dir=is_dir,
+                                size=info.st_size,
+                                mtime_ns=info.st_mtime_ns,
+                            )
+                        except OSError:
+                            continue
+
+                        if file_browser_entry_is_noise(entry) and not include_noise:
+                            skipped_noise += 1
+                            continue
+                        if needle in entry.name.casefold():
+                            if len(matches) >= match_limit:
+                                truncated = True
+                                stop = True
+                                break
+                            matches.append(entry)
+                        if entry.is_dir:
+                            pending.append(target)
+            except OSError:
+                continue
+
+        matches.sort(key=lambda item: (not item.is_dir, item.relative_path.casefold()))
+        return FileSearch(
+            entries=matches,
+            scanned_entries=scanned,
+            skipped_noise=skipped_noise,
+            truncated=truncated,
+        )
 
     def read_text(self, workspace_path: Path, relative_path: str) -> FileSnapshot:
         target = self._resolve_existing(workspace_path, relative_path)

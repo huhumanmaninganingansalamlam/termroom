@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import io
+import re
 import shutil
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+from fastapi.responses import PlainTextResponse
 
 from termroom.app import MAX_INLINE_IMAGE_BYTES, PACKAGE_ROOT, create_app
 from termroom.assets import TERMINAL_FONT_ASSETS
@@ -66,8 +68,20 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
         assert "빠른 실행" not in authenticated.text
         assert "최근 원격 실행" not in authenticated.text
         assert authenticated.headers["cache-control"] == "no-store"
+        assert authenticated.headers["x-content-type-options"] == "nosniff"
         assert authenticated.headers["x-frame-options"] == "SAMEORIGIN"
         assert authenticated.headers["referrer-policy"] == "no-referrer"
+        assert authenticated.headers.get_list("x-content-type-options") == ["nosniff"]
+        assert authenticated.headers.get_list("x-frame-options") == ["SAMEORIGIN"]
+        assert authenticated.headers.get_list("referrer-policy") == ["no-referrer"]
+        csp = authenticated.headers["content-security-policy"]
+        nonce_match = re.search(r"script-src 'self' 'nonce-([^']+)'", csp)
+        assert nonce_match is not None
+        assert "frame-ancestors 'self'" in csp
+        assert "connect-src 'self' ws: wss:" in csp
+        assert "style-src 'self' 'unsafe-inline'" in csp
+        assert "upgrade-insecure-requests" not in csp
+        assert authenticated.text.count(f'nonce="{nonce_match.group(1)}"') == 2
 
 
 @pytest.mark.asyncio
@@ -98,10 +112,12 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=53'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=61'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=54'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=62'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
+    assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
+    assert response.headers.get_list("x-frame-options") == ["SAMEORIGIN"]
 
 
 @pytest.mark.asyncio
@@ -1382,8 +1398,9 @@ async def test_file_browser_can_download_selected_files_and_folders_as_zip(
 
 
 @pytest.mark.asyncio
-async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_zip(
+async def test_file_browser_searches_subfolders_and_downloads_one_folder_as_zip(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "root"
     project = root / "project"
@@ -1391,7 +1408,10 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
     reports.mkdir(parents=True)
     (project / "report-final.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     (project / "notes.txt").write_text("notes\n", encoding="utf-8")
-    (reports / "nested.txt").write_text("nested\n", encoding="utf-8")
+    (reports / "nested-report.txt").write_text("nested\n", encoding="utf-8")
+    dependency = project / "node_modules"
+    dependency.mkdir()
+    (dependency / "hidden-report.txt").write_text("hidden\n", encoding="utf-8")
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
@@ -1403,14 +1423,31 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
-        search = await client.get(f"/w/{workspace['id']}/files", params={"q": "report"})
+        with monkeypatch.context() as search_guard:
+            search_guard.setattr(
+                app.state.files,
+                "list_dir",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "Recursive search must not pre-list the current directory"
+                ),
+            )
+            search = await client.get(
+                f"/w/{workspace['id']}/files", params={"q": "report"}
+            )
         assert search.status_code == 200
         assert "report-final.csv" in search.text
+        assert "nested-report.txt" in search.text
         assert "reports" in search.text
+        assert "hidden-report.txt" not in search.text
         assert "notes.txt" not in search.text
         assert 'value="report"' in search.text
+        assert "현재 폴더와 하위 폴더에서 이름 검색" in search.text
+        assert "현재 폴더와 모든 하위 폴더" in search.text
         assert "data-live-file-search" in search.text
         assert 'id="file-results"' in search.text
+        assert 'id="file-bulk-form"' in search.text
+        assert "data-file-select" not in search.text
+        assert 'data-file-search-metadata' in search.text
 
         partial = await client.get(
             f"/w/{workspace['id']}/files",
@@ -1419,16 +1456,32 @@ async def test_file_browser_searches_current_folder_and_downloads_one_folder_as_
         )
         assert partial.status_code == 200
         assert "report-final.csv" in partial.text
+        assert "nested-report.txt" in partial.text
         assert "notes.txt" not in partial.text
+        assert "data-file-select" not in partial.text
         assert "<!doctype html>" not in partial.text
+
+        cleared = await client.get(
+            f"/w/{workspace['id']}/files",
+            headers={"X-Termroom-Partial": "file-results"},
+        )
+        assert cleared.status_code == 200
+        assert "data-file-select" in cleared.text
+
+        hidden = await client.get(
+            f"/w/{workspace['id']}/files",
+            params={"q": "hidden-report", "noise": 1},
+        )
+        assert hidden.status_code == 200
+        assert "hidden-report.txt" in hidden.text
 
         archive = await client.get(f"/w/{workspace['id']}/archive/reports")
 
     assert archive.status_code == 200
     assert archive.headers["content-type"] == "application/zip"
     with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
-        assert set(bundle.namelist()) == {"reports/", "reports/nested.txt"}
-        assert bundle.read("reports/nested.txt") == b"nested\n"
+        assert set(bundle.namelist()) == {"reports/", "reports/nested-report.txt"}
+        assert bundle.read("reports/nested-report.txt") == b"nested\n"
 
 
 @pytest.mark.asyncio
@@ -3382,7 +3435,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=61")
+        script = await client.get("/static/app.js?v=62")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3417,7 +3470,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=61")
+        script = await client.get("/static/app.js?v=62")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3429,7 +3482,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=61" in korean_page.text
+    assert "/static/app.js?v=62" in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3580,6 +3633,87 @@ async def test_pwa_icon_generation_runs_off_the_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_dynamic_text_compression_skips_downloads_and_ranges(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    payload = ("dynamic compression\n" * 400).encode()
+    (project / "payload.txt").write_bytes(payload)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+
+    @app.get("/etagged-text")
+    async def etagged_text() -> PlainTextResponse:
+        return PlainTextResponse(
+            "validator-safe\n" * 400,
+            headers={"ETag": '"validator-safe"'},
+        )
+
+    workspace = app.state.workspaces.open("project")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        identity = await client.get(
+            f"/w/{workspace['id']}/files",
+            headers={"Accept-Encoding": "identity"},
+        )
+        async with client.stream(
+            "GET",
+            f"/w/{workspace['id']}/files",
+            headers={"Accept-Encoding": "gzip"},
+        ) as compressed:
+            raw = b"".join([chunk async for chunk in compressed.aiter_raw()])
+            assert compressed.status_code == 200
+            assert compressed.headers["content-encoding"] == "gzip"
+            assert "accept-encoding" in compressed.headers["vary"].casefold()
+            normalized_compressed = re.sub(
+                rb'nonce="[A-Za-z0-9_-]+"',
+                b'nonce="<nonce>"',
+                gzip.decompress(raw),
+            )
+            normalized_identity = re.sub(
+                rb'nonce="[A-Za-z0-9_-]+"',
+                b'nonce="<nonce>"',
+                identity.content,
+            )
+            assert normalized_compressed == normalized_identity
+
+        disabled = await client.get(
+            f"/w/{workspace['id']}/files",
+            headers={"Accept-Encoding": "gzip;q=0, *;q=1"},
+        )
+        download = await client.get(
+            f"/w/{workspace['id']}/download/payload.txt",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        ranged = await client.get(
+            f"/w/{workspace['id']}/download/payload.txt",
+            headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
+        )
+        etagged = await client.get(
+            "/etagged-text",
+            headers={"Accept-Encoding": "gzip"},
+        )
+
+    assert "content-encoding" not in identity.headers
+    assert "accept-encoding" in identity.headers["vary"].casefold()
+    assert "content-encoding" not in disabled.headers
+    assert download.content == payload
+    assert "content-encoding" not in download.headers
+    assert ranged.status_code == 206
+    assert ranged.content == payload[:32]
+    assert "content-encoding" not in ranged.headers
+    assert etagged.headers["etag"] == '"validator-safe"'
+    assert "content-encoding" not in etagged.headers
+    assert "accept-encoding" not in etagged.headers.get("vary", "").casefold()
+
+
+@pytest.mark.asyncio
 async def test_static_assets_use_selective_compression_and_versioned_cache(
     tmp_path: Path,
 ) -> None:
@@ -3636,7 +3770,7 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=61",
+            "/static/app.js?v=62",
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]
@@ -3678,4 +3812,5 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
         assert missing.headers["cache-control"] == "no-store"
         assert private_page.status_code == 401
         assert private_page.headers["cache-control"] == "no-store"
-        assert "content-encoding" not in private_page.headers
+        assert private_page.headers["content-encoding"] == "gzip"
+        assert "accept-encoding" in private_page.headers["vary"].casefold()

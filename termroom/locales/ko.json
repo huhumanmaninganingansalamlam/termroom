@@ -667,8 +667,8 @@
   "files.kind": "종류",
   "files.current": "현재 위치",
   "files.search": "검색",
-  "files.search_placeholder": "현재 폴더에서 이름 검색",
-  "files.no_search_results": "‘{query}’와 일치하는 항목이 없습니다.",
+  "files.search_placeholder": "현재 폴더와 하위 폴더에서 이름 검색",
+  "files.no_search_results": "현재 폴더와 하위 폴더에서 ‘{query}’와 일치하는 항목이 없습니다.",
   "files.parent": "상위 폴더",
   "files.empty": "이 폴더는 비어 있습니다.",
   "files.actions": "파일 작업",
@@ -856,5 +856,7 @@
   "js.share_preparing": "준비 중…",
   "js.share_failed": "공유 실패",
   "js.diff_loading": "계산 중…",
-  "js.diff_failed": "Diff를 불러오지 못했습니다: {error}"
+  "js.diff_failed": "Diff를 불러오지 못했습니다: {error}",
+  "files.search_scope": "현재 폴더와 모든 하위 폴더 · 결과 {count}개",
+  "files.search_truncated": "항목 {count}개를 확인한 뒤 안전 상한에서 검색을 멈췄습니다. 시작 폴더나 검색어를 좁혀 주세요."
 }
