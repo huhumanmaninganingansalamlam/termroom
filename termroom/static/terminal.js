@@ -111,6 +111,8 @@
   const bundledTerminalFontLoad = beginBundledTerminalFontLoad();
   let bundledTerminalFontLoaded = await bundledTerminalFontLoad.initial;
   host.dataset.terminalFont = bundledTerminalFontLoaded ? "bundled" : "system-fallback";
+  const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;
+  const unicode11Available = typeof Unicode11AddonClass === "function";
   const term = new window.Terminal({
     cursorBlink: true,
     cursorStyle: "bar",
@@ -118,9 +120,22 @@
     fontSize: initialTerminalFontSize,
     lineHeight: 1.2,
     scrollback: 5000,
-    allowProposedApi: false,
+    allowProposedApi: unicode11Available,
     theme: terminalTheme(),
   });
+  host.dataset.terminalUnicode = "default";
+  if (unicode11Available) {
+    try {
+      const unicode11Addon = new Unicode11AddonClass();
+      term.loadAddon(unicode11Addon);
+      term.unicode.activeVersion = "11";
+      host.dataset.terminalUnicode = "11";
+    } catch {
+      // Keep the terminal usable if an asset is stale or incompatible. The
+      // pinned asset and static contract make this a recovery path, not the
+      // normal runtime configuration.
+    }
+  }
   term.open(host);
   const refreshTerminalFont = () => {
     term.clearTextureAtlas?.();
@@ -169,6 +184,7 @@
   let socket = null;
   let reconnectTimer = null;
   let reconnectDelay = 500;
+  let reconnectAllowed = true;
   let isConnected = false;
   let lastInputRevision = 0;
   let presenceInitialized = false;
@@ -462,8 +478,9 @@
         4429: tr("terminal.status.too_many"),
       };
       const terminalCloseMessage = terminalCloseMessages[event.code];
+      reconnectAllowed = !terminalCloseMessage;
       setStatus(terminalCloseMessage || tr("terminal.status.reconnecting"));
-      if (!terminalCloseMessage && document.visibilityState !== "hidden") {
+      if (reconnectAllowed && document.visibilityState !== "hidden") {
         reconnectTimer = window.setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 1.7, 5000);
       }
@@ -508,13 +525,17 @@
   terminalTextarea?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
-    if (socket?.readyState === WebSocket.CLOSED) {
+    if (reconnectAllowed && socket?.readyState === WebSocket.CLOSED) {
       connect();
       return;
     }
     scheduleActivityAcknowledge();
   });
   window.addEventListener("focus", () => {
+    if (reconnectAllowed && socket?.readyState === WebSocket.CLOSED) {
+      connect();
+      return;
+    }
     scheduleActivityAcknowledge();
   });
   window.addEventListener("orientationchange", () => {
@@ -531,7 +552,21 @@
       .replace(/\\u([0-9a-fA-F]{4})/g, (_, code) => String.fromCharCode(parseInt(code, 16)))
       .replace(/\\t/g, "\t");
 
-  const terminalActionValue = (action) => {
+  const terminalActionValue = (action, { ctrl = false } = {}) => {
+    if (ctrl) {
+      switch (action) {
+        case "arrow-up":
+          return "\u001b[1;5A";
+        case "arrow-down":
+          return "\u001b[1;5B";
+        case "arrow-right":
+          return "\u001b[1;5C";
+        case "arrow-left":
+          return "\u001b[1;5D";
+        default:
+          return "";
+      }
+    }
     const application = term.modes.applicationCursorKeysMode;
     switch (action) {
       case "arrow-up":
@@ -545,6 +580,17 @@
       default:
         return "";
     }
+  };
+
+  const terminalCtrlValue = (value) => {
+    if (!value || value.length !== 1) return "";
+    const code = value.charCodeAt(0);
+    if (code < 32 || code === 127) return value;
+    if (/^[A-Za-z]$/.test(value)) {
+      return String.fromCharCode(value.toUpperCase().charCodeAt(0) & 31);
+    }
+    if (value === "_") return "\u001f";
+    return "";
   };
 
   let ctrlArmed = false;
@@ -567,16 +613,16 @@
 
   document.querySelectorAll("[data-terminal-key], [data-terminal-action]").forEach((button) => {
     button.addEventListener("click", () => {
-      let value = button.dataset.terminalAction
-        ? terminalActionValue(button.dataset.terminalAction)
+      const action = button.dataset.terminalAction || "";
+      let value = action
+        ? terminalActionValue(action, { ctrl: ctrlArmed })
         : decodeKey(button.dataset.terminalKey || "");
-      if (!value) return;
-      if (ctrlArmed && value.length === 1) {
-        value = String.fromCharCode(value.toUpperCase().charCodeAt(0) & 31);
+      if (ctrlArmed) {
+        if (!action) value = terminalCtrlValue(value);
         ctrlArmed = false;
         ctrlButton?.setAttribute("aria-pressed", "false");
       }
-      term.input(value, true);
+      if (value) term.input(value, true);
       if (button.closest(".more-keys-panel")) {
         closeMoreKeys();
       } else {

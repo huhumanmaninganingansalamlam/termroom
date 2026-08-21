@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import shutil
+import subprocess
+
+import pytest
 
 from termroom.assets import (
     ASSETS,
@@ -12,6 +17,7 @@ from termroom.assets import (
     TERMINAL_FONT_SOURCE_TTF_SHA256,
     TERMINAL_FONT_VERSION,
     VENDOR_DIR,
+    XTERM_UNICODE11_VERSION,
     XTERM_VERSION,
     XTERM_VERSION_FILE,
 )
@@ -31,16 +37,60 @@ def _range_points(ranges: list[tuple[int, int]]) -> set[int]:
 
 def test_vendored_xterm_matches_declared_scoped_release() -> None:
     assert XTERM_VERSION == "6.0.0"
-    assert set(ASSETS) == {"xterm.js", "xterm.css"}
+    assert XTERM_UNICODE11_VERSION == "0.8.0"
+    assert set(ASSETS) == {"xterm.js", "xterm.css", "addon-unicode11.js"}
     assert XTERM_VERSION_FILE.read_text(encoding="utf-8").strip() == XTERM_VERSION
     assert (VENDOR_DIR / "xterm.js").stat().st_size > 400_000
     assert (VENDOR_DIR / "xterm.css").stat().st_size > 5_000
-    assert all(
-        f"@xterm/xterm@{XTERM_VERSION}" in str(details["url"]) for details in ASSETS.values()
+    assert (VENDOR_DIR / "addon-unicode11.js").stat().st_size > 12_000
+    for filename in ("xterm.js", "xterm.css"):
+        assert f"@xterm/xterm@{XTERM_VERSION}" in str(ASSETS[filename]["url"])
+    assert (
+        f"@xterm/addon-unicode11@{XTERM_UNICODE11_VERSION}"
+        in str(ASSETS["addon-unicode11.js"]["url"])
     )
     for filename, details in ASSETS.items():
         digest = hashlib.sha256((VENDOR_DIR / filename).read_bytes()).hexdigest()
         assert digest == details["sha256"]
+
+
+def test_unicode11_provider_reports_standard_terminal_widths() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the vendored browser addon")
+    script = r"""
+const { Unicode11Addon } = require(process.argv[1]);
+let provider = null;
+const addon = new Unicode11Addon();
+addon.activate({
+  unicode: {
+    register(value) {
+      provider = value;
+      return { dispose() {} };
+    },
+  },
+});
+if (!provider || typeof provider.wcwidth !== "function") {
+  throw new Error("Unicode11 provider was not registered");
+}
+const codepoints = [0x41, 0x0301, 0xAC00, 0x4E2D, 0x200D, 0x1F600];
+process.stdout.write(JSON.stringify({
+  version: provider.version,
+  widths: codepoints.map((codepoint) => provider.wcwidth(codepoint)),
+}));
+addon.dispose();
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(VENDOR_DIR / "addon-unicode11.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "version": "11",
+        "widths": [1, 0, 2, 2, 0, 2],
+    }
 
 
 def test_vendored_terminal_font_is_reproducible_and_attributed() -> None:
@@ -203,6 +253,40 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert 'kind: "command"' in terminal_script
     assert "rows: term.rows" in terminal_script
     assert "cols: term.cols" in terminal_script
+    assert 'const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;' in terminal_script
+    assert (
+        'const unicode11Available = typeof Unicode11AddonClass === "function";'
+        in terminal_script
+    )
+    assert "allowProposedApi: unicode11Available" in terminal_script
+    assert 'host.dataset.terminalUnicode = "default";' in terminal_script
+    assert "if (unicode11Available)" in terminal_script
+    assert "term.loadAddon(unicode11Addon);" in terminal_script
+    assert 'term.unicode.activeVersion = "11";' in terminal_script
+    assert 'host.dataset.terminalUnicode = "11";' in terminal_script
+    assert 'return "\\u001b[1;5A";' in terminal_script
+    assert 'return "\\u001b[1;5B";' in terminal_script
+    assert 'return "\\u001b[1;5C";' in terminal_script
+    assert 'return "\\u001b[1;5D";' in terminal_script
+    assert "const terminalCtrlValue = (value) =>" in terminal_script
+    assert "if (/^[A-Za-z]$/.test(value))" in terminal_script
+    assert 'if (value === "_") return "\\u001f";' in terminal_script
+    assert "if (!action) value = terminalCtrlValue(value);" in terminal_script
+    assert "let reconnectAllowed = true;" in terminal_script
+    assert "reconnectAllowed = !terminalCloseMessage;" in terminal_script
+    assert re.search(
+        r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
+        r'if \(document\.visibilityState !== "visible"\) return;\s*'
+        r'if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{',
+        terminal_script,
+    )
+    assert re.search(
+        r'window\.addEventListener\("focus", \(\) => \{\s*'
+        r'if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{\s*'
+        r'connect\(\);\s*return;\s*\}\s*'
+        r'scheduleActivityAcknowledge\(\);\s*\}\);',
+        terminal_script,
+    )
 
 
 def test_template_static_asset_versions_are_consistent() -> None:
@@ -214,11 +298,12 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"52"}
+    assert versions["app.css"] == {"53"}
     assert versions["app.js"] == {"61"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
-    assert versions["terminal.js"] == {"45"}
+    assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
+    assert versions["terminal.js"] == {"50"}
 
 
 def test_mobile_editor_toolbar_uses_balanced_rows() -> None:

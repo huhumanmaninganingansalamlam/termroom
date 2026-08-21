@@ -8,6 +8,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_DIR = PACKAGE_ROOT / "static" / "vendor"
 XTERM_VERSION = "6.0.0"
+XTERM_UNICODE11_VERSION = "0.8.0"
 XTERM_VERSION_FILE = VENDOR_DIR / "xterm.version"
 TERMINAL_FONT_VERSION = "3.5.0"
 TERMINAL_FONT_ASSETS = {
@@ -71,6 +72,16 @@ ASSETS = {
         "sha256": "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6",
         "candidates": [
             Path.cwd() / "node_modules/@xterm/xterm/css/xterm.css",
+        ],
+    },
+    "addon-unicode11.js": {
+        "url": (
+            "https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@"
+            f"{XTERM_UNICODE11_VERSION}/lib/addon-unicode11.js"
+        ),
+        "sha256": "b0c3be540a9984713aea996966c24ed1a639d11f60d44986b22661e3a8a148d0",
+        "candidates": [
+            Path.cwd() / "node_modules/@xterm/addon-unicode11/lib/addon-unicode11.js",
         ],
     },
 }

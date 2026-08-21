@@ -98,7 +98,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=52'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=53'
     script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=61'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
@@ -558,6 +558,49 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
             check=False,
             capture_output=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_terminal_page_canonicalizes_stale_terminal_query(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        initial = await client.get(
+            f"/w/{workspace['id']}/terminal",
+            follow_redirects=False,
+        )
+        assert initial.status_code == 200
+        terminal = app.state.store.list_terminals(str(workspace["id"]))[0]
+
+        stale = await client.get(
+            f"/w/{workspace['id']}/terminal?terminal=missing-terminal",
+            follow_redirects=False,
+        )
+        assert stale.status_code == 302
+        assert stale.headers["location"].endswith(
+            f"/w/{workspace['id']}/terminal?terminal={terminal['id']}"
+        )
+
+        canonical = await client.get(stale.headers["location"])
+        assert canonical.status_code == 200
+        assert f'data-terminal-id="{terminal["id"]}"' in canonical.text
+
+    subprocess.run(
+        ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+        check=False,
+        capture_output=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -1445,8 +1488,29 @@ async def test_open_workspace_flow_chooses_computer_then_workspace(
         assert picker.status_code == 200
         assert f'/w/{first["id"]}' in picker.text
         assert f'/w/{second["id"]}' in picker.text
+        assert f'action="/w/{first["id"]}/remove"' in picker.text
+        assert f'name="return_computer_id" value="{computer["id"]}"' in picker.text
+        assert "등록 해제" in picker.text
         assert "새 작업공간 추가" in picker.text
         assert "연결 설정" in picker.text
+
+        removed = await client.post(
+            f'/w/{first["id"]}/remove',
+            data={
+                "_csrf": settings.csrf_token,
+                "return_computer_id": computer["id"],
+            },
+            follow_redirects=False,
+        )
+        assert removed.status_code == 303
+        assert removed.headers["location"] == (
+            f'/open/{computer["id"]}?workspace_removed=1'
+        )
+
+        refreshed = await client.get(removed.headers["location"])
+        assert "작업공간 등록을 해제했습니다" in refreshed.text
+        assert f'/w/{first["id"]}' not in refreshed.text
+        assert f'/w/{second["id"]}' in refreshed.text
 
 
 @pytest.mark.asyncio

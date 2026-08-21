@@ -970,7 +970,7 @@ class RemoteAccess:
         await self.ensure_workspace(workspace)
         self.store.touch_terminal(str(terminal["id"]))
         terminal_id = str(terminal["id"])
-        client_id = self.control.register(terminal_id)
+        client_id = self.control.register(terminal_id, device_id=device_id)
         resize_lock = self._node_terminal_resize_locks.setdefault(
             terminal_id,
             asyncio.Lock(),

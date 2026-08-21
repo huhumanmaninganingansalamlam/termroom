@@ -950,6 +950,33 @@ body:has(.remote-workspace-form .remote-folder-browser:not([hidden])) {
   background: var(--surface-hover);
 }
 
+.open-workspace-manage-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px;
+  padding: 0 10px 0 0;
+}
+
+.open-workspace-row-main {
+  display: grid;
+  min-width: 0;
+  min-height: 58px;
+  grid-template-columns: 34px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 4px 9px 14px;
+}
+
+.open-workspace-row-main > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.open-workspace-manage-row form,
+.open-workspace-manage-row button {
+  white-space: nowrap;
+}
+
 .open-workspace-row.unavailable {
   grid-template-columns: 34px minmax(0, 1fr) auto;
 }

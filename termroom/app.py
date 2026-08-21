@@ -3011,6 +3011,10 @@ def create_app(settings: Settings) -> FastAPI:
         ]
         return_root_id = str(form.get("return_root_id") or "")
         return_to_local = return_root_id == str(workspace["root_id"])
+        return_computer_id = str(form.get("return_computer_id") or "")
+        return_to_remote = bool(return_computer_id) and return_computer_id == str(
+            workspace.get("computer_id") or ""
+        )
         try:
             store.remove_workspace_registration(workspace_id)
         except RuntimeError:
@@ -3021,6 +3025,11 @@ def create_app(settings: Settings) -> FastAPI:
                     error=translate(locale, "workspace.remove.remote_runs_first"),
                 )
                 if return_to_local
+                else _url_with_query(
+                    f"/open/{return_computer_id}",
+                    error=translate(locale, "workspace.remove.remote_runs_first"),
+                )
+                if return_to_remote
                 else _url_with_query(
                     f"/w/{workspace_id}/{workspace.get('last_tab') or 'terminal'}",
                     error=translate(locale, "workspace.remove.remote_runs_first"),
@@ -3039,6 +3048,10 @@ def create_app(settings: Settings) -> FastAPI:
                 "/open/local", root=return_root_id, workspace_removed=1
             )
             if return_to_local
+            else _url_with_query(
+                f"/open/{return_computer_id}", workspace_removed=1
+            )
+            if return_to_remote
             else "/?workspace_removed=1"
         )
         return RedirectResponse(destination, status_code=303)
@@ -3156,7 +3169,7 @@ def create_app(settings: Settings) -> FastAPI:
         workspace_id: str,
         terminal: str | None = None,
         error: str | None = None,
-    ) -> HTMLResponse:
+    ) -> Response:
         locale = locale_from_request(request)
         workspace = _require_workspace(workspaces, workspace_id)
         terminal_error = error
@@ -3170,6 +3183,15 @@ def create_app(settings: Settings) -> FastAPI:
                 raise
             terminal_error = _localized_exception(locale, exc)
         selected = next((item for item in terminal_list if item["id"] == terminal), None)
+        if terminal is not None and selected is None:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    terminal=terminal_list[0]["id"],
+                    error=error,
+                ),
+                status_code=302,
+            )
         selected = selected or terminal_list[0]
         selected_file_run = None
         if selected.get("role") == "file_run" and selected.get("managed_run_id"):

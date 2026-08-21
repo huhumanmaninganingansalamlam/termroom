@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import io
 import json
 import os
@@ -877,6 +878,22 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 backend.read_text(workspace, "escape/secret.txt", 1024)
             backend.create(workspace, ".", "empty.txt", directory=False)
             assert backend.stat(workspace, "empty.txt").size == 0
+            backend.create(workspace, ".", "not-empty", directory=True)
+            backend.create(workspace, "not-empty", "child.txt", directory=False)
+            with pytest.raises(OSError) as nonempty_error:
+                backend.delete(workspace, "not-empty")
+            assert nonempty_error.value.errno == errno.ENOTEMPTY
+            backend.delete(workspace, "not-empty/child.txt")
+            backend.delete(workspace, "not-empty")
+            backend.create(workspace, ".", "empty-no-read", directory=True)
+            unreadable_empty = project / "empty-no-read"
+            unreadable_empty.chmod(0)
+            try:
+                backend.delete(workspace, "empty-no-read")
+            finally:
+                if unreadable_empty.exists():
+                    unreadable_empty.chmod(0o700)
+            assert not unreadable_empty.exists()
 
             upload = UploadFile(file=io.BytesIO(b"a,b\n1,2\n"), filename="result.csv")
             await backend.upload(

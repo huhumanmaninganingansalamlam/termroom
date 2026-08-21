@@ -1325,7 +1325,7 @@ class TerminalManager:
         self.ensure_workspace(workspace)
         self.store.touch_terminal(terminal["id"])
         terminal_id = str(terminal["id"])
-        client_id = self.control.register(terminal_id)
+        client_id = self.control.register(terminal_id, device_id=device_id)
         view_session = tmux_browser_view_session(client_id)
         process_pid: int | None = None
         master_fd: int | None = None

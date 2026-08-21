@@ -55,6 +55,29 @@ def test_presence_reports_client_count_and_input_device() -> None:
     }
 
 
+def test_presence_deduplicates_clients_from_same_device() -> None:
+    control = TerminalControl()
+    first = control.register("term", device_id="device-a")
+    second = control.register("term", device_id="device-a")
+    control.register("term", device_id="device-b")
+
+    control.mark_input("term", first, "device-a")
+    assert control.client_count("term") == 3
+    assert control.presence("term") == {
+        "count": 2,
+        "input_revision": 1,
+        "last_input_device_id": "device-a",
+    }
+
+    control.unregister("term", first)
+    assert control.client_count("term") == 2
+    assert control.presence("term")["count"] == 2
+
+    control.unregister("term", second)
+    assert control.client_count("term") == 1
+    assert control.presence("term")["count"] == 1
+
+
 def test_input_from_unknown_client_does_not_take_resize_ownership() -> None:
     control = TerminalControl()
     first = control.register("term")

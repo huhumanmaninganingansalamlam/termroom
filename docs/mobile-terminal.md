@@ -35,9 +35,18 @@ composition 중간 값을 PTY에 직접 전송하지 않는다.
 
 ## 2. xterm dependency
 
-Termroom은 vendored `@xterm/xterm 6.0.0`을 사용한다. asset bootstrap은 version marker를
-검사하며 버전이 바뀌면 JS/CSS를 함께 갱신한다. vendored JS/CSS에는 고정 SHA-256을
-두어 다른 버전이나 손상된 CDN 응답이 같은 파일명으로 조용히 들어오지 않게 한다.
+Termroom은 vendored `@xterm/xterm 6.0.0`과 stable
+`@xterm/addon-unicode11 0.8.0`을 사용한다. asset bootstrap은 version marker와 고정
+SHA-256을 검사해 다른 버전이나 손상된 CDN 응답이 같은 파일명으로 조용히 들어오지
+않게 한다.
+
+Unicode11 provider는 PTY output을 쓰기 전에 활성화해 ASCII, combining mark, 한글,
+CJK 같은 code point의 terminal cell width를 stable table로 계산한다. 별도 emoji 예외나
+Termroom 전용 width 추측은 두지 않는다. 이 addon은 grapheme-cluster 지원이 아니며
+experimental `addon-unicode-graphemes`도 기본으로 켜지 않는다. Unicode 11 이후 추가된
+code point는 remote `wcwidth`와 차이가 남을 수 있으므로 representative device QA에서
+별도로 확인한다. addon asset이 없거나 호환되지 않으면 기본 xterm provider로 안전하게
+돌아가 terminal 연결 자체는 유지한다.
 
 IME 조합 알고리즘은 Termroom에서 fork하지 않는다. xterm upstream의 IME 수정과
 terminal-mode 처리를 그대로 받을 수 있어야 한다.

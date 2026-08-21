@@ -119,6 +119,36 @@ def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(tmp_path
         _cleanup(app, workspace)
 
 
+def test_terminal_presence_deduplicates_tabs_in_same_session(tmp_path: Path) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    terminal_id = str(terminal["id"])
+    try:
+        with TestClient(app, base_url="http://testserver") as client:
+            login = client.post("/login", data={"password": "correct-password"})
+            assert login.status_code == 200
+            headers = {"origin": "http://testserver"}
+
+            with client.websocket_connect(
+                f"/ws/terminal/{terminal_id}", headers=headers
+            ) as first:
+                first.receive_text()
+                assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
+
+                with client.websocket_connect(
+                    f"/ws/terminal/{terminal_id}", headers=headers
+                ) as second:
+                    second.receive_text()
+                    assert app.state.terminals.control.client_count(terminal_id) == 2
+                    assert (
+                        client.get(f"/api/terminals/{terminal_id}/presence").json()["count"]
+                        == 1
+                    )
+
+                assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
+    finally:
+        _cleanup(app, workspace)
+
+
 def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -127,8 +157,8 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
     registered: list[str] = []
     original_register = control.register
 
-    def record_registration(terminal_id: str) -> str:
-        client_id = original_register(terminal_id)
+    def record_registration(terminal_id: str, *, device_id: str = "") -> str:
+        client_id = original_register(terminal_id, device_id=device_id)
         registered.append(client_id)
         return client_id
 

@@ -16,16 +16,20 @@ class TerminalControl:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._clients: dict[str, list[str]] = {}
+        self._client_devices: dict[str, dict[str, str]] = {}
         self._input_owners: dict[str, str] = {}
         self._input_revisions: dict[str, int] = {}
         self._last_input_devices: dict[str, str] = {}
         self._applied_resizes: dict[str, tuple[str, int, int]] = {}
 
-    def register(self, terminal_id: str) -> str:
+    def register(self, terminal_id: str, *, device_id: str = "") -> str:
         client_id = uuid.uuid4().hex
+        safe_device_id = str(device_id).strip()
         with self._lock:
             clients = self._clients.setdefault(terminal_id, [])
             clients.append(client_id)
+            if safe_device_id:
+                self._client_devices.setdefault(terminal_id, {})[client_id] = safe_device_id
         return client_id
 
     def mark_input(self, terminal_id: str, client_id: str, device_id: str = "") -> None:
@@ -84,6 +88,7 @@ class TerminalControl:
         with self._lock:
             clients = self._clients.get(terminal_id)
             if not clients:
+                self._client_devices.pop(terminal_id, None)
                 self._input_owners.pop(terminal_id, None)
                 self._applied_resizes.pop(terminal_id, None)
                 return
@@ -91,8 +96,12 @@ class TerminalControl:
                 clients.remove(client_id)
             except ValueError:
                 return
+            client_devices = self._client_devices.get(terminal_id)
+            if client_devices is not None:
+                client_devices.pop(client_id, None)
             if not clients:
                 self._clients.pop(terminal_id, None)
+                self._client_devices.pop(terminal_id, None)
                 self._input_owners.pop(terminal_id, None)
                 self._applied_resizes.pop(terminal_id, None)
                 return
@@ -107,8 +116,18 @@ class TerminalControl:
 
     def presence(self, terminal_id: str) -> dict[str, int | str]:
         with self._lock:
+            clients = self._clients.get(terminal_id, [])
+            client_devices = self._client_devices.get(terminal_id, {})
+            known_devices = {
+                device_id
+                for client_id in clients
+                if (device_id := client_devices.get(client_id, ""))
+            }
+            anonymous_clients = sum(
+                1 for client_id in clients if not client_devices.get(client_id, "")
+            )
             return {
-                "count": len(self._clients.get(terminal_id, [])),
+                "count": len(known_devices) + anonymous_clients,
                 "input_revision": self._input_revisions.get(terminal_id, 0),
                 "last_input_device_id": self._last_input_devices.get(terminal_id, ""),
             }

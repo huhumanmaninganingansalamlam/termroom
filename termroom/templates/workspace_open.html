@@ -443,23 +443,32 @@
   {% if remote_workspaces %}
   <div class="open-workspace-list">
     {% for workspace in remote_workspaces %}
-    <a class="open-workspace-row"
-       href="/w/{{ workspace.id }}"
-       data-workspace-open-pending
-       data-workspace-opening-label="{{ t('terminal.status.connecting') }}">
-      <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
-      <span>
-        <strong>{{ workspace.display_name }}</strong>
-        <small data-workspace-open-idle>{{ workspace.canonical_path }}</small>
-        <span class="state-chip remote"
-              data-workspace-open-status
-              hidden>
-          <span class="status-dot" aria-hidden="true"></span>
-          <span data-workspace-open-status-label>{{ t('terminal.status.connecting') }}</span>
+    <div class="open-workspace-row open-workspace-manage-row">
+      <a class="open-workspace-row-main"
+         href="/w/{{ workspace.id }}"
+         data-workspace-open-pending
+         data-workspace-opening-label="{{ t('terminal.status.connecting') }}">
+        <span class="project-avatar" aria-hidden="true">{{ workspace.display_name[:1] | upper }}</span>
+        <span>
+          <strong>{{ workspace.display_name }}</strong>
+          <small data-workspace-open-idle>{{ workspace.canonical_path }}</small>
+          <span class="state-chip remote"
+                data-workspace-open-status
+                hidden>
+            <span class="status-dot" aria-hidden="true"></span>
+            <span data-workspace-open-status-label>{{ t('terminal.status.connecting') }}</span>
+          </span>
         </span>
-      </span>
-      <span class="row-arrow" aria-hidden="true">→</span>
-    </a>
+        <span class="row-arrow" aria-hidden="true">→</span>
+      </a>
+      <form method="post"
+            action="/w/{{ workspace.id }}/remove"
+            data-confirm="{{ t('workspace.remove.confirm', name=workspace.display_name) }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="return_computer_id" value="{{ computer.id }}">
+        <button class="quiet-action" type="submit">{{ t('workspace.remove.list_action') }}</button>
+      </form>
+    </div>
     {% endfor %}
   </div>
   {% else %}

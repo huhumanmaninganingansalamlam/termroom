@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import errno
 import fcntl
 import hashlib
 import heapq
@@ -3923,7 +3924,7 @@ class SSHBackend:
         await asyncio.to_thread(self.ensure_workspace, workspace)
         self.store.touch_terminal(str(terminal["id"]))
         terminal_id = str(terminal["id"])
-        client_id = self.control.register(terminal_id)
+        client_id = self.control.register(terminal_id, device_id=device_id)
         view_session = tmux_browser_view_session(client_id)
         try:
             process_pid, master_fd = self._spawn_ssh_tmux_client(
@@ -4392,7 +4393,22 @@ class SSHBackend:
             if remote == self._remote_root(workspace):
                 raise SSHBackendError("The Workspace root cannot be deleted")
             if stat_module.S_ISDIR(attr.st_mode):
-                sftp.rmdir(remote)
+                try:
+                    sftp.rmdir(remote)
+                except OSError as exc:
+                    if exc.errno == errno.ENOTEMPTY:
+                        raise
+                    try:
+                        first_entry = next(sftp.listdir_iter(remote, read_aheads=1), None)
+                    except OSError:
+                        raise exc from None
+                    if first_entry is None:
+                        raise
+                    raise OSError(
+                        errno.ENOTEMPTY,
+                        os.strerror(errno.ENOTEMPTY),
+                        remote,
+                    ) from exc
             else:
                 sftp.remove(remote)
         finally:

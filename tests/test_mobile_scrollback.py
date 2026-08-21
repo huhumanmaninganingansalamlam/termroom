@@ -13,9 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_base_loads_mobile_scrollback_assets() -> None:
     template = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
+    terminal_template = (ROOT / "termroom/templates/terminal.html").read_text(
+        encoding="utf-8"
+    )
+
     assert "mobile_scrollback.css') }}?v=11" in template
     assert "mobile_scrollback.js') }}?v=23\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
+    assert "terminal.js') }}?v=50" in terminal_template
 
 
 @pytest.mark.asyncio
