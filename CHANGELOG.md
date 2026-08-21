@@ -2,6 +2,24 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.11] - 2026-08-21
+
+### Added
+
+- Scroll through tmux history and the live terminal as one native browser surface on desktop and mobile, with an exact `LIVE` return and preserved tmux copy-mode and mouse-reporting TUI behavior.
+- Use the official xterm Unicode 11 width provider so ASCII, combining marks, Hangul, CJK, and other terminal code points use a stable cell-width table without Termroom-specific character heuristics.
+
+### Changed
+
+- Count connected terminal devices instead of counting every tab from the same browser session, while keeping input ownership and resize coordination per live client.
+- Match mobile Ctrl helper keys to xterm control and modified-arrow sequences and recover transient mobile WebSocket disconnects without reopening permanently closed terminals.
+
+### Fixed
+
+- Keep terminal history refreshes lightweight during idle and output bursts, preserve the exact reading position during delayed responses, and return to the true live bottom after layout changes.
+- Restore Workspace unregister controls in Remote Computer lists and return to the same computer after removal.
+- Redirect stale terminal URLs to a valid terminal and normalize remote non-empty-directory errors without breaking deletion of unreadable empty directories.
+
 ## [0.3.10] - 2026-08-19
 
 ### Fixed
