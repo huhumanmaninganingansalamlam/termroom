@@ -71,9 +71,15 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
         assert authenticated.headers["x-content-type-options"] == "nosniff"
         assert authenticated.headers["x-frame-options"] == "SAMEORIGIN"
         assert authenticated.headers["referrer-policy"] == "no-referrer"
+        assert authenticated.headers["permissions-policy"] == (
+            "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+        )
         assert authenticated.headers.get_list("x-content-type-options") == ["nosniff"]
         assert authenticated.headers.get_list("x-frame-options") == ["SAMEORIGIN"]
         assert authenticated.headers.get_list("referrer-policy") == ["no-referrer"]
+        assert authenticated.headers.get_list("permissions-policy") == [
+            "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+        ]
         csp = authenticated.headers["content-security-policy"]
         nonce_match = re.search(r"script-src 'self' 'nonce-([^']+)'", csp)
         assert nonce_match is not None
@@ -118,6 +124,9 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
     assert response.headers.get_list("x-frame-options") == ["SAMEORIGIN"]
+    assert response.headers.get_list("permissions-policy") == [
+        "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+    ]
 
 
 @pytest.mark.asyncio

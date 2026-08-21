@@ -281,6 +281,7 @@ class _StaticGZipMiddleware:
 
 _DYNAMIC_GZIP_MINIMUM_SIZE = 1024
 _DYNAMIC_GZIP_THREAD_MINIMUM_SIZE = 64 * 1024
+_PERMISSIONS_POLICY = "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
 
 
 def _dynamic_response_is_compressible(content_type: str) -> bool:
@@ -949,6 +950,7 @@ def create_app(settings: Settings) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = _PERMISSIONS_POLICY
         response.headers.setdefault("Content-Security-Policy", _content_security_policy(nonce))
         path = request.url.path
         if path.startswith("/static/"):
