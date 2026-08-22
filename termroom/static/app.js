@@ -370,6 +370,7 @@
   const workspaceTerminalActivity = document.querySelector("[data-workspace-terminal-activity]");
   const TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS = 15000;
   const TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS = 500;
+  const TERMINAL_ACTIVITY_RETURN_IDLE_MS = 15000;
   const TERMINAL_ACTIVITY_CHANNEL_NAME = "termroom-terminal-activity";
   const terminalActivityScopeWorkspaceIds = new Set(
     terminalActivitySummary
@@ -667,6 +668,15 @@
     markAllTerminalActivityWorkspacesForRefresh();
     scheduleTerminalActivitySignalRefresh();
   };
+  let terminalActivityLastInteractionAt = window.performance.now();
+  const noteTerminalActivityInteraction = () => {
+    const now = window.performance.now();
+    const idleFor = now - terminalActivityLastInteractionAt;
+    terminalActivityLastInteractionAt = now;
+    const hasUnread = [...terminalActivityUnreadByTerminal.values()].some(Boolean);
+    if (!hasUnread || idleFor < TERMINAL_ACTIVITY_RETURN_IDLE_MS) return;
+    refreshTerminalActivityAfterExternalState();
+  };
   if (terminalActivitySummary || workspaceTerminalActivity) {
     refreshTerminalActivity({ force: true });
     document.addEventListener("visibilitychange", () => {
@@ -687,6 +697,13 @@
     window.addEventListener("online", () => {
       refreshTerminalActivityAfterExternalState();
     });
+    window.addEventListener("pointermove", noteTerminalActivityInteraction, {
+      passive: true,
+    });
+    window.addEventListener("pointerdown", noteTerminalActivityInteraction, {
+      passive: true,
+    });
+    window.addEventListener("keydown", noteTerminalActivityInteraction);
     window.addEventListener("termroom:terminal-output", (event) => {
       if (!terminalActivityOutputNeedsRefresh(event.detail)) return;
       scheduleTerminalActivitySignalRefresh({

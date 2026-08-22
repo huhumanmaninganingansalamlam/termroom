@@ -305,7 +305,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"54"}
-    assert versions["app.js"] == {"66"}
+    assert versions["app.js"] == {"67"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
@@ -508,6 +508,7 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     terminal_script = app_script[terminal_start:terminal_end]
     assert "const TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS = 15000;" in terminal_script
     assert "const TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS = 500;" in terminal_script
+    assert "const TERMINAL_ACTIVITY_RETURN_IDLE_MS = 15000;" in terminal_script
     assert 'const TERMINAL_ACTIVITY_CHANNEL_NAME = "termroom-terminal-activity";' in (
         terminal_script
     )
@@ -547,6 +548,12 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert 'window.addEventListener("focus"' in terminal_script
     assert 'window.addEventListener("pageshow"' in terminal_script
     assert 'window.addEventListener("online"' in terminal_script
+    assert 'window.addEventListener("pointermove"' in terminal_script
+    assert 'window.addEventListener("pointerdown"' in terminal_script
+    assert 'window.addEventListener("keydown"' in terminal_script
+    assert "const noteTerminalActivityInteraction = () =>" in terminal_script
+    assert "idleFor < TERMINAL_ACTIVITY_RETURN_IDLE_MS" in terminal_script
+    assert "[...terminalActivityUnreadByTerminal.values()].some(Boolean)" in terminal_script
     assert "const refreshTerminalActivityAfterExternalState = () =>" in terminal_script
     assert "markAllTerminalActivityWorkspacesForRefresh();" in terminal_script
     assert '"termroom:terminal-activity-changed"' in terminal_script
