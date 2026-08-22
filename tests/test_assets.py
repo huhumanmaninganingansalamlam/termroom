@@ -246,6 +246,10 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400" in terminal_script
     assert "const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;" in terminal_script
     assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
+    assert 'new CustomEvent("termroom:terminal-output"' in terminal_script
+    assert 'new CustomEvent("termroom:terminal-activity-changed"' in terminal_script
+    assert "workspace_id: host.dataset.workspaceId" in terminal_script
+    assert "terminal_id: host.dataset.terminalId" in terminal_script
     assert "scheduleResize(true)" in terminal_script
     assert "const onUserInput = term._core?.coreService?.onUserInput;" in terminal_script
     assert "const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;" in terminal_script
@@ -301,11 +305,11 @@ def test_template_static_asset_versions_are_consistent() -> None:
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"54"}
-    assert versions["app.js"] == {"62"}
+    assert versions["app.js"] == {"63"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"51"}
+    assert versions["terminal.js"] == {"52"}
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:
@@ -484,7 +488,7 @@ def test_workspace_command_pending_contract_is_wired() -> None:
     assert "window.location" not in pending_script
 
 
-def test_workspace_background_refresh_is_user_driven() -> None:
+def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     workspace_template = (templates_dir / "workspace_base.html").read_text(
         encoding="utf-8"
@@ -502,7 +506,24 @@ def test_workspace_background_refresh_is_user_driven() -> None:
     terminal_start = app_script.index("  const terminalActivitySummary =")
     terminal_end = app_script.index("  const pendingWorkspaceLinks =", terminal_start)
     terminal_script = app_script[terminal_start:terminal_end]
-    assert "setTimeout" not in terminal_script
+    assert "const TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS = 15000;" in terminal_script
+    assert "const TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS = 500;" in terminal_script
+    assert 'const TERMINAL_ACTIVITY_CHANNEL_NAME = "termroom-terminal-activity";' in (
+        terminal_script
+    )
+    assert "const createTerminalActivityChannel = () =>" in terminal_script
+    assert "new window.BroadcastChannel(TERMINAL_ACTIVITY_CHANNEL_NAME)" in terminal_script
+    assert "const terminalActivityChannel = createTerminalActivityChannel();" in (
+        terminal_script
+    )
+    assert "scheduleTerminalActivityRefresh();" in terminal_script
+    assert "scheduleTerminalActivitySignalRefresh" in terminal_script
+    assert 'window.addEventListener("termroom:terminal-output"' in terminal_script
+    assert 'terminalActivityChannel?.addEventListener("message"' in terminal_script
+    assert "terminalActivityRefreshPending" in terminal_script
+    assert "window.clearTimeout(terminalActivityRefreshTimer)" in terminal_script
+    assert "window.setTimeout(async () =>" in terminal_script
+    assert "setInterval" not in terminal_script
     assert 'document.addEventListener("visibilitychange"' in terminal_script
     assert 'window.addEventListener("focus"' in terminal_script
     assert '"termroom:terminal-activity-changed"' in terminal_script

@@ -330,7 +330,14 @@
       acknowledged_activity_at: acknowledgedActivityAt,
       unread: pendingActivityAt > acknowledgedActivityAt,
     });
-    window.dispatchEvent(new CustomEvent("termroom:terminal-activity-changed"));
+    window.dispatchEvent(
+      new CustomEvent("termroom:terminal-activity-changed", {
+        detail: {
+          workspace_id: host.dataset.workspaceId,
+          terminal_id: host.dataset.terminalId,
+        },
+      }),
+    );
   };
   const scheduleActivityAcknowledge = () => {
     window.clearTimeout(activityAckTimer);
@@ -474,6 +481,14 @@
           renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
         }
         scheduleActivityAcknowledge();
+        window.dispatchEvent(
+          new CustomEvent("termroom:terminal-output", {
+            detail: {
+              workspace_id: host.dataset.workspaceId,
+              terminal_id: host.dataset.terminalId,
+            },
+          }),
+        );
       });
     });
     socket.addEventListener("close", (event) => {

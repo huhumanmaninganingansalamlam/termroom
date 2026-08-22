@@ -368,6 +368,9 @@
 
   const terminalActivitySummary = document.querySelector("[data-terminal-activity-summary]");
   const workspaceTerminalActivity = document.querySelector("[data-workspace-terminal-activity]");
+  const TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS = 15000;
+  const TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS = 500;
+  const TERMINAL_ACTIVITY_CHANNEL_NAME = "termroom-terminal-activity";
   const terminalActivityEntries = (result, key) => {
     const payload = result?.data && typeof result.data === "object" ? result.data : result;
     const entries = payload?.[key];
@@ -440,7 +443,21 @@
     });
   };
   let terminalActivityRefreshInFlight = false;
+  let terminalActivityRefreshPending = false;
   let lastTerminalActivityRefreshAt = 0;
+  let terminalActivityRefreshTimer = 0;
+  let terminalActivitySignalTimer = 0;
+  const createTerminalActivityChannel = () => {
+    if (typeof window.BroadcastChannel !== "function") return null;
+    try {
+      return new window.BroadcastChannel(TERMINAL_ACTIVITY_CHANNEL_NAME);
+    } catch {
+      // A restricted browser context can disable cross-tab messaging. The
+      // visible-page refresh remains the complete fallback.
+      return null;
+    }
+  };
+  const terminalActivityChannel = createTerminalActivityChannel();
   const terminalActivityRequestUrl = (target) => {
     const url = target?.dataset.summaryUrl || target?.dataset.activityUrl;
     if (!url || !terminalActivitySummary) return url;
@@ -457,12 +474,20 @@
     return query ? `${url}?${query}` : url;
   };
   const refreshTerminalActivity = async ({ force = false } = {}) => {
-    if (document.hidden || terminalActivityRefreshInFlight) return;
+    if (document.hidden) {
+      terminalActivityRefreshPending = true;
+      return;
+    }
     const now = window.performance.now();
     if (!force && now - lastTerminalActivityRefreshAt < 750) return;
+    if (terminalActivityRefreshInFlight) {
+      if (force) terminalActivityRefreshPending = true;
+      return;
+    }
     const target = terminalActivitySummary || workspaceTerminalActivity;
     const url = terminalActivityRequestUrl(target);
     if (!url) return;
+    lastTerminalActivityRefreshAt = now;
     terminalActivityRefreshInFlight = true;
     try {
       const response = await fetch(url, {
@@ -480,21 +505,69 @@
     } catch {
       // Unread state is durable; leave the last rendered state until the next visit.
     } finally {
-      lastTerminalActivityRefreshAt = window.performance.now();
       terminalActivityRefreshInFlight = false;
+      if (terminalActivityRefreshPending && !document.hidden) {
+        terminalActivityRefreshPending = false;
+        window.queueMicrotask(() => refreshTerminalActivity({ force: true }));
+      }
     }
+  };
+  const scheduleTerminalActivityRefresh = () => {
+    window.clearTimeout(terminalActivityRefreshTimer);
+    terminalActivityRefreshTimer = 0;
+    if (document.hidden || (!terminalActivitySummary && !workspaceTerminalActivity)) return;
+    terminalActivityRefreshTimer = window.setTimeout(async () => {
+      terminalActivityRefreshTimer = 0;
+      try {
+        await refreshTerminalActivity({ force: true });
+      } finally {
+        scheduleTerminalActivityRefresh();
+      }
+    }, TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS);
+  };
+  const scheduleTerminalActivitySignalRefresh = ({ kind = "", detail = null } = {}) => {
+    const firstSignalInBurst = terminalActivitySignalTimer === 0;
+    window.clearTimeout(terminalActivitySignalTimer);
+    if (firstSignalInBurst && kind) {
+      publishTerminalActivitySignal(kind, detail);
+    }
+    terminalActivitySignalTimer = window.setTimeout(() => {
+      terminalActivitySignalTimer = 0;
+      refreshTerminalActivity({ force: true });
+    }, TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS);
+  };
+  const publishTerminalActivitySignal = (kind, detail) => {
+    terminalActivityChannel?.postMessage({ kind, ...(detail || {}) });
   };
   if (terminalActivitySummary || workspaceTerminalActivity) {
     refreshTerminalActivity({ force: true });
+    scheduleTerminalActivityRefresh();
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) refreshTerminalActivity();
+      if (document.hidden) {
+        window.clearTimeout(terminalActivityRefreshTimer);
+        terminalActivityRefreshTimer = 0;
+        return;
+      }
+      terminalActivityRefreshPending = false;
+      refreshTerminalActivity({ force: true });
+      scheduleTerminalActivityRefresh();
     });
     window.addEventListener("focus", () => {
       refreshTerminalActivity();
+      scheduleTerminalActivityRefresh();
+    });
+    window.addEventListener("termroom:terminal-output", (event) => {
+      scheduleTerminalActivitySignalRefresh({ kind: "output", detail: event.detail });
+    });
+    terminalActivityChannel?.addEventListener("message", () => {
+      scheduleTerminalActivitySignalRefresh();
     });
     window.addEventListener(
       "termroom:terminal-activity-changed",
-      syncWorkspaceTerminalUnreadFromTabs,
+      (event) => {
+        syncWorkspaceTerminalUnreadFromTabs();
+        publishTerminalActivitySignal("changed", event.detail);
+      },
     );
   }
 
