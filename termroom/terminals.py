@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import stat as stat_module
 import struct
 import subprocess
 import termios
@@ -50,6 +51,7 @@ TMUX_WORKSPACE_COMMAND_DIGEST_OPTION = "@termroom_workspace_command_digest"
 TMUX_TERMINAL_EDITOR_DIGEST_OPTION = "@termroom_terminal_editor_digest"
 WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS = 2.0
 WORKSPACE_COMMAND_READY_POLL_SECONDS = 0.01
+FILE_RUN_COMPLETION_GRACE_SECONDS = 2.0
 TMUX_WORKSPACE_COMMAND_RECORD_FORMAT = (
     "#{window_id}|#{pane_dead}|"
     f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}|"
@@ -436,6 +438,46 @@ def file_run_completion_was_stopped(record: dict[str, Any]) -> bool:
         "TERM",
         "HUP",
     }
+
+
+def file_run_dispatch_timestamp(request_id: Path) -> float | None:
+    """Return the trusted local dispatch timestamp for one File Run request."""
+
+    try:
+        info = request_id.lstat()
+    except OSError:
+        return None
+    if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+        return None
+    return float(info.st_mtime)
+
+
+def file_run_completion_grace_active(
+    pane: dict[str, Any] | None,
+    *,
+    dispatch_at: float | int | None = None,
+    now: float | None = None,
+) -> bool:
+    """Keep a just-dispatched dead pane provisional while records settle.
+
+    A reusable pane's dead timestamp belongs to the tmux lifecycle and is not
+    by itself a reliable timestamp for the newly assigned run. The request-id
+    file is written immediately before respawn, so the newest trustworthy
+    timestamp defines the bounded completion-record grace period without
+    guessing from the program name or exit code.
+    """
+
+    timestamps: list[float] = []
+    dead_at = pane.get("dead_at") if pane is not None else None
+    for value in (dead_at, dispatch_at):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        timestamps.append(float(value))
+    if not timestamps:
+        return False
+    current = time.time() if now is None else float(now)
+    age = current - max(timestamps)
+    return 0 <= age < FILE_RUN_COMPLETION_GRACE_SECONDS
 
 
 def file_run_dead_pane_fallback(
@@ -946,8 +988,8 @@ class TerminalManager:
                 "exit_code": pane.get("exit_code") if pane else None,
                 "error_code": "forced",
             }
-        dead_at = pane.get("dead_at") if pane else None
-        if isinstance(dead_at, int) and time.time() - dead_at < 2:
+        dispatch_at = file_run_dispatch_timestamp(metadata_dir / "request-id")
+        if file_run_completion_grace_active(pane, dispatch_at=dispatch_at):
             return {
                 "state": "running" if state else "preparing",
                 "started_at": state.get("started_at") if state else None,

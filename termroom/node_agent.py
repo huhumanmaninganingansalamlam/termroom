@@ -105,8 +105,10 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER,
+    file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
+    file_run_dispatch_timestamp,
     normalize_terminal_editor_path,
     normalize_terminal_name,
     normalize_workspace_command,
@@ -1933,8 +1935,8 @@ class NodeRuntime:
                 },
                 windows,
             )
-        dead_at = pane.get("dead_at") if pane else None
-        if isinstance(dead_at, int) and time.time() - dead_at < 2:
+        dispatch_at = file_run_dispatch_timestamp(metadata_dir / "request-id")
+        if file_run_completion_grace_active(pane, dispatch_at=dispatch_at):
             return (
                 {
                     "state": "running" if state else "preparing",

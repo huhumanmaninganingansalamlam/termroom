@@ -77,6 +77,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER,
     TerminalOutputDecoder,
+    file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
     normalize_terminal_editor_path,
@@ -3552,8 +3553,22 @@ class SSHBackend:
                     "exit_code": pane.get("exit_code") if pane else None,
                     "error_code": "forced",
                 }
-            dead_at = pane.get("dead_at") if pane else None
-            if isinstance(dead_at, int) and time.time() - dead_at < 2:
+            try:
+                request_info = sftp.lstat(paths["request_id"])
+            except OSError:
+                dispatch_at = None
+            else:
+                request_mode = int(request_info.st_mode or 0)
+                request_mtime = request_info.st_mtime
+                dispatch_at = (
+                    float(request_mtime)
+                    if not stat_module.S_ISLNK(request_mode)
+                    and stat_module.S_ISREG(request_mode)
+                    and not isinstance(request_mtime, bool)
+                    and isinstance(request_mtime, (int, float))
+                    else None
+                )
+            if file_run_completion_grace_active(pane, dispatch_at=dispatch_at):
                 return {
                     "state": "running" if state else "preparing",
                     "started_at": state.get("started_at") if state else None,

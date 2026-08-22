@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import io
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -28,6 +29,7 @@ from termroom.ssh_backend import SSHBackend, SSHBackendError
 from termroom.terminals import (
     TerminalError,
     TerminalManager,
+    file_run_completion_grace_active,
     file_run_dead_pane_fallback,
 )
 from termroom.workspaces import RootManager, WorkspaceManager
@@ -504,6 +506,77 @@ def test_dead_pane_fallback_requires_successful_runtime_preparation(
     assert file_run_dead_pane_fallback(None, pane) is None
     assert file_run_dead_pane_fallback(state, {"dead": False, "exit_code": exit_code}) is None
     assert file_run_dead_pane_fallback(state, {"dead": True, "exit_code": None}) is None
+
+
+def test_recent_dispatch_marker_outlives_a_stale_reused_pane_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, workspace = _store_with_workspace(tmp_path)
+    manager = TerminalManager(store)
+    run_id = str(uuid.uuid4())
+    metadata = tmp_path / "metadata" / run_id
+    manager._write_file_run_metadata(metadata, run_id=run_id)
+    terminal = store.create_terminal(
+        str(workspace["id"]),
+        "Run",
+        "@1",
+        role="file_run",
+        managed_run_id=run_id,
+    )
+    records = [
+        {
+            "tmux_window": "@1",
+            "tmux_session": str(workspace["tmux_session"]),
+            "activity_at": None,
+            "name": "Run",
+            "role": "file_run",
+            "managed_run_id": run_id,
+        }
+    ]
+    stale_dead_pane = {
+        "dead": True,
+        "exit_code": 0,
+        "pid": None,
+        "dead_at": 1,
+    }
+    monkeypatch.setattr(manager, "session_exists", lambda _session: True)
+    monkeypatch.setattr(manager, "_list_tmux_window_records", lambda _session: records)
+    monkeypatch.setattr(manager, "_file_run_pane", lambda _window: stale_dead_pane)
+
+    provisional = manager.inspect_file_run(
+        workspace,
+        run_id=run_id,
+        metadata_dir=metadata,
+    )
+
+    assert provisional == {
+        "state": "preparing",
+        "started_at": None,
+    }
+    assert file_run_completion_grace_active(
+        stale_dead_pane,
+        dispatch_at=100,
+        now=101,
+    )
+    assert not file_run_completion_grace_active(
+        stale_dead_pane,
+        dispatch_at=100,
+        now=103,
+    )
+
+    request_id = metadata / "request-id"
+    os.utime(request_id, (1, 1))
+    expired = manager.inspect_file_run(
+        workspace,
+        run_id=run_id,
+        metadata_dir=metadata,
+    )
+    assert expired["state"] == "lost"
+    assert expired["error_code"] == "completion_missing"
+    assert terminal["id"] == store.get_managed_terminal(
+        str(workspace["id"]), "file_run"
+    )["id"]
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
