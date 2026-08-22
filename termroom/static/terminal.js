@@ -15,6 +15,11 @@
   const DEFAULT_TERMINAL_FONT_SIZE = 14;
   const MIN_TERMINAL_FONT_SIZE = 12;
   const MAX_TERMINAL_FONT_SIZE = 20;
+  // Programs can emit palette indices or fixed RGB colors that nearly match
+  // either the light or dark terminal background. Let xterm preserve the hue
+  // while lifting only low-contrast foregrounds to normal-text readability.
+  // Its theme service clears this contrast cache whenever the theme changes.
+  const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;
   const BUNDLED_TERMINAL_FONT_FAMILY = '"Termroom D2Koding Nerd Mono"';
   const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C";
   // Let fast cached/local loads avoid a font swap without holding terminal input
@@ -119,6 +124,7 @@
     fontFamily: terminalFontFamily(bundledTerminalFontLoaded),
     fontSize: initialTerminalFontSize,
     lineHeight: 1.2,
+    minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO,
     scrollback: 5000,
     allowProposedApi: unicode11Available,
     theme: terminalTheme(),
@@ -324,7 +330,14 @@
       acknowledged_activity_at: acknowledgedActivityAt,
       unread: pendingActivityAt > acknowledgedActivityAt,
     });
-    window.dispatchEvent(new CustomEvent("termroom:terminal-activity-changed"));
+    window.dispatchEvent(
+      new CustomEvent("termroom:terminal-activity-changed", {
+        detail: {
+          workspace_id: host.dataset.workspaceId,
+          terminal_id: host.dataset.terminalId,
+        },
+      }),
+    );
   };
   const scheduleActivityAcknowledge = () => {
     window.clearTimeout(activityAckTimer);
@@ -468,6 +481,14 @@
           renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
         }
         scheduleActivityAcknowledge();
+        window.dispatchEvent(
+          new CustomEvent("termroom:terminal-output", {
+            detail: {
+              workspace_id: host.dataset.workspaceId,
+              terminal_id: host.dataset.terminalId,
+            },
+          }),
+        );
       });
     });
     socket.addEventListener("close", (event) => {

@@ -32,6 +32,9 @@ from websockets.exceptions import ConnectionClosed
 
 from termroom.file_runs import RUNNER_REGISTRY_VERSION, resolve_runner
 from termroom.files import (
+    DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+    DEFAULT_FILE_SEARCH_MAX_MATCHES,
+    DEFAULT_FILE_SEARCH_MAX_SECONDS,
     DirectoryListingLimitError,
     FileConflictError,
     FileService,
@@ -102,8 +105,10 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER,
+    file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
+    file_run_dispatch_timestamp,
     normalize_terminal_editor_path,
     normalize_terminal_name,
     normalize_workspace_command,
@@ -534,6 +539,29 @@ class NodeRuntime:
             return {
                 "directory": self._relative(root, directory),
                 "entries": [asdict(entry) for entry in entries],
+            }
+        if operation == "files.search":
+            root = self._workspace_path(payload)
+            raw_query = payload.get("query")
+            if not isinstance(raw_query, str) or not raw_query.strip() or len(raw_query) > 256:
+                raise NodeAgentError("File search query is invalid", code="request_invalid")
+            raw_include_noise = payload.get("include_noise", False)
+            if not isinstance(raw_include_noise, bool):
+                raise NodeAgentError("File search visibility is invalid", code="request_invalid")
+            search = self.files.search_files(
+                root,
+                str(payload.get("path") or "."),
+                raw_query,
+                include_noise=raw_include_noise,
+                max_matches=DEFAULT_FILE_SEARCH_MAX_MATCHES,
+                max_entries=DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+                max_seconds=DEFAULT_FILE_SEARCH_MAX_SECONDS,
+            )
+            return {
+                "entries": [asdict(entry) for entry in search.entries],
+                "scanned_entries": search.scanned_entries,
+                "skipped_noise": search.skipped_noise,
+                "truncated": search.truncated,
             }
         if operation == "files.recent":
             root = self._workspace_path(payload)
@@ -1907,8 +1935,8 @@ class NodeRuntime:
                 },
                 windows,
             )
-        dead_at = pane.get("dead_at") if pane else None
-        if isinstance(dead_at, int) and time.time() - dead_at < 2:
+        dispatch_at = file_run_dispatch_timestamp(metadata_dir / "request-id")
+        if file_run_completion_grace_active(pane, dispatch_at=dispatch_at):
             return (
                 {
                     "state": "running" if state else "preparing",

@@ -93,6 +93,56 @@ def test_file_operations_reject_symlink_components(tmp_path: Path) -> None:
     assert not (real / "new.txt").exists()
 
 
+def test_file_search_recurses_and_respects_noise_symlinks_and_bounds(tmp_path: Path) -> None:
+    service = FileService()
+    nested = tmp_path / "src" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "needle-한글.txt").write_text("match\n", encoding="utf-8")
+    (tmp_path / ".env-needle").write_text("useful dotfile\n", encoding="utf-8")
+    dependency = tmp_path / "node_modules"
+    dependency.mkdir()
+    (dependency / "needle-dependency.txt").write_text("noise\n", encoding="utf-8")
+    internal = tmp_path / ".termroom-state"
+    internal.mkdir()
+    (internal / "needle-secret.txt").write_text("secret\n", encoding="utf-8")
+    outside = tmp_path.parent / "outside-search"
+    outside.mkdir(exist_ok=True)
+    (outside / "needle-outside.txt").write_text("outside\n", encoding="utf-8")
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+
+    search = service.search_files(
+        tmp_path,
+        ".",
+        "needle",
+        excluded_paths=frozenset({".termroom-state"}),
+    )
+
+    assert [entry.relative_path for entry in search.entries] == [
+        ".env-needle",
+        "src/deep/needle-한글.txt",
+    ]
+    assert search.skipped_noise == 1
+    assert search.truncated is False
+    assert all("outside" not in entry.relative_path for entry in search.entries)
+
+    with_noise = service.search_files(
+        tmp_path,
+        ".",
+        "needle",
+        include_noise=True,
+        excluded_paths=frozenset({".termroom-state"}),
+    )
+    assert [entry.relative_path for entry in with_noise.entries] == [
+        ".env-needle",
+        "node_modules/needle-dependency.txt",
+        "src/deep/needle-한글.txt",
+    ]
+
+    bounded = service.search_files(tmp_path, ".", "needle", max_entries=1)
+    assert bounded.scanned_entries == 1
+    assert bounded.truncated is True
+
+
 def test_binary_file_is_not_editable(tmp_path: Path) -> None:
     (tmp_path / "binary.dat").write_bytes(b"abc\x00def")
     with pytest.raises(UnsupportedFileError):

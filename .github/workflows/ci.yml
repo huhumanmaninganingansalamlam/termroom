@@ -38,7 +38,7 @@ jobs:
       - name: Install Linux test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes openssh-server tmux
+          sudo apt-get install --yes netcat-openbsd openssh-server tmux
 
       - name: Install project dependencies
         run: uv sync --all-groups --frozen
@@ -47,7 +47,25 @@ jobs:
         run: uv run --frozen ruff check termroom tests
 
       - name: Run tests
-        run: env -u TMUX -u TMUX_PANE uv run --frozen pytest --ignore=tests/test_websocket.py
+        run: |
+          set +e
+          pytest_log="${RUNNER_TEMP}/pytest.log"
+          env -u TMUX -u TMUX_PANE uv run --frozen pytest --ignore=tests/test_websocket.py 2>&1 | tee "$pytest_log"
+          test_status=${PIPESTATUS[0]}
+          if (( test_status != 0 )); then
+            while IFS= read -r failure; do
+              failure=${failure//'%'/'%25'}
+              failure=${failure//$'\r'/'%0D'}
+              failure=${failure//$'\n'/'%0A'}
+              echo "::error title=pytest failure::$failure"
+            done < <(grep -E '^FAILED ' "$pytest_log" || true)
+            failure_tail=$(tail -n 80 "$pytest_log")
+            failure_tail=${failure_tail//'%'/'%25'}
+            failure_tail=${failure_tail//$'\r'/'%0D'}
+            failure_tail=${failure_tail//$'\n'/'%0A'}
+            echo "::error title=pytest failure tail::$failure_tail"
+          fi
+          exit "$test_status"
 
       - name: Run WebSocket integration tests
         # These tests own real tmux PTYs and Starlette TestClient event-loop threads.

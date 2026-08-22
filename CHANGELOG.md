@@ -2,6 +2,23 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.12] - 2026-08-22
+
+### Added
+
+- Search the current folder recursively across Local, SSH, and Node Workspaces with bounded traversal, path-aware results, and safe fallback behavior.
+
+### Changed
+
+- Compress eligible dynamic HTML, JSON, and text responses with gzip and apply nonce-based CSP, a minimal Permissions Policy, and proxy-safe security headers.
+- Keep terminal text readable across light and dark themes using xterm's cell-aware minimum contrast handling.
+- Share Terminal `New output` read state across devices and poll only while unread discovery is still needed.
+
+### Fixed
+
+- Refresh shared Terminal activity after live output, reconnects, and returning to an idle tab without repeatedly polling an already-unread Workspace.
+- Preserve very fast File Run completion when a reused tmux pane exits before its atomic completion record becomes visible.
+
 ## [0.3.11] - 2026-08-21
 
 ### Added

@@ -795,6 +795,12 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
     project = tmp_path / "remote-project"
     project.mkdir()
     (project / "readme.txt").write_text("hello remote\n", encoding="utf-8")
+    nested_search = project / "src" / "deep"
+    nested_search.mkdir(parents=True)
+    (nested_search / "ssh-needle.txt").write_text("match\n", encoding="utf-8")
+    dependency = project / "node_modules"
+    dependency.mkdir()
+    (dependency / "hidden-needle.txt").write_text("hidden\n", encoding="utf-8")
     (project / "large.log").write_text(
         "".join(f"remote-line-{index:05d}\n" for index in range(4000)),
         encoding="utf-8",
@@ -864,6 +870,22 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             assert workspace_usage.cpu_percent >= 0
 
             assert backend.read_text(workspace, "readme.txt", 1024).content == "hello remote\n"
+            search = backend.search_files(workspace, ".", "needle")
+            assert [entry.relative_path for entry in search.entries] == [
+                "src/deep/ssh-needle.txt"
+            ]
+            assert search.skipped_noise == 1
+            assert search.truncated is False
+            search_with_noise = backend.search_files(
+                workspace,
+                ".",
+                "needle",
+                include_noise=True,
+            )
+            assert [entry.relative_path for entry in search_with_noise.entries] == [
+                "node_modules/hidden-needle.txt",
+                "src/deep/ssh-needle.txt",
+            ]
             remote_range = backend.read_text_preview(
                 workspace,
                 "large.log",

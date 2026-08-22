@@ -79,18 +79,21 @@
     <button class="secondary-button" type="submit">{{ t('files.search') }}</button>
     <button id="file-search-clear" class="quiet-action" type="button" {% if not query %}hidden{% endif %}>{{ t('common.clear') }}</button>
   </form>
-  {% if noise_count %}
-  <form class="file-visibility-form" method="get" action="/w/{{ workspace.id }}/files">
+  <form class="file-visibility-form"
+        method="get"
+        action="/w/{{ workspace.id }}/files"
+        data-file-visibility-form
+        {% if not noise_count and not show_noise %}hidden{% endif %}>
     <input type="hidden" name="path" value="{{ path }}">
     <input type="hidden" name="noise" value="{{ 0 if show_noise else 1 }}">
-    {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+    <input type="hidden" name="q" value="{{ query }}" data-file-visibility-query>
     <button class="file-visibility-toggle{% if show_noise %} is-active{% endif %}"
             type="submit"
+            data-file-visibility-toggle
             aria-pressed="{{ 'true' if show_noise else 'false' }}">
       {% if show_noise %}{{ t('files.hide_noise') }}{% else %}{{ t('files.show_noise', count=noise_count) }}{% endif %}
     </button>
   </form>
-  {% endif %}
 </section>
 
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}

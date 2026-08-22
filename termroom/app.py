@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import csv
+import gzip
 import hashlib
 import io
 import ipaddress
@@ -12,6 +13,7 @@ import secrets
 import tempfile
 import uuid
 import zipfile
+import zlib
 from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -32,23 +34,27 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
-from starlette.datastructures import Headers, UploadFile
+from starlette.datastructures import Headers, MutableHeaders, UploadFile
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.staticfiles import NotModifiedResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from termroom.auth import AuthManager, AuthRateLimited
 from termroom.config import Settings
 from termroom.db import StateStore
 from termroom.file_runs import FileRunConflict, FileRunError, FileRunManager
 from termroom.files import (
-    DEFAULT_FILE_BROWSER_NOISE,
+    DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+    DEFAULT_FILE_SEARCH_MAX_MATCHES,
+    DEFAULT_FILE_SEARCH_MAX_SECONDS,
     FileConflictError,
+    FileSearch,
     FileService,
     FileSnapshot,
     RecentFiles,
     UnsupportedFileError,
     editor_newline_style,
+    file_browser_entry_is_noise,
     normalize_editor_newlines,
 )
 from termroom.i18n import (
@@ -191,7 +197,7 @@ def _static_request_has_range(scope: Scope) -> bool:
     return any(name.lower() == b"range" for name, _ in scope.get("headers", ()))
 
 
-def _static_request_accepts_gzip(scope: Scope) -> bool:
+def _request_accepts_gzip(scope: Scope) -> bool:
     explicit_quality: float | None = None
     wildcard_quality: float | None = None
     raw_values = Headers(scope=scope).getlist("Accept-Encoding")
@@ -240,7 +246,7 @@ class _CacheAwareStaticFiles(StaticFiles):
             can_compress
             and scope.get("method") == "GET"
             and not _static_request_has_range(scope)
-            and _static_request_accepts_gzip(scope)
+            and _request_accepts_gzip(scope)
         ):
             etag = response.headers["etag"]
             response.headers["etag"] = f'{etag[:-1]}-gzip"'
@@ -266,11 +272,203 @@ class _StaticGZipMiddleware:
             and scope.get("method") == "GET"
             and not _static_request_has_range(scope)
             and _static_request_suffix(scope) in _COMPRESSIBLE_STATIC_SUFFIXES
-            and _static_request_accepts_gzip(scope)
+            and _request_accepts_gzip(scope)
         ):
             await self.gzip_app(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+_DYNAMIC_GZIP_MINIMUM_SIZE = 1024
+_DYNAMIC_GZIP_THREAD_MINIMUM_SIZE = 64 * 1024
+_PERMISSIONS_POLICY = "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+
+
+def _dynamic_response_is_compressible(content_type: str) -> bool:
+    media_type = content_type.partition(";")[0].strip().casefold()
+    if media_type == "text/event-stream":
+        return False
+    return (
+        media_type.startswith("text/")
+        or media_type in {
+            "application/json",
+            "application/javascript",
+            "application/xml",
+            "application/manifest+json",
+            "image/svg+xml",
+        }
+        or media_type.endswith("+json")
+        or media_type.endswith("+xml")
+    )
+
+
+class _DynamicGZipResponder:
+    """Compress dynamic text while leaving binary, range, and attachment streams intact."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        accepts_gzip: bool,
+        minimum_size: int,
+        compresslevel: int,
+    ) -> None:
+        self.app = app
+        self.accepts_gzip = accepts_gzip
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+        self.send: Send | None = None
+        self.initial_message: Message | None = None
+        self.mode = "pending"
+        self.compressor: zlib.Compress | None = None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.send = send
+        await self.app(scope, receive, self._send)
+
+    async def _send(self, message: Message) -> None:
+        if self.send is None:  # pragma: no cover - ASGI lifecycle invariant
+            raise RuntimeError("Dynamic compression responder is not attached")
+        message_type = message["type"]
+        if message_type == "http.response.start":
+            self.initial_message = message
+            return
+        if self.mode == "passthrough":
+            await self.send(message)
+            return
+        if self.mode == "compress":
+            if message_type != "http.response.body" or self.compressor is None:
+                await self.send(message)
+                return
+            body = message.get("body", b"")
+            compressed = self.compressor.compress(body)
+            if not message.get("more_body", False):
+                compressed += self.compressor.flush(zlib.Z_FINISH)
+                self.mode = "passthrough"
+            message["body"] = compressed
+            await self.send(message)
+            return
+        if self.initial_message is None:
+            await self.send(message)
+            return
+        if message_type == "http.response.pathsend":
+            await self.send(self.initial_message)
+            self.initial_message = None
+            self.mode = "passthrough"
+            await self.send(message)
+            return
+        if message_type != "http.response.body":
+            await self.send(message)
+            return
+
+        start_message = self.initial_message
+        self.initial_message = None
+        headers = MutableHeaders(raw=start_message["headers"])
+        content_type = headers.get("content-type", "")
+        compressible = (
+            _dynamic_response_is_compressible(content_type)
+            and "content-encoding" not in headers
+            and "content-range" not in headers
+            and "content-disposition" not in headers
+            and "etag" not in headers
+        )
+        if compressible:
+            headers.add_vary_header("Accept-Encoding")
+        body = message.get("body", b"")
+        more_body = message.get("more_body", False)
+        if not compressible or not self.accepts_gzip:
+            self.mode = "passthrough"
+            await self.send(start_message)
+            await self.send(message)
+            return
+        if more_body:
+            headers["Content-Encoding"] = "gzip"
+            if "content-length" in headers:
+                del headers["Content-Length"]
+            self.compressor = zlib.compressobj(
+                self.compresslevel,
+                zlib.DEFLATED,
+                wbits=31,
+            )
+            self.mode = "compress"
+            message["body"] = self.compressor.compress(body)
+            await self.send(start_message)
+            await self.send(message)
+            return
+        if len(body) < self.minimum_size:
+            self.mode = "passthrough"
+            await self.send(start_message)
+            await self.send(message)
+            return
+
+        if len(body) >= _DYNAMIC_GZIP_THREAD_MINIMUM_SIZE:
+            compressed = await asyncio.to_thread(
+                gzip.compress,
+                body,
+                compresslevel=self.compresslevel,
+                mtime=0,
+            )
+        else:
+            compressed = gzip.compress(body, compresslevel=self.compresslevel, mtime=0)
+        if len(compressed) >= len(body):
+            self.mode = "passthrough"
+            await self.send(start_message)
+            await self.send(message)
+            return
+        headers["Content-Encoding"] = "gzip"
+        headers["Content-Length"] = str(len(compressed))
+        message["body"] = compressed
+        self.mode = "passthrough"
+        await self.send(start_message)
+        await self.send(message)
+
+
+class _DynamicGZipMiddleware:
+    """Apply one safe compression policy to HTML, JSON, and other dynamic text."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        minimum_size: int = _DYNAMIC_GZIP_MINIMUM_SIZE,
+        compresslevel: int = 6,
+    ) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "GET":
+            await self.app(scope, receive, send)
+            return
+        responder = _DynamicGZipResponder(
+            self.app,
+            accepts_gzip=_request_accepts_gzip(scope),
+            minimum_size=self.minimum_size,
+            compresslevel=self.compresslevel,
+        )
+        await responder(scope, receive, send)
+
+
+def _content_security_policy(nonce: str) -> str:
+    return "; ".join(
+        (
+            "default-src 'self'",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "frame-ancestors 'self'",
+            "object-src 'none'",
+            f"script-src 'self' 'nonce-{nonce}'",
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data: blob:",
+            "font-src 'self'",
+            "connect-src 'self' ws: wss:",
+            "worker-src 'self'",
+            "manifest-src 'self'",
+            "media-src 'self' blob:",
+            "frame-src 'self'",
+        )
+    )
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -387,14 +585,16 @@ def create_app(settings: Settings) -> FastAPI:
                     status_code=503,
                     headers=headers,
                 )
+            nonce = request.state.csp_nonce
             return HTMLResponse(
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<meta name='color-scheme' content='dark light'>"
-                "<script>(()=>{let t;try{t=localStorage.getItem('termroom.theme')}catch{};"
+                f"<script nonce='{nonce}'>(()=>{{let t;try{{t="
+                "localStorage.getItem('termroom.theme')}catch{};"
                 "if(t!=='dark'&&t!=='light')t=matchMedia('(prefers-color-scheme:light)').matches?"
                 "'light':'dark';document.documentElement.dataset.theme=t})()</script>"
-                "<style>:root{color-scheme:dark;--bg:#212830;--surface:#2a313c;"
+                f"<style nonce='{nonce}'>:root{{color-scheme:dark;--bg:#212830;--surface:#2a313c;"
                 "--border:#3d444d;--text:#e1e6ed;--muted:#b7bec8;--accent:#adbbff}"
                 ":root[data-theme=light]{color-scheme:light;--bg:#d9d6ce;"
                 "--surface:#ece9e1;--border:#afa99f;--text:#302f2c;"
@@ -413,28 +613,6 @@ def create_app(settings: Settings) -> FastAPI:
                 headers=headers,
             )
         return await call_next(request)
-
-    @app.middleware("http")
-    async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
-        response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        path = request.url.path
-        if path.startswith("/static/"):
-            if response.status_code not in {200, 206, 304}:
-                response.headers["Cache-Control"] = "no-store"
-            elif path in {"/static/manifest.webmanifest", "/static/sw.js"}:
-                response.headers["Cache-Control"] = "no-cache"
-            elif request.query_params.get("v"):
-                response.headers["Cache-Control"] = (
-                    "public, max-age=31536000, immutable"
-                )
-            else:
-                response.headers["Cache-Control"] = "no-cache"
-        elif path != "/health":
-            response.headers.setdefault("Cache-Control", "no-store")
-        return response
 
     def is_remote(workspace: Mapping[str, Any]) -> bool:
         return workspace.get("backend_kind") == "remote"
@@ -479,6 +657,41 @@ def create_app(settings: Settings) -> FastAPI:
             return await remote.list_dir(workspace, relative_path)
         ensure_exposed_local_path(workspace, relative_path)
         return files.list_dir(workspace["path"], relative_path)
+
+    async def search_workspace_files(
+        workspace: dict[str, Any],
+        relative_path: str,
+        query: str,
+        *,
+        include_noise: bool,
+    ) -> FileSearch:
+        if is_remote(workspace):
+            return await remote.search_files(
+                workspace,
+                relative_path,
+                query,
+                include_noise=include_noise,
+            )
+        ensure_exposed_local_path(workspace, relative_path)
+        workspace_root = Path(workspace["path"]).resolve(strict=True)
+        try:
+            config_root = settings.state_dir.resolve(strict=True)
+        except OSError:
+            config_root = settings.state_dir.resolve(strict=False)
+        excluded_paths: frozenset[str] = frozenset()
+        if config_root != workspace_root and is_within(config_root, workspace_root):
+            excluded_paths = frozenset({config_root.relative_to(workspace_root).as_posix()})
+        return await asyncio.to_thread(
+            files.search_files,
+            workspace_root,
+            relative_path,
+            query,
+            include_noise=include_noise,
+            max_matches=DEFAULT_FILE_SEARCH_MAX_MATCHES,
+            max_entries=DEFAULT_FILE_SEARCH_MAX_ENTRIES,
+            max_seconds=DEFAULT_FILE_SEARCH_MAX_SECONDS,
+            excluded_paths=excluded_paths,
+        )
 
     async def stat_workspace_file(workspace: dict[str, Any], relative_path: str):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
@@ -728,6 +941,34 @@ def create_app(settings: Settings) -> FastAPI:
             if forwarded_proto.partition(",")[0].strip().lower() == "https":
                 request.scope["scheme"] = "https"
         return await call_next(request)
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+        nonce = secrets.token_urlsafe(18)
+        request.state.csp_nonce = nonce
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = _PERMISSIONS_POLICY
+        response.headers.setdefault("Content-Security-Policy", _content_security_policy(nonce))
+        path = request.url.path
+        if path.startswith("/static/"):
+            if response.status_code not in {200, 206, 304}:
+                response.headers["Cache-Control"] = "no-store"
+            elif path in {"/static/manifest.webmanifest", "/static/sw.js"}:
+                response.headers["Cache-Control"] = "no-cache"
+            elif request.query_params.get("v"):
+                response.headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable"
+                )
+            else:
+                response.headers["Cache-Control"] = "no-cache"
+        elif path != "/health":
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
+    app.add_middleware(_DynamicGZipMiddleware)
 
     @app.exception_handler(PathBoundaryError)
     async def path_error(request: Request, exc: PathBoundaryError) -> HTMLResponse:
@@ -1147,14 +1388,12 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
     def terminal_activity_payload(
-        request: Request,
         *,
         workspace_id: str | None = None,
         workspace_ids: list[str] | None = None,
         terminal_id: str | None = None,
     ) -> dict[str, Any]:
         summary = store.terminal_activity_summary(
-            str(request.state.session["id"]),
             workspace_id=workspace_id,
             workspace_ids=workspace_ids,
             terminal_id=terminal_id,
@@ -1163,7 +1402,6 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/terminal-activity/summary", response_class=JSONResponse)
     async def terminal_activity_summary(
-        request: Request,
         workspace_id: Annotated[list[str] | None, Query()] = None,
     ) -> dict[str, Any]:
         requested_ids = list(dict.fromkeys(workspace_id or ()))
@@ -1178,7 +1416,6 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace not found")
         await refresh_terminal_activity_scope(scoped_workspaces)
         return terminal_activity_payload(
-            request,
             workspace_ids=requested_ids,
         )
 
@@ -1186,12 +1423,10 @@ def create_app(settings: Settings) -> FastAPI:
         "/api/workspaces/{workspace_id}/terminal-activity",
         response_class=JSONResponse,
     )
-    async def workspace_terminal_activity(
-        request: Request, workspace_id: str
-    ) -> dict[str, Any]:
+    async def workspace_terminal_activity(workspace_id: str) -> dict[str, Any]:
         workspace = _require_workspace(workspaces, workspace_id)
         await refresh_terminal_activity_scope([workspace])
-        return terminal_activity_payload(request, workspace_id=workspace_id)
+        return terminal_activity_payload(workspace_id=workspace_id)
 
     @app.post(
         "/api/activity/notifications/claim",
@@ -3374,33 +3609,42 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> HTMLResponse:
         locale = locale_from_request(request)
         workspace = _require_workspace(workspaces, workspace_id)
-        directory, all_entries = await list_workspace_dir(workspace, path)
-        relative = (
-            _normalize_relative_path(path)
-            if is_remote(workspace)
-            else _workspace_relative(workspace["path"], directory)
-        )
-        visible_entries = [
-            entry
-            for entry in all_entries
-            if not _is_internal_state_entry(settings, workspace, relative, entry.name)
-        ]
-        noise_count = sum(_file_browser_entry_is_noise(entry) for entry in visible_entries)
-        filtered_entries = (
-            visible_entries
-            if noise
-            else [
-                entry
-                for entry in visible_entries
-                if not _file_browser_entry_is_noise(entry)
-            ]
-        )
         query = q.strip()[:120]
+        search_truncated = False
+        search_scanned_entries = 0
         if query:
-            needle = query.casefold()
-            filtered_entries = [
-                entry for entry in filtered_entries if needle in entry.name.casefold()
+            relative = _normalize_relative_path(path)
+            search = await search_workspace_files(
+                workspace,
+                relative,
+                query,
+                include_noise=noise,
+            )
+            filtered_entries = search.entries
+            search_truncated = search.truncated
+            search_scanned_entries = search.scanned_entries
+            noise_count = 0 if noise else search.skipped_noise
+        else:
+            directory, all_entries = await list_workspace_dir(workspace, path)
+            relative = (
+                _normalize_relative_path(path)
+                if is_remote(workspace)
+                else _workspace_relative(workspace["path"], directory)
+            )
+            visible_entries = [
+                entry
+                for entry in all_entries
+                if not _is_internal_state_entry(settings, workspace, relative, entry.name)
             ]
+            noise_entries = [
+                entry for entry in visible_entries if file_browser_entry_is_noise(entry)
+            ]
+            noise_count = len(noise_entries)
+            filtered_entries = (
+                visible_entries
+                if noise
+                else [entry for entry in visible_entries if entry not in noise_entries]
+            )
         total_entries = len(filtered_entries)
         page_count = max(
             1,
@@ -3429,6 +3673,8 @@ def create_app(settings: Settings) -> FastAPI:
             page_count=page_count,
             total_entries=total_entries,
             query=query,
+            search_truncated=search_truncated,
+            search_scanned_entries=search_scanned_entries,
             terminal_editor_supported=remote.supports_capability(
                 workspace, "terminal_editor"
             ),
@@ -5419,18 +5665,6 @@ def _is_internal_state_entry(
         return False
     return state_dir.parent == current and state_dir.name == entry_name
 
-
-def _file_browser_entry_is_noise(entry: Any) -> bool:
-    name = str(entry.name)
-    return (
-        name in DEFAULT_FILE_BROWSER_NOISE
-        or (bool(entry.is_dir) and name.startswith("."))
-        or (
-            not bool(entry.is_dir)
-            and name.startswith(".")
-            and name.endswith((".swp", ".swo", ".swn", ".swm", ".swl", ".swk"))
-        )
-    )
 
 
 def _normalize_upload_filename(value: str) -> str:

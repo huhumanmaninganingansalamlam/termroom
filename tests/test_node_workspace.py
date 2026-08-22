@@ -30,7 +30,12 @@ from termroom.node_protocol import (
     NODE_WORKSPACE_USAGE_VERSION,
     generate_private_key,
 )
-from termroom.remote_access import RemoteAccess, _cancel_bridge_tasks, _settle_bridge_tasks
+from termroom.remote_access import (
+    RemoteAccess,
+    RemoteAccessError,
+    _cancel_bridge_tasks,
+    _settle_bridge_tasks,
+)
 from termroom.run_sources import SourceFileChangedError, SourceValidationError
 from termroom.security import PathBoundaryError
 from termroom.terminal_control import TerminalControl
@@ -69,6 +74,12 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
     workspace.mkdir(parents=True)
     outside.mkdir()
     (workspace / "hello.txt").write_text("before\n", encoding="utf-8")
+    nested = workspace / "src" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "node-needle.txt").write_text("match\n", encoding="utf-8")
+    dependency = workspace / "node_modules"
+    dependency.mkdir()
+    (dependency / "hidden-needle.txt").write_text("hidden\n", encoding="utf-8")
     (allowed / "escape").symlink_to(outside, target_is_directory=True)
 
     runtime = NodeRuntime([allowed])
@@ -83,10 +94,31 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
         runtime._handle_sync("workspace.validate", {"path": str(allowed / "escape")})
 
     listed = runtime._handle_sync("files.list", {"workspace_path": str(workspace), "path": "."})
-    assert [entry["name"] for entry in listed["entries"]] == ["hello.txt"]
+    assert [entry["name"] for entry in listed["entries"]] == [
+        "node_modules",
+        "src",
+        "hello.txt",
+    ]
+    search = runtime._handle_sync(
+        "files.search",
+        {
+            "workspace_path": str(workspace),
+            "path": ".",
+            "query": "needle",
+            "include_noise": False,
+        },
+    )
+    assert [entry["relative_path"] for entry in search["entries"]] == [
+        "src/deep/node-needle.txt"
+    ]
+    assert search["skipped_noise"] == 1
+    assert search["truncated"] is False
     recent = runtime._handle_sync("files.recent", {"workspace_path": str(workspace), "limit": 5})
-    assert [entry["relative_path"] for entry in recent["entries"]] == ["hello.txt"]
-    assert recent["scanned_files"] == 1
+    assert {entry["relative_path"] for entry in recent["entries"]} == {
+        "hello.txt",
+        "src/deep/node-needle.txt",
+    }
+    assert recent["scanned_files"] == 2
     assert recent["truncated"] is False
     (workspace / "second.txt").write_text("second\n", encoding="utf-8")
     with pytest.raises(DirectoryListingLimitError):
@@ -644,6 +676,66 @@ async def test_remote_access_forwards_history_only_to_node() -> None:
             "terminal.scrollback",
             {"tmux_window": "@7", "lines": 321, "history_only": True},
         )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remote_access_falls_back_to_recursive_listing_for_older_nodes() -> None:
+    access = RemoteAccess(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        TerminalControl(),
+    )
+    workspace = {
+        "id": "workspace",
+        "computer": {"id": "node", "connection_method": "node"},
+    }
+    calls: list[tuple[str, dict[str, Any]]] = []
+    access.is_node = lambda _workspace: True  # type: ignore[method-assign]
+
+    def entry(name: str, relative_path: str, *, directory: bool) -> dict[str, Any]:
+        return {
+            "name": name,
+            "relative_path": relative_path,
+            "is_dir": directory,
+            "size": 0,
+            "mtime_ns": 1,
+        }
+
+    listings = {
+        ".": [
+            entry("node_modules", "node_modules", directory=True),
+            entry("src", "src", directory=True),
+        ],
+        "src": [entry("deep", "src/deep", directory=True)],
+        "src/deep": [entry("node-needle.txt", "src/deep/node-needle.txt", directory=False)],
+    }
+
+    async def request(  # type: ignore[no-untyped-def]
+        _workspace,
+        operation,
+        payload,
+    ) -> dict[str, Any]:
+        calls.append((str(operation), dict(payload)))
+        if operation == "files.search":
+            raise RemoteAccessError("Node operation is unsupported", code="operation_unsupported")
+        assert operation == "files.list"
+        relative = str(payload["path"])
+        return {"directory": relative, "entries": listings[relative]}
+
+    access._workspace_request = request  # type: ignore[method-assign]
+    result = await access.search_files(workspace, ".", "needle")
+
+    assert [entry.relative_path for entry in result.entries] == [
+        "src/deep/node-needle.txt"
+    ]
+    assert result.skipped_noise == 1
+    assert result.truncated is False
+    assert [payload["path"] for operation, payload in calls if operation == "files.list"] == [
+        ".",
+        "src",
+        "src/deep",
     ]
 
 

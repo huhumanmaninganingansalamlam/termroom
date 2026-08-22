@@ -67,7 +67,7 @@ def test_first_terminal_activity_observation_baselines_without_unread(
         [_record("@1", "shell", 100)],
     )[0]
 
-    first = store.terminal_activity_summary("browser-a")
+    first = store.terminal_activity_summary()
 
     assert first == {
         "terminals": [
@@ -93,7 +93,7 @@ def test_first_terminal_activity_observation_baselines_without_unread(
     }
 
     store.reconcile_terminals(workspace_id, [_record("@1", "shell", 101)])
-    second = store.terminal_activity_summary("browser-a")
+    second = store.terminal_activity_summary()
 
     assert second["unread_count"] == 1
     assert second["latest_unread_terminal_id"] == terminal["id"]
@@ -106,7 +106,7 @@ def test_first_terminal_activity_observation_baselines_without_unread(
     }
 
 
-def test_terminal_activity_is_per_device_shell_only_and_filterable(
+def test_terminal_activity_is_shared_shell_only_and_filterable(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
@@ -136,7 +136,7 @@ def test_terminal_activity_is_per_device_shell_only_and_filterable(
         [_record("@3", "logs", 20)],
     )[0]
 
-    assert store.terminal_activity_summary("browser-a")["unread_count"] == 0
+    assert store.terminal_activity_summary()["unread_count"] == 0
     store.reconcile_terminals(
         first_workspace_id,
         [
@@ -155,24 +155,24 @@ def test_terminal_activity_is_per_device_shell_only_and_filterable(
         [_record("@3", "logs", 21)],
     )
 
-    first_device = store.terminal_activity_summary("browser-a")
-    new_device = store.terminal_activity_summary("browser-b")
+    first_view = store.terminal_activity_summary()
+    second_view = store.terminal_activity_summary()
     first_workspace_view = store.terminal_activity_summary(
-        "browser-a", workspace_id=first_workspace_id
+        workspace_id=first_workspace_id
     )
     terminal_view = store.terminal_activity_summary(
-        "browser-a", terminal_id=str(second_shell["id"])
+        terminal_id=str(second_shell["id"])
     )
 
-    assert first_device["unread_count"] == 2
-    assert {item["terminal_id"] for item in first_device["terminals"]} == {
+    assert first_view["unread_count"] == 2
+    assert {item["terminal_id"] for item in first_view["terminals"]} == {
         first_shell["id"],
         second_shell["id"],
     }
     assert managed["id"] not in {
-        item["terminal_id"] for item in first_device["terminals"]
+        item["terminal_id"] for item in first_view["terminals"]
     }
-    assert new_device["unread_count"] == 0
+    assert second_view["unread_count"] == 2
     assert first_workspace_view["unread_count"] == 1
     assert [item["terminal_id"] for item in first_workspace_view["terminals"]] == [
         first_shell["id"]
@@ -218,7 +218,7 @@ def test_terminal_activity_revisions_never_move_backwards_or_include_unknown_dat
     assert store.get_terminal(str(terminal["id"]))["activity_at"] == _revision(50)  # type: ignore[index]
 
     unobserved = store.create_terminal(workspace_id, "new", "@2")
-    view = store.terminal_activity_summary("browser-a")
+    view = store.terminal_activity_summary()
     assert unobserved["id"] not in {
         item["terminal_id"] for item in view["terminals"]
     }
@@ -227,7 +227,7 @@ def test_terminal_activity_revisions_never_move_backwards_or_include_unknown_dat
         store.reconcile_terminals(workspace_id, [_record("@1", "shell", -1)])
 
 
-def test_terminal_activity_acknowledges_exact_provider_revision_monotonically(
+def test_terminal_activity_acknowledges_shared_provider_revision_monotonically(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
@@ -241,35 +241,45 @@ def test_terminal_activity_acknowledges_exact_provider_revision_monotonically(
         [_record("@1", "shell", 10)],
     )[0]
     terminal_id = str(terminal["id"])
-    store.terminal_activity_summary("browser-a")
+    store.terminal_activity_summary()
 
     store.observe_terminal_activity_batch(
         {workspace_id: [_record("@1", "shell", 20)]}
     )
     exact = store.acknowledge_terminal_activity(
         terminal_id,
-        "browser-a",
         observed_activity_at=_revision(20),
     )
     assert exact["acknowledged_activity_at"] == _revision(20)
     assert exact["unread"] is False
+    assert store.terminal_activity_summary()["unread_count"] == 0
 
     store.observe_terminal_activity_batch(
         {workspace_id: [_record("@1", "shell", 30)]}
     )
     stale = store.acknowledge_terminal_activity(
         terminal_id,
-        "browser-a",
         observed_activity_at=_revision(20),
     )
     assert stale["activity_at"] == _revision(30)
     assert stale["acknowledged_activity_at"] == _revision(20)
     assert stale["unread"] is True
 
+    newest = store.acknowledge_terminal_activity(
+        terminal_id,
+        observed_activity_at=_revision(30),
+    )
+    regressed = store.acknowledge_terminal_activity(
+        terminal_id,
+        observed_activity_at=_revision(20),
+    )
+    assert newest["acknowledged_activity_at"] == _revision(30)
+    assert regressed["acknowledged_activity_at"] == _revision(30)
+    assert regressed["unread"] is False
+
     with pytest.raises(ValueError, match="newer than the server cache"):
         store.acknowledge_terminal_activity(
             terminal_id,
-            "browser-a",
             observed_activity_at=_revision(31),
         )
 
@@ -488,7 +498,7 @@ def test_terminal_activity_revision_advances_after_store_restart(tmp_path: Path)
         [_record("@1", "shell", 0)],
     )[0]
     terminal_id = str(terminal["id"])
-    baseline = store.terminal_activity_summary("browser-a")
+    baseline = store.terminal_activity_summary()
     assert baseline["unread_count"] == 0
 
     restarted = StateStore(database)
@@ -502,7 +512,7 @@ def test_terminal_activity_revision_advances_after_store_restart(tmp_path: Path)
     )
 
     summary = restarted.terminal_activity_summary(
-        "browser-a", terminal_id=terminal_id
+        terminal_id=terminal_id
     )
     assert summary["unread_count"] == 1
     assert summary["terminals"][0]["activity_at"] > baseline["terminals"][0][
@@ -619,53 +629,119 @@ def test_provider_revision_change_is_the_only_unread_source(tmp_path: Path) -> N
     )[0]
     terminal_id = str(terminal["id"])
 
-    assert store.terminal_activity_summary("browser-a")["unread_count"] == 0
+    assert store.terminal_activity_summary()["unread_count"] == 0
     store.touch_terminal_output(terminal_id)
     store.observe_terminal_activity_batch(
         {workspace_id: [_record("@1", "shell", 100)]}
     )
-    assert store.terminal_activity_summary("browser-a")["unread_count"] == 0
+    assert store.terminal_activity_summary()["unread_count"] == 0
 
     store.observe_terminal_activity_batch(
         {workspace_id: [_record("@1", "shell", 101)]}
     )
-    changed = store.terminal_activity_summary("browser-a", terminal_id=terminal_id)
+    changed = store.terminal_activity_summary(terminal_id=terminal_id)
     assert changed["unread_count"] == 1
     assert changed["terminals"][0]["activity_at"] == _revision(101)
 
 
-def test_terminal_activity_summary_prunes_expired_device_reads(tmp_path: Path) -> None:
+def test_terminal_activity_migrates_per_device_reads_to_latest_shared_revision(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    store = StateStore(tmp_path / "state.sqlite3")
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
     store.initialize()
     workspace = _workspace(store, root, "project")
     terminal = store.reconcile_terminals(
         str(workspace["id"]),
-        [_record("@1", "shell", 100)],
+        [_record("@1", "shell", 130)],
     )[0]
-    store.terminal_activity_summary("expired-browser")
+    terminal_id = str(terminal["id"])
+
     with store.connect() as db:
+        db.execute("DROP TABLE terminal_activity_reads")
         db.execute(
             """
-            UPDATE terminal_activity_reads
-            SET updated_at = '2000-01-01T00:00:00+00:00'
-            WHERE terminal_id = ? AND device_id = 'expired-browser'
+            CREATE TABLE terminal_activity_reads (
+                terminal_id TEXT NOT NULL
+                    REFERENCES terminals(id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL,
+                acknowledged_activity_at INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(terminal_id, device_id)
+            )
             """,
-            (str(terminal["id"]),),
+        )
+        db.execute(
+            """
+            CREATE INDEX idx_terminal_activity_reads_updated_at
+            ON terminal_activity_reads(updated_at)
+            """
+        )
+        db.executemany(
+            """
+            INSERT INTO terminal_activity_reads(
+                terminal_id, device_id, acknowledged_activity_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    terminal_id,
+                    "desktop",
+                    _revision(110),
+                    "2026-08-20T00:00:00+00:00",
+                    "2026-08-20T00:00:00+00:00",
+                ),
+                (
+                    terminal_id,
+                    "mobile",
+                    _revision(120),
+                    "2026-08-21T00:00:00+00:00",
+                    "2026-08-22T00:00:00+00:00",
+                ),
+            ),
         )
 
-    # A different current device triggers the bounded maintenance path without
-    # immediately recreating the expired device's row.
-    store_for_cleanup = StateStore(store.path)
-    store_for_cleanup.terminal_activity_summary("current-browser")
+    migrated = StateStore(database)
+    migrated.initialize()
 
-    with store.connect() as db:
-        expired = db.execute(
+    with migrated.connect() as db:
+        columns = {
+            str(row["name"]): int(row["pk"])
+            for row in db.execute("PRAGMA table_info(terminal_activity_reads)")
+        }
+        rows = db.execute(
             """
-            SELECT 1 FROM terminal_activity_reads
-            WHERE terminal_id = ? AND device_id = 'expired-browser'
+            SELECT terminal_id, acknowledged_activity_at, created_at, updated_at
+            FROM terminal_activity_reads
             """,
-            (str(terminal["id"]),),
-        ).fetchone()
-    assert expired is None
+        ).fetchall()
+
+    assert columns == {
+        "terminal_id": 1,
+        "acknowledged_activity_at": 0,
+        "created_at": 0,
+        "updated_at": 0,
+    }
+    assert [dict(row) for row in rows] == [
+        {
+            "terminal_id": terminal_id,
+            "acknowledged_activity_at": _revision(120),
+            "created_at": "2026-08-20T00:00:00+00:00",
+            "updated_at": "2026-08-22T00:00:00+00:00",
+        }
+    ]
+    assert migrated.terminal_activity_summary(terminal_id=terminal_id)[
+        "unread_count"
+    ] == 1
+
+    migrated.acknowledge_terminal_activity(
+        terminal_id,
+        observed_activity_at=_revision(130),
+    )
+    assert StateStore(database).terminal_activity_summary(terminal_id=terminal_id)[
+        "unread_count"
+    ] == 0

@@ -470,6 +470,17 @@ HTTPS reverse proxy를 사용한다면 `TERMROOM_BIND_HOST=127.0.0.1`을 유지�
 WebSocket upgrade를 전달해야 하며 일반적인 reverse proxy 기본 설정은 둘 다 처리합니다.
 Termroom의 native HTTP는 proxy 뒤에 남고 browser와 HTTPS/WSS Node는 proxy URL을 사용합니다.
 
+Termroom은 Content Security Policy, Permissions Policy, frame, content-type, referrer
+header를 직접 설정하고, 클라이언트가 gzip을 허용하면 적합한 동적 text 응답도
+압축합니다. Proxy는 `Content-Encoding`과 `Vary`를 그대로 전달해야 합니다. 이 host에
+`Content-Security-Policy`, `Permissions-Policy`, `X-Frame-Options`,
+`X-Content-Type-Options`, `Referrer-Policy`를 한 번 더 추가하지 말고, 공용 proxy
+template의 해당 지시문을 끄거나 upstream 값을 한 곳에서만 명시적으로 대체하세요.
+Application 정책은 직접 local HTTP와 HTTPS/WSS reverse proxy를 모두 지원하며 local
+URL을 강제로 HTTPS로 바꾸지 않습니다. Permissions Policy는 camera, microphone,
+geolocation, payment, USB 접근만 차단하며 일반 browser workspace 흐름에서 사용하는
+clipboard와 fullscreen API는 차단하지 않습니다.
+
 Core를 SSH/Node-only로 운영할 때는 `TERMROOM_MODE=core`를 유지하면서
 `TERMROOM_ALLOW_LOCAL_WORKSPACES=false`를 설정합니다. 이것은 Docker Node process를 선택하는
 `TERMROOM_MODE=node`와 다른 Core 정책입니다.

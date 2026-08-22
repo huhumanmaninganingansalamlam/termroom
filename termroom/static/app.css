@@ -3703,6 +3703,26 @@ details:not([open]) > :not(summary) {
   opacity: 0.72;
 }
 
+.file-search-summary {
+  display: grid;
+  max-width: var(--content-max);
+  gap: 3px;
+  margin: -4px auto 10px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+}
+
+.file-search-summary strong {
+  color: var(--warning-text);
+  font-weight: 600;
+}
+
+.file-select-placeholder {
+  display: block;
+  width: 34px;
+  min-height: 1px;
+}
+
 .create-popover {
   top: calc(100% + 8px);
   bottom: auto;
@@ -3787,8 +3807,24 @@ details:not([open]) > :not(summary) {
 }
 
 .file-name {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
   color: var(--text-secondary);
   font-size: 0.79rem;
+}
+
+.file-name > span,
+.file-name > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-name > small {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 0.61rem;
 }
 
 .file-size,
@@ -4151,6 +4187,10 @@ details:not([open]) > :not(summary) {
   }
 
   .file-table-head > span {
+    display: none;
+  }
+
+  .file-table-head.search-results-head {
     display: none;
   }
 
