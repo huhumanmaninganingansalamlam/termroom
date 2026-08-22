@@ -244,6 +244,8 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "bundledTerminalFontLoaded = true" in terminal_script
     assert "term.options.fontFamily = terminalFontFamily(true)" in terminal_script
     assert "BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400" in terminal_script
+    assert "const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;" in terminal_script
+    assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
     assert "scheduleResize(true)" in terminal_script
     assert "const onUserInput = term._core?.coreService?.onUserInput;" in terminal_script
     assert "const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;" in terminal_script
@@ -303,7 +305,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"50"}
+    assert versions["terminal.js"] == {"51"}
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:
