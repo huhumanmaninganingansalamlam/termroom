@@ -371,6 +371,20 @@
   const TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS = 15000;
   const TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS = 500;
   const TERMINAL_ACTIVITY_CHANNEL_NAME = "termroom-terminal-activity";
+  const terminalActivityScopeWorkspaceIds = new Set(
+    terminalActivitySummary
+      ? [...terminalActivitySummary.querySelectorAll("[data-terminal-activity-workspace]")]
+          .map((row) => String(row.dataset.terminalActivityWorkspace || ""))
+          .filter(Boolean)
+          .slice(0, 20)
+      : [String(workspaceTerminalActivity?.dataset.workspaceId || "")].filter(Boolean),
+  );
+  const terminalActivityWorkspaceNeedsRefresh = new Map(
+    [...terminalActivityScopeWorkspaceIds].map((workspaceId) => [workspaceId, true]),
+  );
+  const terminalActivityUnreadByTerminal = new Map();
+  const terminalActivityWorkspaceByTerminal = new Map();
+  const terminalActivityRevisionByTerminal = new Map();
   const terminalActivityEntries = (result, key) => {
     const payload = result?.data && typeof result.data === "object" ? result.data : result;
     const entries = payload?.[key];
@@ -385,39 +399,54 @@
     }
     return terminalActivityEntries(entry, "terminals").filter((item) => item?.unread).length;
   };
-  const latestUnreadTerminalId = (entry) => {
-    const explicit = entry?.latest_unread_terminal_id ?? entry?.latest_terminal_id;
-    if (explicit) return String(explicit);
-    const unread = terminalActivityEntries(entry, "terminals").filter((item) => item?.unread);
-    unread.sort((left, right) => Number(right.activity_at || 0) - Number(left.activity_at || 0));
-    return unread[0]?.terminal_id || unread[0]?.id || "";
-  };
-  const renderHomeTerminalActivity = (result) => {
-    const entries = terminalActivityEntries(result, "workspaces");
-    const byWorkspace = new Map(
-      entries.map((entry) => [String(entry.workspace_id ?? entry.id ?? ""), entry]),
+  const rememberedUnreadTerminalIds = (workspaceId) =>
+    [...terminalActivityWorkspaceByTerminal]
+      .filter(
+        ([terminalId, terminalWorkspaceId]) =>
+          terminalWorkspaceId === workspaceId
+          && terminalActivityUnreadByTerminal.get(terminalId) === true,
+      )
+      .map(([terminalId]) => terminalId)
+      .sort(
+        (left, right) =>
+          (terminalActivityRevisionByTerminal.get(right) || 0)
+          - (terminalActivityRevisionByTerminal.get(left) || 0),
+      );
+  const renderRememberedTerminalActivity = (workspaceId) => {
+    const unreadTerminalIds = rememberedUnreadTerminalIds(workspaceId);
+    const count = unreadTerminalIds.length;
+    const row = terminalActivitySummary?.querySelector(
+      `[data-terminal-activity-workspace="${CSS.escape(workspaceId)}"]`,
     );
-    terminalActivitySummary
-      ?.querySelectorAll("[data-terminal-activity-workspace]")
-      .forEach((row) => {
-        const entry = byWorkspace.get(String(row.dataset.terminalActivityWorkspace || ""));
-        const count = unreadTerminalCount(entry);
-        const unread = row.querySelector("[data-terminal-activity-unread]");
-        const countNode = row.querySelector("[data-terminal-activity-count]");
-        if (unread) unread.hidden = count === 0;
-        if (countNode) {
-          countNode.textContent = tr(
-            count === 1
-              ? "terminal.activity.unread_terminal"
-              : "terminal.activity.unread_terminals",
-            { count },
-          );
-        }
-        const terminalId = latestUnreadTerminalId(entry);
-        row.href = count > 0 && terminalId
-          ? `/w/${encodeURIComponent(row.dataset.terminalActivityWorkspace)}/terminal?terminal=${encodeURIComponent(terminalId)}`
-          : row.dataset.workspaceHref;
-      });
+    if (row) {
+      const unread = row.querySelector("[data-terminal-activity-unread]");
+      const countNode = row.querySelector("[data-terminal-activity-count]");
+      if (unread) unread.hidden = count === 0;
+      if (countNode) {
+        countNode.textContent = tr(
+          count === 1
+            ? "terminal.activity.unread_terminal"
+            : "terminal.activity.unread_terminals",
+          { count },
+        );
+      }
+      const terminalId = unreadTerminalIds[0] || "";
+      row.href = terminalId
+        ? `/w/${encodeURIComponent(workspaceId)}/terminal?terminal=${encodeURIComponent(terminalId)}`
+        : row.dataset.workspaceHref;
+    }
+    document.querySelectorAll("[data-terminal-activity-tab]").forEach((tab) => {
+      const terminalId = String(tab.dataset.terminalActivityTab || "");
+      if (terminalActivityWorkspaceByTerminal.get(terminalId) !== workspaceId) return;
+      const dot = tab.querySelector("[data-terminal-activity-tab-unread]");
+      if (dot && tab.dataset.terminalRole === "shell") {
+        dot.hidden = terminalActivityUnreadByTerminal.get(terminalId) !== true;
+      }
+    });
+    syncWorkspaceTerminalUnreadFromTabs();
+  };
+  const renderHomeTerminalActivity = (_result, requestedWorkspaceIds) => {
+    requestedWorkspaceIds.forEach(renderRememberedTerminalActivity);
   };
   const renderWorkspaceTerminalActivity = (result) => {
     const payload = result?.data && typeof result.data === "object" ? result.data : result;
@@ -442,6 +471,56 @@
       dot.hidden = !unread;
     });
   };
+  const terminalActivityRequestedWorkspaceIds = () =>
+    [...terminalActivityScopeWorkspaceIds].filter(
+      (workspaceId) => terminalActivityWorkspaceNeedsRefresh.get(workspaceId) !== false,
+    );
+  const markTerminalActivityWorkspaceForRefresh = (workspaceId) => {
+    const normalized = String(workspaceId || "");
+    if (!normalized || !terminalActivityScopeWorkspaceIds.has(normalized)) return false;
+    terminalActivityWorkspaceNeedsRefresh.set(normalized, true);
+    return true;
+  };
+  const markAllTerminalActivityWorkspacesForRefresh = () => {
+    terminalActivityScopeWorkspaceIds.forEach((workspaceId) => {
+      terminalActivityWorkspaceNeedsRefresh.set(workspaceId, true);
+    });
+  };
+  const rememberTerminalActivity = (result, requestedWorkspaceIds) => {
+    const requested = new Set(requestedWorkspaceIds);
+    const terminalsByWorkspace = new Map(
+      requestedWorkspaceIds.map((workspaceId) => [workspaceId, []]),
+    );
+    terminalActivityEntries(result, "terminals").forEach((entry) => {
+      const terminalId = String(entry?.terminal_id ?? entry?.id ?? "");
+      const workspaceId = String(entry?.workspace_id ?? "");
+      if (!terminalId || !requested.has(workspaceId)) return;
+      terminalsByWorkspace.get(workspaceId)?.push(entry);
+    });
+
+    for (const [terminalId, workspaceId] of terminalActivityWorkspaceByTerminal) {
+      if (!requested.has(workspaceId)) continue;
+      terminalActivityWorkspaceByTerminal.delete(terminalId);
+      terminalActivityUnreadByTerminal.delete(terminalId);
+      terminalActivityRevisionByTerminal.delete(terminalId);
+    }
+    terminalsByWorkspace.forEach((items, workspaceId) => {
+      items.forEach((item) => {
+        const terminalId = String(item?.terminal_id ?? item?.id ?? "");
+        terminalActivityWorkspaceByTerminal.set(terminalId, workspaceId);
+        terminalActivityUnreadByTerminal.set(terminalId, Boolean(item?.unread));
+        terminalActivityRevisionByTerminal.set(
+          terminalId,
+          Number(item?.activity_at) || 0,
+        );
+      });
+      const hasUnread = items.some((item) => Boolean(item?.unread));
+      terminalActivityWorkspaceNeedsRefresh.set(
+        workspaceId,
+        items.length > 0 && !hasUnread,
+      );
+    });
+  };
   let terminalActivityRefreshInFlight = false;
   let terminalActivityRefreshPending = false;
   let lastTerminalActivityRefreshAt = 0;
@@ -458,20 +537,22 @@
     }
   };
   const terminalActivityChannel = createTerminalActivityChannel();
-  const terminalActivityRequestUrl = (target) => {
+  const terminalActivityRequest = () => {
+    const requestedWorkspaceIds = terminalActivityRequestedWorkspaceIds();
+    if (!requestedWorkspaceIds.length) return null;
+    const target = terminalActivitySummary || workspaceTerminalActivity;
     const url = target?.dataset.summaryUrl || target?.dataset.activityUrl;
-    if (!url || !terminalActivitySummary) return url;
-    const workspaceIds = [
-      ...new Set(
-        [...terminalActivitySummary.querySelectorAll("[data-terminal-activity-workspace]")]
-          .map((row) => String(row.dataset.terminalActivityWorkspace || ""))
-          .filter(Boolean),
-      ),
-    ].slice(0, 20);
+    if (!url) return null;
+    if (!terminalActivitySummary) return { url, requestedWorkspaceIds };
     const searchParams = new URLSearchParams();
-    workspaceIds.forEach((workspaceId) => searchParams.append("workspace_id", workspaceId));
+    requestedWorkspaceIds.forEach((workspaceId) => {
+      searchParams.append("workspace_id", workspaceId);
+    });
     const query = searchParams.toString();
-    return query ? `${url}?${query}` : url;
+    return {
+      url: query ? `${url}?${query}` : url,
+      requestedWorkspaceIds,
+    };
   };
   const refreshTerminalActivity = async ({ force = false } = {}) => {
     if (document.hidden) {
@@ -484,20 +565,22 @@
       if (force) terminalActivityRefreshPending = true;
       return;
     }
-    const target = terminalActivitySummary || workspaceTerminalActivity;
-    const url = terminalActivityRequestUrl(target);
-    if (!url) return;
+    const request = terminalActivityRequest();
+    if (!request) return;
     lastTerminalActivityRefreshAt = now;
     terminalActivityRefreshInFlight = true;
     try {
-      const response = await fetch(url, {
+      const response = await fetch(request.url, {
         credentials: "same-origin",
         cache: "no-store",
         headers: { Accept: "application/json" },
       });
       const result = await response.json();
       if (!response.ok || result?.ok === false) throw new Error("terminal activity unavailable");
-      if (terminalActivitySummary) renderHomeTerminalActivity(result);
+      rememberTerminalActivity(result, request.requestedWorkspaceIds);
+      if (terminalActivitySummary) {
+        renderHomeTerminalActivity(result, request.requestedWorkspaceIds);
+      }
       if (workspaceTerminalActivity) renderWorkspaceTerminalActivity(result);
       window.dispatchEvent(
         new CustomEvent("termroom:terminal-activity-refreshed", { detail: result }),
@@ -509,27 +592,64 @@
       if (terminalActivityRefreshPending && !document.hidden) {
         terminalActivityRefreshPending = false;
         window.queueMicrotask(() => refreshTerminalActivity({ force: true }));
+      } else {
+        scheduleTerminalActivityRefresh();
       }
     }
   };
   const scheduleTerminalActivityRefresh = () => {
     window.clearTimeout(terminalActivityRefreshTimer);
     terminalActivityRefreshTimer = 0;
-    if (document.hidden || (!terminalActivitySummary && !workspaceTerminalActivity)) return;
+    if (
+      document.hidden
+      || (!terminalActivitySummary && !workspaceTerminalActivity)
+      || !terminalActivityRequest()
+    ) return;
     terminalActivityRefreshTimer = window.setTimeout(async () => {
       terminalActivityRefreshTimer = 0;
-      try {
-        await refreshTerminalActivity({ force: true });
-      } finally {
-        scheduleTerminalActivityRefresh();
-      }
+      await refreshTerminalActivity({ force: true });
     }, TERMINAL_ACTIVITY_REFRESH_INTERVAL_MS);
   };
-  const scheduleTerminalActivitySignalRefresh = ({ kind = "", detail = null } = {}) => {
+  const terminalActivitySignalWorkspaceId = (detail) => {
+    const explicit = String(detail?.workspace_id || "");
+    if (explicit) return explicit;
+    const terminalId = String(detail?.terminal_id || "");
+    return terminalActivityWorkspaceByTerminal.get(terminalId) || "";
+  };
+  const terminalActivityOutputNeedsRefresh = (detail) => {
+    const terminalId = String(detail?.terminal_id || "");
+    const workspaceId = terminalActivitySignalWorkspaceId(detail);
+    if (
+      workspaceId
+      && terminalActivityWorkspaceNeedsRefresh.get(workspaceId) === false
+    ) return false;
+    if (terminalId && terminalActivityUnreadByTerminal.get(terminalId) === true) {
+      return false;
+    }
+    return workspaceId
+      ? markTerminalActivityWorkspaceForRefresh(workspaceId)
+      : (markAllTerminalActivityWorkspacesForRefresh(), true);
+  };
+  const noteTerminalActivityRead = (detail) => {
+    const terminalId = String(detail?.terminal_id || "");
+    const workspaceId = terminalActivitySignalWorkspaceId(detail);
+    const knownTerminal = terminalId && terminalActivityUnreadByTerminal.has(terminalId);
+    if (terminalId) terminalActivityUnreadByTerminal.set(terminalId, false);
+    if (terminalId && workspaceId) {
+      terminalActivityWorkspaceByTerminal.set(terminalId, workspaceId);
+    }
+    if (workspaceId) {
+      const hasUnread = rememberedUnreadTerminalIds(workspaceId).length > 0;
+      terminalActivityWorkspaceNeedsRefresh.set(workspaceId, !hasUnread);
+      renderRememberedTerminalActivity(workspaceId);
+    }
+    return Boolean(knownTerminal && workspaceId);
+  };
+  const scheduleTerminalActivitySignalRefresh = ({ publish = null } = {}) => {
     const firstSignalInBurst = terminalActivitySignalTimer === 0;
     window.clearTimeout(terminalActivitySignalTimer);
-    if (firstSignalInBurst && kind) {
-      publishTerminalActivitySignal(kind, detail);
+    if (firstSignalInBurst && publish) {
+      publishTerminalActivitySignal(publish.kind, publish.detail);
     }
     terminalActivitySignalTimer = window.setTimeout(() => {
       terminalActivitySignalTimer = 0;
@@ -537,11 +657,14 @@
     }, TERMINAL_ACTIVITY_SIGNAL_DEBOUNCE_MS);
   };
   const publishTerminalActivitySignal = (kind, detail) => {
-    terminalActivityChannel?.postMessage({ kind, ...(detail || {}) });
+    try {
+      terminalActivityChannel?.postMessage({ kind, ...(detail || {}) });
+    } catch {
+      // Focus/visibility refresh remains the cross-tab fallback.
+    }
   };
   if (terminalActivitySummary || workspaceTerminalActivity) {
     refreshTerminalActivity({ force: true });
-    scheduleTerminalActivityRefresh();
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         window.clearTimeout(terminalActivityRefreshTimer);
@@ -549,24 +672,38 @@
         return;
       }
       terminalActivityRefreshPending = false;
+      if (!terminalActivityChannel) markAllTerminalActivityWorkspacesForRefresh();
       refreshTerminalActivity({ force: true });
-      scheduleTerminalActivityRefresh();
     });
     window.addEventListener("focus", () => {
+      if (!terminalActivityChannel) markAllTerminalActivityWorkspacesForRefresh();
       refreshTerminalActivity();
-      scheduleTerminalActivityRefresh();
     });
     window.addEventListener("termroom:terminal-output", (event) => {
-      scheduleTerminalActivitySignalRefresh({ kind: "output", detail: event.detail });
+      if (!terminalActivityOutputNeedsRefresh(event.detail)) return;
+      scheduleTerminalActivitySignalRefresh({
+        publish: { kind: "output", detail: event.detail },
+      });
     });
-    terminalActivityChannel?.addEventListener("message", () => {
-      scheduleTerminalActivitySignalRefresh();
+    terminalActivityChannel?.addEventListener("message", (event) => {
+      const message = event.data && typeof event.data === "object" ? event.data : {};
+      if (message.kind === "changed") {
+        const updatedFromMemory = noteTerminalActivityRead(message);
+        if (updatedFromMemory) scheduleTerminalActivityRefresh();
+        else scheduleTerminalActivitySignalRefresh();
+        return;
+      }
+      if (message.kind === "output" && terminalActivityOutputNeedsRefresh(message)) {
+        scheduleTerminalActivitySignalRefresh();
+      }
     });
     window.addEventListener(
       "termroom:terminal-activity-changed",
       (event) => {
-        syncWorkspaceTerminalUnreadFromTabs();
+        const updatedFromMemory = noteTerminalActivityRead(event.detail);
         publishTerminalActivitySignal("changed", event.detail);
+        if (updatedFromMemory) scheduleTerminalActivityRefresh();
+        else scheduleTerminalActivitySignalRefresh();
       },
     );
   }

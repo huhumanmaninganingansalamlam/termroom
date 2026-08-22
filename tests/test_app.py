@@ -119,7 +119,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
 
     assert response.status_code == 401
     css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=54'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=63'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=65'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -3444,7 +3444,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=63")
+        script = await client.get("/static/app.js?v=65")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3479,7 +3479,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=63")
+        script = await client.get("/static/app.js?v=65")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3491,7 +3491,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=63" in korean_page.text
+    assert "/static/app.js?v=65" in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3779,7 +3779,7 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=63",
+            "/static/app.js?v=65",
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]

@@ -305,7 +305,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"54"}
-    assert versions["app.js"] == {"63"}
+    assert versions["app.js"] == {"65"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
@@ -516,6 +516,25 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert "const terminalActivityChannel = createTerminalActivityChannel();" in (
         terminal_script
     )
+    assert "const terminalActivityWorkspaceNeedsRefresh = new Map(" in terminal_script
+    assert "const terminalActivityUnreadByTerminal = new Map();" in terminal_script
+    assert "const terminalActivityRevisionByTerminal = new Map();" in terminal_script
+    assert "const terminalActivityRequestedWorkspaceIds = () =>" in terminal_script
+    assert "if (!requestedWorkspaceIds.length) return null;" in terminal_script
+    assert "const hasUnread = items.some((item) => Boolean(item?.unread));" in (
+        terminal_script
+    )
+    assert "items.length > 0 && !hasUnread" in terminal_script
+    assert "const rememberedUnreadTerminalIds = (workspaceId) =>" in terminal_script
+    assert "const renderRememberedTerminalActivity = (workspaceId) =>" in terminal_script
+    assert "terminalActivityWorkspaceNeedsRefresh.get(workspaceId) === false" in (
+        terminal_script
+    )
+    assert "terminalActivityUnreadByTerminal.get(terminalId) === true" in terminal_script
+    assert "|| !terminalActivityRequest()" in terminal_script
+    assert "const firstSignalInBurst = terminalActivitySignalTimer === 0;" in (
+        terminal_script
+    )
     assert "scheduleTerminalActivityRefresh();" in terminal_script
     assert "scheduleTerminalActivitySignalRefresh" in terminal_script
     assert 'window.addEventListener("termroom:terminal-output"' in terminal_script
@@ -527,6 +546,7 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert 'document.addEventListener("visibilitychange"' in terminal_script
     assert 'window.addEventListener("focus"' in terminal_script
     assert '"termroom:terminal-activity-changed"' in terminal_script
+    assert 'data-workspace-id="{{ workspace.id }}"' in workspace_template
 
     usage_start = app_script.index("  const workspaceUsageViews =")
     usage_end = app_script.index(

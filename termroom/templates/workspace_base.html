@@ -241,6 +241,7 @@
 <nav class="bottom-nav"
      aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}"
      data-workspace-terminal-activity
+     data-workspace-id="{{ workspace.id }}"
      data-activity-url="/api/workspaces/{{ workspace.id }}/terminal-activity">
   <span class="workspace-nav-label">{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}</span>
   <a class="{% if active_tab == 'terminal' %}active{% endif %}" href="/w/{{ workspace.id }}/terminal" data-terminal-activity-nav>

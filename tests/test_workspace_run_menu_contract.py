@@ -47,7 +47,7 @@ def test_workspace_run_menu_asset_versions_are_bumped() -> None:
     base = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
 
     assert "app.css') }}?v=54" in base
-    assert "app.js') }}?v=63" in base
+    assert "app.js') }}?v=65" in base
 
 
 def test_workspace_command_editing_stays_inside_each_command_card() -> None:
