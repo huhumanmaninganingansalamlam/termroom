@@ -38,7 +38,7 @@ jobs:
       - name: Install Linux test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes openssh-server tmux
+          sudo apt-get install --yes netcat-openbsd openssh-server tmux
 
       - name: Install project dependencies
         run: uv sync --all-groups --frozen
