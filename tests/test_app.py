@@ -119,7 +119,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
 
     assert response.status_code == 401
     css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=54'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=65'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=66'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -377,7 +377,7 @@ async def test_workspace_with_remote_run_source_cannot_be_unregistered(
 
 
 @pytest.mark.asyncio
-async def test_terminal_activity_apis_are_per_browser_scoped_and_race_safe(
+async def test_terminal_activity_apis_share_read_state_across_browser_sessions(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
@@ -442,12 +442,27 @@ async def test_terminal_activity_apis_are_per_browser_scoped_and_race_safe(
             "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
         )
         assert second_baseline.status_code == 200
-        assert second_baseline.json()["unread_count"] == 0
+        assert second_baseline.json()["unread_count"] == 1
+
+        app.state.store.acknowledge_terminal_activity(
+            terminal_id,
+            observed_activity_at=_terminal_activity_seconds(20),
+        )
+        shared_read = await first.get(
+            "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
+        )
+        assert shared_read.status_code == 200
+        assert shared_read.json()["unread_count"] == 0
 
         app.state.store.observe_terminal_activity(
             workspace_id,
             [{"tmux_window": "@1", "activity_at": _terminal_activity_seconds(30)}],
         )
+        shared_new_output = await second.get(
+            "/api/terminal-activity/summary", params={"workspace_id": workspace_id}
+        )
+        assert shared_new_output.status_code == 200
+        assert shared_new_output.json()["unread_count"] == 1
         assert managed["id"] != terminal_id
         missing_workspace = await first.get(
             "/api/workspaces/missing/terminal-activity"
@@ -3444,7 +3459,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=65")
+        script = await client.get("/static/app.js?v=66")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3479,7 +3494,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=65")
+        script = await client.get("/static/app.js?v=66")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3491,7 +3506,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=65" in korean_page.text
+    assert "/static/app.js?v=66" in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3779,7 +3794,7 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=65",
+            "/static/app.js?v=66",
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]

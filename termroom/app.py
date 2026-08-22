@@ -1388,14 +1388,12 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
     def terminal_activity_payload(
-        request: Request,
         *,
         workspace_id: str | None = None,
         workspace_ids: list[str] | None = None,
         terminal_id: str | None = None,
     ) -> dict[str, Any]:
         summary = store.terminal_activity_summary(
-            str(request.state.session["id"]),
             workspace_id=workspace_id,
             workspace_ids=workspace_ids,
             terminal_id=terminal_id,
@@ -1404,7 +1402,6 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/terminal-activity/summary", response_class=JSONResponse)
     async def terminal_activity_summary(
-        request: Request,
         workspace_id: Annotated[list[str] | None, Query()] = None,
     ) -> dict[str, Any]:
         requested_ids = list(dict.fromkeys(workspace_id or ()))
@@ -1419,7 +1416,6 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace not found")
         await refresh_terminal_activity_scope(scoped_workspaces)
         return terminal_activity_payload(
-            request,
             workspace_ids=requested_ids,
         )
 
@@ -1427,12 +1423,10 @@ def create_app(settings: Settings) -> FastAPI:
         "/api/workspaces/{workspace_id}/terminal-activity",
         response_class=JSONResponse,
     )
-    async def workspace_terminal_activity(
-        request: Request, workspace_id: str
-    ) -> dict[str, Any]:
+    async def workspace_terminal_activity(workspace_id: str) -> dict[str, Any]:
         workspace = _require_workspace(workspaces, workspace_id)
         await refresh_terminal_activity_scope([workspace])
-        return terminal_activity_payload(request, workspace_id=workspace_id)
+        return terminal_activity_payload(workspace_id=workspace_id)
 
     @app.post(
         "/api/activity/notifications/claim",

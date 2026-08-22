@@ -20,9 +20,6 @@ FILE_RUN_STATES = frozenset(
 FILE_RUN_TERMINAL_STATES = frozenset({"finished", "stopped", "failed", "lost"})
 TERMINAL_ROLES = frozenset({"shell", "file_run", "remote_run"})
 SQLITE_MAX_INTEGER = (1 << 63) - 1
-TERMINAL_ACTIVITY_READ_RETENTION = timedelta(days=30)
-TERMINAL_ACTIVITY_CLOCK_SKEW_ALLOWANCE = timedelta(days=1)
-TERMINAL_ACTIVITY_READ_CLEANUP_INTERVAL_SECONDS = 60 * 60
 ACTIVITY_EVENT_RETENTION = timedelta(days=30)
 NOTIFICATION_DEVICE_RETENTION = timedelta(days=90)
 HISTORY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
@@ -132,6 +129,21 @@ def _remote_runs_table_sql(
     """
 
 
+def _terminal_activity_reads_table_sql(
+    table: str = "terminal_activity_reads", *, if_not_exists: bool = False
+) -> str:
+    clause = "IF NOT EXISTS " if if_not_exists else ""
+    return f"""
+        CREATE TABLE {clause}{table} (
+            terminal_id TEXT PRIMARY KEY
+                REFERENCES terminals(id) ON DELETE CASCADE,
+            acknowledged_activity_at INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """
+
+
 def normalize_computer_name(value: str) -> str:
     """Return a safe one-line display label for a registered computer."""
 
@@ -155,7 +167,6 @@ def utc_now() -> str:
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._terminal_activity_cleanup_at = 0.0
         self._history_cleanup_at = 0.0
 
     @contextmanager
@@ -213,15 +224,7 @@ class StateStore:
                     UNIQUE(workspace_id, tmux_window)
                 );
 
-                CREATE TABLE IF NOT EXISTS terminal_activity_reads (
-                    terminal_id TEXT NOT NULL
-                        REFERENCES terminals(id) ON DELETE CASCADE,
-                    device_id TEXT NOT NULL,
-                    acknowledged_activity_at INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(terminal_id, device_id)
-                );
+                {_terminal_activity_reads_table_sql(if_not_exists=True)}
 
                 CREATE TABLE IF NOT EXISTS command_history (
                     id TEXT PRIMARY KEY,
@@ -328,10 +331,9 @@ class StateStore:
                     ON event_notification_claims(device_id, claimed_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_event_reads_device
                     ON event_reads(device_id, read_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_terminal_activity_reads_updated_at
-                    ON terminal_activity_reads(updated_at);
                 """
             )
+            self._migrate_terminal_activity_reads(db)
             self._ensure_column(db, "terminals", "last_output_at", "TEXT")
             self._ensure_column(db, "terminals", "activity_at", "INTEGER")
             self._ensure_column(
@@ -517,6 +519,53 @@ class StateStore:
             ).fetchall():
                 self._insert_remote_run_event(db, row, historical=True)
         self.path.chmod(0o600)
+
+    @staticmethod
+    def _migrate_terminal_activity_reads(db: sqlite3.Connection) -> None:
+        """Collapse legacy per-device reads into one shared Terminal revision."""
+
+        columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(terminal_activity_reads)")
+        }
+        if "device_id" not in columns:
+            return
+
+        db.execute("SAVEPOINT terminal_activity_reads_global")
+        try:
+            db.execute(
+                "ALTER TABLE terminal_activity_reads "
+                "RENAME TO terminal_activity_reads_per_device"
+            )
+            db.execute(_terminal_activity_reads_table_sql())
+            db.execute(
+                """
+                INSERT INTO terminal_activity_reads(
+                    terminal_id, acknowledged_activity_at, created_at, updated_at
+                )
+                SELECT
+                    legacy.terminal_id,
+                    MAX(legacy.acknowledged_activity_at),
+                    MIN(legacy.created_at),
+                    MAX(legacy.updated_at)
+                FROM terminal_activity_reads_per_device AS legacy
+                JOIN terminals ON terminals.id = legacy.terminal_id
+                GROUP BY legacy.terminal_id
+                """
+            )
+            db.execute("DROP TABLE terminal_activity_reads_per_device")
+            foreign_key_issue = db.execute(
+                "PRAGMA foreign_key_check(terminal_activity_reads)"
+            ).fetchone()
+            if foreign_key_issue is not None:
+                raise RuntimeError(
+                    "Terminal activity read migration violated a foreign key"
+                )
+        except Exception:
+            db.execute("ROLLBACK TO terminal_activity_reads_global")
+            db.execute("RELEASE terminal_activity_reads_global")
+            raise
+        db.execute("RELEASE terminal_activity_reads_global")
 
     @staticmethod
     def _ensure_column(
@@ -1513,35 +1562,15 @@ class StateStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Unknown Terminal: {terminal_id}")
 
-    def _cleanup_terminal_activity_reads(self, db: sqlite3.Connection) -> None:
-        monotonic_now = time.monotonic()
-        if monotonic_now < self._terminal_activity_cleanup_at:
-            return
-        self._terminal_activity_cleanup_at = (
-            monotonic_now + TERMINAL_ACTIVITY_READ_CLEANUP_INTERVAL_SECONDS
-        )
-        cutoff = datetime.now(UTC) - (
-            TERMINAL_ACTIVITY_READ_RETENTION
-            + TERMINAL_ACTIVITY_CLOCK_SKEW_ALLOWANCE
-        )
-        db.execute(
-            "DELETE FROM terminal_activity_reads WHERE updated_at < ?",
-            (cutoff.isoformat(timespec="seconds"),),
-        )
-
     def terminal_activity_summary(
         self,
-        device_id: str,
         *,
         workspace_id: str | None = None,
         workspace_ids: Iterable[str] | None = None,
         terminal_id: str | None = None,
     ) -> dict[str, Any]:
-        """Return cached shell activity, baselining a device on first observation."""
+        """Return shared shell activity, baselining each Terminal once."""
 
-        safe_device_id = str(device_id).strip()
-        if not safe_device_id:
-            raise ValueError("Terminal activity device identity is required")
         conditions = ["terminals.role = 'shell'", "terminals.activity_at IS NOT NULL"]
         parameters: list[object] = []
         if workspace_id is not None:
@@ -1563,19 +1592,17 @@ class StateStore:
         where = " AND ".join(conditions)
         now = utc_now()
         with self.connect() as db:
-            self._cleanup_terminal_activity_reads(db)
             db.execute(
                 f"""
                 INSERT INTO terminal_activity_reads(
-                    terminal_id, device_id, acknowledged_activity_at,
-                    created_at, updated_at
+                    terminal_id, acknowledged_activity_at, created_at, updated_at
                 )
-                SELECT terminals.id, ?, terminals.activity_at, ?, ?
+                SELECT terminals.id, terminals.activity_at, ?, ?
                 FROM terminals
                 WHERE {where}
-                ON CONFLICT(terminal_id, device_id) DO NOTHING
+                ON CONFLICT(terminal_id) DO NOTHING
                 """,
-                (safe_device_id, now, now, *parameters),
+                (now, now, *parameters),
             )
             rows = db.execute(
                 f"""
@@ -1583,11 +1610,11 @@ class StateStore:
                        terminals.activity_at, reads.acknowledged_activity_at
                 FROM terminals
                 JOIN terminal_activity_reads AS reads
-                  ON reads.terminal_id = terminals.id AND reads.device_id = ?
+                  ON reads.terminal_id = terminals.id
                 WHERE {where}
                 ORDER BY terminals.activity_at DESC, terminals.created_at DESC
                 """,
-                (safe_device_id, *parameters),
+                parameters,
             ).fetchall()
             terminal_rows = [
                 {
@@ -1634,21 +1661,16 @@ class StateStore:
     def acknowledge_terminal_activity(
         self,
         terminal_id: str,
-        device_id: str,
         observed_activity_at: int,
     ) -> dict[str, Any]:
-        """Advance one device only to the exact cached revision it observed."""
+        """Advance the shared read state to the exact cached revision observed."""
 
         normalized_observed_activity_at = self._terminal_activity_revision(
             observed_activity_at
         )
         assert normalized_observed_activity_at is not None
-        safe_device_id = str(device_id).strip()
-        if not safe_device_id:
-            raise ValueError("Terminal activity device identity is required")
         now = utc_now()
         with self.connect() as db:
-            self._cleanup_terminal_activity_reads(db)
             terminal = db.execute(
                 "SELECT id, workspace_id, role, activity_at FROM terminals WHERE id = ?",
                 (str(terminal_id),),
@@ -1664,10 +1686,9 @@ class StateStore:
             db.execute(
                 """
                 INSERT INTO terminal_activity_reads(
-                    terminal_id, device_id, acknowledged_activity_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(terminal_id, device_id) DO UPDATE SET
+                    terminal_id, acknowledged_activity_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(terminal_id) DO UPDATE SET
                     acknowledged_activity_at = MAX(
                         terminal_activity_reads.acknowledged_activity_at,
                         excluded.acknowledged_activity_at
@@ -1676,7 +1697,6 @@ class StateStore:
                 """,
                 (
                     str(terminal_id),
-                    safe_device_id,
                     normalized_observed_activity_at,
                     now,
                     now,
@@ -1686,9 +1706,9 @@ class StateStore:
                 db.execute(
                     """
                     SELECT acknowledged_activity_at FROM terminal_activity_reads
-                    WHERE terminal_id = ? AND device_id = ?
+                    WHERE terminal_id = ?
                     """,
-                    (str(terminal_id), safe_device_id),
+                    (str(terminal_id),),
                 ).fetchone()["acknowledged_activity_at"]
             )
         return {

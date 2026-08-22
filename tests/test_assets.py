@@ -305,7 +305,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"54"}
-    assert versions["app.js"] == {"65"}
+    assert versions["app.js"] == {"66"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
@@ -545,6 +545,10 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert "setInterval" not in terminal_script
     assert 'document.addEventListener("visibilitychange"' in terminal_script
     assert 'window.addEventListener("focus"' in terminal_script
+    assert 'window.addEventListener("pageshow"' in terminal_script
+    assert 'window.addEventListener("online"' in terminal_script
+    assert "const refreshTerminalActivityAfterExternalState = () =>" in terminal_script
+    assert "markAllTerminalActivityWorkspacesForRefresh();" in terminal_script
     assert '"termroom:terminal-activity-changed"' in terminal_script
     assert 'data-workspace-id="{{ workspace.id }}"' in workspace_template
 

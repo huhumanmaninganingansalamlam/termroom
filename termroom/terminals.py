@@ -1450,7 +1450,6 @@ class TerminalManager:
                         await asyncio.to_thread(
                             self.store.acknowledge_terminal_activity,
                             terminal_id,
-                            device_id,
                             revision,
                         )
                     except (KeyError, ValueError):

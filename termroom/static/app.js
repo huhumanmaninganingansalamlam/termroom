@@ -663,6 +663,10 @@
       // Focus/visibility refresh remains the cross-tab fallback.
     }
   };
+  const refreshTerminalActivityAfterExternalState = () => {
+    markAllTerminalActivityWorkspacesForRefresh();
+    scheduleTerminalActivitySignalRefresh();
+  };
   if (terminalActivitySummary || workspaceTerminalActivity) {
     refreshTerminalActivity({ force: true });
     document.addEventListener("visibilitychange", () => {
@@ -672,12 +676,16 @@
         return;
       }
       terminalActivityRefreshPending = false;
-      if (!terminalActivityChannel) markAllTerminalActivityWorkspacesForRefresh();
-      refreshTerminalActivity({ force: true });
+      refreshTerminalActivityAfterExternalState();
     });
     window.addEventListener("focus", () => {
-      if (!terminalActivityChannel) markAllTerminalActivityWorkspacesForRefresh();
-      refreshTerminalActivity();
+      refreshTerminalActivityAfterExternalState();
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted) refreshTerminalActivityAfterExternalState();
+    });
+    window.addEventListener("online", () => {
+      refreshTerminalActivityAfterExternalState();
     });
     window.addEventListener("termroom:terminal-output", (event) => {
       if (!terminalActivityOutputNeedsRefresh(event.detail)) return;
