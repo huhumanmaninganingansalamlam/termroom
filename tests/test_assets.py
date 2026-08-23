@@ -231,6 +231,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         encoding="utf-8"
     )
     assert str(TERMINAL_FONT_ASSETS["core_hangul"]["filename"]) in terminal_template
+    assert "data-terminal-command-clear-target" in terminal_template
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
         assert str(TERMINAL_FONT_ASSETS[key]["filename"]) not in terminal_template
     terminal_script = (VENDOR_DIR.parent / "terminal.js").read_text(encoding="utf-8")
@@ -280,6 +281,19 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "if (!action) value = terminalCtrlValue(value);" in terminal_script
     assert "let reconnectAllowed = true;" in terminal_script
     assert "reconnectAllowed = !terminalCloseMessage;" in terminal_script
+    assert 'document.querySelectorAll("[data-terminal-switch]")' in terminal_script
+    assert (
+        'if (!targetId || !shellTerminal || targetRole !== "shell") return false;'
+        in terminal_script
+    )
+    assert "connectionEpoch += 1;" in terminal_script
+    assert "term.reset();" in terminal_script
+    assert "closeMoreKeys({ focus: false });" in terminal_script
+    assert "terminalCommandClearTarget.value = targetId" in terminal_script
+    assert "history.pushState(" in terminal_script
+    assert 'window.addEventListener("popstate"' in terminal_script
+    assert 'new CustomEvent("termroom:terminal-switched"' in terminal_script
+    assert "if (epoch !== connectionEpoch || nextSocket !== socket) return;" in terminal_script
     assert re.search(
         r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
         r'if \(document\.visibilityState !== "visible"\) return;\s*'
@@ -309,7 +323,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"2"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"52"}
+    assert versions["terminal.js"] == {"53"}
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:

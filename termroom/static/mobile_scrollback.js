@@ -36,6 +36,7 @@
   let loading = false;
   let refreshTimer = 0;
   let refreshQueued = false;
+  let urgentRefreshQueued = false;
   let forceNextHistoryRefresh = false;
   let lastLiveHeight = 0;
   let touchGesture = null;
@@ -46,6 +47,7 @@
   let historyDirtySince = performance.now();
   let lastHistoryChangeAt = historyDirtySince;
   let historyRenderRevision = 0;
+  let terminalRevision = 0;
   let userScrollRevision = 0;
   let liveFollowing = true;
 
@@ -161,10 +163,12 @@
   const loadHistory = async ({ stickToBottom = false, force = false } = {}) => {
     if (loading) {
       refreshQueued = true;
+      urgentRefreshQueued ||= stickToBottom || force;
       forceNextHistoryRefresh ||= force;
       return;
     }
     loading = true;
+    const requestedTerminalRevision = terminalRevision;
     const requestedChangeRevision = historyChangeRevision;
     surface.dataset.historyLoading = "true";
     try {
@@ -175,6 +179,12 @@
         cache: "no-store",
         headers,
       });
+      if (requestedTerminalRevision !== terminalRevision) {
+        refreshQueued = true;
+        urgentRefreshQueued = true;
+        forceNextHistoryRefresh = true;
+        return;
+      }
       if (response.status === 304) {
         if (historyChangeRevision === requestedChangeRevision) {
           clearHistoryDirty();
@@ -187,6 +197,12 @@
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const responseEtag = response.headers.get("etag") || historyEtag;
       const historicalText = normalizeText(await response.text()).replace(/\n+$/, "");
+      if (requestedTerminalRevision !== terminalRevision) {
+        refreshQueued = true;
+        urgentRefreshQueued = true;
+        forceNextHistoryRefresh = true;
+        return;
+      }
 
       // History is a stable reading snapshot. If the user left live while this
       // request was in flight, keep the existing DOM untouched. A bounded tmux
@@ -255,7 +271,9 @@
       delete surface.dataset.historyLoading;
       if (refreshQueued) {
         refreshQueued = false;
-        scheduleHistoryRefresh({ urgent: !liveFollowing });
+        const urgent = urgentRefreshQueued || !liveFollowing;
+        urgentRefreshQueued = false;
+        scheduleHistoryRefresh({ urgent });
       }
     }
   };
@@ -514,6 +532,27 @@
   window.addEventListener("focus", () => scheduleHistoryRefresh({ urgent: true }));
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) scheduleHistoryRefresh({ urgent: true });
+  });
+  window.addEventListener("termroom:terminal-switched", () => {
+    terminalRevision += 1;
+    historyRenderRevision += 1;
+    userScrollRevision += 1;
+    window.clearTimeout(refreshTimer);
+    refreshTimer = 0;
+    refreshQueued = loading;
+    urgentRefreshQueued = loading;
+    forceNextHistoryRefresh = true;
+    renderedHistoryText = "";
+    historyEtag = "";
+    history.textContent = "";
+    history.hidden = true;
+    touchGesture = null;
+    liveFollowing = true;
+    liveButton.hidden = true;
+    document.body.classList.remove("terminal-scroll-away");
+    markHistoryDirty();
+    if (loading) return;
+    void loadHistory({ stickToBottom: true, force: true });
   });
 
   syncLiveHeight();

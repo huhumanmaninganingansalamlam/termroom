@@ -2,6 +2,17 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.14] - 2026-08-23
+
+### Changed
+
+- Switch between existing shell terminals inside a Workspace without reloading the full page, while keeping the selected URL, browser back/forward history, output link, and terminal management controls aligned.
+- Keep managed Run terminals on their existing server-navigation path and continue discovering tmux windows created outside the UI on an explicit page refresh instead of background polling.
+
+### Fixed
+
+- Reset native terminal scrollback state and reject stale WebSocket, presence, and history responses when changing shell terminals in place.
+
 ## [0.3.13] - 2026-08-23
 
 ### Added
