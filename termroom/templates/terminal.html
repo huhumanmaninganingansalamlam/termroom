@@ -17,7 +17,10 @@
     <a class="{% if item.id == terminal.id %}active{% endif %}"
        href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}"
        data-terminal-activity-tab="{{ item.id }}"
-       data-terminal-role="{{ item.role | default('shell') }}">{{ item.name }}{% if (item.role | default('shell')) == 'shell' %}<span class="terminal-unread-dot terminal-tab-unread" data-terminal-activity-tab-unread hidden><span class="sr-only">{{ t('terminal.activity.new_output') }}</span></span>{% endif %}</a>
+       data-terminal-switch="{{ item.id }}"
+       data-terminal-name="{{ item.name }}"
+       data-terminal-role="{{ item.role | default('shell') }}"
+       {% if item.id == terminal.id %}aria-current="page"{% endif %}>{{ item.name }}{% if (item.role | default('shell')) == 'shell' %}<span class="terminal-unread-dot terminal-tab-unread" data-terminal-activity-tab-unread hidden><span class="sr-only">{{ t('terminal.activity.new_output') }}</span></span>{% endif %}</a>
     {% endfor %}
   </nav>
   <div class="terminal-top-actions">
@@ -27,6 +30,7 @@
     </span>
     <a class="terminal-tool-button terminal-output-action"
        href="/w/{{ workspace.id }}/terminal/{{ terminal.id }}/scrollback"
+       data-terminal-output-link
        aria-label="{{ t('terminal.output') }}">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
       <span class="terminal-tool-label">{{ t('terminal.output') }}</span>
@@ -44,6 +48,7 @@
             method="post"
             action="/w/{{ workspace.id }}/terminals/{{ terminal.id }}"
             class="terminal-manage-form"
+            data-terminal-manage-form
             data-popover-panel
             hidden>
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -62,7 +67,7 @@
         {% if (terminal.role | default('shell')) == 'shell' %}
           <label>
             <span>{{ t('terminal.name') }}</span>
-            <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}">
+            <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}" data-terminal-name-input>
           </label>
           <button type="submit" name="action" value="rename">{{ t('terminal.rename') }}</button>
           <button type="submit"
@@ -220,7 +225,10 @@
       {% endfor %}
       <form method="post" action="/w/{{ workspace.id }}/commands/clear" class="recent-command-clear-form">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <input type="hidden" name="terminal" value="{{ terminal.id }}">
+        <input type="hidden"
+               name="terminal"
+               value="{{ terminal.id }}"
+               data-terminal-command-clear-target>
         <button type="submit" class="recent-command-clear">{{ t('terminal.clear_recent') }}</button>
       </form>
     </div>
@@ -233,5 +241,5 @@
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
 <script src="{{ url_for('static', path='vendor/addon-unicode11.js') }}?v=0.8.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=52"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=53"></script>
 {% endblock %}

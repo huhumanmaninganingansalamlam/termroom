@@ -18,9 +18,9 @@ def test_base_loads_mobile_scrollback_assets() -> None:
     )
 
     assert "mobile_scrollback.css') }}?v=11" in template
-    assert "mobile_scrollback.js') }}?v=23\" defer" in template
+    assert "mobile_scrollback.js') }}?v=24\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
-    assert "terminal.js') }}?v=52" in terminal_template
+    assert "terminal.js') }}?v=53" in terminal_template
 
 
 @pytest.mark.asyncio
@@ -38,11 +38,11 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         page = await client.get("/")
         stylesheet = await client.get("/static/mobile_scrollback.css?v=11")
-        script = await client.get("/static/mobile_scrollback.js?v=23")
+        script = await client.get("/static/mobile_scrollback.js?v=24")
 
     assert page.status_code == 401
     assert "/static/mobile_scrollback.css?v=11" in page.text
-    assert "/static/mobile_scrollback.js?v=23" in page.text
+    assert "/static/mobile_scrollback.js?v=24" in page.text
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text
     assert "scrollbar-gutter: stable" in stylesheet.text
@@ -89,6 +89,13 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "availableRows" not in script
     assert 'headers["If-None-Match"] = historyEtag' in script
     assert "response.status === 304" in script
+    assert "let terminalRevision = 0;" in script
+    assert "let urgentRefreshQueued = false;" in script
+    assert "requestedTerminalRevision !== terminalRevision" in script
+    assert "urgentRefreshQueued = true;" in script
+    assert 'window.addEventListener("termroom:terminal-switched"' in script
+    assert 'historyEtag = "";' in script
+    assert 'history.textContent = "";' in script
     assert "forceNextHistoryRefresh" in script
     assert "const responseEtag = response.headers.get" in script
     assert script.index("if (!stickToBottom && !liveFollowing && !atLiveBottom())") < script.index(
@@ -108,7 +115,7 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "new MutationObserver(() =>" in script
     assert "const afterLayout = (callback) =>" in script
     assert "if (document.hidden)" in script
-    assert "void loadHistory({ stickToBottom: true, force: true });" in script
+    assert script.count("void loadHistory({ stickToBottom: true, force: true });") == 2
     assert "event.touches.length !== 1" in script
     assert "touch.identifier" in script
     assert 'terminalHost.querySelector(".xterm.enable-mouse-events")' in script

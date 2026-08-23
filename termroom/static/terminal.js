@@ -191,11 +191,12 @@
   let reconnectTimer = null;
   let reconnectDelay = 500;
   let reconnectAllowed = true;
+  let connectionEpoch = 0;
   let isConnected = false;
   let lastInputRevision = 0;
   let presenceInitialized = false;
   let otherInputTimer = null;
-  const shellTerminal = (host.dataset.terminalRole || "shell") === "shell";
+  let shellTerminal = (host.dataset.terminalRole || "shell") === "shell";
   let activityAckTimer = 0;
   let pendingActivityAt = 0;
   let acknowledgedActivityAt = 0;
@@ -226,13 +227,15 @@
 
   const updatePresence = async () => {
     if (!isConnected) return;
+    const terminalId = host.dataset.terminalId;
     try {
-      const response = await fetch(`/api/terminals/${host.dataset.terminalId}/presence`, {
+      const response = await fetch(`/api/terminals/${terminalId}/presence`, {
         credentials: "same-origin",
         cache: "no-store",
       });
       if (!response.ok) return;
       const presence = await response.json();
+      if (terminalId !== host.dataset.terminalId) return;
       const count = Number(presence.count || 0);
       const revision = Number(presence.input_revision || 0);
       if (!presenceInitialized) {
@@ -461,19 +464,27 @@
   const connect = () => {
     window.clearTimeout(reconnectTimer);
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    socket = new WebSocket(
-      `${scheme}://${location.host}/ws/terminal/${host.dataset.terminalId}`,
+    const epoch = connectionEpoch;
+    const terminalId = host.dataset.terminalId;
+    const nextSocket = new WebSocket(
+      `${scheme}://${location.host}/ws/terminal/${terminalId}`,
     );
+    socket = nextSocket;
     setStatus(tr("terminal.status.connecting"));
 
-    socket.addEventListener("open", () => {
+    nextSocket.addEventListener("open", () => {
+      if (epoch !== connectionEpoch || nextSocket !== socket) {
+        nextSocket.close(1000, "terminal switched");
+        return;
+      }
       reconnectDelay = 500;
       setStatus(tr("terminal.status.connected"), true);
       scheduleResize(true);
       updatePresence();
       if (!coarsePrimaryPointer.matches) term.focus();
     });
-    socket.addEventListener("message", (event) => {
+    nextSocket.addEventListener("message", (event) => {
+      if (epoch !== connectionEpoch || nextSocket !== socket) return;
       if (typeof event.data !== "string") return;
       term.write(event.data, () => {
         outputRenderSequence += 1;
@@ -491,7 +502,8 @@
         );
       });
     });
-    socket.addEventListener("close", (event) => {
+    nextSocket.addEventListener("close", (event) => {
+      if (epoch !== connectionEpoch || nextSocket !== socket) return;
       const terminalCloseMessages = {
         4401: tr("terminal.status.auth_required"),
         4403: tr("terminal.status.rejected"),
@@ -506,7 +518,7 @@
         reconnectDelay = Math.min(reconnectDelay * 1.7, 5000);
       }
     });
-    socket.addEventListener("error", () => socket.close());
+    nextSocket.addEventListener("error", () => nextSocket.close());
   };
 
   let nextTerminalDataIsUserInput = false;
@@ -729,6 +741,133 @@
       commandInput.focus();
       commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
     });
+  });
+
+  const terminalTabs = [...document.querySelectorAll("[data-terminal-switch]")];
+  const terminalOutputLink = document.querySelector("[data-terminal-output-link]");
+  const terminalManageForm = document.querySelector("[data-terminal-manage-form]");
+  const terminalNameInput = document.querySelector("[data-terminal-name-input]");
+  const terminalCommandClearTarget = document.querySelector(
+    "[data-terminal-command-clear-target]",
+  );
+  const terminalHistoryState = (terminalId) => {
+    const current = history.state && typeof history.state === "object" ? history.state : {};
+    return { ...current, termroomTerminalId: terminalId };
+  };
+  const closeTerminalPopovers = () => {
+    document.querySelectorAll(".terminal-chrome [data-popover]").forEach((popover) => {
+      popover.removeAttribute("open");
+      popover.querySelector("[data-popover-trigger]")?.setAttribute("aria-expanded", "false");
+      popover.querySelectorAll("[data-popover-panel]").forEach((panel) => {
+        panel.hidden = true;
+      });
+    });
+  };
+  const resetTerminalActivityState = () => {
+    window.clearTimeout(activityAckTimer);
+    pendingActivityAt = 0;
+    acknowledgedActivityAt = 0;
+    renderedActivityAt = 0;
+    outputRenderSequence = 0;
+    acknowledgedRenderSequence = 0;
+  };
+  const switchShellTerminal = (tab, { historyMode = "push" } = {}) => {
+    const targetId = tab.dataset.terminalSwitch || "";
+    const targetRole = tab.dataset.terminalRole || "shell";
+    if (!targetId || !shellTerminal || targetRole !== "shell") return false;
+    if (targetId === host.dataset.terminalId) return true;
+    const previousTerminalId = host.dataset.terminalId || "";
+
+    connectionEpoch += 1;
+    window.clearTimeout(reconnectTimer);
+    window.clearTimeout(otherInputTimer);
+    const previousSocket = socket;
+    socket = null;
+    if (previousSocket && previousSocket.readyState < WebSocket.CLOSING) {
+      previousSocket.close(1000, "terminal switched");
+    }
+
+    reconnectAllowed = true;
+    reconnectDelay = 500;
+    presenceInitialized = false;
+    lastInputRevision = 0;
+    resetTerminalActivityState();
+    setComposerOpen(false, { focus: false });
+    closeMoreKeys({ focus: false });
+    closeTerminalPopovers();
+    document.body.classList.remove("terminal-keyboard-open");
+
+    host.dataset.terminalId = targetId;
+    host.dataset.terminalRole = targetRole;
+    shellTerminal = true;
+    terminalTabs.forEach((candidate) => {
+      const active = candidate === tab;
+      candidate.classList.toggle("active", active);
+      if (active) candidate.setAttribute("aria-current", "page");
+      else candidate.removeAttribute("aria-current");
+    });
+
+    const workspaceId = host.dataset.workspaceId || "";
+    terminalOutputLink?.setAttribute(
+      "href",
+      `/w/${encodeURIComponent(workspaceId)}/terminal/${encodeURIComponent(targetId)}/scrollback`,
+    );
+    terminalManageForm?.setAttribute(
+      "action",
+      `/w/${encodeURIComponent(workspaceId)}/terminals/${encodeURIComponent(targetId)}`,
+    );
+    if (terminalNameInput) {
+      terminalNameInput.value = tab.dataset.terminalName || "shell";
+    }
+    if (terminalCommandClearTarget) terminalCommandClearTarget.value = targetId;
+    document.querySelector(".terminal-error-banner")?.remove();
+
+    term.reset();
+    term.clearSelection?.();
+    window.dispatchEvent(
+      new CustomEvent("termroom:terminal-switched", {
+        detail: {
+          workspace_id: workspaceId,
+          previous_terminal_id: previousTerminalId,
+          terminal_id: targetId,
+        },
+      }),
+    );
+    setStatus(tr("terminal.status.connecting"));
+    if (historyMode === "push") {
+      history.pushState(
+        terminalHistoryState(targetId),
+        "",
+        tab.getAttribute("href") || location.href,
+      );
+    }
+    connect();
+    return true;
+  };
+
+  terminalTabs.forEach((tab) => {
+    tab.addEventListener("click", (event) => {
+      const modifiedClick = event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey;
+      if (event.defaultPrevented || modifiedClick || tab.target === "_blank") return;
+      if (switchShellTerminal(tab)) event.preventDefault();
+    });
+  });
+  history.replaceState(
+    terminalHistoryState(host.dataset.terminalId || ""),
+    "",
+    location.href,
+  );
+  window.addEventListener("popstate", (event) => {
+    const stateTerminalId = event.state?.termroomTerminalId;
+    const urlTerminalId = new URL(location.href).searchParams.get("terminal");
+    const targetId = String(stateTerminalId || urlTerminalId || "");
+    const tab = terminalTabs.find((candidate) => candidate.dataset.terminalSwitch === targetId);
+    if (tab && switchShellTerminal(tab, { historyMode: "none" })) return;
+    location.reload();
   });
 
   connect();

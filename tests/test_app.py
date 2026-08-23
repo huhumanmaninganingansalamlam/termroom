@@ -644,6 +644,46 @@ async def test_terminal_page_canonicalizes_stale_terminal_query(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_terminal_page_exposes_shell_tabs_for_in_place_switching(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    first = app.state.terminals.ensure_workspace(workspace)[0]
+    second = app.state.terminals.create_terminal(workspace, "logs")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            response = await client.get(
+                f"/w/{workspace['id']}/terminal?terminal={first['id']}"
+            )
+
+        assert response.status_code == 200
+        assert f'data-terminal-switch="{first["id"]}"' in response.text
+        assert f'data-terminal-switch="{second["id"]}"' in response.text
+        assert 'data-terminal-name="logs"' in response.text
+        assert 'aria-current="page"' in response.text
+        assert "data-terminal-output-link" in response.text
+        assert "data-terminal-manage-form" in response.text
+        assert "data-terminal-name-input" in response.text
+        assert 'terminal.js?v=53' in response.text
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_terminal_scrollback_route_forwards_history_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
