@@ -1,7 +1,7 @@
 {
   "name": "Termroom",
   "short_name": "Termroom",
-  "description": "Persistent terminal and files for local and remote Linux workspaces",
+  "description": "Persistent terminal and files for local Linux and remote Linux or macOS workspaces",
   "id": "/",
   "start_url": "/",
   "scope": "/",

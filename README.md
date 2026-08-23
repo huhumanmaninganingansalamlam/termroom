@@ -10,7 +10,7 @@ devices does not end the work that is already running.
 
 Termroom is aimed at workflows such as starting a long build or AI task on a laptop,
 checking it from a phone later, running a small set of explicit project commands, and
-working with remote Linux servers through the same terminal-and-files interface.
+working with remote Linux or macOS computers through the same terminal-and-files interface.
 
 > **Status: early release.** Termroom is available as a Python CLI package and the
 > project is still evolving quickly. Expect small workflow and UI changes between
@@ -22,7 +22,7 @@ working with remote Linux servers through the same terminal-and-files interface.
 - Keep terminal work alive even when the browser is closed.
 - Browse, upload, download, or edit project files from the browser.
 - Move between several local projects from one interface.
-- Use SSH Linux servers and outbound-only Termroom Nodes in the same Workspace flow.
+- Use SSH Linux or macOS computers and outbound-only Termroom Nodes in the same Workspace flow.
 - Save up to three explicit commands per Workspace and run them from its root.
 - Run the current Python, JavaScript, or Bash file without assembling its command by hand.
 - Send a Workspace snapshot, public HTTPS Git repository, or ZIP to another Remote and
@@ -31,7 +31,7 @@ working with remote Linux servers through the same terminal-and-files interface.
   back to the source Workspace.
 
 Termroom is not a cloud IDE. **The real terminal processes and files stay on your Linux
-computer or on a Remote Linux computer you control.** Termroom provides the browser interface.
+Core computer or on a Remote computer you control.** Termroom provides the browser interface.
 
 ## Quick start
 
@@ -200,8 +200,8 @@ Computer
    └─ Recent
 ```
 
-A `Computer` is either this Linux machine or a Remote Linux computer connected through SSH
-or Termroom Node.
+A `Computer` is either this Linux machine, a Linux or macOS computer connected through SSH,
+or a Linux computer connected through Termroom Node.
 
 The Workspace settings menu can unregister a Workspace from Termroom without deleting its
 project folder, files, tmux session, or running processes.
@@ -247,7 +247,11 @@ Enter SSH address
 The remote folder browser has the same **New project** action. The directory is created via
 SFTP and then opened as an ordinary remote Workspace.
 
-The remote Linux host needs an SSH server, `/bin/bash`, and `tmux`.
+The SSH host may run Linux or macOS and needs an SSH server, `/bin/bash`, and `tmux`.
+Termroom asks the account's configured login shell for its exported command environment once,
+then verifies `tmux` with `command -v tmux` and `tmux -V`. It does not assume a Homebrew or
+other package-manager directory; a command available after a normal SSH login is discovered
+from that login environment and reused without reloading shell startup files for every command.
 
 ### Termroom Node
 

@@ -28,8 +28,13 @@ filesystem └─ Node outbound WSS → remote filesystem + tmux
 tmux
 ```
 
-SSH Remotes require normal SSH, `/bin/bash`, and tmux. Node Remotes require the
-Termroom package, `/bin/bash`, and tmux, but no inbound port.
+SSH Remotes may run Linux or macOS and require normal SSH, `/bin/bash`, and tmux.
+Termroom queries the authenticated account's configured login shell once for its exported
+absolute command-search entries, isolates startup output from the protocol, and caches the
+sanitized result for subsequent `/bin/sh` operations. Tool availability is still verified
+with command lookup; no Homebrew, package-manager, or executable directory is guessed. Node
+Remotes remain Linux computers and require the Termroom package, `/bin/bash`, and tmux, but
+no inbound port.
 
 ## Data model
 
@@ -66,6 +71,8 @@ implicitly.
 For SSH computers, the pre-Workspace picker uses SFTP to browse real remote
 directories starting from the SSH user's home directory. It skips symlinks and
 does not create a Workspace until the user explicitly opens the selected folder.
+Recent-file traversal also uses bounded SFTP operations rather than GNU `find`, so the
+same Files behavior works on Linux and macOS SSH hosts.
 
 The same folder browsers may create one new child directory. Project creation is deliberately
 not a new project system: validate one folder name, create the directory, then pass it through

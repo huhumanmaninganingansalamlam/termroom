@@ -2,7 +2,7 @@
 
 Thanks for helping improve Termroom. Keep changes aligned with its narrow product
 contract: a self-hosted workspace for persistent terminals, files, managed runs,
-and quick resume across Local, SSH, and Termroom Node Linux computers.
+and quick resume across Linux Local/Node computers and Linux or macOS SSH computers.
 
 ## Setup
 
@@ -71,7 +71,11 @@ xterm IME/composition and bracketed-paste paths.
 
 Keep host-key pinning and credential storage intact. The normal managed-key path
 should reuse one Ed25519 key. Existing-key mode is advanced functionality. Remote
-Linux connected through SSH must not require a Termroom-specific agent.
+Linux or macOS computers connected through SSH must not require a Termroom-specific
+agent. Resolve commands through the shared login-shell bootstrap and verify them with
+`command -v`; do not add guessed package-manager or executable directories. Keep filesystem
+scans on the portable SFTP path unless a remote command is explicitly proven on both
+GNU/Linux and macOS/BSD userlands.
 
 ## Node
 

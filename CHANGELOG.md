@@ -2,6 +2,20 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.13] - 2026-08-23
+
+### Added
+
+- Support Linux and macOS SSH computers through the same Workspace flow, including Homebrew-installed `tmux` and `git` on Apple Silicon and Intel Macs.
+
+### Changed
+
+- Traverse recent SSH files through bounded SFTP operations instead of GNU-only `timeout` and `find` flags.
+
+### Fixed
+
+- Resolve remote commands through the authenticated user's configured login shell, so `command -v tmux` sees the same properly installed command without hard-coded Homebrew or package-manager directories.
+
 ## [0.3.12] - 2026-08-22
 
 ### Added

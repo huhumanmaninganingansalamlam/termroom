@@ -113,6 +113,11 @@ REMOTE_RUN_SESSION_PREFIX = "termroom-run-"
 REMOTE_RUN_DELETE_TIMEOUT_SECONDS = 10 * 60
 SSH_REUSE_IDLE_SECONDS = 30.0
 SSH_REUSE_MAX_IDLE_PER_TARGET = 2
+REMOTE_LOGIN_PATH_MARKER = "__TERMROOM_LOGIN_PATH__"
+REMOTE_LOGIN_PATH_MAX_BYTES = 32 * 1024
+REMOTE_LOGIN_PATH_PROBE_TIMEOUT_SECONDS = 8.0
+REMOTE_RECENT_MAX_FILES = 20_000
+REMOTE_RECENT_MAX_SECONDS = 2.0
 
 REMOTE_RUN_LOG_PIPE_SCRIPT = r"""#!/bin/bash
 set -u
@@ -715,6 +720,8 @@ class SSHBackend:
         self._ssh_idle: dict[tuple[Any, ...], list[tuple[paramiko.SSHClient, float]]] = {}
         self._ssh_pool_generation: dict[str, int] = {}
         self._ssh_pool_closed = False
+        self._remote_command_paths: dict[str, str] = {}
+        self._remote_command_paths_lock = threading.Lock()
         self._workspace_command_locks: dict[str, threading.RLock] = {}
         self._workspace_command_locks_guard = threading.Lock()
         self._browser_grid_locks: dict[str, threading.RLock] = {}
@@ -1050,12 +1057,12 @@ class SSHBackend:
     def test_connection(self, computer: dict[str, Any]) -> dict[str, str]:
         self._require_ssh_client()
         client = self._connect(computer)
-        return self._connection_info(client)
+        return self._connection_info(client, computer, refresh_command_path=True)
 
     def test_password_connection(self, computer: dict[str, Any], password: str) -> dict[str, str]:
         self._require_ssh_client()
         client = self._connect_password(self._effective_connection_target(computer), password)
-        return self._connection_info(client)
+        return self._connection_info(client, computer, refresh_command_path=True)
 
     @staticmethod
     def _require_ssh_client() -> None:
@@ -1065,16 +1072,29 @@ class SSHBackend:
                 locale_key="ssh.backend.ssh_missing",
             )
 
-    def _connection_info(self, client: paramiko.SSHClient) -> dict[str, str]:
+    def _connection_info(
+        self,
+        client: paramiko.SSHClient,
+        computer: Mapping[str, Any],
+        *,
+        refresh_command_path: bool = False,
+    ) -> dict[str, str]:
         try:
+            remote_path = self._remote_command_path_for_client(
+                computer,
+                client,
+                refresh=refresh_command_path,
+            )
             script = (
                 "printf 'shell=%s\\n' \"${SHELL:-unknown}\"; "
-                "if command -v tmux >/dev/null 2>&1; "
-                "then tmux -V; else echo 'tmux=missing'; fi"
+                "command -v tmux >/dev/null 2>&1 || "
+                "{ echo '__TERMROOM_NO_TMUX__' >&2; exit 45; }; "
+                "tmux -V"
             )
             output = self._exec_client(
                 client,
                 self._remote_posix_command(script),
+                remote_path=remote_path,
             )
         finally:
             client.close()
@@ -1436,7 +1456,7 @@ class SSHBackend:
             try:
                 output = self._exec_remote_run_bash(
                     client,
-                    f"df -Pk -- {shlex.quote(run_base)} | tail -n 1 | awk '{{print $4}}'",
+                    f"df -Pk {shlex.quote(run_base)} | tail -n 1 | awk '{{print $4}}'",
                 ).strip()
                 if output:
                     available_bytes = int(output.splitlines()[-1]) * 1024
@@ -4728,93 +4748,94 @@ class SSHBackend:
             client.close()
 
     def recent_files(self, workspace: dict[str, Any], *, limit: int = 50) -> RecentFiles:
-        root = self._remote_root(workspace)
-        ignore_patterns = self._recent_ignore_patterns(workspace)
-        prune_names = ["-name '.*'"] + [
-            f"-name {shlex.quote(name)}" for name in DEFAULT_RECENT_EXCLUDES
-        ]
-        prune = " -o ".join(prune_names)
-        command = (
-            f"cd {shlex.quote(root)} && "
-            "timeout 2s find . -xdev -mindepth 1 "
-            f"\\( -type d \\( ! -readable -o {prune} \\) -prune \\) -o "
-            "\\( -type f -printf '%T@\\t%s\\t%p\\n' \\)"
-        )
-        client = self._connect(self._computer(workspace))
-        heap: list[tuple[float, str, FileEntry]] = []
-        scanned = 0
-        truncated = False
-        try:
-            stdin, stdout, stderr = client.exec_command(command, timeout=8)
-            stdin.close()
-            for raw_line in stdout:
-                scanned += 1
-                if scanned > 20_000:
-                    truncated = True
-                    stdout.channel.close()
-                    break
-                timestamp, separator, remainder = raw_line.rstrip("\n").partition("\t")
-                size_text, separator2, relative = remainder.partition("\t")
-                if not separator or not separator2:
-                    continue
-                try:
-                    mtime = float(timestamp)
-                    size = int(size_text)
-                except ValueError:
-                    continue
-                relative = relative.removeprefix("./")
-                if (
-                    PurePosixPath(relative).name in DEFAULT_RECENT_EXCLUDES
-                    or relative == RECENT_IGNORE_FILE
-                    or recent_path_ignored(relative, ignore_patterns)
-                ):
-                    continue
-                entry = FileEntry(
-                    name=PurePosixPath(relative).name,
-                    relative_path=relative,
-                    is_dir=False,
-                    size=size,
-                    mtime_ns=int(mtime * 1_000_000_000),
-                )
-                key = (mtime, relative, entry)
-                if len(heap) < limit:
-                    heapq.heappush(heap, key)
-                elif key[:2] > heap[0][:2]:
-                    heapq.heapreplace(heap, key)
-            status = stdout.channel.recv_exit_status()
-            error = stderr.read().decode("utf-8", errors="replace")
-            if status == 124:
-                truncated = True
-            elif status not in {0, 141} and "timeout" not in error.casefold():
-                raise SSHBackendError(error.strip() or "Remote recent-file scan failed")
-        finally:
-            client.close()
-        entries = [item[2] for item in sorted(heap, key=lambda item: item[:2], reverse=True)]
-        return RecentFiles(entries=entries, scanned_files=scanned, truncated=truncated)
-
-    def _recent_ignore_patterns(self, workspace: dict[str, Any]) -> tuple[str, ...]:
+        wanted = max(1, min(limit, 200))
+        heap: list[tuple[int, str, FileEntry]] = []
         client, sftp = self._sftp(workspace)
         try:
-            root = self._remote_root(workspace)
-            remote = posixpath.join(root, RECENT_IGNORE_FILE)
-            try:
-                attr = sftp.lstat(remote)
-            except OSError:
-                return ()
+            root, root_attr = self._existing_sftp_path(sftp, workspace, ".")
+            if not stat_module.S_ISDIR(root_attr.st_mode):
+                raise NotADirectoryError(root)
+            ignore_patterns = self._recent_ignore_patterns_from_sftp(sftp, root)
+            deadline = time.monotonic() + REMOTE_RECENT_MAX_SECONDS
+            pending = [root]
+            scanned = 0
+            truncated = False
+            stop = False
+
+            while pending and not stop:
+                if scanned >= REMOTE_RECENT_MAX_FILES or time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                directory = pending.pop()
+                try:
+                    children = sftp.listdir_iter(directory, read_aheads=1)
+                    for attr in children:
+                        if (
+                            scanned >= REMOTE_RECENT_MAX_FILES
+                            or time.monotonic() >= deadline
+                        ):
+                            truncated = True
+                            stop = True
+                            break
+                        if stat_module.S_ISLNK(attr.st_mode):
+                            continue
+                        name = str(attr.filename)
+                        if name in DEFAULT_RECENT_EXCLUDES or name == RECENT_IGNORE_FILE:
+                            continue
+                        child = posixpath.join(directory, name)
+                        relative = self._relative_remote(workspace, child)
+                        if recent_path_ignored(relative, ignore_patterns):
+                            continue
+                        if stat_module.S_ISDIR(attr.st_mode):
+                            if not name.startswith("."):
+                                pending.append(child)
+                            continue
+                        if not stat_module.S_ISREG(attr.st_mode):
+                            continue
+
+                        scanned += 1
+                        mtime_ns = int(attr.st_mtime or 0) * 1_000_000_000
+                        entry = FileEntry(
+                            name=name,
+                            relative_path=relative,
+                            is_dir=False,
+                            size=int(attr.st_size or 0),
+                            mtime_ns=mtime_ns,
+                        )
+                        key = (mtime_ns, relative, entry)
+                        if len(heap) < wanted:
+                            heapq.heappush(heap, key)
+                        elif key[:2] > heap[0][:2]:
+                            heapq.heapreplace(heap, key)
+                except OSError:
+                    continue
+
+            entries = [
+                item[2] for item in sorted(heap, key=lambda item: item[:2], reverse=True)
+            ]
+            return RecentFiles(entries=entries, scanned_files=scanned, truncated=truncated)
+        finally:
+            sftp.close()
+            client.close()
+
+    @staticmethod
+    def _recent_ignore_patterns_from_sftp(
+        sftp: paramiko.SFTPClient, root: str
+    ) -> tuple[str, ...]:
+        remote = posixpath.join(root, RECENT_IGNORE_FILE)
+        try:
+            attr = sftp.lstat(remote)
             if (
-                not stat_module.S_ISREG(attr.st_mode)
+                stat_module.S_ISLNK(attr.st_mode)
+                or not stat_module.S_ISREG(attr.st_mode)
                 or int(attr.st_size or 0) > MAX_RECENT_IGNORE_BYTES
             ):
                 return ()
             with sftp.open(remote, "rb") as handle:
                 raw = handle.read(MAX_RECENT_IGNORE_BYTES)
-            try:
-                return parse_recent_ignore_patterns(raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                return ()
-        finally:
-            sftp.close()
-            client.close()
+            return parse_recent_ignore_patterns(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            return ()
 
     def content_type(self, relative_path: str) -> str:
         from termroom.files import FileService
@@ -4944,6 +4965,11 @@ class SSHBackend:
                 for key in tuple(self._ssh_idle):
                     if str(key[0]) == computer_id:
                         clients.extend(client for client, _ in self._ssh_idle.pop(key))
+        with self._remote_command_paths_lock:
+            if computer_id is None:
+                self._remote_command_paths.clear()
+            else:
+                self._remote_command_paths.pop(computer_id, None)
         self._close_clients(clients)
 
     def close(self) -> None:
@@ -4951,6 +4977,8 @@ class SSHBackend:
             self._ssh_pool_closed = True
             clients = [client for entries in self._ssh_idle.values() for client, _ in entries]
             self._ssh_idle.clear()
+        with self._remote_command_paths_lock:
+            self._remote_command_paths.clear()
         self._close_clients(clients)
 
     def _release_connection(
@@ -4984,7 +5012,9 @@ class SSHBackend:
     def _connect(self, computer: dict[str, Any]) -> paramiko.SSHClient | _SSHClientLease:
         target = self._effective_connection_target(computer)
         if not self._reuse_connections:
-            return self._connect_fresh(target)
+            client = self._connect_fresh(target)
+            self._seed_client_remote_command_path(client, str(target.get("id") or ""))
+            return client
         key = self._connection_cache_key(target)
         computer_id = str(target.get("id") or "")
         reused: paramiko.SSHClient | None = None
@@ -5012,6 +5042,7 @@ class SSHBackend:
             return _SSHClientLease(self, key, computer_id, reused)
 
         client = self._connect_fresh(target)
+        self._seed_client_remote_command_path(client, computer_id)
         transport = client.get_transport()
         if transport is not None:
             transport.set_keepalive(15)
@@ -5254,19 +5285,169 @@ class SSHBackend:
     def _exec(self, computer: dict[str, Any], command: str) -> str:
         client = self._connect(computer)
         try:
-            return self._exec_client(client, command)
+            remote_path = self._remote_command_path_for_client(computer, client)
+            return self._exec_client(client, command, remote_path=remote_path)
         finally:
             client.close()
 
     @staticmethod
+    def _client_state_target(client: Any) -> Any:
+        return client._client if isinstance(client, _SSHClientLease) else client
+
+    @staticmethod
+    def _sanitize_remote_command_path(value: str) -> str:
+        if not value or len(value.encode("utf-8")) > REMOTE_LOGIN_PATH_MAX_BYTES:
+            return ""
+        paths: list[str] = []
+        for raw_path in value.split(":"):
+            if not raw_path.startswith("/") or any(
+                ord(character) < 32 or ord(character) == 127 for character in raw_path
+            ):
+                continue
+            normalized = posixpath.normpath(raw_path)
+            if normalized not in paths:
+                paths.append(normalized)
+        return ":".join(paths)
+
+    @staticmethod
+    def _remote_login_path_probe() -> str:
+        probe = f"printf '{REMOTE_LOGIN_PATH_MARKER}%s\\n' \"$PATH\""
+        inner = f"exec /bin/sh -c {shlex.quote(probe)} >&3"
+        bootstrap = (
+            'shell=${SHELL:-/bin/sh}; '
+            'case "$shell" in /*) ;; *) shell=/bin/sh ;; esac; '
+            'test -x "$shell" || shell=/bin/sh; '
+            f'exec "$shell" -l -c {shlex.quote(inner)} '
+            "3>&1 >/dev/null 2>/dev/null"
+        )
+        return f"/bin/sh -c {shlex.quote(bootstrap)}"
+
+    @classmethod
+    def _client_remote_command_path(
+        cls,
+        client: Any,
+        *,
+        refresh: bool = False,
+        timeout: float | None = REMOTE_LOGIN_PATH_PROBE_TIMEOUT_SECONDS,
+    ) -> str:
+        state_target = cls._client_state_target(client)
+        cached = getattr(state_target, "_termroom_remote_command_path", None)
+        if not refresh and isinstance(cached, str):
+            return cached
+
+        get_transport = getattr(client, "get_transport", None)
+        if not callable(get_transport):
+            return ""
+        try:
+            transport = get_transport()
+        except Exception:
+            return ""
+        if transport is None:
+            return ""
+
+        probe_timeout = REMOTE_LOGIN_PATH_PROBE_TIMEOUT_SECONDS
+        if timeout is not None:
+            probe_timeout = min(probe_timeout, max(0.1, float(timeout)))
+        stdin = stdout = stderr = None
+        resolved = ""
+        try:
+            stdin, stdout, stderr = client.exec_command(
+                cls._remote_login_path_probe(), timeout=probe_timeout
+            )
+            stdin.close()
+            output = stdout.read().decode("utf-8", errors="replace")
+            stderr.read()
+            status = stdout.channel.recv_exit_status()
+            if status == 0:
+                candidates = [
+                    line[len(REMOTE_LOGIN_PATH_MARKER) :]
+                    for line in output.splitlines()
+                    if line.startswith(REMOTE_LOGIN_PATH_MARKER)
+                ]
+                if candidates:
+                    resolved = cls._sanitize_remote_command_path(candidates[-1])
+        except (EOFError, OSError, ValueError, paramiko.SSHException):
+            resolved = ""
+        finally:
+            channel = getattr(stdout, "channel", None)
+            if channel is not None:
+                with contextlib.suppress(Exception):
+                    channel.close()
+        state_target._termroom_remote_command_path = resolved
+        return resolved
+
+    def _seed_client_remote_command_path(self, client: Any, computer_id: str) -> None:
+        if not computer_id:
+            return
+        with self._remote_command_paths_lock:
+            if computer_id not in self._remote_command_paths:
+                return
+            remote_path = self._remote_command_paths[computer_id]
+        self._client_state_target(client)._termroom_remote_command_path = remote_path
+
+    def _remote_command_path_for_client(
+        self,
+        computer: Mapping[str, Any],
+        client: Any,
+        *,
+        refresh: bool = False,
+    ) -> str:
+        computer_id = str(computer.get("id") or "")
+        if computer_id and not refresh:
+            with self._remote_command_paths_lock:
+                cached = self._remote_command_paths.get(computer_id)
+                known = computer_id in self._remote_command_paths
+            if known:
+                self._client_state_target(client)._termroom_remote_command_path = cached or ""
+                return cached or ""
+
+        remote_path = self._client_remote_command_path(client, refresh=refresh)
+        if computer_id:
+            with self._remote_command_paths_lock:
+                self._remote_command_paths[computer_id] = remote_path
+        return remote_path
+
+    def _remote_command_path_for_computer(self, computer: dict[str, Any]) -> str:
+        computer_id = str(computer.get("id") or "")
+        if computer_id:
+            with self._remote_command_paths_lock:
+                if computer_id in self._remote_command_paths:
+                    return self._remote_command_paths[computer_id]
+        client = self._connect(computer)
+        try:
+            return self._remote_command_path_for_client(computer, client)
+        finally:
+            client.close()
+
+    @staticmethod
+    def _remote_command(command: str, remote_path: str = "") -> str:
+        """Run a bounded command with the resolved login-shell command path.
+
+        The login shell is queried once per authenticated computer/connection.
+        Only its exported absolute PATH entries are retained; Termroom does not
+        guess Homebrew, package-manager, or executable locations.
+        """
+
+        script = command
+        if remote_path:
+            script = f"PATH={shlex.quote(remote_path)}; export PATH; {command}"
+        return f"/bin/sh -c {shlex.quote(script)}"
+
+    @classmethod
     def _exec_client(
-        client: paramiko.SSHClient,
+        cls,
+        client: Any,
         command: str,
         *,
         timeout: float | None = 20,
+        remote_path: str | None = None,
     ) -> str:
+        if remote_path is None:
+            remote_path = cls._client_remote_command_path(client, timeout=timeout)
         try:
-            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            stdin, stdout, stderr = client.exec_command(
+                cls._remote_command(command, remote_path), timeout=timeout
+            )
             stdin.close()
             output = stdout.read().decode("utf-8", errors="replace")
             error = stderr.read().decode("utf-8", errors="replace")
@@ -5280,7 +5461,10 @@ class SSHBackend:
             if "__TERMROOM_NO_DIR__" in error:
                 raise SSHBackendError("Remote Workspace directory does not exist")
             if "__TERMROOM_NO_TMUX__" in error:
-                raise SSHBackendError("tmux is not installed on the remote computer")
+                raise SSHBackendError(
+                    "tmux is not installed on the remote computer",
+                    locale_key="ssh.backend.tmux_missing",
+                )
             if "__TERMROOM_NO_BASH__" in error:
                 raise SSHBackendError("/bin/bash is not installed on the remote computer")
             if "__TERMROOM_NO_GIT__" in error:
@@ -5399,7 +5583,10 @@ class SSHBackend:
             f"trap {shlex.quote(cleanup)} EXIT HUP INT TERM; "
             f"tmux attach-session -f ignore-size -t {quoted_view}"
         )
-        process_pid, master_fd = spawn_pty_process([*argv, remote_command], environment=environment)
+        remote_path = self._remote_command_path_for_computer(computer)
+        process_pid, master_fd = spawn_pty_process(
+            [*argv, self._remote_command(remote_command, remote_path)], environment=environment
+        )
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process_pid, signal.SIGWINCH)
         return process_pid, master_fd
