@@ -150,10 +150,32 @@ def node_reconnect_delay(base_seconds: float) -> float:
 
 
 NODE_MAX_CONCURRENT_REQUESTS = 8
-NODE_SESSION_PATTERN = re.compile(r"^termroom-[A-Za-z0-9_-]{1,112}$")
+NODE_LEGACY_SESSION_PATTERN = re.compile(r"^termroom-[A-Za-z0-9_-]{1,112}$")
 NODE_WINDOW_PATTERN = re.compile(r"^@[0-9]+$")
 NODE_WORKSPACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 FILE_RUN_DIGEST_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+
+
+def node_session_is_valid(session: str) -> bool:
+    """Accept legacy sessions and the canonical short Workspace session form."""
+
+    value = str(session)
+    if NODE_LEGACY_SESSION_PATTERN.fullmatch(value):
+        return True
+    if not value.startswith("tr-"):
+        return False
+    try:
+        slug, suffix = value[3:].rsplit("-", 1)
+    except ValueError:
+        return False
+    return (
+        1 <= len(slug) <= 16
+        and slug == slug.strip("-")
+        and "--" not in slug
+        and all(character.isalnum() or character == "-" for character in slug)
+        and len(suffix) == 4
+        and all(character in "0123456789abcdef" for character in suffix)
+    )
 
 
 class NodeAgentError(RuntimeError):
@@ -1303,7 +1325,7 @@ class NodeRuntime:
                     code="terminal_activity_invalid",
                 )
             session = str(raw.get("tmux_session") or "")
-            if not NODE_SESSION_PATTERN.fullmatch(session) or session in requested:
+            if not node_session_is_valid(session) or session in requested:
                 raise NodeAgentError(
                     "Terminal activity request is invalid",
                     code="terminal_activity_invalid",
@@ -2120,7 +2142,7 @@ class NodeRuntime:
 
     def _session(self, payload: Mapping[str, Any]) -> str:
         session = str(payload.get("tmux_session") or "")
-        if not NODE_SESSION_PATTERN.fullmatch(session):
+        if not node_session_is_valid(session):
             raise NodeAgentError("Workspace session identity is invalid", code="session_invalid")
         return session
 

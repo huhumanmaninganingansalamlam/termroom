@@ -25,6 +25,34 @@ NOTIFICATION_DEVICE_RETENTION = timedelta(days=90)
 HISTORY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 MAX_WORKSPACE_COMMANDS = 3
 MAX_WORKSPACE_COMMAND_BYTES = 4096
+WORKSPACE_TMUX_SESSION_PREFIX = "tr"
+WORKSPACE_TMUX_SESSION_ID_CHARS = 4
+WORKSPACE_TMUX_SESSION_SLUG_CHARS = 16
+
+
+def workspace_tmux_session_name(display_name: str, workspace_id: str) -> str:
+    """Return one short, readable, collision-resistant Workspace session name."""
+
+    normalized = unicodedata.normalize("NFKC", str(display_name)).casefold()
+    slug_parts: list[str] = []
+    separator_pending = False
+    for character in normalized:
+        if character.isalnum():
+            if separator_pending and slug_parts:
+                slug_parts.append("-")
+            slug_parts.append(character)
+            separator_pending = False
+        else:
+            separator_pending = True
+    slug = "".join(slug_parts).strip("-") or "workspace"
+    slug = slug[:WORKSPACE_TMUX_SESSION_SLUG_CHARS].rstrip("-") or "workspace"
+
+    suffix = str(workspace_id).lower()[:WORKSPACE_TMUX_SESSION_ID_CHARS]
+    if len(suffix) != WORKSPACE_TMUX_SESSION_ID_CHARS or any(
+        character not in "0123456789abcdef" for character in suffix
+    ):
+        raise ValueError("Workspace id must begin with four hexadecimal characters")
+    return f"{WORKSPACE_TMUX_SESSION_PREFIX}-{slug}-{suffix}"
 
 
 def normalize_workspace_commands(values: Iterable[object]) -> tuple[str, ...]:
@@ -830,33 +858,53 @@ class StateStore:
             raise ValueError(f"Unsupported Workspace backend: {backend_kind}")
         if workspace_kind not in WORKSPACE_KINDS:
             raise ValueError(f"Unsupported Workspace kind: {workspace_kind}")
-        workspace_id = uuid.uuid4().hex
-        tmux_session = tmux_session or f"termroom-{workspace_id[:12]}"
         now = utc_now()
+        requested_tmux_session = str(tmux_session) if tmux_session else None
         with self.connect() as db:
-            db.execute(
-                """
-                INSERT INTO workspaces(
-                    id, root_id, relative_path, display_name, tmux_session, last_opened_at,
-                    backend_kind, computer_id, canonical_path, workspace_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    workspace_id,
-                    root_id,
-                    relative_path,
+            for _attempt in range(32):
+                workspace_id = uuid.uuid4().hex
+                safe_tmux_session = requested_tmux_session or workspace_tmux_session_name(
                     display_name,
-                    tmux_session,
-                    now,
-                    backend_kind,
-                    computer_id,
-                    canonical_path,
-                    workspace_kind,
-                ),
-            )
-            return dict(
-                db.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
-            )
+                    workspace_id,
+                )
+                try:
+                    db.execute(
+                        """
+                        INSERT INTO workspaces(
+                            id, root_id, relative_path, display_name, tmux_session,
+                            last_opened_at, backend_kind, computer_id, canonical_path,
+                            workspace_kind
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            workspace_id,
+                            root_id,
+                            relative_path,
+                            display_name,
+                            safe_tmux_session,
+                            now,
+                            backend_kind,
+                            computer_id,
+                            canonical_path,
+                            workspace_kind,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    if requested_tmux_session is not None:
+                        raise
+                    collision = db.execute(
+                        "SELECT 1 FROM workspaces WHERE tmux_session = ?",
+                        (safe_tmux_session,),
+                    ).fetchone()
+                    if collision:
+                        continue
+                    raise
+                return dict(
+                    db.execute(
+                        "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+                    ).fetchone()
+                )
+        raise RuntimeError("Could not allocate a unique Workspace tmux session")
 
     def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
         with self.connect() as db:

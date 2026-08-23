@@ -2,6 +2,17 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.15] - 2026-08-24
+
+### Added
+
+- Show the canonical Workspace tmux session name beside the terminal tabs, with an external attach command in its tooltip.
+
+### Changed
+
+- Name newly registered persistent Workspaces with the short, readable `tr-<workspace>-<4-char ID>` pattern while keeping existing stored session names unchanged.
+- Leave tmux status-line configuration entirely under the user's control.
+
 ## [0.3.14] - 2026-08-23
 
 ### Changed

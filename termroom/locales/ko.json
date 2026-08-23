@@ -619,6 +619,8 @@
   "terminal.switch": "터미널 전환",
   "terminal.output": "출력",
   "terminal.connecting": "연결 중",
+  "terminal.tmux_session": "tmux 세션 {session}",
+  "terminal.tmux_attach": "다른 터미널에서 연결: tmux attach -t '{session}'",
   "terminal.manage": "현재 터미널 관리",
   "terminal.display": "표시",
   "terminal.font_size": "글자 크기",

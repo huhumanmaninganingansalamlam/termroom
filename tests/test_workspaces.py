@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 import pytest
 
-from termroom.db import StateStore
+from termroom.db import StateStore, workspace_tmux_session_name
 from termroom.security import PathBoundaryError
 from termroom.workspaces import (
     ProjectCreatedButWorkspaceFailed,
@@ -27,8 +28,50 @@ def test_open_workspace_is_stable(tmp_path: Path) -> None:
     second = manager.open("project")
 
     assert first["id"] == second["id"]
-    assert first["tmux_session"].startswith("termroom-")
+    assert first["tmux_session"] == f"tr-project-{first['id'][:4]}"
     assert first["path"] == project
+
+
+@pytest.mark.parametrize(
+    ("display_name", "expected"),
+    [
+        ("My API", "tr-my-api-a1b2"),
+        ("한글 프로젝트", "tr-한글-프로젝트-a1b2"),
+        ("project.with:unsafe / separators", "tr-project-with-uns-a1b2"),
+        ("💻", "tr-workspace-a1b2"),
+    ],
+)
+def test_workspace_tmux_session_name_is_short_and_readable(
+    display_name: str,
+    expected: str,
+) -> None:
+    assert workspace_tmux_session_name(display_name, "a1b2" + "0" * 28) == expected
+
+
+def test_workspace_tmux_session_retries_a_four_character_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "one" / "project").mkdir(parents=True)
+    (tmp_path / "two" / "project").mkdir(parents=True)
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    manager = WorkspaceManager(RootManager(tmp_path / "one"), store)
+    store.ensure_root(tmp_path / "two")
+    ids = iter(
+        (
+            uuid.UUID("aaaa0000-0000-0000-0000-000000000001"),
+            uuid.UUID("aaaa0000-0000-0000-0000-000000000002"),
+            uuid.UUID("bbbb0000-0000-0000-0000-000000000003"),
+        )
+    )
+    monkeypatch.setattr("termroom.db.uuid.uuid4", lambda: next(ids))
+
+    first = manager.open_local(tmp_path / "one", "project")
+    second = manager.open_local(tmp_path / "two", "project")
+
+    assert first["tmux_session"] == "tr-project-aaaa"
+    assert second["tmux_session"] == "tr-project-bbbb"
 
 
 def test_workspace_manager_can_reopen_local_workspace_from_another_root(tmp_path: Path) -> None:
