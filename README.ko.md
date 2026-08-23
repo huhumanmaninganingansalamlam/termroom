@@ -9,7 +9,7 @@
 계속 남아 있습니다.
 
 노트북에서 시작한 빌드나 AI 작업을 휴대폰에서 확인하고, 직접 정한 몇 개의 프로젝트
-명령을 실행하며, 원격 Linux 서버의 터미널과 파일도 같은 화면에서 다루는 흐름을
+명령을 실행하며, 원격 Linux 또는 macOS 컴퓨터의 터미널과 파일도 같은 화면에서 다루는 흐름을
 목표로 합니다.
 
 > **현재 상태: early release.** Termroom은 Python CLI 패키지로 배포되며 아직 빠르게
@@ -21,7 +21,7 @@
 - 브라우저를 닫아도 터미널 작업을 끊지 않고 계속 유지하고 싶을 때
 - 프로젝트 파일을 브라우저에서 확인하거나 다운로드·업로드하고 싶을 때
 - 여러 로컬 프로젝트를 한 화면에서 오가고 싶을 때
-- SSH Linux 서버와 outbound 연결만 가능한 Termroom Node를 같은 Workspace 흐름으로
+- SSH Linux 또는 macOS 컴퓨터와 outbound 연결만 가능한 Termroom Node를 같은 Workspace 흐름으로
   사용하고 싶을 때
 - Workspace마다 명시적인 명령을 최대 3개 저장하고 root에서 바로 실행하고 싶을 때
 - 현재 Python, JavaScript 또는 Bash 파일을 실행 명령 조합 없이 바로 실행하고 싶을 때
@@ -29,7 +29,7 @@
   출력과 결과 파일을 회수하고 싶을 때
 - 원격 실행 결과를 ZIP으로 받거나 충돌 없는 변경만 원래 Workspace로 가져오고 싶을 때
 
-Termroom은 클라우드 IDE가 아닙니다. **내 Linux 컴퓨터 또는 내가 연결한 Remote Linux에서
+Termroom은 클라우드 IDE가 아닙니다. **내 Linux Core 컴퓨터 또는 내가 연결한 Remote에서
 실제로 실행되는 터미널과 파일을 브라우저 UI로 연결**합니다.
 
 ## 빠른 시작
@@ -190,7 +190,8 @@ Computer
    └─ Recent
 ```
 
-`Computer`는 이 PC 또는 SSH나 Termroom Node로 연결한 Remote Linux입니다.
+`Computer`는 이 Linux PC, SSH로 연결한 Linux 또는 macOS 컴퓨터, 또는 Termroom Node로
+연결한 Linux 컴퓨터입니다.
 
 Workspace 설정 메뉴에서 등록을 해제해도 실제 프로젝트 폴더, 파일, tmux 세션과 실행 중인
 프로세스는 삭제되지 않습니다.
@@ -234,7 +235,11 @@ SSH 주소 입력
 원격 폴더 탐색 화면에서도 같은 **새 프로젝트** 동작을 사용할 수 있습니다. SFTP로 폴더를
 만든 뒤 일반 SSH Workspace로 엽니다.
 
-원격 Linux에는 SSH 서버, `/bin/bash`, `tmux`가 설치되어 있어야 합니다.
+SSH 원격 컴퓨터는 Linux 또는 macOS를 사용할 수 있으며 SSH 서버, `/bin/bash`, `tmux`가
+설치되어 있어야 합니다. Termroom은 해당 계정의 설정된 login shell에서 export된 명령 환경을
+한 번 읽은 뒤 `command -v tmux`와 `tmux -V`로 실제 명령을 확인합니다. Homebrew나 다른
+package manager의 디렉터리를 가정하지 않으며, 일반 SSH 로그인에서 사용할 수 있는 명령을
+그 환경에서 찾아 이후 명령마다 shell 시작 파일을 다시 읽지 않고 재사용합니다.
 
 ### Termroom Node
 

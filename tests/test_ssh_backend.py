@@ -41,7 +41,13 @@ def _free_port() -> int:
 
 
 @contextlib.contextmanager
-def _test_sshd(tmp_path: Path, *, log_level: str = "ERROR") -> Iterator[dict[str, object]]:
+def _test_sshd(
+    tmp_path: Path,
+    *,
+    log_level: str = "ERROR",
+    remote_path: str | None = None,
+    login_shell: Path | None = None,
+) -> Iterator[dict[str, object]]:
     qa = tmp_path / "sshd"
     qa.mkdir()
     remote_tmux_root = qa / "tmux"
@@ -62,29 +68,40 @@ def _test_sshd(tmp_path: Path, *, log_level: str = "ERROR") -> Iterator[dict[str
     port = _free_port()
     username = os.environ.get("USER") or subprocess.check_output(["id", "-un"], text=True).strip()
     config = qa / "sshd_config"
-    config.write_text(
-        "\n".join(
-            [
-                f"Port {port}",
-                "ListenAddress 127.0.0.1",
-                f"HostKey {host_key}",
-                f"PidFile {qa / 'sshd.pid'}",
-                f"AuthorizedKeysFile {authorized_keys}",
-                "StrictModes no",
-                "PasswordAuthentication no",
-                "KbdInteractiveAuthentication no",
-                "PubkeyAuthentication yes",
-                "UsePAM no",
-                "PermitRootLogin no",
-                f"AllowUsers {username}",
-                f"SetEnv TMUX_TMPDIR={remote_tmux_root}",
-                f"LogLevel {log_level}",
-                "Subsystem sftp internal-sftp",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    lines = [
+        f"Port {port}",
+        "ListenAddress 127.0.0.1",
+        f"HostKey {host_key}",
+        f"PidFile {qa / 'sshd.pid'}",
+        f"AuthorizedKeysFile {authorized_keys}",
+        "StrictModes no",
+        "PasswordAuthentication no",
+        "KbdInteractiveAuthentication no",
+        "PubkeyAuthentication yes",
+        "UsePAM no",
+        "PermitRootLogin no",
+        f"AllowUsers {username}",
+        f"SetEnv TMUX_TMPDIR={remote_tmux_root}",
+    ]
+    if remote_path is not None or login_shell is not None:
+        command_wrapper = qa / "force-command"
+        command_lines = ["#!/bin/sh"]
+        if remote_path is not None:
+            command_lines.extend((f"PATH={shlex.quote(remote_path)}", "export PATH"))
+        if login_shell is not None:
+            command_lines.extend((f"SHELL={shlex.quote(str(login_shell))}", "export SHELL"))
+        command_lines.append('exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"')
+        command_wrapper.write_text("\n".join(command_lines) + "\n", encoding="utf-8")
+        command_wrapper.chmod(0o755)
+        lines.append(f"ForceCommand {command_wrapper}")
+    lines.extend(
+        [
+            f"LogLevel {log_level}",
+            "Subsystem sftp internal-sftp",
+            "",
+        ]
     )
+    config.write_text("\n".join(lines), encoding="utf-8")
     log = (qa / "sshd.log").open("wb")
     process = subprocess.Popen(
         ["/usr/sbin/sshd", "-D", "-e", "-f", str(config)],
@@ -207,6 +224,122 @@ def test_proxy_command_host_key_probe_verifies_final_target(tmp_path: Path) -> N
         )
 
     assert proxied == direct
+
+
+def test_noninteractive_ssh_uses_configured_login_shell_command_path(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+
+    remote_path = tmp_path / "remote-path"
+    remote_path.mkdir()
+    login_bin = tmp_path / "login-bin"
+    login_bin.mkdir()
+    fake_tmux = login_bin / "tmux"
+    fake_tmux.write_text("#!/bin/sh\nprintf 'tmux 3.6b\\n'\n", encoding="utf-8")
+    fake_tmux.chmod(0o755)
+    login_log = tmp_path / "login-shell.log"
+    login_shell = tmp_path / "login-shell"
+    login_shell.write_text(
+        "#!/bin/sh\n"
+        "test \"$1\" = -l || exit 81\n"
+        "test \"$2\" = -c || exit 82\n"
+        f"printf 'login\\n' >> {shlex.quote(str(login_log))}\n"
+        "printf 'profile stdout noise\\n'\n"
+        "printf 'profile stderr noise\\n' >&2\n"
+        f"PATH={shlex.quote(str(login_bin))}\n"
+        "export PATH\n"
+        'exec /bin/sh -c "$3"\n',
+        encoding="utf-8",
+    )
+    login_shell.chmod(0o755)
+
+    with _test_sshd(
+        tmp_path,
+        remote_path=str(remote_path),
+        login_shell=login_shell,
+    ) as server:
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Homebrew PATH QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+
+        assert backend.test_connection(computer)["tmux"] == "tmux 3.6b"
+        assert backend.validate_workspace_path(computer, str(tmp_path)) == str(tmp_path)
+        assert login_log.read_text(encoding="utf-8").splitlines() == ["login"]
+
+
+def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+
+    remote_path = tmp_path / "remote-path"
+    remote_path.mkdir()
+    login_path = tmp_path / "login-path"
+    login_path.mkdir()
+    login_shell = tmp_path / "login-shell"
+    login_shell.write_text(
+        "#!/bin/sh\n"
+        "test \"$1\" = -l || exit 81\n"
+        "test \"$2\" = -c || exit 82\n"
+        f"PATH={shlex.quote(str(login_path))}\n"
+        "export PATH\n"
+        'exec /bin/sh -c "$3"\n',
+        encoding="utf-8",
+    )
+    login_shell.chmod(0o755)
+
+    with _test_sshd(
+        tmp_path,
+        remote_path=str(remote_path),
+        login_shell=login_shell,
+    ) as server:
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Missing tmux QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+
+        with pytest.raises(SSHBackendError, match="tmux is not installed") as raised:
+            backend.test_connection(computer)
+
+        installed_path = tmp_path / "installed-path"
+        installed_path.mkdir()
+        fake_tmux = installed_path / "tmux"
+        fake_tmux.write_text("#!/bin/sh\nprintf 'tmux 3.6b\\n'\n", encoding="utf-8")
+        fake_tmux.chmod(0o755)
+        login_shell.write_text(
+            "#!/bin/sh\n"
+            "test \"$1\" = -l || exit 81\n"
+            "test \"$2\" = -c || exit 82\n"
+            f"PATH={shlex.quote(str(installed_path))}\n"
+            "export PATH\n"
+            'exec /bin/sh -c "$3"\n',
+            encoding="utf-8",
+        )
+        assert backend.test_connection(computer)["tmux"] == "tmux 3.6b"
+
+    assert raised.value.locale_key == "ssh.backend.tmux_missing"
 
 
 def test_ssh_backend_uses_alias_specific_agent_socket(
@@ -374,6 +507,7 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
         "remote_path": "/tmp",
     }
     terminal = {"tmux_window": "@1"}
+    backend._remote_command_paths[str(computer["id"])] = "/login/bin:/usr/bin:/bin"
     process_pid, master_fd = backend._spawn_ssh_tmux_client(
         workspace,
         terminal,
@@ -399,6 +533,10 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
         assert "22" in args
         assert "user" in args
         assert args[-2] == "prod-alias"
+        assert "PATH=/login/bin:/usr/bin:/bin" in args[-1]
+        assert "/opt/homebrew" not in args[-1]
+        assert "/usr/local/bin" not in args[-1]
+        assert "tmux attach-session" in args[-1]
     finally:
         backend._wait_for_pid(process_pid, 1)
         os.close(master_fd)
@@ -971,6 +1109,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 unreadable.chmod(0o700)
             assert "result.csv" in recent_paths
             assert "ignored.tmp" not in recent_paths
+            assert "node_modules/hidden-needle.txt" not in recent_paths
             assert "unreadable/private.txt" not in recent_paths
 
             browser_terminal = backend.create_terminal(workspace, "browser-view")
