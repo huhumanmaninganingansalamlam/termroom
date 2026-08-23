@@ -21,6 +21,7 @@ from termroom.node_agent import (
     NodeAgentError,
     NodeConfig,
     NodeRuntime,
+    node_session_is_valid,
     normalize_allowed_roots,
 )
 from termroom.node_core import NODE_STREAM_QUEUE_DEPTH, NodeCoreError
@@ -64,6 +65,35 @@ def _wait_for_node_file_run(
             return result
         time.sleep(0.05)
     raise AssertionError(f"Node File Run did not reach {states}: {result}")
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        "termroom-node-test-a1b2",
+        "termroom-run-77458706-dc26-476c-bbc6-a06e7991c42c",
+        "tr-project-a1b2",
+        "tr-한글-프로젝트-32cd",
+    ],
+)
+def test_node_accepts_supported_workspace_session_names(session: str) -> None:
+    assert node_session_is_valid(session)
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        "tr-project",
+        "tr--a1b2",
+        "tr-project-a1b",
+        "tr-project-A1B2",
+        "tr-project.with-dot-a1b2",
+        "tr-project--name-a1b2",
+        "tr-project-name-that-is-too-long-a1b2",
+    ],
+)
+def test_node_rejects_invalid_workspace_session_names(session: str) -> None:
+    assert not node_session_is_valid(session)
 
 
 @pytest.mark.asyncio

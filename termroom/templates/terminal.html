@@ -12,17 +12,26 @@
 {% block workspace_content_class %}terminal-screen{% endblock %}
 {% block workspace_content %}
 <div class="terminal-chrome">
-  <nav class="terminal-tabs" aria-label="{{ t('terminal.switch') }}">
-    {% for item in terminals %}
-    <a class="{% if item.id == terminal.id %}active{% endif %}"
-       href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}"
-       data-terminal-activity-tab="{{ item.id }}"
-       data-terminal-switch="{{ item.id }}"
-       data-terminal-name="{{ item.name }}"
-       data-terminal-role="{{ item.role | default('shell') }}"
-       {% if item.id == terminal.id %}aria-current="page"{% endif %}>{{ item.name }}{% if (item.role | default('shell')) == 'shell' %}<span class="terminal-unread-dot terminal-tab-unread" data-terminal-activity-tab-unread hidden><span class="sr-only">{{ t('terminal.activity.new_output') }}</span></span>{% endif %}</a>
-    {% endfor %}
-  </nav>
+  <div class="terminal-chrome-leading">
+    <span class="terminal-session-name"
+          data-terminal-session-name
+          aria-label="{{ t('terminal.tmux_session', session=workspace.tmux_session) }}"
+          title="{{ t('terminal.tmux_attach', session=workspace.tmux_session) }}">
+      <span aria-hidden="true">tmux</span>
+      <code>{{ workspace.tmux_session }}</code>
+    </span>
+    <nav class="terminal-tabs" aria-label="{{ t('terminal.switch') }}">
+      {% for item in terminals %}
+      <a class="{% if item.id == terminal.id %}active{% endif %}"
+         href="/w/{{ workspace.id }}/terminal?terminal={{ item.id }}"
+         data-terminal-activity-tab="{{ item.id }}"
+         data-terminal-switch="{{ item.id }}"
+         data-terminal-name="{{ item.name }}"
+         data-terminal-role="{{ item.role | default('shell') }}"
+         {% if item.id == terminal.id %}aria-current="page"{% endif %}>{{ item.name }}{% if (item.role | default('shell')) == 'shell' %}<span class="terminal-unread-dot terminal-tab-unread" data-terminal-activity-tab-unread hidden><span class="sr-only">{{ t('terminal.activity.new_output') }}</span></span>{% endif %}</a>
+      {% endfor %}
+    </nav>
+  </div>
   <div class="terminal-top-actions">
     <span id="terminal-status" class="terminal-status" role="status">
       <span class="terminal-status-dot" aria-hidden="true"></span>

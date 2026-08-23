@@ -619,6 +619,8 @@
   "terminal.switch": "Switch terminal",
   "terminal.output": "Output",
   "terminal.connecting": "Connecting",
+  "terminal.tmux_session": "tmux session {session}",
+  "terminal.tmux_attach": "Attach outside Termroom: tmux attach -t '{session}'",
   "terminal.manage": "Manage current terminal",
   "terminal.display": "Display",
   "terminal.font_size": "Font size",
