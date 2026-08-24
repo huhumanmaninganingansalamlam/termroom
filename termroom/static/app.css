@@ -4545,8 +4545,8 @@ details:not([open]) > :not(summary) {
 
 .workspace-run-command-fields {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
   gap: 8px;
   margin: 0;
   padding: 10px;
@@ -4570,8 +4570,77 @@ details:not([open]) > :not(summary) {
   font-size: 0.67rem;
 }
 
-.workspace-run-command-fields .primary-button {
+.workspace-run-command-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.workspace-run-command-cancel,
+.workspace-run-command-save {
+  display: inline-flex;
   min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.62rem;
+  font-weight: 680;
+}
+
+.workspace-run-command-cancel:hover,
+.workspace-run-command-cancel:focus-visible,
+.workspace-run-command-save:hover,
+.workspace-run-command-save:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: var(--surface-hover);
+  color: var(--accent-hover);
+}
+
+.workspace-run-command-save:disabled {
+  border-color: var(--border-subtle);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: default;
+  opacity: 0.56;
+}
+
+.workspace-run-command-delete {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 10px;
+  border: 1px solid var(--red-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--red-soft);
+  font-size: 0.62rem;
+  font-weight: 680;
+}
+
+.workspace-run-command-actions > .workspace-run-command-delete {
+  margin-right: auto;
+}
+
+.workspace-run-command-delete:hover,
+.workspace-run-command-delete:focus-visible {
+  background: var(--red-muted);
+}
+
+.workspace-run-command-delete svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
 }
 
 .workspace-run-command-launch {
@@ -4604,6 +4673,13 @@ details:not([open]) > :not(summary) {
 .workspace-run-command-launch button[aria-busy="true"] {
   opacity: 0.78;
   cursor: wait;
+}
+
+.workspace-run-command-launch button:disabled {
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .workspace-run-command-add {

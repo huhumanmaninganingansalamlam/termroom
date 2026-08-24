@@ -71,6 +71,7 @@ from termroom.terminals import (
     TMUX_TERMINAL_ROLE_OPTION,
     TMUX_WORKSPACE_COMMAND_DIGEST_OPTION,
     TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION,
+    TMUX_WORKSPACE_COMMAND_OPTIONS,
     TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
     TMUX_WORKSPACE_COMMAND_SLOT_OPTION,
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
@@ -94,6 +95,7 @@ from termroom.terminals import (
     validate_workspace_command_launch,
     validate_workspace_command_slot,
     workspace_command_digest,
+    workspace_command_history_name,
 )
 from termroom.workspace_usage import (
     WORKSPACE_USAGE_PANES_MARKER,
@@ -3836,6 +3838,7 @@ class SSHBackend:
         except ValueError as exc:
             raise SSHBackendError(str(exc)) from exc
         existing = next((item for item in records if item["slot"] == safe_slot), None)
+        window = ""
         if existing is not None:
             terminal = next(
                 (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
@@ -3849,16 +3852,41 @@ class SSHBackend:
                         "Workspace command launch identity was reused for another command"
                     )
                 return terminal
-            if not existing["dead"]:
+            if existing["digest"] != digest:
+                if existing["dead"]:
+                    self._exec(
+                        computer,
+                        f"tmux kill-window -t {shlex.quote(str(existing['tmux_window']))}",
+                    )
+                else:
+                    quoted_window = shlex.quote(str(existing["tmux_window"]))
+                    detach = "; ".join(
+                        "tmux set-window-option -u "
+                        f"-t {quoted_window} {shlex.quote(option)}"
+                        for option in TMUX_WORKSPACE_COMMAND_OPTIONS
+                    )
+                    history_name = shlex.quote(
+                        workspace_command_history_name(
+                            safe_slot, str(existing["launch_id"])
+                        )
+                    )
+                    self._exec(
+                        computer,
+                        f"{detach}; tmux rename-window -t {quoted_window} {history_name}",
+                    )
+                existing = None
+            elif existing["state"] in {"running", "settling"}:
                 return terminal
-            self._exec(
-                computer,
-                f"tmux kill-window -t {shlex.quote(str(existing['tmux_window']))}",
-            )
+            elif existing["dead"]:
+                self._exec(
+                    computer,
+                    f"tmux kill-window -t {shlex.quote(str(existing['tmux_window']))}",
+                )
+            else:
+                window = str(existing["tmux_window"])
 
-        create = " ".join(
+        process_options = " ".join(
             (
-                "tmux new-window -d -P -F '#{window_id}'",
                 "-e",
                 shlex.quote(f"TERMROOM_WORKSPACE_COMMAND={safe_command}"),
                 "-e",
@@ -3867,15 +3895,39 @@ class SSHBackend:
                 shlex.quote(f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}"),
                 "-e",
                 shlex.quote(f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}"),
-                "-t",
-                shlex.quote(session),
-                "-n",
-                shlex.quote(f"run-{safe_slot + 1}"),
-                "-c",
-                shlex.quote(self._remote_root(workspace)),
-                shlex.quote(WORKSPACE_COMMAND_WRAPPER),
             )
         )
+        if window:
+            launch = " ".join(
+                (
+                    "tmux respawn-pane -k",
+                    "-c",
+                    shlex.quote(self._remote_root(workspace)),
+                    process_options,
+                    "-t",
+                    shlex.quote(window),
+                    shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+                    "|| exit $?;",
+                    f"window={shlex.quote(window)};",
+                )
+            )
+            timeout_cleanup = ":"
+        else:
+            create = " ".join(
+                (
+                    "tmux new-window -d -P -F '#{window_id}'",
+                    process_options,
+                    "-t",
+                    shlex.quote(session),
+                    "-n",
+                    shlex.quote(f"run-{safe_slot + 1}"),
+                    "-c",
+                    shlex.quote(self._remote_root(workspace)),
+                    shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+                )
+            )
+            launch = f"window=$({create}) || exit $?;"
+            timeout_cleanup = 'tmux kill-window -t "$window" 2>/dev/null || true'
         readiness_format = "|".join(
             (
                 f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}",
@@ -3889,7 +3941,7 @@ class SSHBackend:
             int(WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS / WORKSPACE_COMMAND_READY_POLL_SECONDS),
         )
         start = (
-            f"window=$({create}) || exit $?; "
+            f"{launch} "
             "attempt=0; "
             f'while test "$attempt" -lt {readiness_attempts}; do '
             'ready=$(tmux display-message -p -t "$window" '
@@ -3898,7 +3950,7 @@ class SSHBackend:
             "printf '%s\\n' \"$window\"; exit 0; fi; "
             "attempt=$((attempt + 1)); "
             f"sleep {WORKSPACE_COMMAND_READY_POLL_SECONDS}; done; "
-            'tmux kill-window -t "$window" 2>/dev/null || true; exit 1'
+            f"{timeout_cleanup}; exit 1"
         )
         window = self._exec(computer, start).strip()
         terminals = self.ensure_workspace(workspace)

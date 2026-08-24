@@ -50,6 +50,7 @@ from termroom.node_protocol import (
     NODE_REMOTE_RUN_SOURCE_VERSION,
     NODE_REQUEST_DEFAULT_BUDGET_MS,
     NODE_REQUIRED_CAPABILITIES,
+    NODE_WORKSPACE_COMMAND_VERSION,
     NODE_WORKSPACE_USAGE_VERSION,
     NodeProtocolError,
     control_websocket_url,
@@ -105,6 +106,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER,
+    clear_tmux_workspace_command_identity,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
@@ -121,6 +123,7 @@ from termroom.terminals import (
     validate_workspace_command_launch,
     validate_workspace_command_slot,
     workspace_command_digest,
+    workspace_command_history_name,
     workspace_command_record_is_ready,
 )
 from termroom.workspace_usage import (
@@ -1002,6 +1005,12 @@ class NodeRuntime:
     def _run_workspace_command_locked(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         root = self._workspace_path(payload)
         session = self._session(payload)
+        version = payload.get("workspace_command_version")
+        if type(version) is not int or version != NODE_WORKSPACE_COMMAND_VERSION:
+            raise NodeAgentError(
+                "Workspace command version is incompatible; update Termroom Node",
+                code="workspace_command_version_incompatible",
+            )
         try:
             safe_slot = validate_workspace_command_slot(payload.get("slot"))
             safe_command = normalize_workspace_command(payload.get("command"))
@@ -1022,6 +1031,8 @@ class NodeRuntime:
         except ValueError as exc:
             raise NodeAgentError(str(exc), code="workspace_command_invalid") from exc
         existing = next((item for item in records if item["slot"] == safe_slot), None)
+        window = ""
+        created_window = False
         if existing is not None:
             terminal = next(
                 (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
@@ -1039,33 +1050,83 @@ class NodeRuntime:
                         code="idempotency_conflict",
                     )
                 return {"terminal": terminal, "terminals": terminals}
-            if not existing["dead"]:
+            if existing["digest"] != digest:
+                if existing["dead"]:
+                    self._tmux("kill-window", "-t", str(existing["tmux_window"]))
+                elif not clear_tmux_workspace_command_identity(
+                    self._tmux, str(existing["tmux_window"])
+                ):
+                    raise NodeAgentError(
+                        "Previous Workspace command Terminal could not be detached",
+                        code="workspace_command_invalid",
+                    )
+                else:
+                    self._tmux(
+                        "rename-window",
+                        "-t",
+                        str(existing["tmux_window"]),
+                        workspace_command_history_name(
+                            safe_slot, str(existing["launch_id"])
+                        ),
+                        check=False,
+                    )
+                existing = None
+            elif existing["state"] in {"running", "settling"}:
                 return {"terminal": terminal, "terminals": terminals}
-            self._tmux("kill-window", "-t", str(existing["tmux_window"]))
+            elif existing["dead"]:
+                self._tmux("kill-window", "-t", str(existing["tmux_window"]))
+            else:
+                window = str(existing["tmux_window"])
+                respawned = self._tmux(
+                    "respawn-pane",
+                    "-k",
+                    "-c",
+                    str(root),
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                    "-t",
+                    window,
+                    WORKSPACE_COMMAND_WRAPPER,
+                    check=False,
+                )
+                if respawned.returncode:
+                    raise NodeAgentError(
+                        respawned.stderr.strip()
+                        or "Workspace command Terminal could not restart",
+                        code="workspace_command_invalid",
+                    )
 
-        created = self._tmux(
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
-            "-t",
-            session,
-            "-n",
-            f"run-{safe_slot + 1}",
-            "-c",
-            str(root),
-            WORKSPACE_COMMAND_WRAPPER,
-        )
-        window = created.stdout.strip()
+        if not window:
+            created = self._tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                "-t",
+                session,
+                "-n",
+                f"run-{safe_slot + 1}",
+                "-c",
+                str(root),
+                WORKSPACE_COMMAND_WRAPPER,
+            )
+            window = created.stdout.strip()
+            created_window = True
         try:
             deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
@@ -1092,7 +1153,8 @@ class NodeRuntime:
                     code="workspace_command_invalid",
                 )
         except Exception:
-            self._tmux("kill-window", "-t", window, check=False)
+            if created_window:
+                self._tmux("kill-window", "-t", window, check=False)
             raise
         terminals = self._list_terminals(session)
         terminal = next((item for item in terminals if item["tmux_window"] == window), None)

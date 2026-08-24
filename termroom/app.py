@@ -41,7 +41,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from termroom.auth import AuthManager, AuthRateLimited
 from termroom.config import Settings
-from termroom.db import StateStore
+from termroom.db import MAX_WORKSPACE_COMMANDS, StateStore
 from termroom.file_runs import FileRunConflict, FileRunError, FileRunManager
 from termroom.files import (
     DEFAULT_FILE_SEARCH_MAX_ENTRIES,
@@ -69,6 +69,7 @@ from termroom.i18n import (
 )
 from termroom.node_core import NodeCore, NodePairingRateLimiter
 from termroom.node_protocol import (
+    NODE_WORKSPACE_COMMAND_CAPABILITY,
     PAIRING_CODE_TTL_SECONDS,
     NodeProtocolError,
     generate_pairing_code,
@@ -105,7 +106,12 @@ from termroom.security import (
 )
 from termroom.ssh_backend import SSHBackend, SSHBackendError
 from termroom.terminal_control import TerminalControl
-from termroom.terminals import TerminalError, TerminalManager, workspace_command_digest
+from termroom.terminals import (
+    TerminalError,
+    TerminalManager,
+    normalize_workspace_command,
+    workspace_command_digest,
+)
 from termroom.workspace_usage import WorkspaceUsageOffline, WorkspaceUsageService
 from termroom.workspaces import (
     ProjectCreatedButWorkspaceFailed,
@@ -3291,8 +3297,8 @@ def create_app(settings: Settings) -> FastAPI:
         )
         return RedirectResponse(destination, status_code=303)
 
-    @app.post("/w/{workspace_id}/run-commands")
-    async def replace_workspace_run_commands(
+    @app.post("/w/{workspace_id}/run-commands/add")
+    async def add_workspace_run_command(
         request: Request, workspace_id: str
     ) -> RedirectResponse:
         locale = locale_from_request(request)
@@ -3303,15 +3309,116 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=404,
                 detail="Workspace commands are available only for persistent Workspaces",
             )
+        commands = store.list_workspace_commands(workspace_id)
         try:
-            store.replace_workspace_commands(
-                workspace_id, form.getlist("commands")
+            if len(commands) >= MAX_WORKSPACE_COMMANDS:
+                raise ValueError("Workspace command limit reached")
+            command = normalize_workspace_command(form.get("command"))
+            changed = store.replace_workspace_commands_if_current(
+                workspace_id, commands, (*commands, command)
             )
         except ValueError:
             return RedirectResponse(
                 _url_with_query(
                     f"/w/{workspace_id}/terminal",
                     error=translate(locale, "workspace.run.error.invalid"),
+                ),
+                status_code=303,
+            )
+        if changed is None:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.changed"),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/w/{workspace_id}", status_code=303)
+
+    @app.post("/w/{workspace_id}/run-commands/{slot}/save")
+    async def save_workspace_run_command(
+        request: Request, workspace_id: str, slot: int
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        workspace = _require_workspace(workspaces, workspace_id)
+        if workspace.get("transient") or workspace.get("workspace_kind") != "workspace":
+            raise HTTPException(
+                status_code=404,
+                detail="Workspace commands are available only for persistent Workspaces",
+            )
+        commands = store.list_workspace_commands(workspace_id)
+        if slot < 0 or slot >= len(commands):
+            raise HTTPException(status_code=404, detail="Workspace command not found")
+        if not secure_compare(
+            str(form.get("command_digest") or ""),
+            workspace_command_digest(commands[slot]),
+        ):
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.changed"),
+                ),
+                status_code=303,
+            )
+        try:
+            command = normalize_workspace_command(form.get("command"))
+            updated = (*commands[:slot], command, *commands[slot + 1 :])
+            changed = store.replace_workspace_commands_if_current(
+                workspace_id, commands, updated
+            )
+        except ValueError:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.invalid"),
+                ),
+                status_code=303,
+            )
+        if changed is None:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.changed"),
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(f"/w/{workspace_id}", status_code=303)
+
+    @app.post("/w/{workspace_id}/run-commands/{slot}/delete")
+    async def delete_workspace_command(
+        request: Request, workspace_id: str, slot: int
+    ) -> RedirectResponse:
+        locale = locale_from_request(request)
+        form = await _verified_form(request, settings)
+        workspace = _require_workspace(workspaces, workspace_id)
+        if workspace.get("transient") or workspace.get("workspace_kind") != "workspace":
+            raise HTTPException(
+                status_code=404,
+                detail="Workspace commands are available only for persistent Workspaces",
+            )
+        commands = store.list_workspace_commands(workspace_id)
+        if slot < 0 or slot >= len(commands):
+            raise HTTPException(status_code=404, detail="Workspace command not found")
+        if not secure_compare(
+            str(form.get("command_digest") or ""),
+            workspace_command_digest(commands[slot]),
+        ):
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.changed"),
+                ),
+                status_code=303,
+            )
+        changed = store.replace_workspace_commands_if_current(
+            workspace_id, commands, (*commands[:slot], *commands[slot + 1 :])
+        )
+        if changed is None:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.changed"),
                 ),
                 status_code=303,
             )
@@ -3452,7 +3559,7 @@ def create_app(settings: Settings) -> FastAPI:
                 workspace,
                 active_tab="terminal",
                 workspace_commands_supported=remote.supports_capability(
-                    workspace, "workspace_command"
+                    workspace, NODE_WORKSPACE_COMMAND_CAPABILITY
                 ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 terminals=terminal_list,
@@ -3592,7 +3699,7 @@ def create_app(settings: Settings) -> FastAPI:
                 workspace,
                 active_tab="terminal",
                 workspace_commands_supported=remote.supports_capability(
-                    workspace, "workspace_command"
+                    workspace, NODE_WORKSPACE_COMMAND_CAPABILITY
                 ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 terminal=terminal,
@@ -3664,7 +3771,7 @@ def create_app(settings: Settings) -> FastAPI:
             workspace,
             active_tab="files",
             workspace_commands_supported=remote.supports_capability(
-                workspace, "workspace_command"
+                workspace, NODE_WORKSPACE_COMMAND_CAPABILITY
             ),
             recent_supported=remote.supports_capability(workspace, "recent"),
             path=relative,
@@ -3814,7 +3921,7 @@ def create_app(settings: Settings) -> FastAPI:
                 workspace,
                 active_tab="files",
                 workspace_commands_supported=remote.supports_capability(
-                    workspace, "workspace_command"
+                    workspace, NODE_WORKSPACE_COMMAND_CAPABILITY
                 ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 entry=entry,
@@ -4365,7 +4472,7 @@ def create_app(settings: Settings) -> FastAPI:
                 workspace,
                 active_tab="files",
                 workspace_commands_supported=remote.supports_capability(
-                    workspace, "workspace_command"
+                    workspace, NODE_WORKSPACE_COMMAND_CAPABILITY
                 ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 **values,
@@ -4846,7 +4953,7 @@ def create_app(settings: Settings) -> FastAPI:
                 workspace,
                 active_tab="recent",
                 workspace_commands_supported=remote.supports_capability(
-                    workspace, "workspace_command"
+                    workspace, NODE_WORKSPACE_COMMAND_CAPABILITY
                 ),
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 recent_files=recent_file_rows,

@@ -12,6 +12,8 @@ from termroom.node_protocol import (
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
     NODE_REQUEST_OPERATIONS,
     NODE_REQUIRED_CAPABILITIES,
+    NODE_WORKSPACE_COMMAND_CAPABILITY,
+    NODE_WORKSPACE_COMMAND_VERSION,
     NodeProtocolError,
     control_websocket_url,
     decode_message,
@@ -84,6 +86,9 @@ def test_node_messages_and_capabilities_are_bounded_and_typed() -> None:
     with pytest.raises(NodeProtocolError) as exc_info:
         normalize_capabilities(["terminal", "tunnel"])
     assert exc_info.value.code == "capabilities_invalid"
+    with pytest.raises(NodeProtocolError) as legacy_workspace_command:
+        normalize_capabilities(["workspace_command"])
+    assert legacy_workspace_command.value.code == "capabilities_invalid"
     with pytest.raises(NodeProtocolError) as exc_info:
         decode_message(json.dumps({"type": "data", "data": "x" * MAX_NODE_MESSAGE_BYTES}))
     assert exc_info.value.code == "message_too_large"
@@ -98,6 +103,8 @@ def test_node_protocol_rejects_legacy_terminal_resize_contract() -> None:
 
 def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
     assert NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW == 8
+    assert NODE_WORKSPACE_COMMAND_VERSION == 2
+    assert NODE_WORKSPACE_COMMAND_CAPABILITY == "workspace_command_v2"
     assert {"workspace", "terminal", "files"} == NODE_REQUIRED_CAPABILITIES
     assert {
         "file_run",
@@ -105,7 +112,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "remote_run",
         "remote_run_source",
         "terminal_editor",
-        "workspace_command",
+        NODE_WORKSPACE_COMMAND_CAPABILITY,
         "workspace_usage",
     } == NODE_OPTIONAL_CAPABILITIES
     assert {
@@ -117,7 +124,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "remote_run",
         "remote_run_source",
         "terminal_editor",
-        "workspace_command",
+        NODE_WORKSPACE_COMMAND_CAPABILITY,
         "workspace_usage",
     } == NODE_CAPABILITIES
     workspace_operations = {

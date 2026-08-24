@@ -961,6 +961,40 @@ class StateStore:
             )
         return commands
 
+    def replace_workspace_commands_if_current(
+        self,
+        workspace_id: str,
+        expected_values: Iterable[object],
+        values: Iterable[object],
+    ) -> tuple[str, ...] | None:
+        """Atomically replace one Workspace command list when it is still current."""
+
+        expected = normalize_workspace_commands(expected_values)
+        commands = normalize_workspace_commands(values)
+        expected_encoded = json.dumps(
+            expected, ensure_ascii=False, separators=(",", ":")
+        )
+        encoded = json.dumps(commands, ensure_ascii=False, separators=(",", ":"))
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT workspace_kind FROM workspaces WHERE id = ?", (workspace_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown Workspace: {workspace_id}")
+            if row["workspace_kind"] != "workspace":
+                raise ValueError("Commands are available only for persistent Workspaces")
+            changed = db.execute(
+                """
+                UPDATE workspaces
+                SET workspace_commands_json = ?
+                WHERE id = ? AND workspace_commands_json = ?
+                """,
+                (encoded, workspace_id, expected_encoded),
+            )
+            if changed.rowcount != 1:
+                return None
+        return commands
+
     def find_remote_workspace(
         self,
         computer_id: str,

@@ -135,9 +135,11 @@ termroom .
 
 ### Run Workspace commands
 
-- Save up to three commands that you explicitly choose for a persistent Workspace.
-- Start them from the visible Run action at the Workspace root and reopen the managed
-  Terminal while they are running.
+- Save, edit, or delete up to three commands that you explicitly choose for a persistent
+  Workspace.
+- Start them from the visible Run action at the Workspace root. Each command uses a
+  persistent tmux Terminal whose shell stays open after completion for inspection and
+  follow-up commands.
 - Use the tools, runtime, virtual environment, and permissions already present on that
   computer.
 - Termroom does not infer commands from package manifests or add argument, environment,

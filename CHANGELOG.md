@@ -12,7 +12,8 @@ All notable changes to Termroom are documented in this file.
 
 - Continue large native text selections across the history and live xterm boundary in either direction, including automatic scrolling and clean copied line breaks.
 - Reflow styled history for each browser width while matching the live xterm font size and line height.
-- Show only configured Workspace commands (or one initial field) and reveal additional command slots through an explicit add button.
+- Keep Workspace commands compact with the original click-to-edit cards, reveal additional slots through an explicit add button, and save, cancel, or delete each card independently.
+- Keep a usable shell alive in the same tmux window after each Workspace command finishes, with a compact success or exit-status marker instead of tmux's raw dead-pane banner.
 
 ## [0.3.15] - 2026-08-24
 

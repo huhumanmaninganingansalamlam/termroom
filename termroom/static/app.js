@@ -810,17 +810,96 @@
     const commandCards = [
       ...menu.querySelectorAll("[data-workspace-run-command-card]"),
     ];
+    const persistedCommandCards = commandCards.filter(
+      (card) => card.dataset.workspaceRunCommandPersisted === "true",
+    );
+    const emptyCommandCards = commandCards.filter(
+      (card) => card.dataset.workspaceRunCommandPersisted !== "true",
+    );
+    const syncCommandCard = (card) => {
+      const input = card.querySelector('input[name="command"]');
+      if (!(input instanceof HTMLInputElement)) return;
+      const current = input.value.trim();
+      const original = input.defaultValue.trim();
+      const dirty = current !== original;
+      const summary = card.querySelector("[data-workspace-command-summary]");
+      if (summary) summary.textContent = current || summary.dataset.emptyLabel || "";
+      card.classList.toggle("is-dirty", dirty);
+      const save = card.querySelector("[data-workspace-run-command-save]");
+      if (save instanceof HTMLButtonElement) save.disabled = !dirty || !current;
+      const run = card.querySelector("[data-workspace-command-run-button]");
+      if (run instanceof HTMLButtonElement) {
+        if (run.dataset.idleTitle === undefined) run.dataset.idleTitle = run.title;
+        run.disabled = dirty;
+        run.title = dirty
+          ? run.dataset.saveFirstTitle || run.dataset.idleTitle
+          : run.dataset.idleTitle;
+      }
+    };
     const syncAddCommand = () => {
       if (addCommand) addCommand.hidden = !commandCards.some((card) => card.hidden);
+    };
+    const resetEmptyCommandCard = (card) => {
+      card.hidden = true;
+      const input = card.querySelector('input[name="command"]');
+      if (input) input.value = "";
+      const editor = card.querySelector(".workspace-run-command-editor");
+      if (editor instanceof HTMLDetailsElement) editor.open = false;
+      syncCommandCard(card);
+    };
+    const compactEmptyCommandCards = (removedCard) => {
+      const remaining = emptyCommandCards
+        .filter((card) => !card.hidden && card !== removedCard)
+        .map((card) => ({
+          value: card.querySelector('input[name="command"]')?.value || "",
+          open: card.querySelector(".workspace-run-command-editor")?.open === true,
+        }));
+      emptyCommandCards.forEach(resetEmptyCommandCard);
+      const visibleCount = Math.max(persistedCommandCards.length ? 0 : 1, remaining.length);
+      for (let index = 0; index < visibleCount; index += 1) {
+        const card = emptyCommandCards[index];
+        if (!card) break;
+        card.hidden = false;
+        const state = remaining[index];
+        const input = card.querySelector('input[name="command"]');
+        if (input && state) input.value = state.value;
+        const editor = card.querySelector(".workspace-run-command-editor");
+        if (editor instanceof HTMLDetailsElement) editor.open = Boolean(state?.open);
+        syncCommandCard(card);
+      }
+      syncAddCommand();
+      const visibleCards = commandCards.filter((card) => !card.hidden);
+      visibleCards.at(-1)?.querySelector("summary")?.focus({ preventScroll: true });
     };
     addCommand?.addEventListener("click", () => {
       const card = commandCards.find((candidate) => candidate.hidden);
       if (!card) return;
       card.hidden = false;
-      const editor = card.querySelector(".workspace-run-command-editor");
-      if (editor instanceof HTMLDetailsElement) editor.open = true;
-      card.querySelector('input[name="commands"]')?.focus({ preventScroll: true });
+      card.querySelector("summary")?.focus({ preventScroll: true });
       syncAddCommand();
+    });
+    commandCards.forEach((card) => {
+      const input = card.querySelector('input[name="command"]');
+      const editor = card.querySelector(".workspace-run-command-editor");
+      const cancel = card.querySelector("[data-workspace-run-command-cancel]");
+      input?.addEventListener("input", () => syncCommandCard(card));
+      cancel?.addEventListener("click", () => {
+        if (input instanceof HTMLInputElement) input.value = input.defaultValue;
+        syncCommandCard(card);
+        if (editor instanceof HTMLDetailsElement) editor.open = false;
+        card.querySelector("summary")?.focus({ preventScroll: true });
+      });
+      editor?.addEventListener("toggle", () => {
+        if (!(editor instanceof HTMLDetailsElement) || !editor.open) return;
+        window.requestAnimationFrame(() => input?.focus({ preventScroll: true }));
+      });
+      syncCommandCard(card);
+    });
+    emptyCommandCards.forEach((card) => {
+      card.querySelector("[data-workspace-run-command-remove]")?.addEventListener(
+        "click",
+        () => compactEmptyCommandCards(card),
+      );
     });
     syncAddCommand();
   });

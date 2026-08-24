@@ -38,42 +38,69 @@
       </button>
     </header>
     {% if workspace_commands_supported %}
-    <form id="workspace-run-command-config-{{ placement }}"
-          method="post"
-          action="/w/{{ workspace.id }}/run-commands">
-      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    </form>
     <div class="workspace-run-command-list" data-workspace-run-command-list>
       {% for index in range(3) %}
       {% set item = workspace_commands[index] if workspace_commands | length > index else none %}
       <article class="workspace-run-command-card{% if not item %} is-empty{% endif %}"
                data-workspace-run-command-card
+               data-workspace-run-command-persisted="{{ 'true' if item else 'false' }}"
                {% if not item and index > 0 %}hidden{% endif %}>
-        <details class="workspace-run-command-editor"
-                 {% if not item and index == 0 and workspace_commands | length == 0 %}open{% endif %}>
+        <details class="workspace-run-command-editor">
           <summary aria-label="{{ t('workspace.run.configure') }} · {{ t('workspace.run.slot', number=index + 1) }}"
                    title="{{ t('workspace.run.configure') }}">
-            <code>{{ item.command if item else t('workspace.run.slot', number=index + 1) }}</code>
+            <code data-workspace-command-summary
+                  data-empty-label="{{ t('workspace.run.slot', number=index + 1) }}">{{ item.command if item else t('workspace.run.slot', number=index + 1) }}</code>
             <span class="workspace-run-command-edit-action">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
               <span>{{ t('workspace.run.configure') }}</span>
             </span>
           </summary>
-          <div class="workspace-run-command-fields">
+          <form class="workspace-run-command-fields"
+                method="post"
+                action="{% if item %}/w/{{ workspace.id }}/run-commands/{{ item.slot }}/save{% else %}/w/{{ workspace.id }}/run-commands/add{% endif %}"
+                data-workspace-command-edit-form>
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            {% if item %}
+            <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
+            {% endif %}
             <label>
               <span>{{ t('workspace.run.slot', number=index + 1) }}</span>
-              <input name="commands"
+              <input name="command"
                      value="{{ item.command if item else '' }}"
-                     form="workspace-run-command-config-{{ placement }}"
                      maxlength="4096"
                      autocomplete="off"
                      spellcheck="false"
                      placeholder="{{ t('workspace.run.placeholder') }}">
             </label>
-            <button class="primary-button"
-                    type="submit"
-                    form="workspace-run-command-config-{{ placement }}">{{ t('workspace.run.save') }}</button>
-          </div>
+            <div class="workspace-run-command-actions">
+              {% if item %}
+              <button class="workspace-run-command-delete"
+                      type="submit"
+                      formaction="/w/{{ workspace.id }}/run-commands/{{ item.slot }}/delete"
+                      formnovalidate
+                      data-workspace-command-delete
+                      data-confirm="{{ t('workspace.run.delete_confirm') }}"
+                      title="{{ t('workspace.run.delete') }}">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2M8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"/></svg>
+                <span>{{ t('workspace.run.delete') }}</span>
+              </button>
+              {% elif index > 0 %}
+              <button class="workspace-run-command-delete"
+                      type="button"
+                      data-workspace-run-command-remove
+                      title="{{ t('workspace.run.delete') }}">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2M8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"/></svg>
+                <span>{{ t('workspace.run.delete') }}</span>
+              </button>
+              {% endif %}
+              <button class="workspace-run-command-cancel"
+                      type="button"
+                      data-workspace-run-command-cancel>{{ t('workspace.run.cancel') }}</button>
+              <button class="workspace-run-command-save"
+                      type="submit"
+                      data-workspace-run-command-save>{{ t('workspace.run.save') }}</button>
+            </div>
+          </form>
         </details>
         {% if item %}
         <form class="workspace-run-command-launch"
@@ -84,7 +111,10 @@
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <input type="hidden" name="launch_id" value="{{ item.launch_id }}">
           <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
-          <button type="submit" title="{{ item.command }}">
+          <button type="submit"
+                  title="{{ item.command }}"
+                  data-workspace-command-run-button
+                  data-save-first-title="{{ t('workspace.run.save_before_run') }}">
             <span data-workspace-command-label>{{ t('workspace.run.command') }}</span>
           </button>
         </form>
