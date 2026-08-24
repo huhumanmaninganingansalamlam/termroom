@@ -623,11 +623,11 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
             "send-keys",
             "-t",
             window,
-            (
-                "printf 'NODE_HISTORY_OLD\\n'; "
-                "seq -f 'NODE_HISTORY_%02g' 1 24; "
-                "printf 'NODE_HISTORY_%s\\n' LIVE"
-            ),
+                (
+                    "printf '\\033[31mNODE_HISTORY_OLD\\033[0m\\n'; "
+                    "seq -f 'NODE_HISTORY_%02g' 1 24; "
+                    "printf 'NODE_HISTORY_%s\\n' LIVE"
+                ),
             "Enter",
         )
         deadline = time.monotonic() + 2
@@ -653,6 +653,18 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
         assert old_marker in history.splitlines()
         assert live_marker in full.splitlines()
         assert live_marker not in history.splitlines()
+        styled_history = runtime._handle_sync(
+            "terminal.scrollback",
+            {
+                **payload,
+                "tmux_window": window,
+                "lines": 200,
+                "history_only": True,
+                "ansi": True,
+            },
+        )["output"]
+        assert old_marker in styled_history
+        assert "\x1b[31m" in styled_history
         with pytest.raises(NodeAgentError) as invalid:
             runtime._handle_sync(
                 "terminal.scrollback",
@@ -663,12 +675,22 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
                 },
             )
         assert invalid.value.code == "request_invalid"
+        with pytest.raises(NodeAgentError) as invalid_ansi:
+            runtime._handle_sync(
+                "terminal.scrollback",
+                {
+                    **payload,
+                    "tmux_window": window,
+                    "ansi": "true",
+                },
+            )
+        assert invalid_ansi.value.code == "request_invalid"
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
 
 @pytest.mark.asyncio
-async def test_remote_access_forwards_history_only_to_node() -> None:
+async def test_remote_access_forwards_history_and_ansi_to_node() -> None:
     access = RemoteAccess(
         object(),  # type: ignore[arg-type]
         object(),  # type: ignore[arg-type]
@@ -698,13 +720,19 @@ async def test_remote_access_forwards_history_only_to_node() -> None:
         terminal,
         321,
         history_only=True,
+        ansi=True,
     )
 
     assert output == "node-history"
     assert calls == [
         (
             "terminal.scrollback",
-            {"tmux_window": "@7", "lines": 321, "history_only": True},
+            {
+                "tmux_window": "@7",
+                "lines": 321,
+                "history_only": True,
+                "ansi": True,
+            },
         )
     ]
 

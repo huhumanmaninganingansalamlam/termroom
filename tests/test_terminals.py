@@ -371,6 +371,69 @@ def test_tmux_session_survives_detached_commands(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_styled_history_capture_preserves_tmux_sgr_attributes(tmp_path: Path) -> None:
+    marker = "TERMROOM_ANSI_HISTORY"
+    done = "TERMROOM_ANSI_DONE"
+    project = tmp_path / "project"
+    project.mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+
+    try:
+        terminal = manager.ensure_workspace(workspace)[0]
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                terminal["tmux_window"],
+                (
+                    "printf '\\033[1;38;5;196;48;5;25m"
+                    f"{marker}"
+                    "\\033[0m\\n'; seq 1 80; "
+                    f"printf '{done}\\n'"
+                ),
+                "Enter",
+            ],
+            check=True,
+        )
+        deadline = time.monotonic() + 2
+        full = ""
+        while time.monotonic() < deadline:
+            full = manager.capture_scrollback(workspace, terminal)
+            if done in full.splitlines():
+                break
+            time.sleep(0.05)
+
+        styled = manager.capture_scrollback(
+            workspace,
+            terminal,
+            history_only=True,
+            ansi=True,
+        )
+        plain = manager.capture_scrollback(
+            workspace,
+            terminal,
+            history_only=True,
+        )
+        assert done in full.splitlines()
+        assert marker in styled
+        assert marker in plain
+        assert "\x1b[" in styled
+        assert "38;5;196" in styled
+        assert "48;5;25" in styled
+        assert "\x1b[" not in plain
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", workspace["tmux_session"]],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path) -> None:
     old_marker = "HISTORY_ONLY_OLD"
     live_marker = "HISTORY_ONLY_LIVE"

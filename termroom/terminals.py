@@ -48,6 +48,13 @@ TMUX_BROWSER_VIEW_PREFIX = "termroom-view-"
 TMUX_WORKSPACE_COMMAND_SLOT_OPTION = "@termroom_workspace_command_slot"
 TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION = "@termroom_workspace_command_launch"
 TMUX_WORKSPACE_COMMAND_DIGEST_OPTION = "@termroom_workspace_command_digest"
+TMUX_WORKSPACE_COMMAND_STATE_OPTION = "@termroom_workspace_command_state"
+TMUX_WORKSPACE_COMMAND_OPTIONS = (
+    TMUX_WORKSPACE_COMMAND_SLOT_OPTION,
+    TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION,
+    TMUX_WORKSPACE_COMMAND_DIGEST_OPTION,
+    TMUX_WORKSPACE_COMMAND_STATE_OPTION,
+)
 TMUX_TERMINAL_EDITOR_DIGEST_OPTION = "@termroom_terminal_editor_digest"
 WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS = 2.0
 WORKSPACE_COMMAND_READY_POLL_SECONDS = 0.01
@@ -56,7 +63,8 @@ TMUX_WORKSPACE_COMMAND_RECORD_FORMAT = (
     "#{window_id}|#{pane_dead}|"
     f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}|"
     f"#{{{TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION}}}|"
-    f"#{{{TMUX_WORKSPACE_COMMAND_DIGEST_OPTION}}}"
+    f"#{{{TMUX_WORKSPACE_COMMAND_DIGEST_OPTION}}}|"
+    f"#{{{TMUX_WORKSPACE_COMMAND_STATE_OPTION}}}"
 )
 TMUX_TERMINAL_EDITOR_RECORD_FORMAT = (
     "#{window_id}|#{pane_dead}|"
@@ -74,13 +82,33 @@ command=${TERMROOM_WORKSPACE_COMMAND:?}
 slot=${TERMROOM_WORKSPACE_COMMAND_SLOT:?}
 launch=${TERMROOM_WORKSPACE_COMMAND_LAUNCH:?}
 digest=${TERMROOM_WORKSPACE_COMMAND_DIGEST:?}
-tmux set-window-option -t "$pane" remain-on-exit on
+tmux set-window-option -t "$pane" remain-on-exit off
 tmux set-window-option -t "$pane" @termroom_workspace_command_digest "$digest"
 tmux set-window-option -t "$pane" @termroom_workspace_command_launch "$launch"
 tmux set-window-option -t "$pane" @termroom_workspace_command_slot "$slot"
+tmux set-window-option -t "$pane" @termroom_workspace_command_state running
 unset TERMROOM_WORKSPACE_COMMAND TERMROOM_WORKSPACE_COMMAND_SLOT \
     TERMROOM_WORKSPACE_COMMAND_LAUNCH TERMROOM_WORKSPACE_COMMAND_DIGEST
-eval -- "$command"
+set +e
+/bin/bash --noprofile --norc -c "$command"
+status=$?
+set -e
+if test "$status" -eq 0; then
+    printf "\n✓\n"
+else
+    printf "\n✕ %s\n" "$status"
+fi
+shell=${SHELL:-/bin/bash}
+if test ! -x "$shell"; then
+    shell=/bin/bash
+fi
+tmux set-window-option -t "$pane" @termroom_workspace_command_state settling
+# The process switches into the configured interactive shell with exec. Publish
+# the reusable-shell state only after that transition has had time to take
+# effect, so an immediate browser input cannot land in the wrapper teardown.
+tmux run-shell -b "sleep 0.15; tmux set-window-option -t \"$pane\" \
+    @termroom_workspace_command_state shell" >/dev/null 2>&1 || true
+exec "$shell"
 '
 """
 
@@ -182,15 +210,15 @@ def parse_tmux_workspace_command_records(output: str) -> list[dict[str, Any]]:
     for line in output.splitlines():
         if not line:
             continue
-        parts = line.split("|", 4)
+        parts = line.split("|", 5)
         if (
-            len(parts) != 5
+            len(parts) != 6
             or not parts[0].startswith("@")
             or not parts[0][1:].isdigit()
             or parts[1] not in {"0", "1"}
         ):
             raise ValueError("tmux exposed an invalid Workspace command record")
-        window, dead, slot_raw, launch_id, digest = parts
+        window, dead, slot_raw, launch_id, digest, state_raw = parts
         if not slot_raw:
             continue
         if not slot_raw.isdigit():
@@ -199,13 +227,22 @@ def parse_tmux_workspace_command_records(output: str) -> list[dict[str, Any]]:
         validate_workspace_command_launch(launch_id)
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError("tmux exposed an invalid Workspace command digest")
+        if state_raw == "":
+            # The wrapper publishes slot/launch/digest before its running state.
+            # Ignore this incomplete record; old state-less command windows are
+            # intentionally not treated as compatible managed shortcuts.
+            continue
+        if state_raw not in {"running", "settling", "shell"}:
+            raise ValueError("tmux exposed an invalid Workspace command state")
+        dead_pane = dead == "1"
         records.append(
             {
                 "tmux_window": window,
-                "dead": dead == "1",
+                "dead": dead_pane,
                 "slot": slot,
                 "launch_id": launch_id,
                 "digest": digest,
+                "state": "dead" if dead_pane else state_raw,
             }
         )
     slots = [record["slot"] for record in records]
@@ -227,8 +264,32 @@ def workspace_command_record_is_ready(
         and record["slot"] == slot
         and record["launch_id"] == launch_id
         and record["digest"] == digest
+        and record["state"] in {"running", "settling", "shell"}
         for record in parse_tmux_workspace_command_records(output)
     )
+
+
+def clear_tmux_workspace_command_identity(run_tmux: Any, window: str) -> bool:
+    """Detach an existing terminal from one Workspace command shortcut slot."""
+
+    for option in TMUX_WORKSPACE_COMMAND_OPTIONS:
+        result = run_tmux(
+            "set-window-option",
+            "-u",
+            "-t",
+            window,
+            option,
+            check=False,
+        )
+        if result.returncode:
+            return False
+    return True
+
+
+def workspace_command_history_name(slot: int, launch_id: str) -> str:
+    safe_slot = validate_workspace_command_slot(slot)
+    safe_launch = validate_workspace_command_launch(launch_id)
+    return f"run-{safe_slot + 1}-{safe_launch[:4]}"
 
 
 def tmux_browser_view_session(client_id: str) -> str:
@@ -1224,6 +1285,8 @@ class TerminalManager:
         except ValueError as exc:
             raise TerminalError(str(exc)) from exc
         existing = next((item for item in records if item["slot"] == safe_slot), None)
+        window = ""
+        created_window = False
         if existing is not None:
             terminal = next(
                 (item for item in terminal_list if item["tmux_window"] == existing["tmux_window"]),
@@ -1237,33 +1300,81 @@ class TerminalManager:
                         "Workspace command launch identity was reused for another command"
                     )
                 return terminal
-            if not existing["dead"]:
+            if existing["digest"] != digest:
+                if existing["dead"]:
+                    self._run_tmux("kill-window", "-t", str(existing["tmux_window"]))
+                elif not clear_tmux_workspace_command_identity(
+                    self._run_tmux, str(existing["tmux_window"])
+                ):
+                    raise TerminalError(
+                        "Previous Workspace command Terminal could not be detached"
+                    )
+                else:
+                    self._run_tmux(
+                        "rename-window",
+                        "-t",
+                        str(existing["tmux_window"]),
+                        workspace_command_history_name(
+                            safe_slot, str(existing["launch_id"])
+                        ),
+                        check=False,
+                    )
+                existing = None
+            elif existing["state"] in {"running", "settling"}:
                 return terminal
-            self._run_tmux("kill-window", "-t", str(existing["tmux_window"]))
+            elif existing["dead"]:
+                self._run_tmux("kill-window", "-t", str(existing["tmux_window"]))
+            else:
+                window = str(existing["tmux_window"])
+                respawned = self._run_tmux(
+                    "respawn-pane",
+                    "-k",
+                    "-c",
+                    str(workspace["path"]),
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                    "-e",
+                    f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                    "-t",
+                    window,
+                    WORKSPACE_COMMAND_WRAPPER,
+                    check=False,
+                )
+                if respawned.returncode:
+                    raise TerminalError(
+                        respawned.stderr.strip()
+                        or "Workspace command Terminal could not restart"
+                    )
 
-        created = self._run_tmux(
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
-            "-e",
-            f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
-            "-t",
-            session,
-            "-n",
-            f"run-{safe_slot + 1}",
-            "-c",
-            str(workspace["path"]),
-            WORKSPACE_COMMAND_WRAPPER,
-        )
-        window = created.stdout.strip()
+        if not window:
+            created = self._run_tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                "-e",
+                f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                "-t",
+                session,
+                "-n",
+                f"run-{safe_slot + 1}",
+                "-c",
+                str(workspace["path"]),
+                WORKSPACE_COMMAND_WRAPPER,
+            )
+            window = created.stdout.strip()
+            created_window = True
         try:
             deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
@@ -1287,7 +1398,8 @@ class TerminalManager:
             else:
                 raise TerminalError("Workspace command Terminal did not finish starting")
         except Exception:
-            self._run_tmux("kill-window", "-t", window, check=False)
+            if created_window:
+                self._run_tmux("kill-window", "-t", window, check=False)
             raise
         terminal_list = self.ensure_workspace(workspace)
         terminal = next((item for item in terminal_list if item["tmux_window"] == window), None)
@@ -1341,19 +1453,30 @@ class TerminalManager:
         lines: int = 2000,
         *,
         history_only: bool = False,
+        ansi: bool = False,
     ) -> str:
         self.ensure_workspace(workspace)
         args = [
             "capture-pane",
             "-p",
-            "-J",
-            "-S",
-            f"-{max(100, min(lines, 10000))}",
         ]
+        if ansi:
+            args.append("-e")
+        args.extend(
+            (
+                "-J",
+                "-S",
+                f"-{max(100, min(lines, 10000))}",
+            )
+        )
         if history_only:
             args.extend(("-E", "-1"))
         args.extend(("-t", terminal["tmux_window"]))
-        result = self._run_tmux(*args)
+        result = self._run_tmux(*args, check=not ansi)
+        if ansi and result.returncode:
+            # tmux has supported capture-pane -e for years, but keep older
+            # installations usable by retrying the exact capture as plain text.
+            result = self._run_tmux(*(item for item in args if item != "-e"))
         return result.stdout
 
     async def bridge(

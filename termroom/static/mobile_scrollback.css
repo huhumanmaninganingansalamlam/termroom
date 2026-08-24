@@ -49,6 +49,20 @@
   display: none;
 }
 
+/* xterm normally owns selection and therefore disables browser selection on
+ * its DOM renderer. When a native selection begins in the history block, let
+ * that same range continue through the visible xterm rows. The class is
+ * removed before a new interaction starts inside xterm, preserving its normal
+ * cell-aware selection behavior everywhere else. */
+.terminal-scroll-native-selection .xterm,
+.terminal-scroll-native-selection .xterm .xterm-screen,
+.terminal-scroll-native-selection .xterm .xterm-rows,
+.terminal-scroll-native-selection .xterm .xterm-rows > div,
+.terminal-scroll-native-selection .xterm .xterm-rows span {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .terminal-scroll-surface > .terminal-host {
   width: 100%;
   min-height: 72px;

@@ -40,6 +40,39 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def test_ssh_scrollback_ansi_capture_keeps_a_plain_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    commands: list[str] = []
+
+    monkeypatch.setattr(backend, "ensure_workspace", lambda _workspace: [])
+    monkeypatch.setattr(backend, "_computer", lambda _workspace: {"id": "computer"})
+
+    def execute(_computer, command):  # type: ignore[no-untyped-def]
+        commands.append(str(command))
+        return "styled-history"
+
+    monkeypatch.setattr(backend, "_exec", execute)
+    output = backend.capture_scrollback(
+        {"id": "workspace"},
+        {"tmux_window": "@7"},
+        321,
+        history_only=True,
+        ansi=True,
+    )
+
+    assert output == "styled-history"
+    assert len(commands) == 1
+    assert "tmux capture-pane -p -e -J -S -321 -E -1 -t @7" in commands[0]
+    assert "|| tmux capture-pane -p -J -S -321 -E -1 -t @7" in commands[0]
+
+
 @contextlib.contextmanager
 def _test_sshd(
     tmp_path: Path,

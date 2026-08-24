@@ -118,8 +118,8 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=55'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=67'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=59'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=70'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -701,7 +701,7 @@ async def test_terminal_scrollback_route_forwards_history_only(
     app = create_app(settings)
     workspace = app.state.workspaces.open("project")
     terminal = app.state.terminals.ensure_workspace(workspace)[0]
-    calls: list[tuple[int, bool]] = []
+    calls: list[tuple[int, bool, bool]] = []
     history_output = {"value": "history-only"}
 
     def capture_scrollback(  # type: ignore[no-untyped-def]
@@ -710,10 +710,13 @@ async def test_terminal_scrollback_route_forwards_history_only(
         lines=2000,
         *,
         history_only=False,
+        ansi=False,
     ) -> str:
         assert selected_workspace["id"] == workspace["id"]
         assert selected_terminal["id"] == terminal["id"]
-        calls.append((int(lines), bool(history_only)))
+        calls.append((int(lines), bool(history_only), bool(ansi)))
+        if history_only and ansi:
+            return "\x1b[31mhistory-only\x1b[0m"
         return history_output["value"] if history_only else "full-output"
 
     monkeypatch.setattr(app.state.terminals, "capture_scrollback", capture_scrollback)
@@ -731,6 +734,11 @@ async def test_terminal_scrollback_route_forwards_history_only(
             plain_history = await client.get(
                 f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback"
                 "?recent=987&history_only=1",
+                headers={"Accept": "text/plain"},
+            )
+            styled_history = await client.get(
+                f"/w/{workspace['id']}/terminal/{terminal['id']}/scrollback"
+                "?recent=987&history_only=1&ansi=1",
                 headers={"Accept": "text/plain"},
             )
             not_modified = await client.get(
@@ -760,6 +768,8 @@ async def test_terminal_scrollback_route_forwards_history_only(
         assert plain_history.headers["cache-control"] == "private, no-cache"
         assert plain_history.headers["etag"].startswith('"')
         assert plain_history.text == "history-only"
+        assert styled_history.status_code == 200
+        assert styled_history.text == "\x1b[31mhistory-only\x1b[0m"
         assert not_modified.status_code == 304
         assert not_modified.text == ""
         assert not_modified.headers["etag"] == plain_history.headers["etag"]
@@ -767,11 +777,12 @@ async def test_terminal_scrollback_route_forwards_history_only(
         assert modified.text == "history-new"
         assert modified.headers["etag"] != plain_history.headers["etag"]
         assert calls == [
-            (321, False),
-            (654, True),
-            (987, True),
-            (987, True),
-            (987, True),
+            (321, False, False),
+            (654, True, False),
+            (987, True, False),
+            (987, True, True),
+            (987, True, False),
+            (987, True, False),
         ]
     finally:
         subprocess.run(
@@ -3501,7 +3512,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=67")
+        script = await client.get("/static/app.js?v=70")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3536,7 +3547,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=67")
+        script = await client.get("/static/app.js?v=70")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3548,7 +3559,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=67" in korean_page.text
+    assert "/static/app.js?v=70" in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3836,7 +3847,7 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=67",
+            "/static/app.js?v=70",
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]

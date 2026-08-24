@@ -21,6 +21,8 @@ NODE_PROTOCOL_VERSION = 2
 NODE_REMOTE_RUN_VERSION = 1
 NODE_REMOTE_RUN_SOURCE_VERSION = 1
 NODE_WORKSPACE_USAGE_VERSION = 1
+NODE_WORKSPACE_COMMAND_VERSION = 2
+NODE_WORKSPACE_COMMAND_CAPABILITY = "workspace_command_v2"
 NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW = 8
 NODE_REQUIRED_CAPABILITIES = frozenset({"workspace", "terminal", "files"})
 NODE_OPTIONAL_CAPABILITIES = frozenset(
@@ -29,7 +31,7 @@ NODE_OPTIONAL_CAPABILITIES = frozenset(
         "recent",
         "remote_run",
         "remote_run_source",
-        "workspace_command",
+        NODE_WORKSPACE_COMMAND_CAPABILITY,
         "workspace_usage",
         "terminal_editor",
     }

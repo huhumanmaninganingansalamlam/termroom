@@ -30,7 +30,11 @@ from termroom.files import (
     file_browser_entry_is_noise,
 )
 from termroom.node_core import NodeCore, NodeCoreError
-from termroom.node_protocol import NODE_WORKSPACE_USAGE_VERSION
+from termroom.node_protocol import (
+    NODE_WORKSPACE_COMMAND_CAPABILITY,
+    NODE_WORKSPACE_COMMAND_VERSION,
+    NODE_WORKSPACE_USAGE_VERSION,
+)
 from termroom.security import PathBoundaryError, file_digest
 from termroom.ssh_backend import SSHBackend
 from termroom.terminal_control import TerminalControl
@@ -376,15 +380,21 @@ class RemoteAccess:
                 command=command,
                 launch_id=launch_id,
             )
-        if not self.supports_capability(workspace, "workspace_command"):
+        if not self.supports_capability(workspace, NODE_WORKSPACE_COMMAND_CAPABILITY):
             raise RemoteAccessError(
-                "This Node does not support Workspace commands; update Termroom Node",
+                "This Node does not support persistent Workspace command shells; "
+                "update Termroom Node",
                 code="capability_unsupported",
             )
         result = await self._workspace_request(
             workspace,
             "workspace.command.run",
-            {"slot": slot, "command": command, "launch_id": launch_id},
+            {
+                "workspace_command_version": NODE_WORKSPACE_COMMAND_VERSION,
+                "slot": slot,
+                "command": command,
+                "launch_id": launch_id,
+            },
         )
         expected = self._terminal_record(result.get("terminal"))
         terminals = self._reconcile_terminals(workspace, result.get("terminals"))
@@ -434,6 +444,7 @@ class RemoteAccess:
         lines: int,
         *,
         history_only: bool = False,
+        ansi: bool = False,
     ) -> str:
         if not self.is_node(workspace):
             return await asyncio.to_thread(
@@ -442,6 +453,7 @@ class RemoteAccess:
                 terminal,
                 lines,
                 history_only=history_only,
+                ansi=ansi,
             )
         result = await self._workspace_request(
             workspace,
@@ -450,6 +462,7 @@ class RemoteAccess:
                 "tmux_window": terminal["tmux_window"],
                 "lines": lines,
                 "history_only": history_only,
+                "ansi": ansi,
             },
         )
         output = result.get("output")
