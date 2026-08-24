@@ -204,6 +204,7 @@
   "workspace.run.slot": "Command {number}",
   "workspace.run.placeholder": "uv run pytest",
   "workspace.run.save": "Save commands",
+  "workspace.run.add": "Add command",
   "workspace.run.error.invalid": "Save up to three non-empty one-line commands, each no larger than 4096 UTF-8 bytes.",
   "workspace.run.error.changed": "This command changed in another view. Review the updated command and run it again.",
   "time.recent": "Recently",

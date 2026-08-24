@@ -3546,15 +3546,19 @@ def create_app(settings: Settings) -> FastAPI:
         terminal_id: str,
         recent: int = 2000,
         history_only: bool = False,
+        ansi: bool = False,
     ) -> Response:
         workspace = _require_workspace(workspaces, workspace_id)
         terminal = _require_terminal(store, workspace_id, terminal_id)
+        plain_response = "text/plain" in request.headers.get("accept", "")
+        styled_history = plain_response and history_only and ansi
         if is_remote(workspace):
             output = await remote.capture_scrollback(
                 workspace,
                 terminal,
                 recent,
                 history_only=history_only,
+                ansi=styled_history,
             )
         else:
             output = terminals.capture_scrollback(
@@ -3562,8 +3566,9 @@ def create_app(settings: Settings) -> FastAPI:
                 terminal,
                 recent,
                 history_only=history_only,
+                ansi=styled_history,
             )
-        if "text/plain" in request.headers.get("accept", ""):
+        if plain_response:
             response_headers: dict[str, str] = {}
             if history_only:
                 etag = f'"{hashlib.sha256(output.encode()).hexdigest()}"'

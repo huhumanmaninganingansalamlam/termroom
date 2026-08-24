@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import shlex
 import shutil
 import sqlite3
@@ -376,6 +377,16 @@ async def test_workspace_command_http_uses_only_server_saved_command(
         assert "uv run pytest" in page.text
         assert "ruff check ." in page.text
         assert page.text.count('name="commands"') == 3
+        cards = re.findall(
+            r'<article class="workspace-run-command-card[^"]*"\s+'
+            r'data-workspace-run-command-card(?P<attributes>[^>]*)>',
+            page.text,
+        )
+        assert len(cards) == 3
+        assert all("hidden" not in attributes for attributes in cards[:2])
+        assert "hidden" in cards[2]
+        assert page.text.count("data-workspace-run-command-add") == 1
+        assert "Add command" in page.text
         assert page.text.count(
             f'name="command_digest" value="{workspace_command_digest("ruff check .")}"'
         ) == 1

@@ -43,11 +43,14 @@
           action="/w/{{ workspace.id }}/run-commands">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     </form>
-    <div class="workspace-run-command-list">
+    <div class="workspace-run-command-list" data-workspace-run-command-list>
       {% for index in range(3) %}
       {% set item = workspace_commands[index] if workspace_commands | length > index else none %}
-      <article class="workspace-run-command-card{% if not item %} is-empty{% endif %}">
-        <details class="workspace-run-command-editor">
+      <article class="workspace-run-command-card{% if not item %} is-empty{% endif %}"
+               data-workspace-run-command-card
+               {% if not item and index > 0 %}hidden{% endif %}>
+        <details class="workspace-run-command-editor"
+                 {% if not item and index == 0 and workspace_commands | length == 0 %}open{% endif %}>
           <summary aria-label="{{ t('workspace.run.configure') }} · {{ t('workspace.run.slot', number=index + 1) }}"
                    title="{{ t('workspace.run.configure') }}">
             <code>{{ item.command if item else t('workspace.run.slot', number=index + 1) }}</code>
@@ -89,6 +92,13 @@
       </article>
       {% endfor %}
     </div>
+    <button class="workspace-run-command-add"
+            type="button"
+            data-workspace-run-command-add
+            {% if workspace_commands | length >= 3 %}hidden{% endif %}>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      <span>{{ t('workspace.run.add') }}</span>
+    </button>
     {% else %}
     <p class="workspace-run-empty">{{ t('workspace.run.unsupported_node') }}</p>
     {% endif %}

@@ -1341,19 +1341,30 @@ class TerminalManager:
         lines: int = 2000,
         *,
         history_only: bool = False,
+        ansi: bool = False,
     ) -> str:
         self.ensure_workspace(workspace)
         args = [
             "capture-pane",
             "-p",
-            "-J",
-            "-S",
-            f"-{max(100, min(lines, 10000))}",
         ]
+        if ansi:
+            args.append("-e")
+        args.extend(
+            (
+                "-J",
+                "-S",
+                f"-{max(100, min(lines, 10000))}",
+            )
+        )
         if history_only:
             args.extend(("-E", "-1"))
         args.extend(("-t", terminal["tmux_window"]))
-        result = self._run_tmux(*args)
+        result = self._run_tmux(*args, check=not ansi)
+        if ansi and result.returncode:
+            # tmux has supported capture-pane -e for years, but keep older
+            # installations usable by retrying the exact capture as plain text.
+            result = self._run_tmux(*(item for item in args if item != "-e"))
         return result.stdout
 
     async def bridge(

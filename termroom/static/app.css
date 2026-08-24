@@ -4606,6 +4606,42 @@ details:not([open]) > :not(summary) {
   cursor: wait;
 }
 
+.workspace-run-command-add {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.65rem;
+  font-weight: 680;
+}
+
+.workspace-run-command-add:hover,
+.workspace-run-command-add:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  background: var(--accent-muted);
+  color: var(--accent-hover);
+}
+
+.workspace-run-command-add svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
+}
+
+.workspace-run-command-add[hidden] {
+  display: none;
+}
+
 .workspace-run-empty {
   padding: 9px 0;
 }

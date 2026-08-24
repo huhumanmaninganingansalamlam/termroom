@@ -805,6 +805,24 @@
       event.stopPropagation();
       closeWorkspaceRunMenu(menu, { restoreFocus: true });
     });
+
+    const addCommand = menu.querySelector("[data-workspace-run-command-add]");
+    const commandCards = [
+      ...menu.querySelectorAll("[data-workspace-run-command-card]"),
+    ];
+    const syncAddCommand = () => {
+      if (addCommand) addCommand.hidden = !commandCards.some((card) => card.hidden);
+    };
+    addCommand?.addEventListener("click", () => {
+      const card = commandCards.find((candidate) => candidate.hidden);
+      if (!card) return;
+      card.hidden = false;
+      const editor = card.querySelector(".workspace-run-command-editor");
+      if (editor instanceof HTMLDetailsElement) editor.open = true;
+      card.querySelector('input[name="commands"]')?.focus({ preventScroll: true });
+      syncAddCommand();
+    });
+    syncAddCommand();
   });
   document.addEventListener("click", (event) => {
     workspaceRunMenus

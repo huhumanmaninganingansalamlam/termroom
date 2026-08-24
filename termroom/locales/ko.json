@@ -204,6 +204,7 @@
   "workspace.run.slot": "명령 {number}",
   "workspace.run.placeholder": "uv run pytest",
   "workspace.run.save": "명령 저장",
+  "workspace.run.add": "명령 추가",
   "workspace.run.error.invalid": "비어 있지 않은 한 줄 명령을 최대 3개 저장하세요. 각 명령은 UTF-8 4096 byte 이하여야 합니다.",
   "workspace.run.error.changed": "다른 화면에서 이 명령이 변경되었습니다. 새 명령을 확인한 뒤 다시 실행하세요.",
   "time.recent": "최근",

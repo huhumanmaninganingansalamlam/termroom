@@ -3943,14 +3943,22 @@ class SSHBackend:
         lines: int = 2000,
         *,
         history_only: bool = False,
+        ansi: bool = False,
     ) -> str:
         self.ensure_workspace(workspace)
         history_end = "-E -1 " if history_only else ""
-        command = (
-            "tmux capture-pane -p -J "
+        capture = (
+            "tmux capture-pane -p "
+            f"{'-e ' if ansi else ''}"
+            "-J "
             f"-S -{max(100, min(lines, 10000))} {history_end}"
             f"-t {shlex.quote(str(terminal['tmux_window']))}"
         )
+        if ansi:
+            plain_capture = capture.replace(" -e ", " ", 1)
+            command = f"{capture} 2>/dev/null || {plain_capture}"
+        else:
+            command = capture
         return self._exec(self._computer(workspace), command)
 
     async def bridge(

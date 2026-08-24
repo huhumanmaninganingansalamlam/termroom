@@ -434,6 +434,7 @@ class RemoteAccess:
         lines: int,
         *,
         history_only: bool = False,
+        ansi: bool = False,
     ) -> str:
         if not self.is_node(workspace):
             return await asyncio.to_thread(
@@ -442,6 +443,7 @@ class RemoteAccess:
                 terminal,
                 lines,
                 history_only=history_only,
+                ansi=ansi,
             )
         result = await self._workspace_request(
             workspace,
@@ -450,6 +452,7 @@ class RemoteAccess:
                 "tmux_window": terminal["tmux_window"],
                 "lines": lines,
                 "history_only": history_only,
+                "ansi": ansi,
             },
         )
         output = result.get("output")

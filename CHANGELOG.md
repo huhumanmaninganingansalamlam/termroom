@@ -2,6 +2,18 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.16] - 2026-08-24
+
+### Added
+
+- Preserve tmux history colors, backgrounds, and text attributes across Local, SSH, and Node terminals with a safe plain-text fallback.
+
+### Fixed
+
+- Continue large native text selections across the history and live xterm boundary in either direction, including automatic scrolling and clean copied line breaks.
+- Reflow styled history for each browser width while matching the live xterm font size and line height.
+- Show only configured Workspace commands (or one initial field) and reveal additional command slots through an explicit add button.
+
 ## [0.3.15] - 2026-08-24
 
 ### Added
