@@ -3154,6 +3154,31 @@ class SSHBackend:
         session = str(workspace["tmux_session"])
         quoted_session = shlex.quote(session)
         quoted_path = shlex.quote(remote_path)
+        created_marker = "__TERMROOM_TMUX_SESSION_CREATED__"
+        browser_view_listing = (
+            "tmux list-sessions "
+            "-F '#{session_name}|#{session_group}|#{session_attached}' 2>/dev/null"
+        )
+        recovery_lookup = (
+            f"recovery=$({browser_view_listing} | "
+            "while IFS='|' read -r view group attached; do "
+            f'case "$view" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
+            f"[ \"$group\" = {quoted_session} ] || continue; "
+            'printf \'%s\\n\' "$view"; break; done); '
+        )
+        detached_view_cleanup = (
+            f"{browser_view_listing} | while IFS='|' read -r view group attached; do "
+            f'case "$view" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
+            f"[ \"$group\" = {quoted_session} ] || continue; "
+            '[ "$attached" = 0 ] || continue; '
+            'tmux kill-session -t "$view" >/dev/null 2>&1 || true; done; '
+        )
+        all_view_cleanup = (
+            f"{browser_view_listing} | while IFS='|' read -r view group attached; do "
+            f'case "$view" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
+            f"[ \"$group\" = {quoted_session} ] || continue; "
+            'tmux kill-session -t "$view" >/dev/null 2>&1 || true; done; '
+        )
         managed_identity = ""
         if str(workspace.get("workspace_kind") or "workspace") == "remote_run":
             run_id = str(workspace.get("remote_run_id") or "")
@@ -3170,8 +3195,17 @@ class SSHBackend:
             f"test -d {quoted_path} || {{ echo '__TERMROOM_NO_DIR__' >&2; exit 44; }}; "
             "command -v tmux >/dev/null 2>&1 || "
             "{ echo '__TERMROOM_NO_TMUX__' >&2; exit 45; }; "
-            f"tmux has-session -t {quoted_session} 2>/dev/null || "
+            f"if tmux has-session -t {quoted_session} 2>/dev/null; then "
+            "created=0; else "
+            f"{recovery_lookup}"
+            f"if [ -n \"$recovery\" ] && tmux new-session -d -s {quoted_session} "
+            '-t "$recovery"; then '
+            f"created=0; {detached_view_cleanup}"
+            "else "
+            f"{all_view_cleanup}"
             f"tmux new-session -d -s {quoted_session} -c {quoted_path} -n shell; "
+            "created=1; fi; fi; "
+            f"printf '%s%s\\n' {shlex.quote(created_marker)} \"$created\"; "
             f"{managed_identity}"
             f"tmux set-window-option -t {quoted_session} window-size latest "
             ">/dev/null 2>&1 || true; "
@@ -3179,13 +3213,24 @@ class SSHBackend:
             f"-F {shlex.quote(TMUX_TERMINAL_RECORD_FORMAT)}"
         )
         output = self._exec(computer, self._remote_posix_command(command))
+        marker_line, separator, window_output = output.partition("\n")
+        if not separator or marker_line not in {
+            f"{created_marker}0",
+            f"{created_marker}1",
+        }:
+            raise SSHBackendError("Remote tmux session creation state is invalid")
+        created_session = marker_line == f"{created_marker}1"
         try:
-            windows = parse_tmux_terminal_records(output)
+            windows = parse_tmux_terminal_records(window_output)
         except ValueError as exc:
             raise SSHBackendError("Remote tmux exposed an invalid Terminal record") from exc
         if not windows:
             raise SSHBackendError("Remote tmux session did not expose any terminal windows")
-        return self.store.reconcile_terminals(str(workspace["id"]), windows)
+        terminals = self.store.reconcile_terminals(str(workspace["id"]), windows)
+        if created_session:
+            for terminal in terminals:
+                self.control.mark_grid_fresh(str(terminal["id"]))
+        return terminals
 
     def refresh_activity(
         self,
@@ -3687,7 +3732,9 @@ class SSHBackend:
             f"-n {shlex.quote(safe_name)} -c {shlex.quote(self._remote_root(workspace))}"
         )
         window_id = self._exec(computer, command).strip()
-        return self.store.create_terminal(str(workspace["id"]), safe_name, window_id)
+        terminal = self.store.create_terminal(str(workspace["id"]), safe_name, window_id)
+        self.control.mark_grid_fresh(str(terminal["id"]))
+        return terminal
 
     def open_terminal_editor(
         self, workspace: dict[str, Any], relative_path: str

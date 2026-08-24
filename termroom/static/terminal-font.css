@@ -1,3 +1,23 @@
+/*
+ * Keep Hangul on a native two-cell font. The Nerd Fonts Mono face forces its
+ * Hangul glyphs onto a one-cell advance; xterm's DOM renderer then has to add
+ * synthetic spacing and the dense strokes can appear to overlap at terminal
+ * sizes. This local-only face preserves the host platform's normal Hangul
+ * metrics while the bundled font continues to provide Latin, symbols, and
+ * Nerd Font glyphs consistently.
+ */
+@font-face {
+  font-family: "Termroom Korean Terminal";
+  src: local("Noto Sans Mono CJK KR"), local("D2Coding"),
+    local("NanumGothicCoding"), local("Apple SD Gothic Neo"),
+    local("Malgun Gothic"), local("Noto Sans CJK KR"), local("Noto Sans KR");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF,
+    U+FFA0-FFDC;
+}
+
 /* D2KodingLigature Nerd Font Mono v3.5.0, split for range-based loading. */
 @font-face {
   font-family: "Termroom D2Koding Nerd Mono";
@@ -6,7 +26,9 @@
   font-style: normal;
   font-weight: 400;
   font-display: block;
-  unicode-range: U+0000-4DFF, U+AC00-DFFF, U+FB00-FFFF;
+  /* Hangul ranges are deliberately delegated to Termroom Korean Terminal. */
+  unicode-range: U+0000-10FF, U+1200-312F, U+3190-4DFF, U+D800-DFFF,
+    U+FB00-FF9F, U+FFDD-FFFF;
 }
 
 @font-face {
@@ -16,7 +38,8 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  unicode-range: U+4E00-ABFF, U+F900-FAFF;
+  /* Exclude Hangul Jamo Extended-A from the Mono-patched CJK subset. */
+  unicode-range: U+4E00-A95F, U+A980-ABFF, U+F900-FAFF;
 }
 
 @font-face {

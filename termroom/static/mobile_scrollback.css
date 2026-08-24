@@ -49,6 +49,22 @@
   display: none;
 }
 
+.terminal-scroll-history-hangul {
+  letter-spacing: var(--termroom-history-hangul-spacing, 0px);
+}
+
+.terminal-scroll-history-cell-cluster {
+  display: inline-block;
+  inline-size: calc(
+    var(--termroom-terminal-cell-width, 0.5em)
+    * var(--termroom-history-cell-count, 2)
+  );
+  vertical-align: baseline;
+  white-space: pre;
+  letter-spacing: normal;
+  overflow: visible;
+}
+
 /* xterm normally owns selection and therefore disables browser selection on
  * its DOM renderer. When a native selection begins in the history block, let
  * that same range continue through the visible xterm rows. The class is

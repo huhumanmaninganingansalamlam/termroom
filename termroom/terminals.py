@@ -656,6 +656,51 @@ class TerminalManager:
             return set()
         return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
+    def _browser_views_for_group(self, session_name: str) -> list[tuple[str, bool]]:
+        listed = self._run_tmux(
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_group}\t#{session_attached}",
+            check=False,
+        )
+        if listed.returncode:
+            return []
+        views: list[tuple[str, bool]] = []
+        for line in listed.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if (
+                len(parts) == 3
+                and parts[0].startswith(TMUX_BROWSER_VIEW_PREFIX)
+                and parts[1] == session_name
+                and parts[2].isdigit()
+            ):
+                views.append((parts[0], int(parts[2]) > 0))
+        return views
+
+    def _recover_workspace_from_browser_view(self, session_name: str) -> bool:
+        """Restore a missing canonical session from a surviving linked browser view."""
+
+        views = self._browser_views_for_group(session_name)
+        for view_session, _attached in views:
+            restored = self._run_tmux(
+                "new-session",
+                "-d",
+                "-s",
+                session_name,
+                "-t",
+                view_session,
+                check=False,
+            )
+            if restored.returncode:
+                continue
+            for stale_view, attached in views:
+                if not attached:
+                    self._run_tmux("kill-session", "-t", stale_view, check=False)
+            return True
+        for view_session, _attached in views:
+            self._run_tmux("kill-session", "-t", view_session, check=False)
+        return False
+
     def workspace_usage(self, workspace: dict[str, Any]) -> RawWorkspaceUsage:
         try:
             result = self._run_tmux(
@@ -682,17 +727,22 @@ class TerminalManager:
         # is using an already-running tmux server, remove it before a new pane
         # is created.
         self._run_tmux("set-environment", "-g", "-u", "TERMROOM_PASSWORD", check=False)
-        if not self.session_exists(session):
-            self._run_tmux(
-                "new-session",
-                "-d",
-                "-s",
-                session,
-                "-c",
-                str(workspace_path),
-                "-n",
-                "shell",
-            )
+        created_session = not self.session_exists(session)
+        if created_session:
+            recovered_session = self._recover_workspace_from_browser_view(str(session))
+            if recovered_session:
+                created_session = False
+            else:
+                self._run_tmux(
+                    "new-session",
+                    "-d",
+                    "-s",
+                    session,
+                    "-c",
+                    str(workspace_path),
+                    "-n",
+                    "shell",
+                )
 
         # The most recently resized browser client should control the tmux
         # window dimensions. Without this, a detached 80x24 session can keep
@@ -706,9 +756,13 @@ class TerminalManager:
             check=False,
         )
 
-        return self.store.reconcile_terminals(
+        terminals = self.store.reconcile_terminals(
             str(workspace["id"]), self._list_tmux_window_records(session)
         )
+        if created_session:
+            for terminal in terminals:
+                self.control.mark_grid_fresh(str(terminal["id"]))
+        return terminals
 
     def _list_tmux_window_records(self, session_name: str) -> list[dict[str, str | int | None]]:
         result = self._run_tmux(
@@ -1143,7 +1197,11 @@ class TerminalManager:
             "-c",
             str(workspace["path"]),
         )
-        return self.store.create_terminal(workspace["id"], safe_name, result.stdout.strip())
+        terminal = self.store.create_terminal(
+            workspace["id"], safe_name, result.stdout.strip()
+        )
+        self.control.mark_grid_fresh(str(terminal["id"]))
+        return terminal
 
     def open_terminal_editor(
         self, workspace: dict[str, Any], relative_path: str

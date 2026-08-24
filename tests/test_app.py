@@ -118,7 +118,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=59'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=60'
     script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=70'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
@@ -676,7 +676,7 @@ async def test_terminal_page_exposes_shell_tabs_for_in_place_switching(tmp_path:
         assert "data-terminal-output-link" in response.text
         assert "data-terminal-manage-form" in response.text
         assert "data-terminal-name-input" in response.text
-        assert 'terminal.js?v=53' in response.text
+        assert 'terminal.js?v=56' in response.text
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],

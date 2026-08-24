@@ -1119,7 +1119,7 @@ class RemoteAccess:
         input_task: asyncio.Task[None] | None = None
         try:
             connection = self.nodes.connection(str(workspace["computer"]["id"]))
-            _, stream = await connection.open_stream(
+            attach_result, stream = await connection.open_stream(
                 "terminal.attach",
                 {
                     **self._workspace_payload(workspace),
@@ -1128,6 +1128,14 @@ class RemoteAccess:
                     "cols": 80,
                 },
             )
+            bootstrap_grid = attach_result.get("bootstrap_grid", False)
+            if type(bootstrap_grid) is not bool:
+                raise RemoteAccessError(
+                    "Node returned an invalid Terminal grid state",
+                    code="node_response_invalid",
+                )
+            if bootstrap_grid:
+                self.control.mark_grid_fresh(terminal_id, client_id=client_id)
             grid_active = False
             last_viewport: tuple[int, int] | None = None
 

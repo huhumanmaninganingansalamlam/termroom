@@ -6,7 +6,7 @@
       as="font"
       type="font/woff2"
       crossorigin>
-<link rel="stylesheet" href="{{ url_for('static', path='terminal-font.css') }}?v=2">
+<link rel="stylesheet" href="{{ url_for('static', path='terminal-font.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', path='vendor/xterm.css') }}?v=6.0.0">
 {% endblock %}
 {% block workspace_content_class %}terminal-screen{% endblock %}
@@ -250,5 +250,5 @@
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
 <script src="{{ url_for('static', path='vendor/addon-unicode11.js') }}?v=0.8.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=53"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=56"></script>
 {% endblock %}
