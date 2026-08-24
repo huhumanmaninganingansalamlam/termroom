@@ -180,6 +180,7 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
                     assert len(registered) == 2
                     first_id, second_id = registered
 
+                    input_revision = control.presence(terminal_id)["input_revision"]
                     first.send_json(
                         {
                             "kind": "input",
@@ -190,9 +191,10 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
                         }
                     )
                     deadline = time.monotonic() + 2
-                    while not control.can_resize(terminal_id, first_id):
+                    while control.presence(terminal_id)["input_revision"] == input_revision:
                         assert time.monotonic() < deadline
                         time.sleep(0.01)
+                    assert control.can_resize(terminal_id, first_id)
                     revision = control.presence(terminal_id)["input_revision"]
 
                     second.send_text(f"printf '%s\\n' '{marker}'\r")
@@ -288,12 +290,12 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
                             "user_input": True,
                         }
                     )
-                    deadline = time.monotonic() + 2
-                    while (37, 111) not in applied_sizes and time.monotonic() < deadline:
-                        time.sleep(0.01)
-                    while applied_sizes.count((37, 111)) < 2 and time.monotonic() < deadline:
-                        time.sleep(0.01)
-                    assert applied_sizes.count((37, 111)) == 2
+                    time.sleep(0.05)
+                    # The first browser already owns a freshly created grid for
+                    # its one bootstrap resize. Typing on that same browser
+                    # converts bootstrap ownership into input ownership without
+                    # needlessly applying the identical PTY size a second time.
+                    assert applied_sizes.count((37, 111)) == 1
 
                     second.send_json({"kind": "resize", "rows": 30, "cols": 90})
                     deadline = time.monotonic() + 2

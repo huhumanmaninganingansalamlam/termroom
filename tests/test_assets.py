@@ -180,21 +180,44 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         "U+EC60-EC84, U+ED00-EFCF, U+F000-F385, U+F400-F533, "
         "U+F900-FFFF, U+F0001-F1AF0"
     )
+    korean_ranges = (
+        "U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF, U+FFA0-FFDC"
+    )
 
     faces = re.findall(r"@font-face\s*\{(.*?)\}", stylesheet, flags=re.DOTALL)
-    assert len(faces) == 4
+    assert len(faces) == 5
+    korean_face = next(
+        candidate
+        for candidate in faces
+        if 'font-family: "Termroom Korean Terminal"' in candidate
+    )
     assert stylesheet.count('font-family: "Termroom D2Koding Nerd Mono"') == 4
-    assert stylesheet.count("font-weight: 400") == 4
-    assert stylesheet.count("font-style: normal") == 4
+    assert stylesheet.count('font-family: "Termroom Korean Terminal"') == 1
+    assert stylesheet.count("font-weight: 400") == 5
+    assert stylesheet.count("font-style: normal") == 5
     assert "font-weight: 700" not in stylesheet
     assert "font-style: italic" not in stylesheet
     assert stylesheet.count("font-display: block") == 1
-    assert stylesheet.count("font-display: swap") == 3
+    assert stylesheet.count("font-display: swap") == 4
     assert "font-variant-ligatures: none" in stylesheet
     assert 'font-feature-settings: "liga" 0, "calt" 0' in stylesheet
     assert "font-synthesis: weight style" in stylesheet
+    for local_family in (
+        "Noto Sans Mono CJK KR",
+        "D2Coding",
+        "NanumGothicCoding",
+        "Apple SD Gothic Neo",
+        "Malgun Gothic",
+        "Noto Sans CJK KR",
+        "Noto Sans KR",
+    ):
+        assert f'local("{local_family}")' in korean_face
 
     expected_points = _range_points(_unicode_ranges(expected_ranges))
+    korean_points = _range_points(_unicode_ranges(korean_ranges))
+    korean_declaration = re.search(r"unicode-range:\s*([^;]+);", korean_face)
+    assert korean_declaration is not None
+    assert _range_points(_unicode_ranges(korean_declaration.group(1))) == korean_points
     actual_points: set[int] = set()
     face_points: dict[str, set[int]] = {}
     for key, details in TERMINAL_FONT_ASSETS.items():
@@ -203,14 +226,17 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         declaration = re.search(r"unicode-range:\s*([^;]+);", face)
         assert declaration is not None
         points = _range_points(_unicode_ranges(declaration.group(1)))
-        assert points == _range_points(_unicode_ranges(str(details["unicode_range"])))
+        source_points = _range_points(_unicode_ranges(str(details["unicode_range"])))
+        assert points == source_points - korean_points
         assert actual_points.isdisjoint(points)
         actual_points.update(points)
         face_points[key] = points
         assert f'url("vendor/{filename}?v=3.5.0.1")' in face
 
-    assert actual_points == expected_points
-    assert {0x004D, 0x0301, 0x2500, 0x2800, 0xAC00} <= face_points["core_hangul"]
+    assert actual_points == expected_points - korean_points
+    assert actual_points.isdisjoint(korean_points)
+    assert {0x004D, 0x0301, 0x2500, 0x2800} <= face_points["core_hangul"]
+    assert {0x1100, 0x3131, 0xAC00, 0xD7A3, 0xFFA0} <= korean_points
     assert 0x4E2D in face_points["cjk"]
     assert {0xE0B0, 0xF013} <= face_points["nerd_bmp"]
     assert {0xF0001, 0xF1AF0} <= face_points["nerd_supp"]
@@ -235,7 +261,13 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
         assert str(TERMINAL_FONT_ASSETS[key]["filename"]) not in terminal_template
     terminal_script = (VENDOR_DIR.parent / "terminal.js").read_text(encoding="utf-8")
-    assert 'BUNDLED_TERMINAL_FONT_PROBE = "M\\uD55C"' in terminal_script
+    assert 'KOREAN_TERMINAL_FONT_FAMILY = \'"Termroom Korean Terminal"\'' in terminal_script
+    assert 'BUNDLED_TERMINAL_FONT_PROBE = "M"' in terminal_script
+    assert (
+        "`${KOREAN_TERMINAL_FONT_FAMILY}, ${BUNDLED_TERMINAL_FONT_FAMILY}, "
+        "${systemFamily}`" in terminal_script
+    )
+    assert "`${KOREAN_TERMINAL_FONT_FAMILY}, ${systemFamily}`" in terminal_script
     assert "\\uE0B0" not in terminal_script
     assert "\\uF013" not in terminal_script
     assert "\\u{F0001}" not in terminal_script
@@ -247,6 +279,14 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400" in terminal_script
     assert "const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;" in terminal_script
     assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
+    assert 'TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width"' in terminal_script
+    assert 'TERMINAL_CELL_HEIGHT_PROPERTY = "--termroom-terminal-cell-height"' in terminal_script
+    assert "const terminalStringCellWidth = (value) =>" in terminal_script
+    assert 'service.getStringCellWidth(String(value || ""))' in terminal_script
+    assert 'Object.defineProperty(host, "termroomStringCellWidth"' in terminal_script
+    assert "const publishTerminalMetrics = (cell) =>" in terminal_script
+    assert 'new CustomEvent("termroom:terminal-metrics"' in terminal_script
+    assert "publishTerminalMetrics(cell);" in terminal_script
     assert 'new CustomEvent("termroom:terminal-output"' in terminal_script
     assert 'new CustomEvent("termroom:terminal-activity-changed"' in terminal_script
     assert "workspace_id: host.dataset.workspaceId" in terminal_script
@@ -318,12 +358,12 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"59"}
+    assert versions["app.css"] == {"60"}
     assert versions["app.js"] == {"70"}
     assert versions["remote_run.js"] == {"11"}
-    assert versions["terminal-font.css"] == {"2"}
+    assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"53"}
+    assert versions["terminal.js"] == {"56"}
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:

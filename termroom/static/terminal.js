@@ -20,8 +20,11 @@
   // while lifting only low-contrast foregrounds to normal-text readability.
   // Its theme service clears this contrast cache whenever the theme changes.
   const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;
+  const TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width";
+  const TERMINAL_CELL_HEIGHT_PROPERTY = "--termroom-terminal-cell-height";
+  const KOREAN_TERMINAL_FONT_FAMILY = '"Termroom Korean Terminal"';
   const BUNDLED_TERMINAL_FONT_FAMILY = '"Termroom D2Koding Nerd Mono"';
-  const BUNDLED_TERMINAL_FONT_PROBE = "M\uD55C";
+  const BUNDLED_TERMINAL_FONT_PROBE = "M";
   // Let fast cached/local loads avoid a font swap without holding terminal input
   // behind a slow first-visit font download.
   const BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400;
@@ -77,14 +80,14 @@
       .trim();
     return (
       configured ||
-      'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Cascadia Mono", "Segoe UI Mono", "Noto Sans Mono CJK KR", D2Coding, "Nanum Gothic Coding", "Liberation Mono", monospace'
+      'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Cascadia Mono", "Segoe UI Mono", "Noto Sans Mono CJK KR", D2Coding, "Nanum Gothic Coding", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans CJK KR", "Noto Sans KR", "Liberation Mono", monospace'
     );
   };
   const terminalFontFamily = (includeBundledFont) => {
     const systemFamily = systemTerminalFontFamily();
     return includeBundledFont
-      ? `${BUNDLED_TERMINAL_FONT_FAMILY}, ${systemFamily}`
-      : systemFamily;
+      ? `${KOREAN_TERMINAL_FONT_FAMILY}, ${BUNDLED_TERMINAL_FONT_FAMILY}, ${systemFamily}`
+      : `${KOREAN_TERMINAL_FONT_FAMILY}, ${systemFamily}`;
   };
 
   const beginBundledTerminalFontLoad = () => {
@@ -143,11 +146,55 @@
     }
   }
   term.open(host);
+  const terminalStringCellWidth = (value) => {
+    const service = term._core?.unicodeService;
+    if (typeof service?.getStringCellWidth !== "function") return null;
+    try {
+      const width = Number(service.getStringCellWidth(String(value || "")));
+      return Number.isFinite(width) && width >= 0 ? width : null;
+    } catch {
+      return null;
+    }
+  };
+  Object.defineProperty(host, "termroomStringCellWidth", {
+    configurable: true,
+    value: terminalStringCellWidth,
+  });
+  let terminalMetricSignature = "";
+  const invalidateTerminalMetrics = () => {
+    terminalMetricSignature = "";
+  };
+  const publishTerminalMetrics = (cell) => {
+    const width = Number(cell?.width);
+    const height = Number(cell?.height);
+    if (
+      !Number.isFinite(width)
+      || width <= 0
+      || !Number.isFinite(height)
+      || height <= 0
+    ) return;
+    host.style.setProperty(TERMINAL_CELL_WIDTH_PROPERTY, `${width}px`);
+    host.style.setProperty(TERMINAL_CELL_HEIGHT_PROPERTY, `${height}px`);
+    const signature = [
+      width.toFixed(4),
+      height.toFixed(4),
+      String(term.options.fontFamily || ""),
+      String(term.options.fontSize || ""),
+    ].join("|");
+    if (signature === terminalMetricSignature) return;
+    terminalMetricSignature = signature;
+    window.dispatchEvent(
+      new CustomEvent("termroom:terminal-metrics", {
+        detail: { cellWidth: width, cellHeight: height },
+      }),
+    );
+  };
   const refreshTerminalFont = () => {
     term.clearTextureAtlas?.();
     term.refresh(0, Math.max(0, term.rows - 1));
   };
   document.fonts?.addEventListener?.("loadingdone", () => {
+    invalidateTerminalMetrics();
     refreshTerminalFont();
     scheduleResize(true);
   });
@@ -156,6 +203,7 @@
     bundledTerminalFontLoaded = true;
     host.dataset.terminalFont = "bundled";
     term.options.fontFamily = terminalFontFamily(true);
+    invalidateTerminalMetrics();
     refreshTerminalFont();
     scheduleResize(true);
   });
@@ -352,6 +400,7 @@
   const resizeTerminal = (forceSend = false) => {
     const cell = term._core?._renderService?.dimensions?.css?.cell;
     if (!cell?.width || !cell?.height) return;
+    publishTerminalMetrics(cell);
 
     const style = window.getComputedStyle(host);
     const horizontalPadding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);

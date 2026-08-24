@@ -17,10 +17,10 @@ def test_base_loads_mobile_scrollback_assets() -> None:
         encoding="utf-8"
     )
 
-    assert "mobile_scrollback.css') }}?v=12" in template
-    assert "mobile_scrollback.js') }}?v=28\" defer" in template
+    assert "mobile_scrollback.css') }}?v=15" in template
+    assert "mobile_scrollback.js') }}?v=33\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
-    assert "terminal.js') }}?v=53" in terminal_template
+    assert "terminal.js') }}?v=56" in terminal_template
 
 
 @pytest.mark.asyncio
@@ -37,12 +37,12 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         page = await client.get("/")
-        stylesheet = await client.get("/static/mobile_scrollback.css?v=12")
-        script = await client.get("/static/mobile_scrollback.js?v=28")
+        stylesheet = await client.get("/static/mobile_scrollback.css?v=15")
+        script = await client.get("/static/mobile_scrollback.js?v=33")
 
     assert page.status_code == 401
-    assert "/static/mobile_scrollback.css?v=12" in page.text
-    assert "/static/mobile_scrollback.js?v=28" in page.text
+    assert "/static/mobile_scrollback.css?v=15" in page.text
+    assert "/static/mobile_scrollback.js?v=33" in page.text
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text
     assert "scrollbar-gutter: stable" in stylesheet.text
@@ -135,6 +135,38 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "const parseAnsiHistory = (value) =>" in script
     assert "const applyAnsiHistorySgr = (state, rawParameters) =>" in script
     assert "HISTORY_ANSI_MAX_SEGMENTS = 20_000" in script
+    assert "HISTORY_HANGUL_MAX_RUNS = 20_000" in script
+    assert 'const TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width";' in script
+    assert (
+        'const HISTORY_HANGUL_SPACING_PROPERTY = "--termroom-history-hangul-spacing";'
+        in script
+    )
+    assert "HISTORY_CELL_WIDTH_CACHE_LIMIT = 4096" in script
+    assert "HISTORY_HANGUL_CANDIDATE_PATTERN" in script
+    for unicode_range in (
+        "\\u1100-\\u11ff",
+        "\\u3131-\\u318e",
+        "\\ua960-\\ua97f",
+        "\\uac00-\\ud7a3",
+        "\\ud7b0-\\ud7ff",
+        "\\uffa0-\\uffdc",
+    ):
+        assert unicode_range in script
+    assert 'new Intl.Segmenter(undefined, { granularity: "grapheme" })' in script
+    assert "function* manualHistoryGraphemes(value)" in script
+    assert "function* historyGraphemes(value)" in script
+    assert "yield* manualHistoryGraphemes(value);" in script
+    assert "const historyHangulType = (codePoint) =>" in script
+    assert "const historyCellWidth = (value) =>" in script
+    assert "terminalHost.termroomStringCellWidth" in script
+    assert "fallbackHistoryCellWidth(value)" in script
+    assert "const appendHistoryText = (parent, text, budget) =>" in script
+    assert 'wide.className = "terminal-scroll-history-hangul";' in script
+    assert 'wide.className = "terminal-scroll-history-cell-cluster";' in script
+    assert 'wide.style.setProperty("--termroom-history-cell-count", String(cellWidth));' in script
+    assert 'probe.textContent = "한";' in script
+    assert "cellWidth * 2 - naturalHangulWidth" in script
+    assert 'window.addEventListener("termroom:terminal-metrics", syncHistoryMetrics);' in script
     assert 'history.dataset.rendering = rendered.styled ? "ansi" : "plain";' in script
     assert "history.replaceChildren(rendered.fragment);" in script
     assert "document.createElement(\"span\")" in script
@@ -171,6 +203,12 @@ def test_mobile_scrollback_is_native_touch_scrollable() -> None:
     assert "width: revert;" in stylesheet
     assert "overscroll-behavior: contain;" in stylesheet
     assert "white-space: pre-wrap;" in stylesheet
+    assert ".terminal-scroll-history-hangul {" in stylesheet
+    assert "letter-spacing: var(--termroom-history-hangul-spacing, 0px);" in stylesheet
+    assert ".terminal-scroll-history-cell-cluster {" in stylesheet
+    assert "var(--termroom-history-cell-count, 2)" in stylesheet
+    assert "vertical-align: baseline;" in stylesheet
+    assert "overflow: visible;" in stylesheet
     assert ".terminal-scroll-native-selection .xterm" in stylesheet
     assert ".terminal-scroll-native-selection .xterm .xterm-rows > div" in stylesheet
     assert "user-select: text;" in stylesheet

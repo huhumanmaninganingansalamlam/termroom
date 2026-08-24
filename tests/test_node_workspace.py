@@ -630,26 +630,30 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
                 ),
             "Enter",
         )
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 4
         full = ""
+        history = ""
         while time.monotonic() < deadline:
             full = runtime._handle_sync(
                 "terminal.scrollback",
                 {**payload, "tmux_window": window, "lines": 200},
             )["output"]
-            if live_marker in full.splitlines():
+            history = runtime._handle_sync(
+                "terminal.scrollback",
+                {
+                    **payload,
+                    "tmux_window": window,
+                    "lines": 200,
+                    "history_only": True,
+                },
+            )["output"]
+            if (
+                live_marker in full.splitlines()
+                and old_marker in history.splitlines()
+            ):
                 break
             time.sleep(0.05)
 
-        history = runtime._handle_sync(
-            "terminal.scrollback",
-            {
-                **payload,
-                "tmux_window": window,
-                "lines": 200,
-                "history_only": True,
-            },
-        )["output"]
         assert old_marker in history.splitlines()
         assert live_marker in full.splitlines()
         assert live_marker not in history.splitlines()
@@ -1350,6 +1354,95 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         ("send", b"pwd\r"),
         ("send", b"legacy"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeStore:
+        def touch_terminal(self, _terminal_id: str) -> None:
+            return None
+
+        def touch_terminal_output(self, _terminal_id: str) -> None:
+            return None
+
+    class FakeStream:
+        def __aiter__(self) -> FakeStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def control(self, action: str, **values: Any) -> None:
+            events.append((action, values))
+
+        async def send(self, _value: bytes) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    stream = FakeStream()
+
+    class FakeConnection:
+        async def open_stream(
+            self, _operation: str, _payload: dict[str, Any]
+        ) -> tuple[dict[str, Any], FakeStream]:
+            return {"bootstrap_grid": True}, stream
+
+    class FakeNodes:
+        def connection(self, _computer_id: str) -> FakeConnection:
+            return FakeConnection()
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages = [
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps({"kind": "resize", "rows": 33, "cols": 162}),
+                },
+                {"type": "websocket.disconnect", "code": 1000},
+            ]
+
+        async def receive(self) -> dict[str, Any]:
+            return self.messages.pop(0)
+
+        async def send_text(self, _value: str) -> None:
+            return None
+
+        async def close(self, *, code: int, reason: str) -> None:
+            raise AssertionError((code, reason))
+
+    control = TerminalControl()
+    access = RemoteAccess(
+        FakeStore(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        FakeNodes(),  # type: ignore[arg-type]
+        control,
+    )
+
+    async def ensure_workspace(_workspace: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
+    access.ensure_workspace = ensure_workspace  # type: ignore[method-assign]
+    await access.bridge(
+        FakeWebSocket(),  # type: ignore[arg-type]
+        {
+            "id": "workspace",
+            "path": "/project",
+            "tmux_session": "termroom-project",
+            "computer": {"id": "node", "connection_method": "node"},
+        },
+        {"id": "terminal", "tmux_window": "@1"},
+        device_id="device",
+    )
+
+    assert events == [
+        ("resize", {"rows": 33, "cols": 162, "affects_grid": True})
+    ]
+    assert control.presence("terminal")["input_revision"] == 0
 
 
 @pytest.mark.asyncio

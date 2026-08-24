@@ -9,8 +9,12 @@ class TerminalControl:
 
     Only the client that most recently sent real user input may resize the
     shared tmux grid. Connections, focus changes, reloads, and passive viewport
-    resizes never claim ownership. If the input owner disconnects, the existing
-    grid stays unchanged until another client sends real user input.
+    resizes never claim ownership. A newly created tmux grid is the sole
+    exception: its first browser client may establish the default 80x24 pane's
+    initial size so a fresh Workspace does not render tmux padding until the
+    first keystroke. Real input still replaces that bootstrap owner normally.
+    If the input owner disconnects, the existing grid stays unchanged until
+    another client sends real user input.
     """
 
     def __init__(self) -> None:
@@ -18,6 +22,8 @@ class TerminalControl:
         self._clients: dict[str, list[str]] = {}
         self._client_devices: dict[str, dict[str, str]] = {}
         self._input_owners: dict[str, str] = {}
+        self._bootstrap_pending: set[str] = set()
+        self._bootstrap_owners: dict[str, str] = {}
         self._input_revisions: dict[str, int] = {}
         self._last_input_devices: dict[str, str] = {}
         self._applied_resizes: dict[str, tuple[str, int, int]] = {}
@@ -30,12 +36,33 @@ class TerminalControl:
             clients.append(client_id)
             if safe_device_id:
                 self._client_devices.setdefault(terminal_id, {})[client_id] = safe_device_id
+            if (
+                terminal_id in self._bootstrap_pending
+                and terminal_id not in self._input_owners
+                and terminal_id not in self._bootstrap_owners
+            ):
+                self._bootstrap_owners[terminal_id] = client_id
         return client_id
+
+    def mark_grid_fresh(self, terminal_id: str, *, client_id: str = "") -> None:
+        """Let the first browser establish a newly created tmux grid before input."""
+
+        with self._lock:
+            self._bootstrap_pending.add(terminal_id)
+            if (
+                client_id
+                and client_id in self._clients.get(terminal_id, [])
+                and terminal_id not in self._input_owners
+                and terminal_id not in self._bootstrap_owners
+            ):
+                self._bootstrap_owners[terminal_id] = client_id
 
     def mark_input(self, terminal_id: str, client_id: str, device_id: str = "") -> None:
         with self._lock:
             if client_id in self._clients.get(terminal_id, []):
                 self._input_owners[terminal_id] = client_id
+                self._bootstrap_pending.discard(terminal_id)
+                self._bootstrap_owners.pop(terminal_id, None)
                 self._input_revisions[terminal_id] = self._input_revisions.get(terminal_id, 0) + 1
                 if device_id:
                     self._last_input_devices[terminal_id] = device_id
@@ -73,6 +100,8 @@ class TerminalControl:
             if self._applied_resizes.get(terminal_id) == requested:
                 return True, False
             self._applied_resizes[terminal_id] = requested
+            if self._bootstrap_owners.get(terminal_id) == client_id:
+                self._bootstrap_pending.discard(terminal_id)
             return True, True
 
     def _resize_owner(self, terminal_id: str) -> str | None:
@@ -82,6 +111,9 @@ class TerminalControl:
         input_owner = self._input_owners.get(terminal_id)
         if input_owner in clients:
             return input_owner
+        bootstrap_owner = self._bootstrap_owners.get(terminal_id)
+        if bootstrap_owner in clients:
+            return bootstrap_owner
         return None
 
     def unregister(self, terminal_id: str, client_id: str) -> None:
@@ -90,6 +122,7 @@ class TerminalControl:
             if not clients:
                 self._client_devices.pop(terminal_id, None)
                 self._input_owners.pop(terminal_id, None)
+                self._bootstrap_owners.pop(terminal_id, None)
                 self._applied_resizes.pop(terminal_id, None)
                 return
             try:
@@ -103,10 +136,13 @@ class TerminalControl:
                 self._clients.pop(terminal_id, None)
                 self._client_devices.pop(terminal_id, None)
                 self._input_owners.pop(terminal_id, None)
+                self._bootstrap_owners.pop(terminal_id, None)
                 self._applied_resizes.pop(terminal_id, None)
                 return
             if self._input_owners.get(terminal_id) == client_id:
                 self._input_owners.pop(terminal_id, None)
+            if self._bootstrap_owners.get(terminal_id) == client_id:
+                self._bootstrap_owners.pop(terminal_id, None)
             if self._applied_resizes.get(terminal_id, (None, 0, 0))[0] == client_id:
                 self._applied_resizes.pop(terminal_id, None)
 

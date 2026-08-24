@@ -2,6 +2,14 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.17] - 2026-08-24
+
+### Fixed
+
+- Size a newly recreated tmux grid from its first browser viewport without allowing passive devices to take over an established terminal.
+- Recover a missing canonical Workspace tmux session from surviving browser views while preserving linked windows, active panes, and scrollback across Local, SSH, and Node backends.
+- Render composed, decomposed, compatibility, halfwidth, extended, and tone-mark Hangul in historical output using xterm's active Unicode cell widths while preserving ANSI styling, wrapping, selection, and copied text.
+
 ## [0.3.16] - 2026-08-24
 
 ### Added

@@ -40,6 +40,36 @@ def test_new_connections_stay_passive_until_someone_types() -> None:
     assert not control.can_resize("term", third)
 
 
+def test_fresh_grid_bootstraps_only_its_first_browser_client() -> None:
+    control = TerminalControl()
+    control.mark_grid_fresh("term")
+    first = control.register("term", device_id="device-a")
+    second = control.register("term", device_id="device-b")
+
+    assert control.can_resize("term", first)
+    assert not control.can_resize("term", second)
+    assert control.presence("term")["input_revision"] == 0
+    assert control.resize_plan("term", first, rows=33, cols=162) == (True, True)
+
+    control.unregister("term", first)
+    assert not control.can_resize("term", second)
+
+
+def test_fresh_grid_retries_when_the_bootstrap_client_disconnects_before_resize() -> None:
+    control = TerminalControl()
+    control.mark_grid_fresh("term")
+    first = control.register("term")
+    assert control.can_resize("term", first)
+
+    control.unregister("term", first)
+    second = control.register("term")
+
+    assert control.can_resize("term", second)
+    control.mark_input("term", second)
+    assert control.can_resize("term", second)
+    assert control.presence("term")["input_revision"] == 1
+
+
 def test_presence_reports_client_count_and_input_device() -> None:
     control = TerminalControl()
     first = control.register("term")

@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -97,6 +97,7 @@ from termroom.security import (
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
     TERMINAL_EDITOR_WRAPPER,
+    TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
     TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
     TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
@@ -468,6 +469,8 @@ class NodeRuntime:
         self._workspace_command_locks: dict[str, threading.RLock] = {}
         self._workspace_command_locks_guard = threading.Lock()
         self._browser_grid_resize_lock = threading.RLock()
+        self._fresh_grid_windows: set[str] = set()
+        self._fresh_grid_windows_lock = threading.Lock()
 
     async def handle(
         self,
@@ -988,10 +991,77 @@ class NodeRuntime:
     def _ensure_workspace(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         root = self._workspace_path(payload)
         session = self._session(payload)
-        if self._tmux("has-session", "-t", session, check=False).returncode:
-            self._tmux("new-session", "-d", "-s", session, "-c", str(root), "-n", "shell")
+        session_missing = bool(
+            self._tmux("has-session", "-t", session, check=False).returncode
+        )
+        created_session = False
+        if session_missing and not self._recover_workspace_from_browser_view(session):
+            self._tmux(
+                "new-session", "-d", "-s", session, "-c", str(root), "-n", "shell"
+            )
+            created_session = True
         self._tmux("set-window-option", "-t", session, "window-size", "latest", check=False)
-        return self._list_terminals(session)
+        terminals = self._list_terminals(session)
+        if created_session:
+            self._mark_fresh_grid_windows(terminals)
+        return terminals
+
+    def _browser_views_for_group(self, session: str) -> list[tuple[str, bool]]:
+        listed = self._tmux(
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_group}\t#{session_attached}",
+            check=False,
+        )
+        if listed.returncode:
+            return []
+        views: list[tuple[str, bool]] = []
+        for line in listed.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if (
+                len(parts) == 3
+                and parts[0].startswith(TMUX_BROWSER_VIEW_PREFIX)
+                and parts[1] == session
+                and parts[2].isdigit()
+            ):
+                views.append((parts[0], int(parts[2]) > 0))
+        return views
+
+    def _recover_workspace_from_browser_view(self, session: str) -> bool:
+        views = self._browser_views_for_group(session)
+        for view_session, _attached in views:
+            restored = self._tmux(
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-t",
+                view_session,
+                check=False,
+            )
+            if restored.returncode:
+                continue
+            for stale_view, attached in views:
+                if not attached:
+                    self._tmux("kill-session", "-t", stale_view, check=False)
+            return True
+        for view_session, _attached in views:
+            self._tmux("kill-session", "-t", view_session, check=False)
+        return False
+
+    def _mark_fresh_grid_windows(self, terminals: Iterable[Mapping[str, Any]]) -> None:
+        with self._fresh_grid_windows_lock:
+            self._fresh_grid_windows.update(
+                str(terminal["tmux_window"]) for terminal in terminals
+            )
+
+    def _fresh_grid_window(self, window: str) -> bool:
+        with self._fresh_grid_windows_lock:
+            return window in self._fresh_grid_windows
+
+    def _complete_fresh_grid_window(self, window: str) -> None:
+        with self._fresh_grid_windows_lock:
+            self._fresh_grid_windows.discard(window)
 
     def _workspace_command_lock(self, session: str) -> threading.RLock:
         with self._workspace_command_locks_guard:
@@ -1221,7 +1291,11 @@ class NodeRuntime:
             str(root),
         )
         window = result.stdout.strip()
-        return next(item for item in self._list_terminals(session) if item["tmux_window"] == window)
+        terminal = next(
+            item for item in self._list_terminals(session) if item["tmux_window"] == window
+        )
+        self._mark_fresh_grid_windows((terminal,))
+        return terminal
 
     def _open_terminal_editor(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         root = self._workspace_path(payload)
@@ -1445,6 +1519,7 @@ class NodeRuntime:
         session = self._session(payload)
         self._ensure_workspace(payload)
         window = self._window(payload, session)
+        bootstrap_grid = self._fresh_grid_window(window)
         stream_id = validate_request_id(str(payload.get("stream_id") or ""))
         rows = max(4, min(int(payload.get("rows") or 24), 500))
         cols = max(20, min(int(payload.get("cols") or 80), 1000))
@@ -1493,10 +1568,18 @@ class NodeRuntime:
             set_grid_resize=lambda enabled: self._set_browser_view_grid_resize(
                 view_session, enabled=enabled
             ),
+            grid_resize_applied=(
+                lambda: self._complete_fresh_grid_window(window)
+                if bootstrap_grid
+                else None
+            ),
             cleanup=lambda: self._tmux("kill-session", "-t", view_session, check=False),
         )
         self.streams[stream_id] = stream
-        return OperationResult({"stream_id": stream_id}, start=stream.start)
+        return OperationResult(
+            {"stream_id": stream_id, "bootstrap_grid": bootstrap_grid},
+            start=stream.start,
+        )
 
     def _set_browser_view_grid_resize(self, view_session: str, *, enabled: bool) -> bool:
         with self._browser_grid_resize_lock:
@@ -2508,6 +2591,7 @@ class TerminalAgentStream:
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
         registry: dict[str, AgentStream],
         set_grid_resize: Callable[[bool], bool] | None = None,
+        grid_resize_applied: Callable[[], object] | None = None,
         cleanup: Callable[[], object] | None = None,
     ) -> None:
         self.stream_id = stream_id
@@ -2516,6 +2600,7 @@ class TerminalAgentStream:
         self.send = send
         self.registry = registry
         self.set_grid_resize = set_grid_resize
+        self.grid_resize_applied = grid_resize_applied
         self.cleanup = cleanup
         self.grid_active = False
         self.last_viewport: tuple[int, int] | None = None
@@ -2569,6 +2654,10 @@ class TerminalAgentStream:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(self.process_pid, signal.SIGWINCH)
         self.last_viewport = viewport
+        if affects_grid and self.grid_resize_applied is not None:
+            callback = self.grid_resize_applied
+            self.grid_resize_applied = None
+            await asyncio.to_thread(callback)
 
     async def close(self) -> None:
         if self.closed:

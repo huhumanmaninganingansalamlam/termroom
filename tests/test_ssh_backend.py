@@ -1014,6 +1014,27 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
         manager = WorkspaceManager(RootManager(local_root), store)
         workspace = manager.open_remote(computer["id"], canonical, "remote-qa")
         terminal = backend.ensure_workspace(workspace)[0]
+        stale_view = tmux_browser_view_session(uuid.uuid4().hex)
+        backend._exec(
+            computer,
+            "tmux new-session -d "
+            f"-s {shlex.quote(stale_view)} -t {shlex.quote(str(workspace['tmux_session']))}",
+        )
+        backend._exec(
+            computer,
+            f"tmux kill-session -t {shlex.quote(str(workspace['tmux_session']))}",
+        )
+        recovered_terminal = backend.ensure_workspace(workspace)[0]
+        assert recovered_terminal["tmux_window"] == terminal["tmux_window"]
+        assert (
+            backend._exec(
+                computer,
+                f"tmux has-session -t {shlex.quote(stale_view)} 2>/dev/null "
+                "&& echo present || echo absent",
+            ).strip()
+            == "absent"
+        )
+        terminal = recovered_terminal
         remote_home = backend.home_directory(computer)
         server_workspace = manager.open_server_terminal(computer["id"], remote_home)
         server_terminal = backend.ensure_workspace(server_workspace)[0]

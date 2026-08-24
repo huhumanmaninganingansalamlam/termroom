@@ -14,6 +14,12 @@
   const NATIVE_COPY_SELECTION_CLASS = "terminal-scroll-native-selection";
   const HISTORY_ANSI_MAX_CHARS = 2_000_000;
   const HISTORY_ANSI_MAX_SEGMENTS = 20_000;
+  const HISTORY_HANGUL_MAX_RUNS = 20_000;
+  const HISTORY_CELL_WIDTH_CACHE_LIMIT = 4096;
+  const TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width";
+  const HISTORY_HANGUL_SPACING_PROPERTY = "--termroom-history-hangul-spacing";
+  const HISTORY_HANGUL_CANDIDATE_PATTERN =
+    /[\u1100-\u11ff\u302e\u302f\u3131-\u318e\ua960-\ua97f\uac00-\ud7a3\ud7b0-\ud7ff\uffa0-\uffdc]+/gu;
   const ANSI_COLOR_VARIABLES = [
     "--terminal-black",
     "--terminal-red",
@@ -73,6 +79,11 @@
   let liveFollowing = true;
   let nativeCopySelectionActive = false;
   let nativeCopyPointerDown = false;
+  let historyHangulMetricKey = "";
+  const historyCellWidthCache = new Map();
+  const historyGraphemeSegmenter = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
 
   const normalizeText = (value) =>
     String(value || "")
@@ -88,6 +99,190 @@
       .replace(/\x1b[@-_]/g, "")
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
       .replace(/\n+$/, "");
+
+  const historyCodePoint = (value, offset) => {
+    const codePoint = value.codePointAt(offset);
+    return {
+      codePoint,
+      length: codePoint > 0xffff ? 2 : 1,
+    };
+  };
+
+  const historyHangulType = (codePoint) => {
+    if (
+      (codePoint >= 0x1100 && codePoint <= 0x115f)
+      || (codePoint >= 0xa960 && codePoint <= 0xa97c)
+    ) return "L";
+    if (
+      (codePoint >= 0x1160 && codePoint <= 0x11a7)
+      || (codePoint >= 0xd7b0 && codePoint <= 0xd7c6)
+    ) return "V";
+    if (
+      (codePoint >= 0x11a8 && codePoint <= 0x11ff)
+      || (codePoint >= 0xd7cb && codePoint <= 0xd7fb)
+    ) return "T";
+    if (codePoint >= 0xac00 && codePoint <= 0xd7a3) {
+      return (codePoint - 0xac00) % 28 === 0 ? "LV" : "LVT";
+    }
+    return "other";
+  };
+
+  function* manualHistoryGraphemes(value) {
+    let offset = 0;
+    const consume = (types) => {
+      while (offset < value.length) {
+        const next = historyCodePoint(value, offset);
+        if (!types.includes(historyHangulType(next.codePoint))) break;
+        offset += next.length;
+      }
+    };
+    while (offset < value.length) {
+      const start = offset;
+      const first = historyCodePoint(value, offset);
+      const type = historyHangulType(first.codePoint);
+      offset += first.length;
+      if (type === "L") {
+        consume(["L"]);
+        if (offset < value.length) {
+          const next = historyCodePoint(value, offset);
+          if (historyHangulType(next.codePoint) === "V") {
+            consume(["V"]);
+            consume(["T"]);
+          }
+        }
+      } else if (type === "LV" || type === "V") {
+        consume(["V"]);
+        consume(["T"]);
+      } else if (type === "LVT" || type === "T") {
+        consume(["T"]);
+      }
+      while (offset < value.length) {
+        const next = historyCodePoint(value, offset);
+        if (next.codePoint !== 0x302e && next.codePoint !== 0x302f) break;
+        offset += next.length;
+      }
+      yield value.slice(start, offset);
+    }
+  }
+
+  function* historyGraphemes(value) {
+    if (!historyGraphemeSegmenter) {
+      yield* manualHistoryGraphemes(value);
+      return;
+    }
+    for (const item of historyGraphemeSegmenter.segment(value)) {
+      yield item.segment;
+    }
+  }
+
+  const fallbackHistoryCellWidth = (value) => {
+    let width = 0;
+    for (const character of value) {
+      const codePoint = character.codePointAt(0);
+      if (
+        (codePoint >= 0x1100 && codePoint <= 0x115f)
+        || (codePoint >= 0x302e && codePoint <= 0x302f)
+        || (codePoint >= 0x3131 && codePoint <= 0x318e)
+        || (codePoint >= 0xa960 && codePoint <= 0xa97c)
+        || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+      ) width += 2;
+      else if (
+        (codePoint >= 0x1160 && codePoint <= 0x11ff)
+      ) width += 0;
+      else width += 1;
+    }
+    return width;
+  };
+
+  const historyCellWidth = (value) => {
+    if (historyCellWidthCache.has(value)) return historyCellWidthCache.get(value);
+    const measure = terminalHost.termroomStringCellWidth;
+    let width = typeof measure === "function" ? Number(measure(value)) : Number.NaN;
+    if (!Number.isInteger(width) || width < 0) {
+      width = fallbackHistoryCellWidth(value);
+    }
+    if (historyCellWidthCache.size < HISTORY_CELL_WIDTH_CACHE_LIMIT) {
+      historyCellWidthCache.set(value, width);
+    }
+    return width;
+  };
+
+  const appendHistoryCellSpan = (
+    parent,
+    text,
+    budget,
+    cellWidth = 2,
+    { letterSpaced = false } = {},
+  ) => {
+    if (budget.hangulRuns >= HISTORY_HANGUL_MAX_RUNS) return false;
+    const wide = document.createElement("span");
+    if (letterSpaced) {
+      wide.className = "terminal-scroll-history-hangul";
+    } else {
+      wide.className = "terminal-scroll-history-cell-cluster";
+      wide.style.setProperty("--termroom-history-cell-count", String(cellWidth));
+    }
+    wide.textContent = text;
+    parent.append(wide);
+    budget.hangulRuns += 1;
+    return true;
+  };
+
+  const appendHistoryText = (parent, text, budget) => {
+    let offset = 0;
+    for (const match of text.matchAll(HISTORY_HANGUL_CANDIDATE_PATTERN)) {
+      const index = Number(match.index);
+      const candidate = match[0];
+      if (index > offset) {
+        parent.append(document.createTextNode(text.slice(offset, index)));
+      }
+      const graphemes = historyGraphemes(candidate);
+      let candidateOffset = 0;
+      let simpleRunStart = -1;
+      const flushSimpleRun = (end) => {
+        if (simpleRunStart < 0) return true;
+        const appended = appendHistoryCellSpan(
+          parent,
+          candidate.slice(simpleRunStart, end),
+          budget,
+          2,
+          { letterSpaced: true },
+        );
+        simpleRunStart = -1;
+        return appended;
+      };
+      for (const grapheme of graphemes) {
+        const start = candidateOffset;
+        candidateOffset += grapheme.length;
+        const cellWidth = historyCellWidth(grapheme);
+        const simpleWideCharacter = cellWidth === 2 && grapheme.length === 1;
+        if (simpleWideCharacter) {
+          if (simpleRunStart < 0) simpleRunStart = start;
+          continue;
+        }
+        if (!flushSimpleRun(start)) {
+          parent.append(document.createTextNode(candidate.slice(start) + text.slice(index + candidate.length)));
+          return;
+        }
+        if (cellWidth >= 0) {
+          if (!appendHistoryCellSpan(parent, grapheme, budget, cellWidth)) {
+            parent.append(document.createTextNode(candidate.slice(start) + text.slice(index + candidate.length)));
+            return;
+          }
+        } else {
+          parent.append(document.createTextNode(grapheme));
+        }
+      }
+      if (!flushSimpleRun(candidate.length)) {
+        parent.append(document.createTextNode(text.slice(index + candidate.length)));
+        return;
+      }
+      offset = index + candidate.length;
+    }
+    if (offset < text.length) {
+      parent.append(document.createTextNode(text.slice(offset)));
+    }
+  };
 
   const createAnsiHistoryState = () => ({
     bold: false,
@@ -220,7 +415,7 @@
   const plainAnsiHistoryResult = (value) => {
     const text = stripAnsiHistoryControls(value);
     const fragment = document.createDocumentFragment();
-    if (text) fragment.append(document.createTextNode(text));
+    if (text) appendHistoryText(fragment, text, { hangulRuns: 0 });
     return { fragment, text, styled: false };
   };
 
@@ -307,14 +502,15 @@
     if (removedTrailing) plainText = plainText.slice(0, -removedTrailing);
 
     const fragment = document.createDocumentFragment();
+    const historyTextBudget = { hangulRuns: 0 };
     for (const segment of segments) {
       if (!Object.keys(segment.style).length) {
-        fragment.append(document.createTextNode(segment.text));
+        appendHistoryText(fragment, segment.text, historyTextBudget);
         continue;
       }
       const span = document.createElement("span");
       Object.assign(span.style, segment.style);
-      span.textContent = segment.text;
+      appendHistoryText(span, segment.text, historyTextBudget);
       fragment.append(span);
     }
     return { fragment, text: plainText, styled };
@@ -454,6 +650,51 @@
     if (rowHeight > 0) history.style.lineHeight = `${rowHeight}px`;
     history.style.paddingLeft = hostStyle.paddingLeft;
     history.style.paddingRight = hostStyle.paddingRight;
+
+    const cellWidth = Number.parseFloat(
+      terminalHost.style.getPropertyValue(TERMINAL_CELL_WIDTH_PROPERTY),
+    );
+    const hangulMetricKey = [
+      history.style.fontFamily,
+      history.style.fontSize,
+      Number.isFinite(cellWidth) ? cellWidth.toFixed(4) : "",
+    ].join("|");
+    if (
+      Number.isFinite(cellWidth)
+      && cellWidth > 0
+      && hangulMetricKey !== historyHangulMetricKey
+    ) {
+      const probe = document.createElement("span");
+      probe.textContent = "한";
+      Object.assign(probe.style, {
+        position: "absolute",
+        left: "-10000px",
+        top: "0",
+        visibility: "hidden",
+        pointerEvents: "none",
+        whiteSpace: "pre",
+        fontFamily: history.style.fontFamily,
+        fontSize: history.style.fontSize,
+        fontStyle: "normal",
+        fontWeight: "400",
+        fontVariantLigatures: "none",
+        fontFeatureSettings: '"liga" 0, "calt" 0',
+        letterSpacing: "normal",
+      });
+      document.body.append(probe);
+      const naturalHangulWidth = probe.getBoundingClientRect().width;
+      probe.remove();
+      if (Number.isFinite(naturalHangulWidth) && naturalHangulWidth > 0) {
+        const hangulSpacing = Math.max(0, cellWidth * 2 - naturalHangulWidth);
+        history.style.setProperty(
+          HISTORY_HANGUL_SPACING_PROPERTY,
+          `${hangulSpacing}px`,
+        );
+        history.dataset.hangulCellWidth = cellWidth.toFixed(3);
+        history.dataset.hangulAdvance = (naturalHangulWidth + hangulSpacing).toFixed(3);
+        historyHangulMetricKey = hangulMetricKey;
+      }
+    }
   };
 
   const syncLiveHeight = () => {
@@ -939,6 +1180,7 @@
   resizeObserver.observe(surface);
 
   window.addEventListener("focus", () => scheduleHistoryRefresh({ urgent: true }));
+  window.addEventListener("termroom:terminal-metrics", syncHistoryMetrics);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) scheduleHistoryRefresh({ urgent: true });
   });
@@ -954,6 +1196,7 @@
     forceNextHistoryRefresh = true;
     renderedHistoryText = "";
     historyEtag = "";
+    historyHangulMetricKey = "";
     history.textContent = "";
     history.hidden = true;
     touchGesture = null;
