@@ -410,7 +410,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"61"}
     assert versions["app.js"] == {"70"}
-    assert versions["remote_run.js"] == {"11"}
+    assert versions["remote_run.js"] == {"12"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
     assert versions["terminal.js"] == {"57"}
@@ -505,6 +505,68 @@ def test_remote_run_result_zip_is_the_primary_completed_run_action() -> None:
         collect_template
     )
     assert 'class="primary-button" type="submit"' in collect_template
+
+
+def test_remote_workspace_connection_freshness_is_transition_deduped() -> None:
+    templates_dir = VENDOR_DIR.parents[1] / "templates"
+    workspace_template = (templates_dir / "workspace_base.html").read_text(
+        encoding="utf-8"
+    )
+    remote_run_script = (VENDOR_DIR.parent / "remote_run.js").read_text(
+        encoding="utf-8"
+    )
+
+    status_wrapper = re.search(
+        r"<span[^>]*data-run-workspace-connection[^>]*>", workspace_template
+    )
+    assert status_wrapper is not None
+    assert 'role="status"' in status_wrapper.group(0)
+    assert 'aria-live="polite"' in status_wrapper.group(0)
+    assert 'aria-atomic="true"' in status_wrapper.group(0)
+    assert " hidden" not in status_wrapper.group(0)
+
+    visual_chip = re.search(
+        r"<span[^>]*data-run-workspace-connection-chip[^>]*>", workspace_template
+    )
+    assert visual_chip is not None
+    assert 'class="state-chip remote-run-connection-state"' in visual_chip.group(0)
+    assert 'aria-hidden="true"' in visual_chip.group(0)
+    assert " hidden" in visual_chip.group(0)
+    assert "{{ t('remote_run.connection_rechecking') }}" in workspace_template
+    assert (
+        '<span class="sr-only" data-run-workspace-connection-announcer></span>'
+        in workspace_template
+    )
+
+    workspace_start = remote_run_script.index(
+        '  const workspaceRun = document.querySelector("[data-remote-run-workspace]");'
+    )
+    workspace_end = remote_run_script.index(
+        "  const recentRuns = [...document.querySelectorAll", workspace_start
+    )
+    workspace_script = remote_run_script[workspace_start:workspace_end]
+    for behavior in (
+        'querySelector("[data-run-workspace-connection-chip]")',
+        'querySelector("[data-run-workspace-connection-announcer]")',
+        "let connectionUnavailable = false;",
+        "const setConnectionUnavailable = (unavailable) =>",
+        "if (connectionUnavailable === unavailable) return;",
+        "connectionChip.hidden = !unavailable;",
+        'tr("remote_run.connection_rechecking")',
+        'if (result.connection !== "online") {',
+        "setConnectionUnavailable(true);",
+        "setConnectionUnavailable(false);",
+        "window.setInterval(poll, 1500);",
+    ):
+        assert behavior in workspace_script
+    assert workspace_script.count("setConnectionUnavailable(true);") == 2
+    assert workspace_script.index('if (result.connection !== "online") {') < (
+        workspace_script.index('if (!["preparing", "running"].includes(result.state))')
+    )
+    assert workspace_script.index("setConnectionUnavailable(false);") < (
+        workspace_script.index('if (!["preparing", "running"].includes(result.state))')
+    )
+    assert ".focus(" not in workspace_script
 
 
 def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
