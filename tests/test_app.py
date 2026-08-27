@@ -118,7 +118,7 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=60'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=61'
     script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=70'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
@@ -676,7 +676,61 @@ async def test_terminal_page_exposes_shell_tabs_for_in_place_switching(tmp_path:
         assert "data-terminal-output-link" in response.text
         assert "data-terminal-manage-form" in response.text
         assert "data-terminal-name-input" in response.text
-        assert 'terminal.js?v=56' in response.text
+        assert 'terminal.js?v=57' in response.text
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_display_screen_reader_mode_is_opt_in_and_localized(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    terminal = app.state.terminals.ensure_workspace(workspace)[0]
+    terminal_url = f"/w/{workspace['id']}/terminal?terminal={terminal['id']}"
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            korean = await client.get(terminal_url)
+
+            assert korean.status_code == 200
+            assert 'id="terminal-screen-reader-mode"' in korean.text
+            assert 'type="checkbox"' in korean.text
+            assert (
+                'aria-describedby="terminal-screen-reader-mode-help"' in korean.text
+            )
+            assert "스크린 리더 모드" in korean.text
+            assert (
+                "켜져 있는 동안 실시간 터미널 버퍼를 스크린 리더에 노출합니다. "
+                "페이지를 완전히 다시 불러오면 꺼집니다."
+                in korean.text
+            )
+
+            client.cookies.set("termroom_locale", "en")
+            english = await client.get(terminal_url)
+
+            assert english.status_code == 200
+            assert "Screen reader mode" in english.text
+            assert (
+                "Expose the live terminal buffer to screen readers while this is on. "
+                "It turns off when the page is fully reloaded."
+                in english.text
+            )
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],

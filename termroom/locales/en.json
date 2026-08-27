@@ -633,6 +633,8 @@
   "terminal.font_smaller": "Decrease font size",
   "terminal.font_larger": "Increase font size",
   "terminal.font_reset": "Default",
+  "terminal.screen_reader_mode": "Screen reader mode",
+  "terminal.screen_reader_mode_help": "Expose the live terminal buffer to screen readers while this is on. It turns off when the page is fully reloaded.",
   "terminal.name": "Terminal name",
   "terminal.rename": "Rename",
   "terminal.close": "Close terminal",

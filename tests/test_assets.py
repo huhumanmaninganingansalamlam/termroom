@@ -256,6 +256,18 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     terminal_template = (VENDOR_DIR.parents[1] / "templates/terminal.html").read_text(
         encoding="utf-8"
     )
+    assert 'id="terminal-screen-reader-mode"' in terminal_template
+    assert 'for="terminal-screen-reader-mode"' in terminal_template
+    assert 'aria-describedby="terminal-screen-reader-mode-help"' in terminal_template
+    assert 'id="terminal-screen-reader-mode-help"' in terminal_template
+    screen_reader_input = re.search(
+        r'<input id="terminal-screen-reader-mode"[^>]*>', terminal_template
+    )
+    assert screen_reader_input is not None
+    assert 'type="checkbox"' in screen_reader_input.group(0)
+    assert 'autocomplete="off"' in screen_reader_input.group(0)
+    assert re.search(r"\schecked(?:\s|=|>)", screen_reader_input.group(0)) is None
+    assert re.search(r"\sname=", screen_reader_input.group(0)) is None
     assert str(TERMINAL_FONT_ASSETS["core_hangul"]["filename"]) in terminal_template
     assert "data-terminal-command-clear-target" in terminal_template
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
@@ -279,6 +291,44 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400" in terminal_script
     assert "const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;" in terminal_script
     assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
+    assert "screenReaderMode: false," in terminal_script
+    assert (
+        'const screenReaderModeToggle = document.querySelector('
+        '"#terminal-screen-reader-mode");' in terminal_script
+    )
+    assert "screenReaderModeToggle.checked = false;" in terminal_script
+    assert "term.options.screenReaderMode = false;" in terminal_script
+    assert terminal_script.count("new window.Terminal(") == 1
+    assert re.search(
+        r'screenReaderModeToggle\?\.addEventListener\("change", \(\) => \{\s*'
+        r"term\.options\.screenReaderMode = screenReaderModeToggle\.checked;\s*"
+        r"\}\);",
+        terminal_script,
+    )
+    screen_reader_query_at = terminal_script.index(
+        'const screenReaderModeToggle = document.querySelector('
+    )
+    screen_reader_checked_reset_at = terminal_script.index(
+        "screenReaderModeToggle.checked = false;"
+    )
+    first_font_await_at = terminal_script.index("await bundledTerminalFontLoad.initial")
+    terminal_constructor_at = terminal_script.index("new window.Terminal(")
+    terminal_open_at = terminal_script.index("term.open(host);")
+    screen_reader_option_reset_at = terminal_script.index(
+        "term.options.screenReaderMode = false;"
+    )
+    screen_reader_listener_at = terminal_script.index(
+        'screenReaderModeToggle?.addEventListener("change"'
+    )
+    assert (
+        screen_reader_query_at
+        < screen_reader_checked_reset_at
+        < first_font_await_at
+        < terminal_constructor_at
+        < terminal_open_at
+        < screen_reader_option_reset_at
+        < screen_reader_listener_at
+    )
     assert 'TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width"' in terminal_script
     assert 'TERMINAL_CELL_HEIGHT_PROPERTY = "--termroom-terminal-cell-height"' in terminal_script
     assert "const terminalStringCellWidth = (value) =>" in terminal_script
@@ -358,12 +408,12 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"60"}
+    assert versions["app.css"] == {"61"}
     assert versions["app.js"] == {"70"}
     assert versions["remote_run.js"] == {"11"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"56"}
+    assert versions["terminal.js"] == {"57"}
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:

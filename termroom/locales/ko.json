@@ -633,6 +633,8 @@
   "terminal.font_smaller": "글자 작게",
   "terminal.font_larger": "글자 크게",
   "terminal.font_reset": "기본값",
+  "terminal.screen_reader_mode": "스크린 리더 모드",
+  "terminal.screen_reader_mode_help": "켜져 있는 동안 실시간 터미널 버퍼를 스크린 리더에 노출합니다. 페이지를 완전히 다시 불러오면 꺼집니다.",
   "terminal.name": "터미널 이름",
   "terminal.rename": "이름 변경",
   "terminal.close": "터미널 종료",

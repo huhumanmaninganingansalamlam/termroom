@@ -3166,6 +3166,38 @@ details:not([open]) > :not(summary) {
   opacity: 0.42;
 }
 
+.terminal-screen-reader-setting {
+  display: grid;
+  gap: 4px;
+}
+
+.terminal-manage-form .terminal-screen-reader-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.terminal-manage-form .terminal-screen-reader-control input {
+  width: 17px;
+  height: 17px;
+  min-height: 0;
+  flex: none;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.terminal-screen-reader-setting small {
+  color: var(--text-tertiary);
+  font-size: 0.64rem;
+  line-height: 1.4;
+}
+
 .terminal-manage-form .danger-button {
   min-height: 44px;
 }
