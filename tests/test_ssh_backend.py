@@ -1167,6 +1167,46 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             assert "unreadable/private.txt" not in recent_paths
 
             browser_terminal = backend.create_terminal(workspace, "browser-view")
+            backend._exec(
+                computer,
+                "tmux resize-window -t "
+                f"{shlex.quote(str(browser_terminal['tmux_window']))} -x 80 -y 6",
+            )
+            geometry_deadline = time.monotonic() + 2
+            window_geometry = ""
+            while time.monotonic() < geometry_deadline:
+                window_geometry = backend._exec(
+                    computer,
+                    "tmux display-message -p -t "
+                    f"{shlex.quote(str(browser_terminal['tmux_window']))} "
+                    "'#{window_width}x#{window_height}'",
+                ).strip()
+                if window_geometry == "80x6":
+                    break
+                time.sleep(0.05)
+            assert window_geometry == "80x6"
+
+            ready_history_marker = "SSH_HISTORY_READY"
+            backend._exec(
+                computer,
+                "tmux send-keys -t "
+                f"{shlex.quote(str(browser_terminal['tmux_window']))} "
+                + shlex.quote("printf 'SSH_HISTORY_%s\\n' READY")
+                + " Enter",
+            )
+            ready_deadline = time.monotonic() + 8
+            ready_scrollback = ""
+            while time.monotonic() < ready_deadline:
+                ready_scrollback = backend._exec(
+                    computer,
+                    "tmux capture-pane -p -J -S -100 -t "
+                    f"{shlex.quote(str(browser_terminal['tmux_window']))}",
+                )
+                if ready_history_marker in ready_scrollback.splitlines():
+                    break
+                time.sleep(0.05)
+            assert ready_history_marker in ready_scrollback.splitlines()
+
             old_history_marker = "SSH_HISTORY_OLD"
             live_history_marker = "SSH_HISTORY_LIVE"
             backend._exec(
@@ -1180,21 +1220,28 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 )
                 + " Enter",
             )
-            deadline = time.monotonic() + 2
             full_scrollback = ""
-            while time.monotonic() < deadline:
+            history_scrollback = ""
+            for _ in range(5):
                 full_scrollback = backend.capture_scrollback(workspace, browser_terminal)
-                if live_history_marker in full_scrollback.splitlines():
+                history_scrollback = backend.capture_scrollback(
+                    workspace,
+                    browser_terminal,
+                    history_only=True,
+                )
+                if (
+                    live_history_marker in full_scrollback.splitlines()
+                    and old_history_marker in history_scrollback.splitlines()
+                ):
                     break
-                time.sleep(0.05)
-            history_scrollback = backend.capture_scrollback(
-                workspace,
-                browser_terminal,
-                history_only=True,
-            )
             assert old_history_marker in history_scrollback.splitlines()
             assert live_history_marker in full_scrollback.splitlines()
             assert live_history_marker not in history_scrollback.splitlines()
+            backend._exec(
+                computer,
+                "tmux set-window-option -t "
+                f"{shlex.quote(str(browser_terminal['tmux_window']))} window-size latest",
+            )
 
             view_session = tmux_browser_view_session(uuid.uuid4().hex)
             process_pid, master_fd = backend._spawn_ssh_tmux_client(
