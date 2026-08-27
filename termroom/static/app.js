@@ -1155,9 +1155,23 @@
     const stopForm = panel.querySelector("[data-file-run-stop]");
     const forceForm = panel.querySelector("[data-file-run-force]");
     const submitButton = document.querySelector("[data-file-run-submit]");
+    const connectionChip = panel.querySelector("[data-file-run-connection-chip]");
+    const connectionAnnouncer = panel.querySelector("[data-file-run-connection-announcer]");
     let active = ["preparing", "running"].includes(panel.dataset.state || "");
     let failures = 0;
     let timer = 0;
+    let connectionUnavailable = false;
+
+    const setConnectionUnavailable = (unavailable) => {
+      if (connectionUnavailable === unavailable) return;
+      connectionUnavailable = unavailable;
+      if (connectionChip) connectionChip.hidden = !unavailable;
+      if (connectionAnnouncer) {
+        connectionAnnouncer.textContent = unavailable
+          ? tr("file_run.connection_offline")
+          : "";
+      }
+    };
 
     const render = (result) => {
       const previousState = panel.dataset.state || "";
@@ -1187,8 +1201,7 @@
           : tr("file_run.exit_code", { code: result.exit_code });
       }
       if (errorNode) {
-        const message = result.error_detail
-          || (result.connection === "offline" ? tr("file_run.connection_offline") : "");
+        const message = result.error_detail || "";
         errorNode.textContent = message;
         errorNode.hidden = !message;
       }
@@ -1205,6 +1218,15 @@
       }
     };
 
+    const renderConnectionAwareResult = (result) => {
+      if (result.connection !== "online") {
+        setConnectionUnavailable(true);
+        return;
+      }
+      setConnectionUnavailable(false);
+      render(result);
+    };
+
     const schedule = (delay) => {
       window.clearTimeout(timer);
       if (active) timer = window.setTimeout(poll, delay);
@@ -1219,8 +1241,9 @@
         const result = await response.json();
         if (!response.ok || result.ok === false) throw new Error(result.error || response.status);
         failures = 0;
-        render(result);
+        renderConnectionAwareResult(result);
       } catch {
+        setConnectionUnavailable(true);
         failures += 1;
       }
       if (active) {

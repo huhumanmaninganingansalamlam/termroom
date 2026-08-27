@@ -118,8 +118,8 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=61'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=70'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=62'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=71'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -2722,6 +2722,33 @@ async def test_file_run_http_lifecycle_is_idempotent_and_csrf_protected(
                 await asyncio.sleep(0.05)
             assert status_payload["state"] == "running"
 
+            editor_page = await client.get(str(status_payload["editor_url"]))
+            terminal_page = await client.get(str(status_payload["terminal_url"]))
+            for file_run_page in (editor_page, terminal_page):
+                assert file_run_page.status_code == 200
+                status_wrapper = re.search(
+                    r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>",
+                    file_run_page.text,
+                )
+                assert status_wrapper is not None
+                assert 'role="status"' in status_wrapper.group(0)
+                assert 'aria-live="polite"' in status_wrapper.group(0)
+                assert 'aria-atomic="true"' in status_wrapper.group(0)
+                assert " hidden" not in status_wrapper.group(0)
+                connection_chip = re.search(
+                    r"<small[^>]*data-file-run-connection-chip[^>]*>",
+                    file_run_page.text,
+                )
+                assert connection_chip is not None
+                assert 'aria-hidden="true"' in connection_chip.group(0)
+                assert " hidden" in connection_chip.group(0)
+                assert messages("ko")["file_run.connection_offline"] in file_run_page.text
+                assert (
+                    '<span class="sr-only" '
+                    "data-file-run-connection-announcer></span>"
+                    in file_run_page.text
+                )
+
             assert (await client.post(f"/file-runs/{run_id}/stop")).status_code == 403
             stopped = await client.post(
                 f"/file-runs/{run_id}/stop",
@@ -3566,7 +3593,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=70")
+        script = await client.get("/static/app.js?v=71")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3601,7 +3628,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=70")
+        script = await client.get("/static/app.js?v=71")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3613,7 +3640,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=70" in korean_page.text
+    assert "/static/app.js?v=71" in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3901,7 +3928,7 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=70",
+            "/static/app.js?v=71",
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]

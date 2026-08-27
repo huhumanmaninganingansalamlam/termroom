@@ -135,6 +135,25 @@ async def test_nonzero_file_run_is_presented_as_failed_without_changing_lifecycl
     assert "data-file-run-stale" in changed_editor.text
     assert "Failed" in changed_editor.text
     assert "Exit 7" in changed_editor.text
+    status_wrapper = re.search(
+        r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>", editor.text
+    )
+    assert status_wrapper is not None
+    assert 'role="status"' in status_wrapper.group(0)
+    assert 'aria-live="polite"' in status_wrapper.group(0)
+    assert 'aria-atomic="true"' in status_wrapper.group(0)
+    assert " hidden" not in status_wrapper.group(0)
+    connection_chip = re.search(
+        r"<small[^>]*data-file-run-connection-chip[^>]*>", editor.text
+    )
+    assert connection_chip is not None
+    assert 'aria-hidden="true"' in connection_chip.group(0)
+    assert " hidden" in connection_chip.group(0)
+    assert "The Remote connection is unavailable" in editor.text
+    assert (
+        '<span class="sr-only" data-file-run-connection-announcer></span>'
+        in editor.text
+    )
     assert status.json()["state"] == "finished"
     assert status.json()["display_state"] == "failed"
     assert status.json()["state_label"] == "Failed"

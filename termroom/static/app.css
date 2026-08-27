@@ -5652,6 +5652,31 @@ details:not([open]) > :not(summary) {
     display: none;
   }
 
+  .file-run-terminal-bar .file-run-summary {
+    position: relative;
+  }
+
+  .file-run-terminal-bar [data-file-run-connection] {
+    position: absolute;
+    inset: 0 0 auto;
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: flex-end;
+    pointer-events: none;
+  }
+
+  .file-run-terminal-bar .file-run-summary [data-file-run-connection-chip] {
+    box-sizing: border-box;
+    display: block;
+    overflow: hidden;
+    width: 70%;
+    padding-inline-start: 8px;
+    background: var(--bg-elevated);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
 }
 
 @media (max-width: 760px) {

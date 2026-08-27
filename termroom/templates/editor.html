@@ -96,6 +96,16 @@
       <span class="status-dot" aria-hidden="true"></span>
       <strong data-file-run-state>{{ shown_file_run.state_label }}</strong>
     </span>
+    <span data-file-run-connection
+          role="status"
+          aria-live="polite"
+          aria-atomic="true">
+      <small class="file-run-error"
+             data-file-run-connection-chip
+             aria-hidden="true"
+             hidden>{{ t('file_run.connection_offline') }}</small>
+      <span class="sr-only" data-file-run-connection-announcer></span>
+    </span>
     <code title="{{ shown_file_run.relative_path }}">{{ shown_file_run.relative_path }}</code>
     <small data-file-run-duration>
       {% if shown_file_run.duration_seconds is not none %}{{ t('file_run.duration', seconds=shown_file_run.duration_seconds) }}{% endif %}
