@@ -256,6 +256,18 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     terminal_template = (VENDOR_DIR.parents[1] / "templates/terminal.html").read_text(
         encoding="utf-8"
     )
+    assert 'id="terminal-screen-reader-mode"' in terminal_template
+    assert 'for="terminal-screen-reader-mode"' in terminal_template
+    assert 'aria-describedby="terminal-screen-reader-mode-help"' in terminal_template
+    assert 'id="terminal-screen-reader-mode-help"' in terminal_template
+    screen_reader_input = re.search(
+        r'<input id="terminal-screen-reader-mode"[^>]*>', terminal_template
+    )
+    assert screen_reader_input is not None
+    assert 'type="checkbox"' in screen_reader_input.group(0)
+    assert 'autocomplete="off"' in screen_reader_input.group(0)
+    assert re.search(r"\schecked(?:\s|=|>)", screen_reader_input.group(0)) is None
+    assert re.search(r"\sname=", screen_reader_input.group(0)) is None
     assert str(TERMINAL_FONT_ASSETS["core_hangul"]["filename"]) in terminal_template
     assert "data-terminal-command-clear-target" in terminal_template
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
@@ -279,6 +291,44 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400" in terminal_script
     assert "const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;" in terminal_script
     assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
+    assert "screenReaderMode: false," in terminal_script
+    assert (
+        'const screenReaderModeToggle = document.querySelector('
+        '"#terminal-screen-reader-mode");' in terminal_script
+    )
+    assert "screenReaderModeToggle.checked = false;" in terminal_script
+    assert "term.options.screenReaderMode = false;" in terminal_script
+    assert terminal_script.count("new window.Terminal(") == 1
+    assert re.search(
+        r'screenReaderModeToggle\?\.addEventListener\("change", \(\) => \{\s*'
+        r"term\.options\.screenReaderMode = screenReaderModeToggle\.checked;\s*"
+        r"\}\);",
+        terminal_script,
+    )
+    screen_reader_query_at = terminal_script.index(
+        'const screenReaderModeToggle = document.querySelector('
+    )
+    screen_reader_checked_reset_at = terminal_script.index(
+        "screenReaderModeToggle.checked = false;"
+    )
+    first_font_await_at = terminal_script.index("await bundledTerminalFontLoad.initial")
+    terminal_constructor_at = terminal_script.index("new window.Terminal(")
+    terminal_open_at = terminal_script.index("term.open(host);")
+    screen_reader_option_reset_at = terminal_script.index(
+        "term.options.screenReaderMode = false;"
+    )
+    screen_reader_listener_at = terminal_script.index(
+        'screenReaderModeToggle?.addEventListener("change"'
+    )
+    assert (
+        screen_reader_query_at
+        < screen_reader_checked_reset_at
+        < first_font_await_at
+        < terminal_constructor_at
+        < terminal_open_at
+        < screen_reader_option_reset_at
+        < screen_reader_listener_at
+    )
     assert 'TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width"' in terminal_script
     assert 'TERMINAL_CELL_HEIGHT_PROPERTY = "--termroom-terminal-cell-height"' in terminal_script
     assert "const terminalStringCellWidth = (value) =>" in terminal_script
@@ -358,12 +408,12 @@ def test_template_static_asset_versions_are_consistent() -> None:
             versions.setdefault(asset, set()).add(version)
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"60"}
-    assert versions["app.js"] == {"70"}
-    assert versions["remote_run.js"] == {"11"}
+    assert versions["app.css"] == {"62"}
+    assert versions["app.js"] == {"71"}
+    assert versions["remote_run.js"] == {"12"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"56"}
+    assert versions["terminal.js"] == {"57"}
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:
@@ -455,6 +505,190 @@ def test_remote_run_result_zip_is_the_primary_completed_run_action() -> None:
         collect_template
     )
     assert 'class="primary-button" type="submit"' in collect_template
+
+
+def test_remote_workspace_connection_freshness_is_transition_deduped() -> None:
+    templates_dir = VENDOR_DIR.parents[1] / "templates"
+    workspace_template = (templates_dir / "workspace_base.html").read_text(
+        encoding="utf-8"
+    )
+    remote_run_script = (VENDOR_DIR.parent / "remote_run.js").read_text(
+        encoding="utf-8"
+    )
+
+    status_wrapper = re.search(
+        r"<span[^>]*data-run-workspace-connection[^>]*>", workspace_template
+    )
+    assert status_wrapper is not None
+    assert 'role="status"' in status_wrapper.group(0)
+    assert 'aria-live="polite"' in status_wrapper.group(0)
+    assert 'aria-atomic="true"' in status_wrapper.group(0)
+    assert " hidden" not in status_wrapper.group(0)
+
+    visual_chip = re.search(
+        r"<span[^>]*data-run-workspace-connection-chip[^>]*>", workspace_template
+    )
+    assert visual_chip is not None
+    assert 'class="state-chip remote-run-connection-state"' in visual_chip.group(0)
+    assert 'aria-hidden="true"' in visual_chip.group(0)
+    assert " hidden" in visual_chip.group(0)
+    assert "{{ t('remote_run.connection_rechecking') }}" in workspace_template
+    assert (
+        '<span class="sr-only" data-run-workspace-connection-announcer></span>'
+        in workspace_template
+    )
+
+    workspace_start = remote_run_script.index(
+        '  const workspaceRun = document.querySelector("[data-remote-run-workspace]");'
+    )
+    workspace_end = remote_run_script.index(
+        "  const recentRuns = [...document.querySelectorAll", workspace_start
+    )
+    workspace_script = remote_run_script[workspace_start:workspace_end]
+    for behavior in (
+        'querySelector("[data-run-workspace-connection-chip]")',
+        'querySelector("[data-run-workspace-connection-announcer]")',
+        "let connectionUnavailable = false;",
+        "const setConnectionUnavailable = (unavailable) =>",
+        "if (connectionUnavailable === unavailable) return;",
+        "connectionChip.hidden = !unavailable;",
+        'tr("remote_run.connection_rechecking")',
+        'if (result.connection !== "online") {',
+        "setConnectionUnavailable(true);",
+        "setConnectionUnavailable(false);",
+        "window.setInterval(poll, 1500);",
+    ):
+        assert behavior in workspace_script
+    assert workspace_script.count("setConnectionUnavailable(true);") == 2
+    assert workspace_script.index('if (result.connection !== "online") {') < (
+        workspace_script.index('if (!["preparing", "running"].includes(result.state))')
+    )
+    assert workspace_script.index("setConnectionUnavailable(false);") < (
+        workspace_script.index('if (!["preparing", "running"].includes(result.state))')
+    )
+    assert ".focus(" not in workspace_script
+
+
+def test_file_run_connection_freshness_is_transition_deduped() -> None:
+    templates_dir = VENDOR_DIR.parents[1] / "templates"
+    templates = [
+        (templates_dir / "editor.html").read_text(encoding="utf-8"),
+        (templates_dir / "terminal.html").read_text(encoding="utf-8"),
+    ]
+    app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
+
+    for template in templates:
+        status_wrapper = re.search(
+            r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>", template
+        )
+        assert status_wrapper is not None
+        assert 'role="status"' in status_wrapper.group(0)
+        assert 'aria-live="polite"' in status_wrapper.group(0)
+        assert 'aria-atomic="true"' in status_wrapper.group(0)
+        assert " hidden" not in status_wrapper.group(0)
+
+        visual_chip = re.search(
+            r"<small[^>]*data-file-run-connection-chip[^>]*>", template
+        )
+        assert visual_chip is not None
+        assert 'class="file-run-error"' in visual_chip.group(0)
+        assert 'aria-hidden="true"' in visual_chip.group(0)
+        assert " hidden" in visual_chip.group(0)
+        assert "{{ t('file_run.connection_offline') }}" in template
+        assert (
+            '<span class="sr-only" data-file-run-connection-announcer></span>'
+            in template
+        )
+        assert template.index("data-file-run-state") < template.index(
+            "data-file-run-connection"
+        )
+
+    file_run_start = app_script.index(
+        '  document.querySelectorAll("[data-file-run]").forEach((panel) => {'
+    )
+    file_run_end = app_script.index("  const setViewportHeight =", file_run_start)
+    file_run_script = app_script[file_run_start:file_run_end]
+    for behavior in (
+        'querySelector("[data-file-run-connection-chip]")',
+        'querySelector("[data-file-run-connection-announcer]")',
+        "let connectionUnavailable = false;",
+        "const setConnectionUnavailable = (unavailable) =>",
+        "const renderConnectionAwareResult = (result) =>",
+        "if (connectionUnavailable === unavailable) return;",
+        "connectionChip.hidden = !unavailable;",
+        'tr("file_run.connection_offline")',
+        'if (result.connection !== "online") {',
+        "setConnectionUnavailable(true);",
+        "setConnectionUnavailable(false);",
+        "if (active) schedule(250);",
+        "const normalDelay = document.hidden ? 5000 : 1000;",
+        "schedule(Math.min(15000, normalDelay * (2 ** Math.min(failures, 3))));",
+    ):
+        assert behavior in file_run_script
+    assert file_run_script.count("setConnectionUnavailable(true);") == 2
+    connection_handler = file_run_script.index(
+        "const renderConnectionAwareResult = (result) =>"
+    )
+    offline_check = file_run_script.index(
+        'if (result.connection !== "online") {', connection_handler
+    )
+    render_call = file_run_script.index("render(result);", offline_check)
+    assert offline_check < render_call
+    assert file_run_script.index("setConnectionUnavailable(false);", offline_check) < (
+        render_call
+    )
+    poll_start = file_run_script.index("    const poll = async () => {")
+    failure_reset = file_run_script.index("failures = 0;", poll_start)
+    connection_render = file_run_script.index(
+        "renderConnectionAwareResult(result);", failure_reset
+    )
+    assert failure_reset < connection_render
+    catch_start = file_run_script.index("      } catch {")
+    failure_increment = file_run_script.index("failures += 1;", catch_start)
+    assert file_run_script.index("setConnectionUnavailable(true);", catch_start) < (
+        failure_increment
+    )
+    assert 'result.connection === "offline"' not in file_run_script
+    assert ".focus(" not in file_run_script
+    assert "WebSocket" not in file_run_script
+    assert "window.location" not in file_run_script
+
+
+def test_mobile_file_run_terminal_freshness_preserves_action_geometry() -> None:
+    stylesheet = (VENDOR_DIR.parent / "app.css").read_text(encoding="utf-8")
+    mobile_900_start = stylesheet.index(
+        "@media (max-width: 900px)", stylesheet.index(".file-run-terminal-bar")
+    )
+    mobile_760_start = stylesheet.index(
+        "@media (max-width: 760px)", mobile_900_start
+    )
+    mobile_900_styles = stylesheet[mobile_900_start:mobile_760_start]
+
+    assert """  .file-run-terminal-bar .file-run-summary {
+    position: relative;
+  }
+
+  .file-run-terminal-bar [data-file-run-connection] {
+    position: absolute;
+    inset: 0 0 auto;
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: flex-end;
+    pointer-events: none;
+  }
+
+  .file-run-terminal-bar .file-run-summary [data-file-run-connection-chip] {
+    box-sizing: border-box;
+    display: block;
+    overflow: hidden;
+    width: 70%;
+    padding-inline-start: 8px;
+    background: var(--bg-elevated);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+""" in mobile_900_styles
 
 
 def test_remote_workspace_navigation_pending_contract_is_wired() -> None:

@@ -10,6 +10,10 @@
     return text;
   };
   const tr = window.TermroomT || fallbackTranslate;
+  const screenReaderModeToggle = document.querySelector("#terminal-screen-reader-mode");
+  if (screenReaderModeToggle) {
+    screenReaderModeToggle.checked = false;
+  }
 
   const TERMINAL_FONT_SIZE_KEY = "termroom.terminal.font-size";
   const DEFAULT_TERMINAL_FONT_SIZE = 14;
@@ -129,6 +133,7 @@
     lineHeight: 1.2,
     minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO,
     scrollback: 5000,
+    screenReaderMode: false,
     allowProposedApi: unicode11Available,
     theme: terminalTheme(),
   });
@@ -146,6 +151,10 @@
     }
   }
   term.open(host);
+  term.options.screenReaderMode = false;
+  screenReaderModeToggle?.addEventListener("change", () => {
+    term.options.screenReaderMode = screenReaderModeToggle.checked;
+  });
   const terminalStringCellWidth = (value) => {
     const service = term._core?.unicodeService;
     if (typeof service?.getStringCellWidth !== "function") return null;

@@ -1,7 +1,8 @@
 (() => {
   const outputLink = document.querySelector('.terminal-output-action[href*="/scrollback"]');
   const terminalHost = document.querySelector("#terminal");
-  if (!outputLink || !terminalHost) return;
+  const selectionOwnership = window.TermroomSelectionOwnership;
+  if (!outputLink || !terminalHost || !selectionOwnership) return;
 
   const mobileViewport = window.matchMedia("(max-width: 1023px), (pointer: coarse)");
   const SCROLL_BOTTOM_EPSILON_PX = 3;
@@ -77,8 +78,8 @@
   let terminalRevision = 0;
   let userScrollRevision = 0;
   let liveFollowing = true;
+  let selectionOwnershipMode = selectionOwnership.LIVE_XTERM;
   let nativeCopySelectionActive = false;
-  let nativeCopyPointerDown = false;
   let historyHangulMetricKey = "";
   const historyCellWidthCache = new Map();
   const historyGraphemeSegmenter = typeof Intl.Segmenter === "function"
@@ -516,44 +517,29 @@
     return { fragment, text: plainText, styled };
   };
 
-  const enableNativeCopySelection = () => {
-    nativeCopySelectionActive = true;
-    nativeCopyPointerDown = true;
-    surface.classList.add(NATIVE_COPY_SELECTION_CLASS);
-  };
-
-  const clearNativeCopySelection = ({ refreshHistory = true } = {}) => {
+  const applySelectionOwnership = (event, { refreshHistory = true } = {}) => {
     const wasActive = nativeCopySelectionActive;
-    nativeCopySelectionActive = false;
-    nativeCopyPointerDown = false;
-    surface.classList.remove(NATIVE_COPY_SELECTION_CLASS);
-    if (refreshHistory && wasActive && historyDirty && liveFollowing) {
+    selectionOwnershipMode = selectionOwnership.transition(selectionOwnershipMode, event);
+    nativeCopySelectionActive =
+      selectionOwnershipMode === selectionOwnership.READING_NATIVE;
+    surface.classList.toggle(NATIVE_COPY_SELECTION_CLASS, nativeCopySelectionActive);
+    if (refreshHistory && wasActive && !nativeCopySelectionActive && historyDirty && liveFollowing) {
       scheduleHistoryRefresh({ urgent: true });
     }
   };
 
-  const nativeCopySelectionStillStartsInHistory = () => {
+  const selectionBelongsToSurface = () => {
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return false;
-    return history.contains(selection.getRangeAt(0).startContainer);
-  };
-
-  const historyIsVisibleInSurface = () => {
-    if (history.hidden) return false;
-    const surfaceRect = surface.getBoundingClientRect();
-    const historyRect = history.getBoundingClientRect();
+    const range = selection.getRangeAt(0);
     return (
-      historyRect.bottom > surfaceRect.top + SCROLL_BOTTOM_EPSILON_PX
-      && historyRect.top < surfaceRect.bottom - SCROLL_BOTTOM_EPSILON_PX
+      surface.contains(range.startContainer)
+      && surface.contains(range.endContainer)
     );
   };
 
   const finishNativeCopyPointer = () => {
-    if (!nativeCopySelectionActive) return;
-    window.requestAnimationFrame(() => {
-      nativeCopyPointerDown = false;
-      if (!nativeCopySelectionStillStartsInHistory()) clearNativeCopySelection();
-    });
+    applySelectionOwnership({ type: "pointer-finished" });
   };
 
   const crossBoundaryCopyText = () => {
@@ -721,6 +707,16 @@
     // again through xterm's normal pointer handling.
     if (away) {
       document.querySelector(".xterm-helper-textarea")?.blur();
+      applySelectionOwnership({
+        type: "enter-reading",
+        mouseTracking: mouseTrackingActive(),
+      });
+    } else {
+      applySelectionOwnership({
+        type: "return-live",
+        hasSurfaceSelection: selectionBelongsToSurface(),
+        mouseTracking: mouseTrackingActive(),
+      });
     }
   };
 
@@ -945,6 +941,27 @@
   const mouseTrackingActive = () =>
     Boolean(terminalHost.querySelector(".xterm.enable-mouse-events"));
 
+  const bindMouseTrackingOwnership = () => {
+    const xterm = terminalHost.querySelector(".xterm");
+    if (!xterm) {
+      window.setTimeout(bindMouseTrackingOwnership, 80);
+      return;
+    }
+    const syncEdge = selectionOwnership.createMouseTrackingEdge((active) => {
+      applySelectionOwnership({
+        type: "mouse-tracking",
+        active,
+        away: !atLiveBottom(),
+      });
+    });
+    const sync = () => syncEdge(mouseTrackingActive());
+    new MutationObserver(sync).observe(xterm, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+    sync();
+  };
+
   const noteUserScrollIntent = ({ revealHistory = false } = {}) => {
     userScrollRevision += 1;
     if (revealHistory && historyDirty && liveFollowing) {
@@ -954,6 +971,10 @@
 
   surface.addEventListener("scroll", updateScrollState, { passive: true });
   liveButton.addEventListener("click", () => {
+    applySelectionOwnership({
+      type: "terminal-input",
+      mouseTracking: mouseTrackingActive(),
+    });
     scrollToLive({ userInitiated: true });
   });
 
@@ -963,6 +984,7 @@
       if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
       const target = event.target instanceof Node ? event.target : null;
       if (target && terminalHost.contains(target) && mouseTrackingActive()) return;
+      applySelectionOwnership({ type: "wheel" });
       noteUserScrollIntent({ revealHistory: event.deltaY < 0 });
     },
     { capture: true, passive: true },
@@ -972,22 +994,18 @@
     "pointerdown",
     (event) => {
       const target = event.target instanceof Node ? event.target : null;
-      const startsInHistory = Boolean(target && history.contains(target) && !history.hidden);
       const startsInTerminal = Boolean(target && terminalHost.contains(target));
-      const useNativeCopySelection =
-        event.button === 0
-        && event.pointerType !== "touch"
-        && !mouseTrackingActive()
-        && (startsInHistory || (startsInTerminal && historyIsVisibleInSurface()));
+      const primaryMouse = event.button === 0 && event.pointerType !== "touch";
+      applySelectionOwnership({
+        type: "surface-pointer",
+        primaryMouse,
+        away: !atLiveBottom(),
+        mouseTracking: mouseTrackingActive(),
+      });
 
-      if (useNativeCopySelection) {
-        enableNativeCopySelection();
-        if (startsInTerminal) {
-          terminalHost.querySelector(".xterm-helper-textarea")?.blur();
-          event.stopPropagation();
-        }
-      } else if (nativeCopySelectionActive) {
-        clearNativeCopySelection();
+      if (nativeCopySelectionActive && startsInTerminal) {
+        terminalHost.querySelector(".xterm-helper-textarea")?.blur();
+        event.stopPropagation();
       }
       if (target === surface) noteUserScrollIntent({ revealHistory: true });
     },
@@ -1018,15 +1036,20 @@
     capture: true,
     passive: true,
   });
-  document.addEventListener("selectionchange", () => {
-    if (
-      nativeCopySelectionActive
-      && !nativeCopyPointerDown
-      && !nativeCopySelectionStillStartsInHistory()
-    ) {
-      clearNativeCopySelection();
-    }
-  });
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      const target = event.target instanceof Node ? event.target : null;
+      const primaryMouse = event.button === 0 && event.pointerType !== "touch";
+      if (primaryMouse && target && !surface.contains(target)) {
+        applySelectionOwnership({
+          type: "outside-pointer",
+          mouseTracking: mouseTrackingActive(),
+        });
+      }
+    },
+    { capture: true, passive: true },
+  );
   document.addEventListener(
     "copy",
     (event) => {
@@ -1046,6 +1069,10 @@
       return;
     }
     const returnToLive = () => {
+      applySelectionOwnership({
+        type: "terminal-input",
+        mouseTracking: mouseTrackingActive(),
+      });
       if (!atLiveBottom()) scrollToLive({ userInitiated: true });
     };
     textarea.addEventListener(
@@ -1062,6 +1089,10 @@
   document.querySelector("#command-form")?.addEventListener(
     "submit",
     () => {
+      applySelectionOwnership({
+        type: "terminal-input",
+        mouseTracking: mouseTrackingActive(),
+      });
       if (!atLiveBottom()) scrollToLive({ userInitiated: true });
     },
     { capture: true },
@@ -1076,6 +1107,10 @@
         )
         && !atLiveBottom()
       ) {
+        applySelectionOwnership({
+          type: "terminal-input",
+          mouseTracking: mouseTrackingActive(),
+        });
         scrollToLive({ userInitiated: true });
       }
     },
@@ -1185,7 +1220,7 @@
     if (!document.hidden) scheduleHistoryRefresh({ urgent: true });
   });
   window.addEventListener("termroom:terminal-switched", () => {
-    clearNativeCopySelection({ refreshHistory: false });
+    applySelectionOwnership({ type: "reset" }, { refreshHistory: false });
     terminalRevision += 1;
     historyRenderRevision += 1;
     userScrollRevision += 1;
@@ -1210,6 +1245,7 @@
 
   syncLiveHeight();
   bindLiveInputReturn();
+  bindMouseTrackingOwnership();
   bindLiveOutputRefresh();
   bindParsedTerminalOutputRefresh();
   void loadHistory({ stickToBottom: true, force: true });

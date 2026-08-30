@@ -213,6 +213,19 @@
   if (workspaceRun && ["preparing", "running"].includes(workspaceRun.dataset.state)) {
     const stateLabel = workspaceRun.querySelector("[data-run-workspace-state]");
     const stateChip = workspaceRun.querySelector(".state-chip");
+    const connectionChip = workspaceRun.querySelector("[data-run-workspace-connection-chip]");
+    const connectionAnnouncer = workspaceRun.querySelector("[data-run-workspace-connection-announcer]");
+    let connectionUnavailable = false;
+    const setConnectionUnavailable = (unavailable) => {
+      if (connectionUnavailable === unavailable) return;
+      connectionUnavailable = unavailable;
+      if (connectionChip) connectionChip.hidden = !unavailable;
+      if (connectionAnnouncer) {
+        connectionAnnouncer.textContent = unavailable
+          ? tr("remote_run.connection_rechecking")
+          : "";
+      }
+    };
     let stopped = false;
     const poll = async () => {
       if (stopped || document.hidden) return;
@@ -225,6 +238,11 @@
         if (!response.ok || result.ok === false) {
           throw new Error(result.error || "Remote Run status failed");
         }
+        if (result.connection !== "online") {
+          setConnectionUnavailable(true);
+          return;
+        }
+        setConnectionUnavailable(false);
         if (!["preparing", "running"].includes(result.state)) {
           stopped = true;
           window.location.reload();
@@ -234,8 +252,7 @@
         stateChip?.classList.toggle("running", result.state === "running");
         if (stateLabel) stateLabel.textContent = result.state_label || tr(`remote_run.state.${result.state}`);
       } catch (_error) {
-        // A dropped SSH connection does not change the Run state. Keep polling;
-        // the existing terminal reconnect UI remains the visible connection signal.
+        setConnectionUnavailable(true);
       }
     };
     window.setInterval(poll, 1500);

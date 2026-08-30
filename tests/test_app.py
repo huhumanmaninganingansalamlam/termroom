@@ -118,8 +118,8 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=60'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=70'
+    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=62'
+    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=71'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -676,7 +676,61 @@ async def test_terminal_page_exposes_shell_tabs_for_in_place_switching(tmp_path:
         assert "data-terminal-output-link" in response.text
         assert "data-terminal-manage-form" in response.text
         assert "data-terminal-name-input" in response.text
-        assert 'terminal.js?v=56' in response.text
+        assert 'terminal.js?v=57' in response.text
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_display_screen_reader_mode_is_opt_in_and_localized(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    terminal = app.state.terminals.ensure_workspace(workspace)[0]
+    terminal_url = f"/w/{workspace['id']}/terminal?terminal={terminal['id']}"
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            korean = await client.get(terminal_url)
+
+            assert korean.status_code == 200
+            assert 'id="terminal-screen-reader-mode"' in korean.text
+            assert 'type="checkbox"' in korean.text
+            assert (
+                'aria-describedby="terminal-screen-reader-mode-help"' in korean.text
+            )
+            assert "스크린 리더 모드" in korean.text
+            assert (
+                "켜져 있는 동안 실시간 터미널 버퍼를 스크린 리더에 노출합니다. "
+                "페이지를 완전히 다시 불러오면 꺼집니다."
+                in korean.text
+            )
+
+            client.cookies.set("termroom_locale", "en")
+            english = await client.get(terminal_url)
+
+            assert english.status_code == 200
+            assert "Screen reader mode" in english.text
+            assert (
+                "Expose the live terminal buffer to screen readers while this is on. "
+                "It turns off when the page is fully reloaded."
+                in english.text
+            )
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
@@ -2668,6 +2722,33 @@ async def test_file_run_http_lifecycle_is_idempotent_and_csrf_protected(
                 await asyncio.sleep(0.05)
             assert status_payload["state"] == "running"
 
+            editor_page = await client.get(str(status_payload["editor_url"]))
+            terminal_page = await client.get(str(status_payload["terminal_url"]))
+            for file_run_page in (editor_page, terminal_page):
+                assert file_run_page.status_code == 200
+                status_wrapper = re.search(
+                    r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>",
+                    file_run_page.text,
+                )
+                assert status_wrapper is not None
+                assert 'role="status"' in status_wrapper.group(0)
+                assert 'aria-live="polite"' in status_wrapper.group(0)
+                assert 'aria-atomic="true"' in status_wrapper.group(0)
+                assert " hidden" not in status_wrapper.group(0)
+                connection_chip = re.search(
+                    r"<small[^>]*data-file-run-connection-chip[^>]*>",
+                    file_run_page.text,
+                )
+                assert connection_chip is not None
+                assert 'aria-hidden="true"' in connection_chip.group(0)
+                assert " hidden" in connection_chip.group(0)
+                assert messages("ko")["file_run.connection_offline"] in file_run_page.text
+                assert (
+                    '<span class="sr-only" '
+                    "data-file-run-connection-announcer></span>"
+                    in file_run_page.text
+                )
+
             assert (await client.post(f"/file-runs/{run_id}/stop")).status_code == 403
             stopped = await client.post(
                 f"/file-runs/{run_id}/stop",
@@ -3512,7 +3593,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=70")
+        script = await client.get("/static/app.js?v=71")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3547,7 +3628,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=70")
+        script = await client.get("/static/app.js?v=71")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3559,7 +3640,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=70" in korean_page.text
+    assert "/static/app.js?v=71" in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3847,7 +3928,7 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=70",
+            "/static/app.js?v=71",
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]

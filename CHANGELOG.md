@@ -2,6 +2,17 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.3.18] - 2026-08-30
+
+### Added
+
+- Offer an opt-in terminal screen-reader mode and expose fresh connection state for active File Run and Remote Run sessions.
+
+### Fixed
+
+- Stabilize SSH history-only scrollback capture and tmux history readiness before rendering terminal output.
+- Keep terminal text selections active while releasing the pointer or scrolling through history, without letting terminal mouse-tracking mode or unrelated DOM changes clear the selected range.
+
 ## [0.3.17] - 2026-08-24
 
 ### Fixed

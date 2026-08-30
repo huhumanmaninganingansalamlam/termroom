@@ -229,6 +229,19 @@
       <span class="status-dot" aria-hidden="true"></span>
       <span data-run-workspace-state>{{ t(remote_run_state_key) }}</span>
     </span>
+    <span data-run-workspace-connection
+          role="status"
+          aria-live="polite"
+          aria-atomic="true">
+      <span class="state-chip remote-run-connection-state"
+            data-run-workspace-connection-chip
+            aria-hidden="true"
+            hidden>
+        <span class="status-dot" aria-hidden="true"></span>
+        {{ t('remote_run.connection_rechecking') }}
+      </span>
+      <span class="sr-only" data-run-workspace-connection-announcer></span>
+    </span>
     {% if remote_run.exit_code is not none %}<strong>{{ t('remote_run.exit_code', code=remote_run.exit_code) }}</strong>{% endif %}
     <code title="{{ remote_run.command }}">{{ remote_run.command.splitlines()[0] }}</code>
     {% if remote_run_terminal and remote_run.expires_at %}
@@ -351,6 +364,6 @@
 {% endif %}
 {% block workspace_scripts %}{% endblock %}
 {% if remote_run %}
-<script src="{{ url_for('static', path='remote_run.js') }}?v=11" defer></script>
+<script src="{{ url_for('static', path='remote_run.js') }}?v=12" defer></script>
 {% endif %}
 {% endblock %}

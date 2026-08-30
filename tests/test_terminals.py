@@ -383,6 +383,27 @@ def test_styled_history_capture_preserves_tmux_sgr_attributes(tmp_path: Path) ->
 
     try:
         terminal = manager.ensure_workspace(workspace)[0]
+        ready = "TERMROOM_ANSI_READY"
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                terminal["tmux_window"],
+                "printf 'TERMROOM_ANSI_%s\\n' READY",
+                "Enter",
+            ],
+            check=True,
+        )
+        ready_deadline = time.monotonic() + 8
+        ready_scrollback = ""
+        while time.monotonic() < ready_deadline:
+            ready_scrollback = manager.capture_scrollback(workspace, terminal)
+            if ready in ready_scrollback.splitlines():
+                break
+            time.sleep(0.05)
+        assert ready in ready_scrollback.splitlines()
+
         subprocess.run(
             [
                 "tmux",
@@ -399,25 +420,28 @@ def test_styled_history_capture_preserves_tmux_sgr_attributes(tmp_path: Path) ->
             ],
             check=True,
         )
-        deadline = time.monotonic() + 2
         full = ""
-        while time.monotonic() < deadline:
+        styled = ""
+        plain = ""
+        for _ in range(5):
             full = manager.capture_scrollback(workspace, terminal)
-            if done in full.splitlines():
+            styled = manager.capture_scrollback(
+                workspace,
+                terminal,
+                history_only=True,
+                ansi=True,
+            )
+            plain = manager.capture_scrollback(
+                workspace,
+                terminal,
+                history_only=True,
+            )
+            if (
+                done in full.splitlines()
+                and marker in styled
+                and marker in plain
+            ):
                 break
-            time.sleep(0.05)
-
-        styled = manager.capture_scrollback(
-            workspace,
-            terminal,
-            history_only=True,
-            ansi=True,
-        )
-        plain = manager.capture_scrollback(
-            workspace,
-            terminal,
-            history_only=True,
-        )
         assert done in full.splitlines()
         assert marker in styled
         assert marker in plain
@@ -446,6 +470,27 @@ def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path)
 
     try:
         terminal = manager.ensure_workspace(workspace)[0]
+        ready = "HISTORY_ONLY_READY"
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                terminal["tmux_window"],
+                "printf 'HISTORY_ONLY_%s\\n' READY",
+                "Enter",
+            ],
+            check=True,
+        )
+        ready_deadline = time.monotonic() + 8
+        ready_scrollback = ""
+        while time.monotonic() < ready_deadline:
+            ready_scrollback = manager.capture_scrollback(workspace, terminal)
+            if ready in ready_scrollback.splitlines():
+                break
+            time.sleep(0.05)
+        assert ready in ready_scrollback.splitlines()
+
         subprocess.run(
             [
                 "tmux",
@@ -474,19 +519,20 @@ def test_history_only_scrollback_excludes_the_live_tmux_viewport(tmp_path: Path)
             ],
             check=True,
         )
-        deadline = time.monotonic() + 2
         full = ""
-        while time.monotonic() < deadline:
+        history = ""
+        for _ in range(5):
             full = manager.capture_scrollback(workspace, terminal)
-            if live_marker in full.splitlines():
+            history = manager.capture_scrollback(
+                workspace,
+                terminal,
+                history_only=True,
+            )
+            if (
+                live_marker in full.splitlines()
+                and old_marker in history.splitlines()
+            ):
                 break
-            time.sleep(0.05)
-
-        history = manager.capture_scrollback(
-            workspace,
-            terminal,
-            history_only=True,
-        )
         assert old_marker in history.splitlines()
         assert live_marker in full.splitlines()
         assert live_marker not in history.splitlines()

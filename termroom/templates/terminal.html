@@ -72,6 +72,17 @@
             <button id="terminal-font-increase" type="button" aria-label="{{ t('terminal.font_larger') }}">+</button>
             <button id="terminal-font-reset" class="terminal-font-reset" type="button">{{ t('terminal.font_reset') }}</button>
           </div>
+          <div class="terminal-screen-reader-setting">
+            <label class="terminal-screen-reader-control"
+                   for="terminal-screen-reader-mode">
+              <input id="terminal-screen-reader-mode"
+                     type="checkbox"
+                     autocomplete="off"
+                     aria-describedby="terminal-screen-reader-mode-help">
+              <span>{{ t('terminal.screen_reader_mode') }}</span>
+            </label>
+            <small id="terminal-screen-reader-mode-help">{{ t('terminal.screen_reader_mode_help') }}</small>
+          </div>
         </section>
         {% if (terminal.role | default('shell')) == 'shell' %}
           <label>
@@ -120,6 +131,16 @@
     <span class="state-chip {% if file_run.active %}running{% endif %}">
       <span class="status-dot" aria-hidden="true"></span>
       <strong data-file-run-state>{{ file_run.state_label }}</strong>
+    </span>
+    <span data-file-run-connection
+          role="status"
+          aria-live="polite"
+          aria-atomic="true">
+      <small class="file-run-error"
+             data-file-run-connection-chip
+             aria-hidden="true"
+             hidden>{{ t('file_run.connection_offline') }}</small>
+      <span class="sr-only" data-file-run-connection-announcer></span>
     </span>
     <code title="{{ file_run.relative_path }}">{{ file_run.relative_path }}</code>
     <small data-file-run-duration>{% if file_run.duration_seconds is not none %}{{ t('file_run.duration', seconds=file_run.duration_seconds) }}{% endif %}</small>
@@ -250,5 +271,5 @@
 {% block workspace_scripts %}
 <script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
 <script src="{{ url_for('static', path='vendor/addon-unicode11.js') }}?v=0.8.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v=56"></script>
+<script src="{{ url_for('static', path='terminal.js') }}?v=57"></script>
 {% endblock %}
