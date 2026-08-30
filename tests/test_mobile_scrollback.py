@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -18,7 +19,8 @@ def test_base_loads_mobile_scrollback_assets() -> None:
     )
 
     assert "mobile_scrollback.css') }}?v=15" in template
-    assert "mobile_scrollback.js') }}?v=33\" defer" in template
+    assert "terminal_selection.js') }}?v=1\" defer" in template
+    assert "mobile_scrollback.js') }}?v=34\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
     assert "terminal.js') }}?v=57" in terminal_template
 
@@ -38,11 +40,14 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         page = await client.get("/")
         stylesheet = await client.get("/static/mobile_scrollback.css?v=15")
-        script = await client.get("/static/mobile_scrollback.js?v=33")
+        ownership = await client.get("/static/terminal_selection.js?v=1")
+        script = await client.get("/static/mobile_scrollback.js?v=34")
 
     assert page.status_code == 401
     assert "/static/mobile_scrollback.css?v=15" in page.text
-    assert "/static/mobile_scrollback.js?v=33" in page.text
+    assert "/static/terminal_selection.js?v=1" in page.text
+    assert "/static/mobile_scrollback.js?v=34" in page.text
+    assert ownership.status_code == 200
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text
     assert "scrollbar-gutter: stable" in stylesheet.text
@@ -172,9 +177,12 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "document.createElement(\"span\")" in script
     assert "Object.assign(span.style, segment.style);" in script
     assert "innerHTML" not in script
-    assert "history.contains(selection.getRangeAt(0).startContainer)" in script
-    assert "const historyIsVisibleInSurface = () =>" in script
-    assert "startsInTerminal && historyIsVisibleInSurface()" in script
+    assert "const selectionBelongsToSurface = () =>" in script
+    assert "surface.contains(range.startContainer)" in script
+    assert "surface.contains(range.endContainer)" in script
+    assert 'type: "enter-reading"' in script
+    assert 'type: "pointer-finished"' in script
+    assert 'type: "outside-pointer"' in script
     assert 'terminalHost.addEventListener(\n    "mousedown"' in script
     assert "event.stopImmediatePropagation();" in script
     assert "terminalHost.contains(range.endContainer)" in script
@@ -186,6 +194,68 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "event.preventDefault();" not in touch_move
     assert "socket.send(" not in script
     assert "term.input" not in script
+
+
+def test_terminal_selection_ownership_state_machine() -> None:
+    script = ROOT / "termroom/static/terminal_selection.js"
+    probe = """
+const assert = require("node:assert/strict");
+const ownership = require(process.argv[1]);
+const mouseEdges = [];
+const syncMouse = ownership.createMouseTrackingEdge((active) => mouseEdges.push(active));
+assert.equal(syncMouse(false), true);
+assert.equal(syncMouse(false), false);
+assert.equal(syncMouse(true), true);
+assert.equal(syncMouse(true), false);
+assert.equal(syncMouse(false), true);
+assert.deepEqual(mouseEdges, [false, true, false]);
+let mode = ownership.LIVE_XTERM;
+mode = ownership.transition(mode, {type: "enter-reading", mouseTracking: false});
+assert.equal(mode, ownership.READING_NATIVE);
+mode = ownership.transition(mode, {type: "pointer-finished"});
+assert.equal(mode, ownership.READING_NATIVE);
+mode = ownership.transition(mode, {type: "wheel"});
+assert.equal(mode, ownership.READING_NATIVE);
+mode = ownership.transition(mode, {
+  type: "surface-pointer", primaryMouse: false, away: true, mouseTracking: false,
+});
+assert.equal(mode, ownership.READING_NATIVE);
+mode = ownership.transition(mode, {type: "return-live", hasSurfaceSelection: true});
+assert.equal(mode, ownership.READING_NATIVE);
+mode = ownership.transition(mode, {type: "return-live", hasSurfaceSelection: false});
+assert.equal(mode, ownership.LIVE_XTERM);
+mode = ownership.transition(mode, {type: "enter-reading", mouseTracking: false});
+mode = ownership.transition(mode, {type: "terminal-input"});
+assert.equal(mode, ownership.LIVE_XTERM);
+mode = ownership.transition(mode, {type: "enter-reading", mouseTracking: false});
+mode = ownership.transition(mode, {type: "mouse-tracking", active: true, away: true});
+assert.equal(mode, ownership.TUI_MOUSE);
+mode = ownership.transition(mode, {type: "terminal-input", mouseTracking: true});
+assert.equal(mode, ownership.TUI_MOUSE);
+mode = ownership.transition(mode, {
+  type: "return-live", hasSurfaceSelection: false, mouseTracking: true,
+});
+assert.equal(mode, ownership.TUI_MOUSE);
+mode = ownership.transition(mode, {type: "pointer-finished", mouseTracking: true});
+assert.equal(mode, ownership.TUI_MOUSE);
+mode = ownership.transition(mode, {type: "wheel", mouseTracking: true});
+assert.equal(mode, ownership.TUI_MOUSE);
+mode = ownership.transition(mode, {type: "mouse-tracking", active: false, away: true});
+assert.equal(mode, ownership.READING_NATIVE);
+mode = ownership.transition(ownership.TUI_MOUSE, {
+  type: "mouse-tracking", active: false, away: false,
+});
+assert.equal(mode, ownership.LIVE_XTERM);
+mode = ownership.transition(mode, {type: "outside-pointer"});
+assert.equal(mode, ownership.LIVE_XTERM);
+"""
+    result = subprocess.run(
+        ["node", "-e", probe, str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_mobile_scrollback_is_native_touch_scrollable() -> None:
