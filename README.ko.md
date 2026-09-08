@@ -542,8 +542,11 @@ node --check termroom/static/terminal.js
 docker compose config
 ```
 
-사용자 화면을 바꾸는 경우 모바일·태블릿·데스크톱 실제 브라우저에서도 전체 흐름을
-확인합니다.
+사용자 화면을 바꾸는 경우 모바일·태블릿·데스크톱 responsive 폭에서 전체 흐름을 확인합니다.
+이 viewport 검증은 유용한 layout 증거지만 실기기 증거를 대신하지 않습니다. 현재 실제
+브라우저 release gate는 실제 macOS desktop의 Safari입니다. 스마트폰 Safari/Chrome과
+installed PWA 실기기 검증은 사용자가 추후 수행하는 별도 후속 항목이며 현재 release를
+차단하지 않습니다. 같은 Mac의 Chrome 비교 검증은 선택 사항입니다.
 
 ## 문서
 

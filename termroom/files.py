@@ -360,7 +360,10 @@ class FileService:
         stat = target.stat()
         if stat.st_size > self.max_edit_bytes:
             raise UnsupportedFileError("File exceeds the editable size limit")
-        raw = target.read_bytes()
+        with target.open("rb") as handle:
+            raw = handle.read(self.max_edit_bytes + 1)
+        if len(raw) > self.max_edit_bytes:
+            raise UnsupportedFileError("File exceeds the editable size limit")
         if b"\x00" in raw:
             raise UnsupportedFileError("Binary files cannot be edited")
         try:
@@ -640,10 +643,12 @@ class FileService:
             if checked != target or not checked.is_file():
                 raise FileConflictError("The file changed after it was opened")
             before = checked.stat()
-            current = checked.read_bytes()
+            with checked.open("rb") as handle:
+                current = handle.read(self.max_edit_bytes + 1)
             after = checked.stat()
             if (
-                before.st_dev != after.st_dev
+                len(current) > self.max_edit_bytes
+                or before.st_dev != after.st_dev
                 or before.st_ino != after.st_ino
                 or before.st_size != after.st_size
                 or before.st_mtime_ns != after.st_mtime_ns

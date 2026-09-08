@@ -11,27 +11,38 @@ from termroom.config import Settings, default_config_dir
 
 
 @pytest.mark.asyncio
-async def test_password_login_creates_authenticated_browser_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("password", "wrong_password"),
+    [
+        ("correct-password", "wrong-password"),
+        ("correct-password", "\uD55C\uAE00-\uC624\uC785\uB825"),
+        ("\uD55C\uAE00-\uBE44\uBC00\uBC88\uD638\U0001f510", "wrong-password"),
+        ("caf\u00e9-\U0001f510", "cafe\u0301-\U0001f510"),
+    ],
+)
+async def test_password_login_creates_authenticated_browser_session(
+    tmp_path: Path, password: str, wrong_password: str
+) -> None:
     root = tmp_path / "root"
     root.mkdir()
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
         access_token="internal-secret",
-        login_password="correct-password",
+        login_password=password,
     )
     app = create_app(settings)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         wrong = await client.post(
-            "/login", data={"password": "wrong-password"}, follow_redirects=False
+            "/login", data={"password": wrong_password}, follow_redirects=False
         )
         assert wrong.status_code == 401
         assert not client.cookies.get("termroom_session")
 
         login = await client.post(
-            "/login", data={"password": "correct-password"}, follow_redirects=False
+            "/login", data={"password": password}, follow_redirects=False
         )
         assert login.status_code == 303
         token = client.cookies.get("termroom_session")

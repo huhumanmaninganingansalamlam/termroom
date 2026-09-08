@@ -4450,7 +4450,9 @@ class SSHBackend:
             if int(attr.st_size or 0) > max_bytes:
                 raise UnsupportedFileError("File exceeds the editable size limit")
             with sftp.open(remote, "rb") as handle:
-                raw = handle.read()
+                raw = handle.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise UnsupportedFileError("File exceeds the editable size limit")
             if b"\x00" in raw:
                 raise UnsupportedFileError("Binary files cannot be executed")
             try:
@@ -4551,9 +4553,13 @@ class SSHBackend:
                 if checked != remote or not stat_module.S_ISREG(current_attr.st_mode):
                     raise FileConflictError("The file changed after it was opened")
                 with sftp.open(checked, "rb") as current_handle:
-                    current = current_handle.read()
+                    current = current_handle.read(max_bytes + 1)
                 current_mtime = int(current_attr.st_mtime or 0) * 1_000_000_000
-                if current_mtime != expected_mtime_ns or file_digest(current) != expected_digest:
+                if (
+                    len(current) > max_bytes
+                    or current_mtime != expected_mtime_ns
+                    or file_digest(current) != expected_digest
+                ):
                     raise FileConflictError("The file changed after it was opened")
                 return current_attr
 

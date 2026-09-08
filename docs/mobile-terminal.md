@@ -87,7 +87,8 @@ truth로 사용한다.
 - tmux 화면에서도 완성 음절이 유지됨
 
 synthetic browser event는 실제 Gboard/Samsung Keyboard/iOS IME의 완전한 대체물이
-아니다. 따라서 아래 실기기 검증도 release gate다.
+아니다. 실제 macOS Safari 검증과 추후 사용자가 수행하는 스마트폰 실기기 확인은 아래처럼
+구분하며, 확인하지 않은 기기 조합을 검증된 것처럼 표현하지 않는다.
 
 ## 4. Paste
 
@@ -185,18 +186,38 @@ terminal chrome, terminal 본문, composer, bottom navigation의 좌우 padding�
 `safe-area-inset-left/right`를 고려한다. notch가 있는 iPhone landscape에서도 핵심
 터치 컨트롤과 terminal 문자가 safe area 밖에 걸리지 않게 한다.
 
-## 8. Representative device matrix
+## 8. Browser validation matrix
 
-자동 QA 외에 release 전 Android와 iOS의 대표 실기기 흐름을 확인한다. 모든 keyboard vendor,
-tablet 크기와 browser version 조합을 매 release gate로 만들지는 않는다.
+### 현재 release gate: macOS Safari
 
-| 환경 | 필수 검증 |
+자동 QA 외에 실제 macOS desktop의 Safari에서 다음 Terminal 흐름을 확인한다.
+
+- shell과 Vim/Neovim에서 한글·ASCII 입력
+- Esc, Tab, Ctrl 조합과 normal/application cursor mode 방향키
+- 여러 줄 bracketed paste
+- terminal focus와 command editor 전환
+- viewport resize와 alternate-screen redraw
+- reload, WebSocket reconnect와 기존 tmux session 복귀
+- browser selection/copy와 tmux copy mode
+
+동일한 Mac의 Chrome은 비교 진단에 사용할 수 있지만 필수 gate가 아니며, Linux browser,
+user-agent 변경, responsive viewport 또는 WebKit emulation은 실제 macOS Safari 증거를
+대체하지 않는다.
+
+### 사용자 후속 확인: 스마트폰과 installed PWA
+
+Android와 iOS 실기기 및 installed PWA 검증은 사용자가 추후 수행하는 비차단 후속 항목이다.
+기기가 없거나 아직 실행하지 않았다는 이유로 현재 delivery 또는 `PRODUCT_COMPLETE`를
+차단하지 않는다. 모든 keyboard vendor, tablet 크기와 browser version 조합을 매 release
+gate로 만들지도 않는다.
+
+| 환경 | 사용자 후속 확인 |
 |---|---|
 | Android Chrome + installed PWA | 대표 한국어 keyboard의 composition, focus, keyboard open-close, rotation |
 | iPhone Safari + installed PWA | composition, punctuation, copy/paste, safe area |
-| Desktop 또는 Bluetooth keyboard | Esc/Tab/Ctrl/arrows, terminal focus와 resize |
+| 물리 또는 Bluetooth keyboard | Esc/Tab/Ctrl/arrows, terminal focus와 resize |
 
-각 기기에서 최소 다음 시나리오를 실행한다.
+실기기에서 확인할 때는 최소 다음 시나리오를 실행한다.
 
 1. shell prompt에 `한글테스트` 입력
 2. interactive CLI/REPL에서 `echo 한글`
@@ -209,5 +230,4 @@ tablet 크기와 browser version 조합을 매 release gate로 만들지는 않�
 9. keyboard open/close와 portrait/landscape rotation
 10. browser selection/copy와 tmux copy mode
 
-실기기에서 확인하지 않은 항목을 문서나 release note에서 "완벽 지원"으로 표현하지
-않는다.
+실기기에서 확인하지 않은 항목을 문서나 release note에서 "완벽 지원"으로 표현하지 않는다.
