@@ -77,6 +77,7 @@
   let historyRenderRevision = 0;
   let terminalRevision = 0;
   let userScrollRevision = 0;
+  let userScrollIntentPending = false;
   let liveFollowing = true;
   let selectionOwnershipMode = selectionOwnership.LIVE_XTERM;
   let nativeCopySelectionActive = false;
@@ -694,6 +695,13 @@
   const updateScrollState = () => {
     const wasFollowing = liveFollowing;
     const away = !atLiveBottom();
+    // Keyboard viewport changes and history reflow can move the surface
+    // without the user choosing to read. Keep live input focused in that case.
+    if (away && liveFollowing && !userScrollIntentPending) {
+      scrollToLive();
+      return;
+    }
+    if (!away) userScrollIntentPending = false;
     liveFollowing = !away;
     liveButton.hidden = !away;
     document.body.classList.toggle("terminal-scroll-away", away);
@@ -964,6 +972,7 @@
 
   const noteUserScrollIntent = ({ revealHistory = false } = {}) => {
     userScrollRevision += 1;
+    if (revealHistory) userScrollIntentPending = true;
     if (revealHistory && historyDirty && liveFollowing) {
       scheduleHistoryRefresh({ urgent: true });
     }

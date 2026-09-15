@@ -20,7 +20,7 @@ def test_base_loads_mobile_scrollback_assets() -> None:
 
     assert "mobile_scrollback.css') }}?v=15" in template
     assert "terminal_selection.js') }}?v=1\" defer" in template
-    assert "mobile_scrollback.js') }}?v=34\" defer" in template
+    assert "mobile_scrollback.js') }}?v=35\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
     assert "terminal.js') }}?v=57" in terminal_template
 
@@ -41,12 +41,12 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
         page = await client.get("/")
         stylesheet = await client.get("/static/mobile_scrollback.css?v=15")
         ownership = await client.get("/static/terminal_selection.js?v=1")
-        script = await client.get("/static/mobile_scrollback.js?v=34")
+        script = await client.get("/static/mobile_scrollback.js?v=35")
 
     assert page.status_code == 401
     assert "/static/mobile_scrollback.css?v=15" in page.text
     assert "/static/terminal_selection.js?v=1" in page.text
-    assert "/static/mobile_scrollback.js?v=34" in page.text
+    assert "/static/mobile_scrollback.js?v=35" in page.text
     assert ownership.status_code == 200
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text
@@ -115,7 +115,6 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "|| (!stickToBottom && !liveFollowing && !atLiveBottom())" in script
     assert "if (!historyDirty || !liveFollowing) return;" in script
     assert "if (!away && !wasFollowing && historyDirty)" in script
-    assert 'if (away) {\n      document.querySelector(".xterm-helper-textarea")?.blur();' in script
     assert "const bindLiveInputReturn = () =>" in script
     assert 'textarea.addEventListener(\n      "keydown"' in script
     assert 'document.querySelector("#command-form")?.addEventListener' in script
@@ -194,6 +193,56 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "event.preventDefault();" not in touch_move
     assert "socket.send(" not in script
     assert "term.input" not in script
+
+
+def test_layout_scroll_does_not_turn_live_input_into_reading_mode() -> None:
+    script = (ROOT / "termroom/static/mobile_scrollback.js").read_text(encoding="utf-8")
+    start = script.index("  const updateScrollState = () => {")
+    end = script.index("\n\n  const scrollToLive", start)
+    update_scroll_state = script[start:end].replace(
+        "  const updateScrollState = () => {", "globalThis.updateScrollState = () => {", 1
+    )
+    probe = f"""
+const assert = require("node:assert/strict");
+let liveFollowing = true;
+let userScrollIntentPending = false;
+let historyDirty = false;
+let atBottom = false;
+let returnedToLive = 0;
+let blurred = 0;
+let enteredReading = 0;
+const atLiveBottom = () => atBottom;
+const scrollToLive = () => {{ returnedToLive += 1; liveFollowing = true; atBottom = true; }};
+const scheduleHistoryRefresh = () => {{}};
+const mouseTrackingActive = () => false;
+const selectionBelongsToSurface = () => false;
+const applySelectionOwnership = (event) => {{
+  if (event.type === "enter-reading") enteredReading += 1;
+}};
+const liveButton = {{ hidden: true }};
+const document = {{
+  body: {{ classList: {{ toggle() {{}} }} }},
+  querySelector: () => ({{ blur() {{ blurred += 1; }} }}),
+}};
+{update_scroll_state}
+updateScrollState();
+assert.equal(returnedToLive, 1);
+assert.equal(blurred, 0);
+assert.equal(enteredReading, 0);
+assert.equal(liveFollowing, true);
+atBottom = false;
+userScrollIntentPending = true;
+updateScrollState();
+assert.equal(returnedToLive, 1);
+assert.equal(blurred, 1);
+assert.equal(enteredReading, 1);
+assert.equal(liveFollowing, false);
+assert.equal(liveButton.hidden, false);
+"""
+    result = subprocess.run(
+        ["node", "-e", probe], check=False, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_terminal_selection_ownership_state_machine() -> None:
