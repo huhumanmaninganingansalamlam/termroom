@@ -124,15 +124,25 @@
       request.send(file);
     });
 
-    const recoverArchiveUpload = async (runId) => {
+    const inspectArchiveUpload = async (runId) => {
       const response = await fetch(`${form.dataset.uploadPrefix}/${runId}/status`, {
         headers: { Accept: "application/json" },
       });
       const result = await response.json();
-      return response.ok && result.ok !== false && (
-        result.state !== "preparing"
-        || !["waiting_upload", "uploading"].includes(result.phase)
-      );
+      if (!response.ok || result.ok === false || typeof result.state !== "string") {
+        return { known: false, accepted: false, state: null, phase: null };
+      }
+      if (result.state === "preparing" && typeof result.phase !== "string") {
+        return { known: false, accepted: false, state: result.state, phase: null };
+      }
+      const awaitingUpload = result.state === "preparing"
+        && ["waiting_upload", "uploading"].includes(result.phase);
+      return {
+        known: true,
+        accepted: !awaitingUpload,
+        state: result.state,
+        phase: result.phase || null,
+      };
     };
 
     form.addEventListener("submit", async (event) => {
@@ -170,7 +180,11 @@
         return;
       }
       payload.id = runId;
-      const submission = { id: runId, fingerprint, archive, selectionGeneration };
+      const submission = pendingSubmission?.fingerprint === fingerprint
+        && pendingSubmission.archive === archive
+        && pendingSubmission.selectionGeneration === selectionGeneration
+        ? pendingSubmission
+        : { id: runId, fingerprint, archive, selectionGeneration, archiveUploadStarted: false };
       pendingSubmission = submission;
       activeSubmission = submission;
 
@@ -189,8 +203,22 @@
           throw new Error(result.error || tr("remote_run.error.start_failed"));
         }
         if (sourceKind === "archive") {
+          if (submission.archiveUploadStarted) {
+            const uploadStatus = await inspectArchiveUpload(runId);
+            if (uploadStatus.accepted) {
+              if (activeSubmission !== submission) return;
+              navigating = true;
+              window.location.assign(`/remote-runs/${runId}`);
+              return;
+            }
+            if (!uploadStatus.known || uploadStatus.phase === "uploading") {
+              showError(tr("remote_run.error.upload_network"));
+              return;
+            }
+          }
           if (progressBox) progressBox.hidden = false;
-          await uploadArchive(runId, archive);
+          submission.archiveUploadStarted = true;
+          await uploadArchive(runId, submission.archive);
         }
         if (activeSubmission !== submission) return;
         navigating = true;
@@ -199,7 +227,8 @@
         if (activeSubmission !== submission) return;
         if (sourceKind === "archive") {
           try {
-            if (await recoverArchiveUpload(runId)) {
+            const uploadStatus = await inspectArchiveUpload(runId);
+            if (uploadStatus.accepted) {
               navigating = true;
               window.location.assign(`/remote-runs/${runId}`);
               return;

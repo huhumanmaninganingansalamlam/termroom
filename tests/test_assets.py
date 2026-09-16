@@ -410,7 +410,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"62"}
     assert versions["app.js"] == {"72"}
-    assert versions["remote_run.js"] == {"13"}
+    assert versions["remote_run.js"] == {"14"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
     assert versions["terminal.js"] == {"57"}
@@ -440,7 +440,10 @@ const archive = new Target();
 archive.files = [];
 const form = new Target();
 form.dataset = { createUrl: "/api/remote-runs", uploadPrefix: "/api/remote-runs", csrf: "csrf" };
-form.values = { target_computer_id: "target", command: "echo first", source_workspace_id: "source", source_path: "." };
+form.values = {
+  target_computer_id: "target", command: "echo first", source_workspace_id: "source",
+  source_path: ".", source_url: "https://example.test/repo.git",
+};
 form.querySelectorAll = (selector) => selector === "input[name='source_kind']" ? [source] : [];
 form.querySelector = (selector) => ({
   "#remote-run-form-error": error,
@@ -456,23 +459,32 @@ global.document = {
   querySelector: (selector) => selector === "#remote-run-form" ? form : null,
   querySelectorAll: () => [],
 };
-global.FormData = class { constructor(value) { this.value = value; } get(key) { return this.value.values[key] || ""; } };
+global.FormData = class {
+  constructor(value) { this.value = value; }
+  get(key) { return this.value.values[key] || ""; }
+};
 let sequence = 0;
 const requestIds = [];
+const requestBodies = [];
 global.window = {
   crypto: { randomUUID: () => `run-${++sequence}` },
   location: { assign: () => {} },
   TermroomI18n: {},
 };
 global.fetch = async (_url, options) => {
-  const id = JSON.parse(options.body).id;
+  const body = JSON.parse(options.body);
+  const id = body.id;
   requestIds.push(id);
+  requestBodies.push(body);
   if (requestIds.length === 1) throw new Error("response lost");
   return { ok: true, json: async () => ({ ok: true, detail_url: `/remote-runs/${id}` }) };
 };
 let uploadOutcomes = ["error", "load", "load"];
 global.XMLHttpRequest = class {
-  constructor() { this.listeners = {}; this.upload = new Target(); this.status = 202; this.response = { ok: true }; }
+  constructor() {
+    this.listeners = {}; this.upload = new Target(); this.status = 202;
+    this.response = { ok: true };
+  }
   open() {}
   setRequestHeader() {}
   addEventListener(type, handler) { this.listeners[type] = handler; }
@@ -491,7 +503,7 @@ const submitForm = async () => {
   await first;
   await submitForm();
 
-  process.stdout.write(JSON.stringify(requestIds));
+  process.stdout.write(JSON.stringify({ ids: requestIds, bodies: requestBodies }));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     for source_kind in ("workspace", "git"):
@@ -501,7 +513,153 @@ const submitForm = async () => {
             capture_output=True,
             text=True,
         )
-        assert json.loads(result.stdout) == ["run-1", "run-1"]
+        observed = json.loads(result.stdout)
+        assert observed["ids"] == ["run-1", "run-1"]
+        assert observed["bodies"][0] == observed["bodies"][1]
+        assert observed["bodies"][0]["source_kind"] == source_kind
+        if source_kind == "git":
+            assert observed["bodies"][0]["source_url"] == "https://example.test/repo.git"
+
+
+def test_remote_run_archive_retry_checks_status_before_retransmitting() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the Remote Run form")
+    script = r"""
+const fs=require("fs"),vm=require("vm");
+class T {
+  constructor(){this.l={};this.disabled=false;this.hidden=false;this.checked=false;this.files=[];this.value=""}
+  addEventListener(n,f){(this.l[n]??=[]).push(f)}
+  emit(n,e={}){for(const f of this.l[n]??[])f(e)}
+  scrollIntoView(){}
+}
+
+function harness(scenario) {
+  const source=new T(); source.value="archive"; source.checked=true;
+  const submit=new T(), error=new T(), archive=new T(), form=new T();
+  const fileA={name:"same.zip",size:7,lastModified:123,bytes:"A"};
+  const fileB={name:"same.zip",size:7,lastModified:123,bytes:"B"};
+  archive.files=[fileA];
+  form.dataset={createUrl:"/api/remote-runs",uploadPrefix:"/api/remote-runs",csrf:"x"};
+  form.values={target_computer_id:"target",command:"run"};
+  form.querySelectorAll=(s)=>s==="input[name='source_kind']"?[source]
+    :s==="button, input, select, textarea"?[source,submit,archive]:[];
+  form.querySelector=(s)=>({"#remote-run-form-error":error,"button[type='submit']":submit,"#remote-run-upload-progress":null,"input[name='archive']":archive}[s]||null);
+  form.setAttribute=()=>{}; form.removeAttribute=()=>{};
+  let sequence=0, statusCount=0;
+  const createIds=[], uploadBodies=[], uploadUrls=[], assignments=[];
+  const statusResponses = {
+    "create-loss": [{state:"preparing",phase:"waiting_upload"}],
+    uploading: [{state:"preparing",phase:"uploading"},{state:"preparing",phase:"uploading"}],
+    accepted: [{state:"preparing",phase:"uploading"},{state:"preparing",phase:"checking"}],
+    unknown: [{state:"preparing"},{state:"preparing"}],
+    replacement: [{state:"preparing",phase:"waiting_upload"}],
+  }[scenario] || [];
+  const createOutcomes = scenario==="create-loss" || scenario==="replacement"
+    ? ["lost","ok"] : ["ok","ok"];
+  const uploadOutcomes = scenario==="uploading" || scenario==="accepted" || scenario==="unknown"
+    ? ["error"] : ["load"];
+  const context={
+    console,queueMicrotask,
+    document:{documentElement:{lang:"en"},querySelector:s=>s==="#remote-run-form"?form:null,querySelectorAll:()=>[]},
+    FormData:class{constructor(value){this.value=value}get(k){return this.value.values[k]||""}},
+    window:{crypto:{randomUUID:()=>`run-${++sequence}`},location:{assign:url=>assignments.push(url)},TermroomI18n:{}},
+    fetch:async(_url,options)=>{
+      if(options?.body){
+        const body=JSON.parse(options.body); createIds.push(body.id);
+        if(createOutcomes.shift()==="lost") throw new Error("create response lost");
+        return {ok:true,json:async()=>({ok:true,detail_url:`/remote-runs/${body.id}`})};
+      }
+      statusCount++;
+      const response=statusResponses.shift() || {state:"preparing",phase:"waiting_upload"};
+      return {ok:true,json:async()=>response};
+    },
+    XMLHttpRequest:class{
+      constructor(){this.l={};this.upload=new T();this.status=202;this.response={ok:true}}
+      open(_method,url){this.url=url;uploadUrls.push(url)}
+      setRequestHeader(){}
+      addEventListener(n,f){this.l[n]=f}
+      send(body){
+        uploadBodies.push(body);
+        const outcome=uploadOutcomes.shift()||"load";
+        queueMicrotask(()=>this.l[outcome]());
+      }
+    },
+  };
+  vm.runInNewContext(fs.readFileSync(process.argv[1],"utf8"),context);
+  const send=async()=>{for(const f of form.l.submit||[])await f({preventDefault(){}})};
+  return {
+    source,archive,fileA,fileB,form,send,createIds,uploadBodies,uploadUrls,assignments,
+    statusCount:()=>statusCount,error,
+  };
+}
+
+(async()=>{
+  const scenario=process.argv[2];
+  const h=harness(scenario);
+  if(scenario==="replacement"){
+    await h.send();
+    h.archive.files=[h.fileB];
+    h.form.emit("change");
+    await h.send();
+  } else if(scenario==="accepted"){
+    await h.send();
+    await h.send();
+    await h.send();
+  } else {
+    await h.send();
+    await h.send();
+  }
+  process.stdout.write(JSON.stringify({
+    createIds:h.createIds,
+    statusCalls:h.statusCount(),
+    uploadCount:h.uploadBodies.length,
+    uploadedA:h.uploadBodies[0]===h.fileA,
+    uploadedB:h.uploadBodies[0]===h.fileB,
+    assignments:h.assignments,
+    uploadUrls:h.uploadUrls,
+    error:h.error.textContent||"",
+  }));
+})().catch(e=>{console.error(e);process.exitCode=1});
+"""
+    expected = {
+        "create-loss": {
+            "createIds": ["run-1", "run-1"], "statusCalls": 1, "uploadCount": 1,
+            "uploadedA": True, "uploadedB": False, "assignments": ["/remote-runs/run-1"],
+        },
+        "uploading": {
+            "createIds": ["run-1", "run-1"], "statusCalls": 2, "uploadCount": 1,
+            "uploadedA": True, "uploadedB": False, "assignments": [],
+        },
+        "accepted": {
+            "createIds": ["run-1", "run-1"], "statusCalls": 2, "uploadCount": 1,
+            "uploadedA": True, "uploadedB": False, "assignments": ["/remote-runs/run-1"],
+        },
+        "unknown": {
+            "createIds": ["run-1", "run-1"], "statusCalls": 2, "uploadCount": 1,
+            "uploadedA": True, "uploadedB": False, "assignments": [],
+        },
+        "replacement": {
+            "createIds": ["run-1", "run-2"], "statusCalls": 1, "uploadCount": 1,
+            "uploadedA": False, "uploadedB": True, "assignments": ["/remote-runs/run-2"],
+        },
+    }
+    for scenario, assertions in expected.items():
+        result = subprocess.run(
+            [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js"), scenario],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(result.stdout)
+        for key, value in assertions.items():
+            assert observed[key] == value, (scenario, key, observed)
+        expected_upload_url = (
+            "/api/remote-runs/run-2/archive?filename=same.zip"
+            if scenario == "replacement"
+            else "/api/remote-runs/run-1/archive?filename=same.zip"
+        )
+        assert observed["uploadUrls"] == [expected_upload_url]
 
 
 def test_remote_run_archive_validation_and_uploading_recovery_stay_retryable() -> None:
@@ -510,18 +668,47 @@ def test_remote_run_archive_validation_and_uploading_recovery_stay_retryable() -
         pytest.skip("Node.js is required to exercise the Remote Run form")
     script = r"""
 const fs=require("fs"),vm=require("vm");
-class T { constructor(){this.l={};this.disabled=false;this.hidden=false} addEventListener(n,f){(this.l[n]??=[]).push(f)} emit(n){for(const f of this.l[n]??[])f()} scrollIntoView(){} }
+class T {
+  constructor(){this.l={};this.disabled=false;this.hidden=false}
+  addEventListener(n,f){(this.l[n]??=[]).push(f)}
+  emit(n){for(const f of this.l[n]??[])f()}
+  scrollIntoView(){}
+}
 const source=new T(); source.value="archive"; source.checked=true;
 const submit=new T(), error=new T(), archive=new T(), form=new T(); archive.files=[];
-form.dataset={createUrl:"/api/remote-runs",uploadPrefix:"/api/remote-runs",csrf:"x"}; form.values={target_computer_id:"target",command:"run"};
-form.querySelectorAll=(s)=>s==="input[name='source_kind']"?[source]:s==="button, input, select, textarea"?[source,submit,archive]:[];
+form.dataset={createUrl:"/api/remote-runs",uploadPrefix:"/api/remote-runs",csrf:"x"};
+form.values={target_computer_id:"target",command:"run"};
+form.querySelectorAll=(s)=>s==="input[name='source_kind']"?[source]
+  :s==="button, input, select, textarea"?[source,submit,archive]:[];
 form.querySelector=(s)=>({"#remote-run-form-error":error,"button[type='submit']":submit,"#remote-run-upload-progress":null,"input[name='archive']":archive}[s]||null);
 form.setAttribute=()=>{};form.removeAttribute=()=>{};
 let calls=0, assigned=0;
-const context={console,queueMicrotask,document:{documentElement:{lang:"en"},querySelector:s=>s==="#remote-run-form"?form:null,querySelectorAll:()=>[]},FormData:class{constructor(){ }get(k){return form.values[k]||""}},window:{crypto:{randomUUID:()=>"run-1"},location:{assign:()=>assigned++},TermroomI18n:{}},fetch:async(_url, options)=>{calls++;if(options.body)return{ok:true,json:async()=>({ok:true,detail_url:"/remote-runs/run-1"})};return{ok:true,json:async()=>({ok:true,state:"preparing",phase:"uploading"})}},XMLHttpRequest:class{constructor(){this.l={};this.upload=new T();this.status=202;this.response={ok:true}}open(){}setRequestHeader(){}addEventListener(n,f){this.l[n]=f}send(){queueMicrotask(()=>this.l.error())}}};
+const context={
+  console,queueMicrotask,
+  document:{documentElement:{lang:"en"},querySelector:s=>s==="#remote-run-form"?form:null,querySelectorAll:()=>[]},
+  FormData:class{constructor(){}get(k){return form.values[k]||""}},
+  window:{crypto:{randomUUID:()=>"run-1"},location:{assign:()=>assigned++},TermroomI18n:{}},
+  fetch:async(_url, options)=>{
+    calls++;
+    if(options.body)return{ok:true,json:async()=>({ok:true,detail_url:"/remote-runs/run-1"})};
+    return{ok:true,json:async()=>({ok:true,state:"preparing",phase:"uploading"})};
+  },
+  XMLHttpRequest:class{
+    constructor(){this.l={};this.upload=new T();this.status=202;this.response={ok:true}}
+    open(){} setRequestHeader(){} addEventListener(n,f){this.l[n]=f}
+    send(){queueMicrotask(()=>this.l.error())}
+  },
+};
 vm.runInNewContext(fs.readFileSync(process.argv[1],"utf8"),context);
 const send=async()=>{for(const f of form.l.submit||[])await f({preventDefault(){}})};
-(async()=>{await send(); const empty=[calls,error.textContent]; archive.files=[{name:"same.zip"}];form.emit("change");await send(); process.stdout.write(JSON.stringify({empty,calls,assigned}))})().catch(e=>{console.error(e);process.exitCode=1});
+(async()=>{
+  await send();
+  const empty=[calls,error.textContent];
+  archive.files=[{name:"same.zip"}];
+  form.emit("change");
+  await send();
+  process.stdout.write(JSON.stringify({empty,calls,assigned}));
+})().catch(e=>{console.error(e);process.exitCode=1});
 """
     result = subprocess.run(
         [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js")],
