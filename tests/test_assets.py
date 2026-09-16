@@ -432,7 +432,7 @@ class Target {
 }
 
 const source = new Target();
-source.value = "workspace";
+source.value = process.argv[2];
 source.checked = true;
 const submit = new Target();
 const error = new Target();
@@ -494,13 +494,46 @@ const submitForm = async () => {
   process.stdout.write(JSON.stringify(requestIds));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
+    for source_kind in ("workspace", "git"):
+        result = subprocess.run(
+            [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js"), source_kind],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert json.loads(result.stdout) == ["run-1", "run-1"]
+
+
+def test_remote_run_archive_validation_and_uploading_recovery_stay_retryable() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the Remote Run form")
+    script = r"""
+const fs=require("fs"),vm=require("vm");
+class T { constructor(){this.l={};this.disabled=false;this.hidden=false} addEventListener(n,f){(this.l[n]??=[]).push(f)} emit(n){for(const f of this.l[n]??[])f()} scrollIntoView(){} }
+const source=new T(); source.value="archive"; source.checked=true;
+const submit=new T(), error=new T(), archive=new T(), form=new T(); archive.files=[];
+form.dataset={createUrl:"/api/remote-runs",uploadPrefix:"/api/remote-runs",csrf:"x"}; form.values={target_computer_id:"target",command:"run"};
+form.querySelectorAll=(s)=>s==="input[name='source_kind']"?[source]:s==="button, input, select, textarea"?[source,submit,archive]:[];
+form.querySelector=(s)=>({"#remote-run-form-error":error,"button[type='submit']":submit,"#remote-run-upload-progress":null,"input[name='archive']":archive}[s]||null);
+form.setAttribute=()=>{};form.removeAttribute=()=>{};
+let calls=0, assigned=0;
+const context={console,queueMicrotask,document:{documentElement:{lang:"en"},querySelector:s=>s==="#remote-run-form"?form:null,querySelectorAll:()=>[]},FormData:class{constructor(){ }get(k){return form.values[k]||""}},window:{crypto:{randomUUID:()=>"run-1"},location:{assign:()=>assigned++},TermroomI18n:{}},fetch:async(_url, options)=>{calls++;if(options.body)return{ok:true,json:async()=>({ok:true,detail_url:"/remote-runs/run-1"})};return{ok:true,json:async()=>({ok:true,state:"preparing",phase:"uploading"})}},XMLHttpRequest:class{constructor(){this.l={};this.upload=new T();this.status=202;this.response={ok:true}}open(){}setRequestHeader(){}addEventListener(n,f){this.l[n]=f}send(){queueMicrotask(()=>this.l.error())}}};
+vm.runInNewContext(fs.readFileSync(process.argv[1],"utf8"),context);
+const send=async()=>{for(const f of form.l.submit||[])await f({preventDefault(){}})};
+(async()=>{await send(); const empty=[calls,error.textContent]; archive.files=[{name:"same.zip"}];form.emit("change");await send(); process.stdout.write(JSON.stringify({empty,calls,assigned}))})().catch(e=>{console.error(e);process.exitCode=1});
+"""
     result = subprocess.run(
         [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js")],
         check=True,
         capture_output=True,
         text=True,
     )
-    assert json.loads(result.stdout) == ["run-1", "run-1"]
+    assert json.loads(result.stdout) == {
+        "empty": [0, "remote_run.error.zip_required"],
+        "calls": 2,
+        "assigned": 0,
+    }
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:

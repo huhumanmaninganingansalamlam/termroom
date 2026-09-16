@@ -129,7 +129,10 @@
         headers: { Accept: "application/json" },
       });
       const result = await response.json();
-      return response.ok && result.ok !== false && result.phase !== "waiting_upload";
+      return response.ok && result.ok !== false && (
+        result.state !== "preparing"
+        || !["waiting_upload", "uploading"].includes(result.phase)
+      );
     };
 
     form.addEventListener("submit", async (event) => {
@@ -151,6 +154,10 @@
         payload.source_url = String(data.get("source_url") || "");
       } else {
         archive = form.querySelector("input[name='archive']")?.files?.[0] || null;
+        if (!archive) {
+          showError(tr("remote_run.error.zip_required"));
+          return;
+        }
         payload.archive_name = archive?.name || "";
       }
       const fingerprint = JSON.stringify(payload);
@@ -182,7 +189,6 @@
           throw new Error(result.error || tr("remote_run.error.start_failed"));
         }
         if (sourceKind === "archive") {
-          if (!archive) throw new Error(tr("remote_run.error.zip_required"));
           if (progressBox) progressBox.hidden = false;
           await uploadArchive(runId, archive);
         }
