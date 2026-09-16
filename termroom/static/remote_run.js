@@ -38,9 +38,13 @@
     const sourcePanelControlSelector = "button, fieldset, input, optgroup, option, select, textarea";
     const errorBox = form.querySelector("#remote-run-form-error");
     const submit = form.querySelector("button[type='submit']");
+    const submissionControlInitialDisabled = new WeakMap();
     const progressBox = form.querySelector("#remote-run-upload-progress");
     const progress = progressBox?.querySelector("progress");
-    let pendingArchiveRun = null;
+    let pendingSubmission = null;
+    let activeSubmission = null;
+    let selectionGeneration = 0;
+    let navigating = false;
 
     const selectedKind = () => sourceInputs.find((input) => input.checked)?.value || "workspace";
     const updatePanels = () => {
@@ -69,8 +73,32 @@
     const clearError = () => {
       if (errorBox) errorBox.hidden = true;
     };
-    form.addEventListener("input", clearError);
-    form.addEventListener("change", clearError);
+    const resetSubmission = () => {
+      pendingSubmission = null;
+      selectionGeneration += 1;
+    };
+    form.addEventListener("input", () => {
+      clearError();
+      resetSubmission();
+    });
+    form.addEventListener("change", () => {
+      clearError();
+      resetSubmission();
+    });
+
+    const setBusy = (busy) => {
+      form.querySelectorAll("button, input, select, textarea").forEach((control) => {
+        if (!submissionControlInitialDisabled.has(control)) {
+          submissionControlInitialDisabled.set(control, control.disabled);
+        }
+        control.disabled = busy || submissionControlInitialDisabled.get(control);
+      });
+      if (busy) form.setAttribute("aria-busy", "true");
+      else {
+        form.removeAttribute("aria-busy");
+        updatePanels();
+      }
+    };
 
     const uploadArchive = (runId, file) => new Promise((resolve, reject) => {
       const request = new XMLHttpRequest();
@@ -96,8 +124,17 @@
       request.send(file);
     });
 
+    const recoverArchiveUpload = async (runId) => {
+      const response = await fetch(`${form.dataset.uploadPrefix}/${runId}/status`, {
+        headers: { Accept: "application/json" },
+      });
+      const result = await response.json();
+      return response.ok && result.ok !== false && result.phase !== "waiting_upload";
+    };
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (activeSubmission || navigating) return;
       if (errorBox) errorBox.hidden = true;
       const data = new FormData(form);
       const sourceKind = selectedKind();
@@ -117,19 +154,20 @@
         payload.archive_name = archive?.name || "";
       }
       const fingerprint = JSON.stringify(payload);
-      const runId = (
-        sourceKind === "archive" && pendingArchiveRun?.fingerprint === fingerprint
-          ? pendingArchiveRun.id
-          : createUuid()
-      );
+      const runId = pendingSubmission?.fingerprint === fingerprint
+        && pendingSubmission.archive === archive
+        && pendingSubmission.selectionGeneration === selectionGeneration
+        ? pendingSubmission.id : createUuid();
       if (!runId) {
         showError(tr("remote_run.error.uuid_unavailable"));
         return;
       }
       payload.id = runId;
+      const submission = { id: runId, fingerprint, archive, selectionGeneration };
+      pendingSubmission = submission;
+      activeSubmission = submission;
 
-      submit.disabled = true;
-      form.setAttribute("aria-busy", "true");
+      setBusy(true);
       try {
         const response = await fetch(form.dataset.createUrl, {
           method: "POST",
@@ -144,17 +182,33 @@
           throw new Error(result.error || tr("remote_run.error.start_failed"));
         }
         if (sourceKind === "archive") {
-          pendingArchiveRun = { id: runId, fingerprint };
           if (!archive) throw new Error(tr("remote_run.error.zip_required"));
           if (progressBox) progressBox.hidden = false;
           await uploadArchive(runId, archive);
         }
+        if (activeSubmission !== submission) return;
+        navigating = true;
         window.location.assign(result.detail_url || `/remote-runs/${runId}`);
       } catch (error) {
+        if (activeSubmission !== submission) return;
+        if (sourceKind === "archive") {
+          try {
+            if (await recoverArchiveUpload(runId)) {
+              navigating = true;
+              window.location.assign(`/remote-runs/${runId}`);
+              return;
+            }
+          } catch (_recoveryError) {
+            // Keep the original inline error when the recovery check is unavailable.
+          }
+        }
         showError(error?.message || String(error));
-        submit.disabled = false;
-        form.removeAttribute("aria-busy");
         if (progressBox) progressBox.hidden = true;
+      } finally {
+        if (activeSubmission === submission && !navigating) {
+          activeSubmission = null;
+          setBusy(false);
+        }
       }
     });
   }

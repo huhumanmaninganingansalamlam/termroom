@@ -409,11 +409,98 @@ def test_template_static_asset_versions_are_consistent() -> None:
 
     assert all(len(asset_versions) == 1 for asset_versions in versions.values())
     assert versions["app.css"] == {"62"}
-    assert versions["app.js"] == {"71"}
-    assert versions["remote_run.js"] == {"12"}
+    assert versions["app.js"] == {"72"}
+    assert versions["remote_run.js"] == {"13"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
     assert versions["terminal.js"] == {"57"}
+
+
+def test_remote_run_form_reuses_one_submission_identity_until_intent_changes() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the Remote Run form")
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+class Target {
+  constructor() { this.listeners = {}; this.hidden = false; this.disabled = false; }
+  addEventListener(type, handler) { (this.listeners[type] ||= []).push(handler); }
+  emit(type, event = {}) { for (const handler of this.listeners[type] || []) handler(event); }
+  scrollIntoView() {}
+}
+
+const source = new Target();
+source.value = "workspace";
+source.checked = true;
+const submit = new Target();
+const error = new Target();
+const archive = new Target();
+archive.files = [];
+const form = new Target();
+form.dataset = { createUrl: "/api/remote-runs", uploadPrefix: "/api/remote-runs", csrf: "csrf" };
+form.values = { target_computer_id: "target", command: "echo first", source_workspace_id: "source", source_path: "." };
+form.querySelectorAll = (selector) => selector === "input[name='source_kind']" ? [source] : [];
+form.querySelector = (selector) => ({
+  "#remote-run-form-error": error,
+  "button[type='submit']": submit,
+  "#remote-run-upload-progress": null,
+  "input[name='archive']": archive,
+}[selector] || null);
+form.setAttribute = () => {};
+form.removeAttribute = () => {};
+
+global.document = {
+  documentElement: { lang: "en" },
+  querySelector: (selector) => selector === "#remote-run-form" ? form : null,
+  querySelectorAll: () => [],
+};
+global.FormData = class { constructor(value) { this.value = value; } get(key) { return this.value.values[key] || ""; } };
+let sequence = 0;
+const requestIds = [];
+global.window = {
+  crypto: { randomUUID: () => `run-${++sequence}` },
+  location: { assign: () => {} },
+  TermroomI18n: {},
+};
+global.fetch = async (_url, options) => {
+  const id = JSON.parse(options.body).id;
+  requestIds.push(id);
+  if (requestIds.length === 1) throw new Error("response lost");
+  return { ok: true, json: async () => ({ ok: true, detail_url: `/remote-runs/${id}` }) };
+};
+let uploadOutcomes = ["error", "load", "load"];
+global.XMLHttpRequest = class {
+  constructor() { this.listeners = {}; this.upload = new Target(); this.status = 202; this.response = { ok: true }; }
+  open() {}
+  setRequestHeader() {}
+  addEventListener(type, handler) { this.listeners[type] = handler; }
+  send() { queueMicrotask(() => this.listeners[uploadOutcomes.shift()]()); }
+};
+
+vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+const submitForm = async () => {
+  const event = { preventDefault() {} };
+  for (const handler of form.listeners.submit || []) await handler(event);
+};
+
+(async () => {
+  const first = submitForm();
+  await submitForm();
+  await first;
+  await submitForm();
+
+  process.stdout.write(JSON.stringify(requestIds));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == ["run-1", "run-1"]
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:
