@@ -3494,6 +3494,27 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=303,
             )
         launch_id = str(form.get("launch_id") or "")
+        command_digest = workspace_command_digest(commands[slot])
+        try:
+            admission = store.claim_workspace_command(
+                workspace_id, launch_id, slot, command_digest
+            )
+        except ValueError:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.already_submitted"),
+                ),
+                status_code=303,
+            )
+        if admission == "replayed":
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.already_submitted"),
+                ),
+                status_code=303,
+            )
         try:
             if is_remote(workspace):
                 terminal = await remote.run_workspace_command(

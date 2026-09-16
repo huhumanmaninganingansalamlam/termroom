@@ -211,6 +211,7 @@
   "workspace.run.save_before_run": "실행하기 전에 편집 내용을 저장하거나 취소하세요.",
   "workspace.run.error.invalid": "비어 있지 않은 한 줄 명령을 최대 3개 저장하세요. 각 명령은 UTF-8 4096 byte 이하여야 합니다.",
   "workspace.run.error.changed": "다른 화면에서 이 명령이 변경되었습니다. 새 명령을 확인한 뒤 다시 실행하세요.",
+  "workspace.run.error.already_submitted": "이 명령 실행은 이미 제출되었습니다. 다시 실행하려면 새 실행을 시작하세요.",
   "time.recent": "최근",
   "time.just_now": "방금",
   "time.minutes_ago": "{count}분 전",

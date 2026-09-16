@@ -116,6 +116,40 @@ def test_workspace_command_storage_migrates_and_replaces_atomically(tmp_path: Pa
         "npm run build",
     )
 
+
+def test_workspace_command_claim_survives_store_reopen_and_rejects_conflicts(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _local_workspace(tmp_path)
+    workspace_id = str(workspace["id"])
+    launch_id = uuid.uuid4().hex
+    digest = workspace_command_digest("printf one")
+
+    assert store.claim_workspace_command(workspace_id, launch_id, 0, digest) == "created"
+    reopened = StateStore(tmp_path / "state.sqlite3")
+    reopened.initialize()
+    assert reopened.claim_workspace_command(workspace_id, launch_id, 0, digest) == "replayed"
+    with pytest.raises(ValueError, match="different command"):
+        reopened.claim_workspace_command(
+            workspace_id, launch_id, 1, workspace_command_digest("printf two")
+        )
+
+
+def test_workspace_command_claim_admits_one_concurrent_submission(tmp_path: Path) -> None:
+    store, workspace = _local_workspace(tmp_path)
+    workspace_id = str(workspace["id"])
+    launch_id = uuid.uuid4().hex
+    digest = workspace_command_digest("printf one")
+
+    def claim() -> str:
+        return StateStore(store.path).claim_workspace_command(
+            workspace_id, launch_id, 0, digest
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _unused: claim(), range(2)))
+    assert sorted(outcomes) == ["created", "replayed"]
+
     internal = store.create_workspace(
         str(workspace["root_id"]),
         "internal",
@@ -660,6 +694,19 @@ async def test_workspace_command_http_uses_only_server_saved_command(
         assert captured[0]["command"] == "ruff check --fix ."
         assert captured[0]["launch_id"] == launch_id
         assert captured[0]["thread_id"] != threading.get_ident()
+
+        replayed = await client.post(
+            f"/w/{workspace_id}/run-commands/1",
+            data={
+                "_csrf": settings.csrf_token,
+                "launch_id": launch_id,
+                "command_digest": workspace_command_digest("ruff check --fix ."),
+            },
+            follow_redirects=False,
+        )
+        assert replayed.status_code == 303
+        assert "error=" in replayed.headers["location"]
+        assert len(captured) == 1
 
         missing_csrf = await client.post(
             f"/w/{workspace_id}/run-commands/0",

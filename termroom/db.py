@@ -263,6 +263,15 @@ class StateStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS workspace_command_claims (
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                    launch_id TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    command_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(workspace_id, launch_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS file_runs (
                     id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL
@@ -1863,6 +1872,30 @@ class StateStore:
     def clear_commands(self, workspace_id: str) -> None:
         with self.connect() as db:
             db.execute("DELETE FROM command_history WHERE workspace_id = ?", (workspace_id,))
+
+    def claim_workspace_command(
+        self, workspace_id: str, launch_id: str, slot: int, command_digest: str
+    ) -> str:
+        """Consume a Workspace command launch identity before dispatch."""
+        if not launch_id:
+            raise ValueError("Workspace command launch identity is required")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT slot, command_digest FROM workspace_command_claims "
+                "WHERE workspace_id = ? AND launch_id = ?",
+                (workspace_id, launch_id),
+            ).fetchone()
+            if existing is not None:
+                if int(existing["slot"]) != slot or str(existing["command_digest"]) != command_digest:
+                    raise ValueError("Workspace command launch identity was reused with a different command")
+                return "replayed"
+            db.execute(
+                "INSERT INTO workspace_command_claims(workspace_id, launch_id, slot, command_digest, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (workspace_id, launch_id, slot, command_digest, utc_now()),
+            )
+            return "created"
 
     def claim_file_run(
         self, payload: Mapping[str, Any]
