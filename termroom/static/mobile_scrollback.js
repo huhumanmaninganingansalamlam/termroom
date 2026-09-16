@@ -1111,12 +1111,15 @@
     "click",
     (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (
-        target?.closest(
-          '[data-terminal-key], [data-terminal-action], #paste-terminal, #focus-terminal',
-        )
-        && !atLiveBottom()
-      ) {
+      const terminalInputTarget = target?.closest(
+        '[data-terminal-key], [data-terminal-action], #paste-terminal, #focus-terminal',
+      );
+      if (!terminalInputTarget) return;
+      // Helper keys and paste enter xterm through their direct handlers, so
+      // they may not produce a textarea keydown. Clear an older history
+      // gesture before a later layout callback can interpret it as reading.
+      userScrollIntentPending = false;
+      if (!atLiveBottom()) {
         applySelectionOwnership({
           type: "terminal-input",
           mouseTracking: mouseTrackingActive(),
