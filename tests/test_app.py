@@ -2602,6 +2602,42 @@ async def test_editor_conflict_marks_preserved_content_as_unsaved(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_editor_conflict_keeps_draft_when_reread_is_oversized(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "note.txt"
+    target.write_bytes(b"before\r\n")
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "note.txt")
+    oversized = b"x" * (settings.max_edit_bytes + 1)
+    target.write_bytes(oversized)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            f"/w/{workspace['id']}/edit/note.txt",
+            data={
+                "_csrf": settings.csrf_token,
+                "digest": snapshot.digest,
+                "mtime_ns": str(snapshot.mtime_ns),
+                "newline": "crlf",
+                "content": "draft\r\nline",
+            },
+        )
+
+    assert response.status_code == 409
+    assert "외부 변경을 감지했습니다" in response.text
+    assert "draft" in response.text
+    assert 'name="newline" value="crlf"' in response.text
+    assert 'data-unsaved="1"' in response.text
+    assert target.read_bytes() == oversized
+
+
+@pytest.mark.asyncio
 async def test_save_and_run_conflict_creates_no_run_or_managed_terminal(
     tmp_path: Path,
 ) -> None:

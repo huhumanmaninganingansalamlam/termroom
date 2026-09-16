@@ -4479,6 +4479,7 @@ def create_app(settings: Settings) -> FastAPI:
         editor_unsaved: bool,
         terminal_editor_error: str | None = None,
         submitted_content: str | None = None,
+        submitted_newline_style: str | None = None,
         selected_run_id: str | None = None,
         idempotency_key: str | None = None,
         status_code: int = 200,
@@ -4486,7 +4487,7 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         values: dict[str, Any] = {
             "snapshot": snapshot,
-            "newline_style": editor_newline_style(snapshot.content),
+            "newline_style": submitted_newline_style or editor_newline_style(snapshot.content),
             "saved": saved,
             "conflict": conflict,
             "save_error": save_error,
@@ -4551,10 +4552,29 @@ def create_app(settings: Settings) -> FastAPI:
         content = normalize_editor_newlines(
             str(form.get("content", "")), str(form.get("newline", "lf"))
         )
+        submitted_newline_style = "crlf" if str(form.get("newline", "")) == "crlf" else "lf"
         expected_digest = str(form.get("digest", ""))
         expected_mtime_ns = int(str(form.get("mtime_ns", "0")))
         intent = str(form.get("intent", "save"))
         idempotency_key = str(form.get("file_run_idempotency_key", ""))
+
+        async def recovery_snapshot() -> FileSnapshot:
+            try:
+                return await read_workspace_text(workspace, file_path)
+            except (
+                OSError,
+                RemoteAccessError,
+                SSHBackendError,
+                UnsupportedFileError,
+                ValueError,
+            ):
+                return FileSnapshot(
+                    path=Path(file_path),
+                    relative_path=file_path,
+                    content="",
+                    digest=expected_digest,
+                    mtime_ns=expected_mtime_ns,
+                )
 
         if intent == "save_and_run":
             existing = store.get_file_run_by_idempotency(
@@ -4570,7 +4590,7 @@ def create_app(settings: Settings) -> FastAPI:
                         _file_run_destination(store, existing, prefer_terminal=True),
                         status_code=303,
                     )
-                current = await read_workspace_text(workspace, file_path)
+                current = await recovery_snapshot()
                 return await render_editor(
                     request,
                     workspace,
@@ -4581,6 +4601,7 @@ def create_app(settings: Settings) -> FastAPI:
                     run_error=translate(locale, "file_run.error.idempotency_conflict"),
                     editor_unsaved=True,
                     submitted_content=content,
+                    submitted_newline_style=submitted_newline_style,
                     idempotency_key=idempotency_key,
                     status_code=409,
                 )
@@ -4593,7 +4614,7 @@ def create_app(settings: Settings) -> FastAPI:
                 expected_mtime_ns=expected_mtime_ns,
             )
         except FileConflictError as exc:
-            current = await read_workspace_text(workspace, file_path)
+            current = await recovery_snapshot()
             return await render_editor(
                 request,
                 workspace,
@@ -4604,6 +4625,7 @@ def create_app(settings: Settings) -> FastAPI:
                 save_error=None,
                 run_error=None,
                 editor_unsaved=True,
+                submitted_newline_style=submitted_newline_style,
                 idempotency_key=idempotency_key or None,
                 status_code=409,
             )
@@ -4614,22 +4636,7 @@ def create_app(settings: Settings) -> FastAPI:
             UnsupportedFileError,
             ValueError,
         ) as exc:
-            try:
-                current = await read_workspace_text(workspace, file_path)
-            except (
-                OSError,
-                RemoteAccessError,
-                SSHBackendError,
-                UnsupportedFileError,
-                ValueError,
-            ):
-                current = FileSnapshot(
-                    path=Path(file_path),
-                    relative_path=file_path,
-                    content="",
-                    digest=expected_digest,
-                    mtime_ns=expected_mtime_ns,
-                )
+            current = await recovery_snapshot()
             return await render_editor(
                 request,
                 workspace,
@@ -4640,6 +4647,7 @@ def create_app(settings: Settings) -> FastAPI:
                 save_error=_localized_exception(locale, exc),
                 run_error=None,
                 editor_unsaved=True,
+                submitted_newline_style=submitted_newline_style,
                 idempotency_key=idempotency_key or None,
                 status_code=502
                 if isinstance(exc, (RemoteAccessError, SSHBackendError))
