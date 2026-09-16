@@ -202,6 +202,11 @@ def test_layout_scroll_does_not_turn_live_input_into_reading_mode() -> None:
     update_scroll_state = script[start:end].replace(
         "  const updateScrollState = () => {", "globalThis.updateScrollState = () => {", 1
     )
+    input_start = script.index("    const returnToLive = () => {")
+    input_end = script.index("\n    textarea.addEventListener(", input_start)
+    return_to_live = script[input_start:input_end].replace(
+        "    const returnToLive = () => {", "globalThis.returnToLive = () => {", 1
+    )
     probe = f"""
 const assert = require("node:assert/strict");
 let liveFollowing = true;
@@ -238,6 +243,16 @@ assert.equal(blurred, 1);
 assert.equal(enteredReading, 1);
 assert.equal(liveFollowing, false);
 assert.equal(liveButton.hidden, false);
+atBottom = true;
+liveFollowing = true;
+userScrollIntentPending = true;
+{return_to_live}
+returnToLive();
+assert.equal(userScrollIntentPending, false);
+atBottom = false;
+updateScrollState();
+assert.equal(returnedToLive, 2);
+assert.equal(liveFollowing, true);
 """
     result = subprocess.run(
         ["node", "-e", probe], check=False, capture_output=True, text=True

@@ -1078,6 +1078,7 @@
       return;
     }
     const returnToLive = () => {
+      userScrollIntentPending = false;
       applySelectionOwnership({
         type: "terminal-input",
         mouseTracking: mouseTrackingActive(),
