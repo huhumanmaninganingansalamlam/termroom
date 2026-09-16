@@ -1887,11 +1887,17 @@ class StateStore:
                 (workspace_id, launch_id),
             ).fetchone()
             if existing is not None:
-                if int(existing["slot"]) != slot or str(existing["command_digest"]) != command_digest:
-                    raise ValueError("Workspace command launch identity was reused with a different command")
+                if (
+                    int(existing["slot"]) != slot
+                    or str(existing["command_digest"]) != command_digest
+                ):
+                    raise ValueError(
+                        "Workspace command launch identity was reused with a different command"
+                    )
                 return "replayed"
             db.execute(
-                "INSERT INTO workspace_command_claims(workspace_id, launch_id, slot, command_digest, created_at) "
+                "INSERT INTO workspace_command_claims("
+                "workspace_id, launch_id, slot, command_digest, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (workspace_id, launch_id, slot, command_digest, utc_now()),
             )
