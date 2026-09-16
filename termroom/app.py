@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import secrets
+import sqlite3
 import tempfile
 import uuid
 import zipfile
@@ -175,7 +176,7 @@ RESULT_COLLECTION_REASON_KEYS = {
     "source_path_exists": "remote_run.collect.reason.source_conflict",
     "source_changed_since_run": "remote_run.collect.reason.source_changed",
     "source_changed_during_review": "remote_run.collect.reason.source_changed",
-    "source_changed_during_apply": "remote_run.collect.reason.source_changed",
+    "source_changed_during_apply": "remote_run.collect.reason.source_changed_during_apply",
     "source_file_missing": "remote_run.collect.reason.source_missing",
     "source_path_unsupported": "remote_run.collect.reason.source_unsupported",
     "source_not_editable_text": "remote_run.collect.reason.source_unsupported",
@@ -1621,9 +1622,43 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         try:
             run = await asyncio.to_thread(remote_runs.get, run_id)
-            plan = await run_results.review(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        report_id = request.query_params.get("report")
+        if report_id:
+            report = await asyncio.to_thread(
+                store.get_remote_run_collection_report, run_id, report_id
+            )
+            if report is None:
+                return templates.TemplateResponse(
+                    request=request,
+                    name="remote_run_collect.html",
+                    context=_context(
+                        settings,
+                        title=translate(locale, "remote_run.collect.heading"),
+                        run=run,
+                        plan=None,
+                        report=None,
+                        action_error=translate(
+                            locale, "remote_run.collect.error.report_missing"
+                        ),
+                    ),
+                    status_code=409,
+                )
+            return templates.TemplateResponse(
+                request=request,
+                name="remote_run_collect.html",
+                context=_context(
+                    settings,
+                    title=translate(locale, "remote_run.collect.heading"),
+                    run=run,
+                    plan=None,
+                    report=_remote_run_collection_view(report, locale),
+                    action_error=None,
+                ),
+            )
+        try:
+            plan = await run_results.review(run_id)
         except ResultCollectionError as exc:
             return _error_page(
                 request,
@@ -1645,7 +1680,6 @@ def create_app(settings: Settings) -> FastAPI:
                 run=run,
                 plan=_remote_run_collection_view(plan, locale),
                 report=None,
-                collection_result=_remote_run_collection_result_query(request),
                 action_error=None,
             ),
         )
@@ -1703,16 +1737,25 @@ def create_app(settings: Settings) -> FastAPI:
                 translate(locale, "remote_run.collect.error.unavailable"),
                 502,
             )
-        summary = report.as_dict()["summary"]
+        try:
+            report_id = await asyncio.to_thread(
+                store.save_remote_run_collection_report, run_id, report.as_dict()
+            )
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            message_key = (
+                "remote_run.collect.error.report_save_failed_applied"
+                if report.as_dict()["summary"]["applied"]
+                else "remote_run.collect.error.report_save_failed"
+            )
+            return _error_page(
+                request,
+                translate(locale, message_key),
+                500,
+            )
         return RedirectResponse(
             _url_with_query(
                 f"/remote-runs/{run_id}/collect",
-                collected=1,
-                applied=summary.get("applied", 0),
-                conflict=summary.get("conflict", 0),
-                already_result=summary.get("already_result", 0),
-                skipped=summary.get("skipped", 0),
-                failed=summary.get("failed", 0),
+                report=report_id,
             ),
             status_code=303,
         )
@@ -5969,7 +6012,7 @@ def _localized_result_collection_exception(
 
 
 def _remote_run_collection_view(value: Any, locale: str) -> dict[str, Any]:
-    payload = value.as_dict()
+    payload = value.as_dict() if hasattr(value, "as_dict") else dict(value)
     for item in payload["items"]:
         change = str(item["change"])
         item["change_label"] = translate(
@@ -5985,19 +6028,6 @@ def _remote_run_collection_view(value: Any, locale: str) -> dict[str, Any]:
         )
         item["reason_label"] = translate(locale, reason_key)
     return payload
-
-
-def _remote_run_collection_result_query(request: Request) -> dict[str, int] | None:
-    if request.query_params.get("collected") != "1":
-        return None
-    result: dict[str, int] = {}
-    for key in ("applied", "conflict", "already_result", "skipped", "failed"):
-        try:
-            value = int(request.query_params.get(key, "0"))
-        except ValueError:
-            value = 0
-        result[key] = min(max(value, 0), 1_000_000_000)
-    return result
 
 
 def _localized_remote_run_error_detail(
