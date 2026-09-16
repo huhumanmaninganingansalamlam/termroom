@@ -1463,6 +1463,9 @@
   const uploadDialog = document.querySelector("#upload-confirm-dialog");
   const uploadConflictList = document.querySelector("#upload-conflict-list");
   const overwriteInput = document.querySelector("#upload-overwrite");
+  let currentUploadBatch = null;
+  let uploadCheckController = null;
+  let dialogUploadBatch = null;
   const formatBytes = (bytes) => {
     if (bytes < 1024) return `${bytes} B`;
     const units = ["KB", "MB", "GB", "TB"];
@@ -1487,16 +1490,24 @@
   };
 
   uploadInput?.addEventListener("change", async () => {
-    if (!uploadForm || !uploadInput.files?.length) return;
+    if (!uploadForm) return;
+    uploadCheckController?.abort();
+    if (!uploadInput.files?.length) {
+      currentUploadBatch = null;
+      return;
+    }
     overwriteInput.value = "0";
     const selectedFiles = [...uploadInput.files];
     const fileByName = new Map(selectedFiles.map((file) => [file.name, file]));
     const csrf = uploadForm.querySelector('input[name="_csrf"]')?.value || "";
     const parent = uploadForm.querySelector('input[name="parent"]')?.value || ".";
+    const batch = { files: selectedFiles, fileByName, csrf, parent, overwrite: false };
+    currentUploadBatch = batch;
     if (!uploadCheckUrl || !csrf) {
       uploadForm.requestSubmit();
       return;
     }
+    uploadCheckController = new AbortController();
     if (uploadProgressPanel) uploadProgressPanel.hidden = false;
     if (uploadRefreshLink) uploadRefreshLink.hidden = true;
     if (uploadCancelButton) uploadCancelButton.disabled = true;
@@ -1511,6 +1522,7 @@
           "X-Termroom-CSRF": csrf,
         },
         body: JSON.stringify({ parent, names: selectedFiles.map((file) => file.name) }),
+        signal: uploadCheckController.signal,
       });
       if (response.status === 401) throw new Error(tr("files.upload_auth_required"));
       if (response.status === 403) throw new Error(tr("files.upload_refresh_required"));
@@ -1519,11 +1531,13 @@
         throw new Error(result.error || `HTTP ${response.status}`);
       }
     } catch (error) {
+      if (currentUploadBatch !== batch) return;
       showUploadCheckError(tr("files.upload_failed", { error: error?.message || String(error) }));
       return;
     }
+    if (currentUploadBatch !== batch) return;
     const conflicts = (result.conflicts || [])
-      .map((current) => ({ file: fileByName.get(current.name), current }))
+      .map((current) => ({ file: batch.fileByName.get(current.name), current }))
       .filter(({ file }) => Boolean(file));
 
     if (!conflicts.length) {
@@ -1532,6 +1546,7 @@
       return;
     }
     if (!(uploadDialog instanceof HTMLDialogElement) || !uploadConflictList) return;
+    dialogUploadBatch = batch;
     uploadConflictList.replaceChildren(
       ...conflicts.map(({ file, current }) => {
         const row = document.createElement("article");
@@ -1553,14 +1568,20 @@
   });
 
   document.querySelector("#confirm-upload-overwrite")?.addEventListener("click", () => {
-    if (!uploadForm) return;
+    if (!uploadForm || !dialogUploadBatch || dialogUploadBatch !== currentUploadBatch) return;
+    dialogUploadBatch.overwrite = true;
     overwriteInput.value = "1";
     uploadDialog?.close();
     uploadForm.requestSubmit();
   });
 
   uploadDialog?.addEventListener("close", () => {
-    if (overwriteInput?.value !== "1" && uploadInput) uploadInput.value = "";
+    if (
+      dialogUploadBatch === currentUploadBatch
+      && !dialogUploadBatch?.overwrite
+      && uploadInput
+    ) uploadInput.value = "";
+    dialogUploadBatch = null;
   });
 
   const uploadProgressPanel = document.querySelector("#upload-progress-panel");
@@ -1570,11 +1591,9 @@
   const uploadRefreshLink = document.querySelector("#upload-refresh-link");
   let activeUploadRequest = null;
 
-  const uploadOneFile = ({ file, index, total, completedBytes, totalBytes, overwrite }) =>
+  const uploadOneFile = ({ file, index, total, completedBytes, totalBytes, overwrite, parent, csrf }) =>
     new Promise((resolve, reject) => {
       const streamUrl = uploadForm?.dataset.streamUrl;
-      const csrf = uploadForm?.querySelector('input[name="_csrf"]')?.value || "";
-      const parent = uploadForm?.querySelector('input[name="parent"]')?.value || ".";
       if (!streamUrl || !csrf) {
         reject(new Error("Streaming upload is unavailable"));
         return;
@@ -1648,7 +1667,9 @@
     if (!uploadForm.dataset.streamUrl || !uploadInput?.files?.length) return;
     event.preventDefault();
     if (activeUploadRequest) return;
-    const selectedFiles = [...uploadInput.files];
+    const batch = currentUploadBatch;
+    if (!batch) return;
+    const selectedFiles = batch.files;
     const selectedNames = new Set();
     const duplicateName = selectedFiles.find((file) => {
       if (selectedNames.has(file.name)) return true;
@@ -1674,7 +1695,7 @@
       return;
     }
     const totalBytes = selectedFiles.reduce((sum, file) => sum + file.size, 0);
-    const overwrite = overwriteInput?.value === "1";
+    const overwrite = batch.overwrite;
     let completedBytes = 0;
     let completedFiles = 0;
     if (uploadProgressPanel) uploadProgressPanel.hidden = false;
@@ -1692,6 +1713,8 @@
           completedBytes,
           totalBytes,
           overwrite,
+          parent: batch.parent,
+          csrf: batch.csrf,
         });
         completedBytes += file.size;
         completedFiles += 1;
