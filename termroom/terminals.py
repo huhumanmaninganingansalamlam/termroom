@@ -103,11 +103,22 @@ if test ! -x "$shell"; then
     shell=/bin/bash
 fi
 tmux set-window-option -t "$pane" @termroom_workspace_command_state settling
-# The process switches into the configured interactive shell with exec. Publish
-# the reusable-shell state only after that transition has had time to take
-# effect, so an immediate browser input cannot land in the wrapper teardown.
-tmux run-shell -b "sleep 0.15; tmux set-window-option -t \"$pane\" \
-    @termroom_workspace_command_state shell" >/dev/null 2>&1 || true
+# Publish reusable-shell state only after exec has replaced this wrapper. A
+# fixed delay can expose the state while the interactive shell is still
+# starting, so the first follow-up input can be lost.
+shell_name=${shell##*/}
+printf -v pane_literal %q "$pane"
+printf -v shell_name_literal %q "$shell_name"
+readiness_command="while test \"\$(tmux display-message -p -t $pane_literal \
+    #{pane_dead})\" = 0 && test \"\$(tmux display-message -p -t \
+    $pane_literal #{pane_current_command})\" != $shell_name_literal; do
+    sleep 0.01
+done
+if test \"\$(tmux display-message -p -t $pane_literal #{pane_dead})\" = 0; then
+    tmux set-window-option -t $pane_literal \
+        @termroom_workspace_command_state shell
+fi"
+tmux run-shell -b "$readiness_command" >/dev/null 2>&1 || true
 exec "$shell"
 '
 """

@@ -269,6 +269,7 @@ def test_workspace_command_records_are_typed_and_unique() -> None:
     assert "@termroom_workspace_command_state settling" in WORKSPACE_COMMAND_WRAPPER
     assert "@termroom_workspace_command_state shell" in WORKSPACE_COMMAND_WRAPPER
     assert "tmux run-shell -b" in WORKSPACE_COMMAND_WRAPPER
+    assert "pane_current_command" in WORKSPACE_COMMAND_WRAPPER
     assert 'exec "$shell"' in WORKSPACE_COMMAND_WRAPPER
     assert WORKSPACE_COMMAND_WRAPPER.count("'") == 2
 
