@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import re
 import shlex
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -30,6 +32,7 @@ from termroom.terminal_control import TerminalControl
 from termroom.terminals import (
     TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
     WORKSPACE_COMMAND_WRAPPER,
+    WORKSPACE_COMMAND_WRAPPER_ARGV,
     TerminalError,
     TerminalManager,
     parse_tmux_workspace_command_records,
@@ -241,15 +244,15 @@ def test_workspace_command_records_are_typed_and_unique() -> None:
     )
 
     digest_publish = (
-        'tmux set-window-option -t "$pane" '
+        '"$tmux_bin" set-window-option -t "$pane" '
         '@termroom_workspace_command_digest "$digest"'
     )
     launch_publish = (
-        'tmux set-window-option -t "$pane" '
+        '"$tmux_bin" set-window-option -t "$pane" '
         '@termroom_workspace_command_launch "$launch"'
     )
     slot_publish = (
-        'tmux set-window-option -t "$pane" '
+        '"$tmux_bin" set-window-option -t "$pane" '
         '@termroom_workspace_command_slot "$slot"'
     )
     assert WORKSPACE_COMMAND_WRAPPER.index(digest_publish) < (
@@ -258,8 +261,19 @@ def test_workspace_command_records_are_typed_and_unique() -> None:
     assert WORKSPACE_COMMAND_WRAPPER.index(launch_publish) < (
         WORKSPACE_COMMAND_WRAPPER.index(slot_publish)
     )
+    assert WORKSPACE_COMMAND_WRAPPER.index(
+        '"$tmux_bin" set-window-option -t "$pane" @termroom_workspace_command_state running'
+    ) < WORKSPACE_COMMAND_WRAPPER.index(digest_publish)
     assert WORKSPACE_COMMAND_WRAPPER.index(slot_publish) < (
         WORKSPACE_COMMAND_WRAPPER.index('/bin/bash --noprofile --norc -c "$command"')
+    )
+    assert WORKSPACE_COMMAND_WRAPPER_ARGV == (
+        "/bin/bash", "--noprofile", "--norc", "-p", "-c", WORKSPACE_COMMAND_WRAPPER
+    )
+    assert WORKSPACE_COMMAND_WRAPPER.index("tmux_bin=$(type -P tmux)") < (
+        WORKSPACE_COMMAND_WRAPPER.index(
+            '"$tmux_bin" set-window-option -t "$pane" remain-on-exit off'
+        )
     )
     assert 'remain-on-exit off' in WORKSPACE_COMMAND_WRAPPER
     assert 'remain-on-exit-format' not in WORKSPACE_COMMAND_WRAPPER
@@ -268,10 +282,12 @@ def test_workspace_command_records_are_typed_and_unique() -> None:
     assert "@termroom_workspace_command_state running" in WORKSPACE_COMMAND_WRAPPER
     assert "@termroom_workspace_command_state settling" in WORKSPACE_COMMAND_WRAPPER
     assert "@termroom_workspace_command_state shell" in WORKSPACE_COMMAND_WRAPPER
-    assert "tmux run-shell -b" in WORKSPACE_COMMAND_WRAPPER
+    assert '"$tmux_bin" run-shell -b' in WORKSPACE_COMMAND_WRAPPER
     assert "pane_current_command" in WORKSPACE_COMMAND_WRAPPER
     assert 'exec "$shell"' in WORKSPACE_COMMAND_WRAPPER
-    assert WORKSPACE_COMMAND_WRAPPER.count("'") == 2
+    assert "TERMROOM_ZSH_RC" in WORKSPACE_COMMAND_WRAPPER
+    assert "<<'TERMROOM_ZSH_RC'" not in WORKSPACE_COMMAND_WRAPPER
+    assert "unset TERMROOM_WORKSPACE_SHELL_READY" in WORKSPACE_COMMAND_WRAPPER
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -432,6 +448,589 @@ def test_local_workspace_commands_run_at_root_and_reuse_managed_slots(
             "Concurrent command did not start",
         )
         assert (root / "concurrent.txt").read_text().splitlines() == ["once"]
+    finally:
+        manager._run_tmux("kill-server", check=False)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_respawn_waits_for_new_running_state_before_reusing_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = shutil.which("bash")
+    private_tmux = shutil.which("tmux")
+    assert shell is not None and private_tmux is not None
+    monkeypatch.setenv("SHELL", shell)
+    store, workspace = _local_workspace(tmp_path)
+    manager = TerminalManager(store)
+    root = Path(workspace["path"])
+    count = root / "launch-count.txt"
+    delay_flag = tmp_path / "delay-running"
+    delay_started = tmp_path / "delay-started"
+    shim_calls = tmp_path / "shim-calls"
+    shim_dir = tmp_path / "tmux shim with spaces"
+    shim_dir.mkdir()
+    shim = shim_dir / "tmux"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(shim_calls))}\n"
+        f"if test -f {shlex.quote(str(delay_flag))} "
+        '&& test "$1" = set-window-option '
+        '&& test "$4" = @termroom_workspace_command_state '
+        '&& test "$5" = running; then\n'
+        f"  printf 'delayed\\n' >> {shlex.quote(str(delay_started))}\n"
+        "  /bin/sleep 1.2\n"
+        "fi\n"
+        f'exec {shlex.quote(private_tmux)} "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o700)
+    monkeypatch.setenv("PYTEST_TMUX_WRAPPER_DIR", str(shim_dir))
+    monkeypatch.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
+    shell_home = tmp_path / "bash home"
+    shell_home.mkdir()
+    command = f"printf 'run\\n' >> {shlex.quote(str(count))}; /bin/sleep 0.02"
+
+    try:
+        manager.ensure_workspace(workspace)
+        session = str(workspace["tmux_session"])
+        manager._run_tmux(
+            "set-environment", "-t", session, "PATH", f"{shim_dir}:{os.environ['PATH']}"
+        )
+        manager._run_tmux("set-environment", "-t", session, "HOME", str(shell_home))
+        manager._run_tmux("set-environment", "-t", session, "SHELL", shell)
+        first_launch = uuid.uuid4().hex
+        first = manager.run_workspace_command(
+            workspace, slot=0, command=command, launch_id=first_launch
+        )
+        window = str(first["tmux_window"])
+
+        def record() -> dict[str, Any]:
+            return parse_tmux_workspace_command_records(
+                manager._run_tmux(
+                    "display-message", "-p", "-t", window,
+                    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                ).stdout
+            )[0]
+
+        _wait_until(
+            lambda: count.is_file()
+            and count.read_text(encoding="utf-8").splitlines() == ["run"]
+            and record()["state"] == "shell",
+            "First command did not settle into its shell",
+        )
+        delay_flag.touch()
+        second_launch = uuid.uuid4().hex
+        started_at = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            second_future = executor.submit(
+                manager.run_workspace_command,
+                workspace,
+                slot=0,
+                command=command,
+                launch_id=second_launch,
+            )
+            _wait_until(delay_started.is_file, "Delayed running publication was not hit")
+            during_delay = record()
+            assert during_delay["launch_id"] == first_launch
+            assert during_delay["state"] == "shell"
+            assert not second_future.done()
+            second = second_future.result(timeout=4)
+        assert time.monotonic() - started_at >= 1.1
+        assert second["tmux_window"] == window
+        _wait_until(
+            lambda: count.read_text(encoding="utf-8").splitlines() == ["run", "run"]
+            and record()["launch_id"] == second_launch
+            and record()["state"] == "shell",
+            "Second command did not complete under its own launch",
+        )
+        delay_flag.unlink()
+        replay = manager.run_workspace_command(
+            workspace, slot=0, command=command, launch_id=second_launch
+        )
+        assert replay["tmux_window"] == window
+        assert count.read_text(encoding="utf-8").splitlines() == ["run", "run"]
+
+        third_launch = uuid.uuid4().hex
+        third = manager.run_workspace_command(
+            workspace, slot=0, command=command, launch_id=third_launch
+        )
+        assert third["tmux_window"] == window
+        _wait_until(
+            lambda: count.read_text(encoding="utf-8").splitlines()
+            == ["run", "run", "run"]
+            and record()["launch_id"] == third_launch
+            and record()["state"] == "shell",
+            "Third explicit launch did not run once",
+        )
+        assert record()["slot"] == 0
+        assert record()["digest"] == workspace_command_digest(command)
+    finally:
+        manager._run_tmux("kill-server", check=False)
+
+
+@pytest.mark.parametrize("exit_code,completion", [(0, "✓"), (7, "✕ 7")])
+@pytest.mark.parametrize("shell_name", ["bash", "zsh", "sh"])
+@pytest.mark.parametrize("injection_mode", ["path_only", "rc_function", "outer_env"])
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_delayed_shell_startup_retry_preserves_first_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    completion: str,
+    shell_name: str,
+    injection_mode: str,
+) -> None:
+    shell = shutil.which(shell_name)
+    assert shell is not None
+    monkeypatch.setenv("SHELL", shell)
+    store, workspace = _local_workspace(tmp_path)
+    manager = TerminalManager(store)
+    shell_home = tmp_path / f"{shell_name} home"
+    shell_home.mkdir()
+    shell_tmpdir = tmp_path / "tmux temp with spaces"
+    shell_tmpdir.mkdir()
+    shell_ready = tmp_path / "shell-ready"
+    precmd_entered = tmp_path / "precmd-entered"
+    followup = tmp_path / "first-followup.txt"
+    fake_tmux_calls = tmp_path / "fake-tmux-calls.txt"
+    bash_env_calls = tmp_path / "bash-env-calls.txt"
+    imported_function_kinds = tmp_path / "imported-function-kinds.txt"
+    run_count = Path(workspace["path"]) / "run-count.txt"
+    rc_name = {"bash": ".bashrc", "zsh": ".zshrc", "sh": ".shrc"}[shell_name]
+    rc_path = shell_home / rc_name
+    rc_tail = (
+        (
+            "tmux() { "
+            f"printf 'fake\\n' >> {shlex.quote(str(fake_tmux_calls))}; "
+            "return 97; }\n"
+        )
+        if injection_mode == "rc_function"
+        else ""
+    ) + "PATH=/nonexistent\nreadonly current_launch=protected\n"
+    if shell_name == "zsh":
+        zshenv = shell_home / ".zshenv"
+        zshrc = shell_home / ".zshrc"
+        zshenv_bytes = b"typeset -gx TERMROOM_TEST_ZSHENV=loaded\n"
+        zshrc_bytes = (
+            "sleep 0.8\n"
+            "setopt ERR_EXIT NO_UNSET\n"
+            f"TERMROOM_WORKSPACE_INIT_DIR={shlex.quote(str(shell_home))}\n"
+            "readonly TERMROOM_WORKSPACE_INIT_DIR\n"
+            "unset TERMROOM_WORKSPACE_USER_ZDOTDIR\n"
+            f"ZDOTDIR={shlex.quote(str(tmp_path / 'final zdotdir'))}\n"
+            f"{rc_tail}"
+            "termroom_test_precmd() {\n"
+            f"  printf 'entered\\n' >> {shlex.quote(str(precmd_entered))}\n"
+            f"  [[ \"$ZDOTDIR\" == {shlex.quote(str(tmp_path / 'final zdotdir'))} ]] || return 23\n"
+            "  /bin/sleep 0.6\n"
+            f"  printf 'ready\\n' >> {shlex.quote(str(shell_ready))}\n"
+            "}\n"
+            "precmd_functions+=(termroom_test_precmd)\n"
+        ).encode()
+        zshenv.write_bytes(zshenv_bytes)
+        zshrc.write_bytes(zshrc_bytes)
+    else:
+        rc_bytes = (
+            f"sleep 0.8\n{rc_tail}"
+            f"printf 'ready\\n' >> {shlex.quote(str(shell_ready))}\n"
+        ).encode()
+        rc_path.write_bytes(rc_bytes)
+    try:
+        manager.ensure_workspace(workspace)
+        session = str(workspace["tmux_session"])
+        wrapper_path = shutil.which("tmux")
+        assert wrapper_path is not None
+        tmux_path_dir = tmp_path / "tmux executable with spaces"
+        tmux_path_dir.mkdir()
+        (tmux_path_dir / "tmux").symlink_to(wrapper_path)
+        manager._run_tmux(
+            "set-environment", "-t", session, "PATH", f"{tmux_path_dir}:{os.environ['PATH']}"
+        )
+        if injection_mode == "outer_env":
+            bash_env = tmp_path / "saved-command-bash-env"
+            bash_env.write_text(
+                "if [[ -n ${TERMROOM_WORKSPACE_COMMAND+x} ]]; then\n"
+                f"  printf 'outer\\n' >> {shlex.quote(str(bash_env_calls))}\n"
+                "else\n"
+                f"  printf 'saved\\n' >> {shlex.quote(str(bash_env_calls))}\n"
+                "fi\nPATH=/nonexistent\n",
+                encoding="utf-8",
+            )
+            manager._run_tmux(
+                "set-environment", "-t", session, "BASH_ENV", str(bash_env)
+            )
+            manager._run_tmux(
+                "set-environment", "-t", session, "BASH_FUNC_tmux%%",
+                "() { "
+                f"printf 'fake\\n' >> {shlex.quote(str(fake_tmux_calls))}; "
+                "return 97; }",
+            )
+        manager._run_tmux("set-environment", "-t", session, "HOME", str(shell_home))
+        manager._run_tmux("set-environment", "-t", session, "SHELL", shell)
+        manager._run_tmux(
+            "set-environment",
+            "-t",
+            session,
+            "TMPDIR",
+            str(shell_tmpdir if shell_name == "zsh" else tmp_path),
+        )
+        if shell_name == "zsh":
+            manager._run_tmux("set-environment", "-t", session, "ZDOTDIR", str(shell_home))
+        elif shell_name == "sh":
+            manager._run_tmux(
+                "set-environment", "-t", session, "ENV", str(shell_home / rc_name)
+            )
+        launch_id = uuid.uuid4().hex
+        followup_token = f"first-input-{uuid.uuid4().hex}"
+        command = (
+            (
+                f"printf '%s\\n' \"$(type -t tmux)\" >> "
+                f"{shlex.quote(str(imported_function_kinds))}; "
+            )
+            if injection_mode == "outer_env"
+            else ""
+        ) + (
+            f"printf 'run\\n' >> {shlex.quote(str(run_count))}; "
+            f"/bin/sleep 0.2; printf 'command-finished\\n'; exit {exit_code}"
+        )
+        terminal = manager.run_workspace_command(
+            workspace,
+            slot=0,
+            command=command,
+            launch_id=launch_id,
+        )
+        window = str(terminal["tmux_window"])
+        deadline = time.monotonic() + 4
+        completion_visible = False
+        while time.monotonic() < deadline:
+            output = manager._run_tmux(
+                "capture-pane", "-p", "-t", window, "-S", "-100"
+            ).stdout
+            if "command-finished" in output and completion in output:
+                completion_visible = True
+                break
+            time.sleep(0.01)
+        assert completion_visible, "Workspace command completion was not visible"
+        assert not shell_ready.exists()
+
+        pane = manager._run_tmux(
+            "display-message", "-p", "-t", window, "#{pane_id}"
+        ).stdout.strip()
+        record = parse_tmux_workspace_command_records(
+            manager._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                window,
+                TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+            ).stdout
+        )[0]
+        identity = manager._run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{pane_pid}|#{pane_current_command}",
+        ).stdout.strip()
+        pane_pid, pane_command = identity.split("|", 1)
+        process = subprocess.run(
+            ["ps", "-p", pane_pid, "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert record["state"] == "settling"
+        assert record["slot"] == 0
+        assert record["launch_id"] == launch_id
+        assert record["digest"] == workspace_command_digest(command)
+        expected_commands = {"bash", shell_name, "sleep"} if shell_name == "sh" else {
+            "bash",
+            shell_name,
+        }
+        assert pane_command in expected_commands
+        assert process and ("bash" in process or shell_name in process)
+        if shell_name == "zsh":
+            first_input = (
+                f"printf '%s|%s\\n' {shlex.quote(followup_token)} "
+                f'"${{ZDOTDIR-unset}}" >> {shlex.quote(str(followup))}'
+            )
+        else:
+            first_input = (
+                f"printf '%s\\n' {shlex.quote(followup_token)} "
+                f">> {shlex.quote(str(followup))}"
+            )
+        manager._run_tmux("send-keys", "-t", pane, first_input, "Enter")
+        same_launch = manager.run_workspace_command(
+            workspace,
+            slot=0,
+            command=command,
+            launch_id=launch_id,
+        )
+        assert same_launch["tmux_window"] == window
+        retry = manager.run_workspace_command(
+            workspace,
+            slot=0,
+            command=command,
+            launch_id=uuid.uuid4().hex,
+        )
+        assert retry["tmux_window"] == window
+
+        if shell_name == "zsh":
+            _wait_until(precmd_entered.is_file, "User precmd hook did not start")
+            assert not shell_ready.exists()
+            during_hook = parse_tmux_workspace_command_records(
+                manager._run_tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    window,
+                    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                ).stdout
+            )[0]
+            assert during_hook["state"] == "settling"
+        _wait_until(
+            shell_ready.is_file,
+            f"{shell_name} did not finish delayed startup",
+        )
+        assert not fake_tmux_calls.exists()
+        if shell_name == "zsh":
+            _wait_until(
+                lambda: not list(shell_tmpdir.glob("termroom-zsh.*")),
+                "Generated zsh startup files were not cleaned",
+            )
+            assert zshenv.read_bytes() == zshenv_bytes
+            assert zshrc.read_bytes() == zshrc_bytes
+        else:
+            assert rc_path.read_bytes() == rc_bytes
+            if shell_name == "sh":
+                _wait_until(
+                    lambda: not list(tmp_path.glob("termroom-sh.*")),
+                    "Generated sh startup file was not cleaned",
+                )
+        _wait_until(
+            lambda: followup.is_file()
+            and followup.read_text(encoding="utf-8").splitlines()
+            == [
+                followup_token
+                + (
+                    f"|{tmp_path / 'final zdotdir'}"
+                    if shell_name == "zsh"
+                    else ""
+                )
+            ],
+            "First shell input was not preserved exactly once",
+        )
+        assert run_count.read_text(encoding="utf-8").splitlines() == ["run"]
+        if injection_mode == "outer_env":
+            assert bash_env_calls.read_text(encoding="utf-8").splitlines() == ["saved"]
+            assert imported_function_kinds.read_text(encoding="utf-8").splitlines() == [
+                "function"
+            ]
+        def reusable_shell_ready() -> bool:
+            record = manager._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                window,
+                TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                check=False,
+            )
+            if record.returncode:
+                return False
+            parsed = parse_tmux_workspace_command_records(record.stdout)
+            if not parsed or parsed[0]["state"] != "shell":
+                return False
+            for _ in range(2):
+                pane_identity = manager._run_tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane,
+                    "#{pane_pid}|#{pane_current_command}",
+                ).stdout.strip()
+                pane_pid, pane_command = pane_identity.split("|", 1)
+                actual_process = subprocess.run(
+                    ["ps", "-p", pane_pid, "-o", "command="],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                if pane_command != shell_name or shell_name not in actual_process:
+                    return False
+                time.sleep(0.03)
+            return True
+
+        _wait_until(
+            reusable_shell_ready,
+            "Workspace command shell/process did not stabilize after readiness",
+        )
+        new_launch = uuid.uuid4().hex
+        restarted = manager.run_workspace_command(
+            workspace,
+            slot=0,
+            command=command,
+            launch_id=new_launch,
+        )
+        assert restarted["tmux_window"] == window
+
+        def restarted_shell_ready() -> bool:
+            records = parse_tmux_workspace_command_records(
+                manager._run_tmux(
+                    "display-message", "-p", "-t", window,
+                    TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                ).stdout
+            )
+            return bool(
+                records
+                and records[0]["slot"] == 0
+                and records[0]["launch_id"] == new_launch
+                and records[0]["state"] == "shell"
+                and run_count.read_text(encoding="utf-8").splitlines() == ["run", "run"]
+            )
+
+        _wait_until(restarted_shell_ready, "Explicit new launch did not rerun once", timeout=6)
+        assert not fake_tmux_calls.exists()
+        if injection_mode == "outer_env":
+            assert bash_env_calls.read_text(encoding="utf-8").splitlines() == [
+                "saved", "saved"
+            ]
+            assert imported_function_kinds.read_text(encoding="utf-8").splitlines() == [
+                "function", "function"
+            ]
+        assert followup.read_text(encoding="utf-8").splitlines() == [
+            followup_token
+            + (f"|{tmp_path / 'final zdotdir'}" if shell_name == "zsh" else "")
+        ]
+        assert rc_path.read_bytes() == (zshrc_bytes if shell_name == "zsh" else rc_bytes)
+        if shell_name == "zsh":
+            assert zshenv.read_bytes() == zshenv_bytes
+            assert not list(shell_tmpdir.glob("termroom-zsh.*"))
+        elif shell_name == "sh":
+            assert not list(tmp_path.glob("termroom-sh.*"))
+    finally:
+        manager._run_tmux("kill-server", check=False)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_stale_sh_startup_cannot_claim_a_replacement_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = shutil.which("sh")
+    assert shell is not None
+    monkeypatch.setenv("SHELL", shell)
+    store, workspace = _local_workspace(tmp_path)
+    manager = TerminalManager(store)
+    root = Path(workspace["path"])
+    shell_home = tmp_path / "sh-home"
+    shell_home.mkdir()
+    startup_log = tmp_path / "sh-startup.log"
+    first_count = root / "first-run.txt"
+    replacement_count = root / "replacement-run.txt"
+    shell_home.joinpath(".shrc").write_text(
+        f"sleep 2\nprintf 'ready\\n' >> {shlex.quote(str(startup_log))}\n",
+        encoding="utf-8",
+    )
+    first_command = (
+        f"printf 'first\\n' >> {shlex.quote(str(first_count))}; "
+        "sleep 0.1; printf 'first-finished\\n'; exit 0"
+    )
+    replacement_command = (
+        f"printf 'replacement\\n' >> {shlex.quote(str(replacement_count))}; "
+        "sleep 0.1; printf 'replacement-finished\\n'; exit 0"
+    )
+
+    try:
+        manager.ensure_workspace(workspace)
+        session = str(workspace["tmux_session"])
+        for name, value in (
+            ("HOME", str(shell_home)),
+            ("SHELL", shell),
+            ("TMPDIR", str(tmp_path)),
+            ("ENV", str(shell_home / ".shrc")),
+        ):
+            manager._run_tmux("set-environment", "-t", session, name, value)
+        first_launch = uuid.uuid4().hex
+        first = manager.run_workspace_command(
+            workspace,
+            slot=0,
+            command=first_command,
+            launch_id=first_launch,
+        )
+        first_window = str(first["tmux_window"])
+
+        def first_is_settling() -> bool:
+            output = manager._run_tmux(
+                "capture-pane", "-p", "-t", first_window, "-S", "-100"
+            ).stdout
+            record = manager._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                first_window,
+                TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+            ).stdout
+            parsed = parse_tmux_workspace_command_records(record)
+            return "first-finished" in output and bool(
+                parsed and parsed[0]["state"] == "settling"
+            )
+
+        _wait_until(first_is_settling, "First sh command did not enter settling")
+        assert not startup_log.exists()
+        replacement_launch = uuid.uuid4().hex
+        replacement = manager.run_workspace_command(
+            workspace,
+            slot=0,
+            command=replacement_command,
+            launch_id=replacement_launch,
+        )
+        replacement_window = str(replacement["tmux_window"])
+        assert replacement_window != first_window
+
+        def replacement_is_ready() -> bool:
+            result = manager._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                replacement_window,
+                TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
+                check=False,
+            )
+            if result.returncode:
+                return False
+            records = parse_tmux_workspace_command_records(result.stdout)
+            return bool(
+                records
+                and records[0]["launch_id"] == replacement_launch
+                and records[0]["state"] == "shell"
+            )
+
+        _wait_until(
+            lambda: startup_log.is_file()
+            and len(startup_log.read_text(encoding="utf-8").splitlines()) == 2
+            and replacement_count.is_file()
+            and replacement_is_ready(),
+            "Replacement command did not become the sole ready owner",
+            timeout=5,
+        )
+        assert first_count.read_text(encoding="utf-8").splitlines() == ["first"]
+        assert replacement_count.read_text(encoding="utf-8").splitlines() == [
+            "replacement"
+        ]
+        old_state = manager._run_tmux(
+            "show-window-option",
+            "-v",
+            "-t",
+            first_window,
+            "@termroom_workspace_command_state",
+            check=False,
+        )
+        assert old_state.returncode != 0
+        old_name = manager._run_tmux(
+            "display-message", "-p", "-t", first_window, "#{window_name}"
+        ).stdout.strip()
+        assert old_name == f"run-1-{first_launch[:4]}"
     finally:
         manager._run_tmux("kill-server", check=False)
 
@@ -988,6 +1587,9 @@ def test_ssh_workspace_command_quotes_user_text_and_replays_one_window(
     assert shlex.quote(f"TERMROOM_WORKSPACE_COMMAND={command}") in starts[0]
     assert shlex.quote(f"TERMROOM_WORKSPACE_COMMAND={restarted_command}") in restarts[0]
     assert shlex.quote("/srv/project with spaces") in starts[0]
+    quoted_wrapper_argv = " ".join(map(shlex.quote, WORKSPACE_COMMAND_WRAPPER_ARGV))
+    assert quoted_wrapper_argv in starts[0]
+    assert quoted_wrapper_argv in restarts[0]
     assert not (Path.cwd() / "must-not-run-locally").exists()
 
 

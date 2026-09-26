@@ -75,24 +75,27 @@ TMUX_TERMINAL_RECORD_FORMAT = (
     f"#{{{TMUX_TERMINAL_ROLE_OPTION}}}|#{{{TMUX_MANAGED_RUN_OPTION}}}"
 )
 
-WORKSPACE_COMMAND_WRAPPER = r"""/bin/bash --noprofile --norc -c '
-set -eu
+WORKSPACE_COMMAND_WRAPPER = r"""set -eu
 pane=${TMUX_PANE:?}
 command=${TERMROOM_WORKSPACE_COMMAND:?}
 slot=${TERMROOM_WORKSPACE_COMMAND_SLOT:?}
 launch=${TERMROOM_WORKSPACE_COMMAND_LAUNCH:?}
 digest=${TERMROOM_WORKSPACE_COMMAND_DIGEST:?}
-tmux set-window-option -t "$pane" remain-on-exit off
-tmux set-window-option -t "$pane" @termroom_workspace_command_digest "$digest"
-tmux set-window-option -t "$pane" @termroom_workspace_command_launch "$launch"
-tmux set-window-option -t "$pane" @termroom_workspace_command_slot "$slot"
-tmux set-window-option -t "$pane" @termroom_workspace_command_state running
+tmux_bin=$(type -P tmux)
+case "$tmux_bin" in /*) ;; *) tmux_bin="$PWD/$tmux_bin" ;; esac
+printf -v tmux_literal %q "$tmux_bin"
+"$tmux_bin" set-window-option -t "$pane" remain-on-exit off
+"$tmux_bin" set-window-option -t "$pane" @termroom_workspace_command_state running
+"$tmux_bin" set-window-option -t "$pane" @termroom_workspace_command_digest "$digest"
+"$tmux_bin" set-window-option -t "$pane" @termroom_workspace_command_launch "$launch"
+"$tmux_bin" set-window-option -t "$pane" @termroom_workspace_command_slot "$slot"
 unset TERMROOM_WORKSPACE_COMMAND TERMROOM_WORKSPACE_COMMAND_SLOT \
     TERMROOM_WORKSPACE_COMMAND_LAUNCH TERMROOM_WORKSPACE_COMMAND_DIGEST
 set +e
 /bin/bash --noprofile --norc -c "$command"
 status=$?
 set -e
+"$tmux_bin" set-window-option -t "$pane" @termroom_workspace_command_state settling
 if test "$status" -eq 0; then
     printf "\n✓\n"
 else
@@ -102,26 +105,118 @@ shell=${SHELL:-/bin/bash}
 if test ! -x "$shell"; then
     shell=/bin/bash
 fi
-tmux set-window-option -t "$pane" @termroom_workspace_command_state settling
-# Publish reusable-shell state only after exec has replaced this wrapper. A
-# fixed delay can expose the state while the interactive shell is still
-# starting, so the first follow-up input can be lost.
 shell_name=${shell##*/}
-printf -v pane_literal %q "$pane"
-printf -v shell_name_literal %q "$shell_name"
-readiness_command="while test \"\$(tmux display-message -p -t $pane_literal \
-    #{pane_dead})\" = 0 && test \"\$(tmux display-message -p -t \
-    $pane_literal #{pane_current_command})\" != $shell_name_literal; do
-    sleep 0.01
-done
-if test \"\$(tmux display-message -p -t $pane_literal #{pane_dead})\" = 0; then
-    tmux set-window-option -t $pane_literal \
-        @termroom_workspace_command_state shell
-fi"
-tmux run-shell -b "$readiness_command" >/dev/null 2>&1 || true
-exec "$shell"
-'
+if test "$shell_name" = bash; then
+    # pane_current_command becomes "bash" before .bashrc finishes. Source the
+    # user rc normally, then publish readiness at the first Bash prompt.
+    unset TERMROOM_WORKSPACE_SHELL_READY
+    exec "$shell" --rcfile <(
+        if test -r "${HOME:-}/.bashrc"; then
+            printf "source %q\\n" "$HOME/.bashrc"
+        fi
+        printf "TERMROOM_WORKSPACE_READY_LAUNCH=%s\\n" "$launch"
+        cat <<TERMROOM_BASH_RC
+__termroom_workspace_shell_ready() {
+    if test -z "\${TERMROOM_WORKSPACE_SHELL_READY:-}"; then
+        TERMROOM_WORKSPACE_SHELL_READY=1
+        if test "\$($tmux_literal show-window-option -v -t "\$TMUX_PANE" \
+            @termroom_workspace_command_launch 2>/dev/null || true)" \
+            = "\$TERMROOM_WORKSPACE_READY_LAUNCH"; then
+            $tmux_literal set-window-option -t "\$TMUX_PANE" \
+                @termroom_workspace_command_state shell >/dev/null 2>&1 || true
+        fi
+        unset TERMROOM_WORKSPACE_READY_LAUNCH
+    fi
+}
+if [[ "\$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+    PROMPT_COMMAND+=(__termroom_workspace_shell_ready)
+else
+    PROMPT_COMMAND="\${PROMPT_COMMAND:+\$PROMPT_COMMAND; }__termroom_workspace_shell_ready"
+fi
+TERMROOM_BASH_RC
+    )
+elif test "$shell_name" = zsh; then
+    startup_dir=$(mktemp -d "${TMPDIR:-/tmp}/termroom-zsh.XXXXXXXX") \
+        || exec "$shell"
+    user_zdotdir=${ZDOTDIR:-${HOME:-}}
+    printf -v startup_dir_literal %q "$startup_dir"
+    printf -v user_zdotdir_literal %q "$user_zdotdir"
+    umask 077
+    cat > "$startup_dir/.zshenv" <<TERMROOM_ZSH_ENV
+ZDOTDIR=$user_zdotdir_literal
+if [[ -r "\$ZDOTDIR/.zshenv" ]]; then source "\$ZDOTDIR/.zshenv"; fi
+TERMROOM_WORKSPACE_USER_ZDOTDIR=\${ZDOTDIR:-$user_zdotdir_literal}
+TERMROOM_WORKSPACE_INIT_DIR=$startup_dir_literal
+export TERMROOM_WORKSPACE_USER_ZDOTDIR TERMROOM_WORKSPACE_INIT_DIR
+ZDOTDIR=$startup_dir_literal
+export ZDOTDIR
+TERMROOM_ZSH_ENV
+    cat > "$startup_dir/.zshrc" <<TERMROOM_ZSH_RC
+ZDOTDIR=\${TERMROOM_WORKSPACE_USER_ZDOTDIR:-$user_zdotdir_literal}
+if [[ -r "\$ZDOTDIR/.zshrc" ]]; then source "\$ZDOTDIR/.zshrc"; fi
+__termroom_workspace_cleanup() {
+    /bin/rm -f $startup_dir_literal/.zshenv $startup_dir_literal/.zshrc \\
+        $startup_dir_literal/.zcompdump $startup_dir_literal/.zcompdump.zwc
+    /bin/rmdir $startup_dir_literal 2>/dev/null || true
+}
+__termroom_workspace_shell_ready() {
+    precmd_functions=(\${precmd_functions:#__termroom_workspace_shell_ready})
+    __termroom_workspace_cleanup
+    if [[ "\$($tmux_literal show-window-option -v -t "\$TMUX_PANE" \
+        @termroom_workspace_command_launch 2>/dev/null || true)" == "$launch" ]]; then
+        $tmux_literal set-window-option -t "\$TMUX_PANE" \
+            @termroom_workspace_command_state shell >/dev/null 2>&1 || true
+    fi
+}
+precmd_functions+=(__termroom_workspace_shell_ready)
+zshexit_functions+=(__termroom_workspace_cleanup)
+TERMROOM_ZSH_RC
+    ZDOTDIR=$startup_dir
+    export ZDOTDIR
+    exec "$shell"
+elif test "$shell_name" = sh || test "$shell_name" = dash; then
+    startup_file=$(mktemp "${TMPDIR:-/tmp}/termroom-sh.XXXXXXXX") \
+        || exec "$shell"
+    user_env=${ENV:-}
+    printf -v startup_file_literal %q "$startup_file"
+    printf -v user_env_literal %q "$user_env"
+    umask 077
+    cat > "$startup_file" <<TERMROOM_SH_ENV
+if test -r $user_env_literal; then . $user_env_literal; fi
+if test -n $user_env_literal; then ENV=$user_env_literal; export ENV; else unset ENV; fi
+/bin/rm -f $startup_file_literal
+if test "\$($tmux_literal show-window-option -v -t "\$TMUX_PANE" \\
+    @termroom_workspace_command_launch 2>/dev/null || true)" = "$launch"; then
+    $tmux_literal set-window-option -t "\$TMUX_PANE" \\
+        @termroom_workspace_command_state shell >/dev/null 2>&1 || true
+fi
+TERMROOM_SH_ENV
+    ENV=$startup_file
+    export ENV
+    exec "$shell"
+else
+    printf -v pane_literal %q "$pane"
+    printf -v shell_name_literal %q "$shell_name"
+    printf -v launch_literal %q "$launch"
+    readiness_command="while test \"\$($tmux_literal display-message -p -t $pane_literal \
+        \"##{pane_dead}\")\" = 0 && test \"\$($tmux_literal display-message -p -t \
+        $pane_literal \"##{pane_current_command}\")\" != $shell_name_literal; do
+        sleep 0.01
+    done
+    if test \"\$($tmux_literal display-message -p -t $pane_literal \
+        \"##{pane_dead}\")\" = 0 && test \"\$($tmux_literal \
+        show-window-option -v -t $pane_literal \
+        @termroom_workspace_command_launch 2>/dev/null || true)\" = $launch_literal; then
+        $tmux_literal set-window-option -t $pane_literal \
+            @termroom_workspace_command_state shell
+    fi"
+    "$tmux_bin" run-shell -b "$readiness_command" >/dev/null 2>&1 || true
+    exec "$shell"
+fi
 """
+WORKSPACE_COMMAND_WRAPPER_ARGV = (
+    "/bin/bash", "--noprofile", "--norc", "-p", "-c", WORKSPACE_COMMAND_WRAPPER
+)
 
 TERMINAL_EDITOR_WRAPPER = r"""/bin/sh -c '
 set -eu
@@ -239,9 +334,7 @@ def parse_tmux_workspace_command_records(output: str) -> list[dict[str, Any]]:
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError("tmux exposed an invalid Workspace command digest")
         if state_raw == "":
-            # The wrapper publishes slot/launch/digest before its running state.
-            # Ignore this incomplete record; old state-less command windows are
-            # intentionally not treated as compatible managed shortcuts.
+            # Old state-less command windows are not compatible managed shortcuts.
             continue
         if state_raw not in {"running", "settling", "shell"}:
             raise ValueError("tmux exposed an invalid Workspace command state")
@@ -1410,7 +1503,7 @@ class TerminalManager:
                     f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
                     "-t",
                     window,
-                    WORKSPACE_COMMAND_WRAPPER,
+                    *WORKSPACE_COMMAND_WRAPPER_ARGV,
                     check=False,
                 )
                 if respawned.returncode:
@@ -1440,7 +1533,7 @@ class TerminalManager:
                 f"run-{safe_slot + 1}",
                 "-c",
                 str(workspace["path"]),
-                WORKSPACE_COMMAND_WRAPPER,
+                *WORKSPACE_COMMAND_WRAPPER_ARGV,
             )
             window = created.stdout.strip()
             created_window = True

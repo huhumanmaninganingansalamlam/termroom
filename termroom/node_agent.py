@@ -106,7 +106,7 @@ from termroom.terminals import (
     TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
-    WORKSPACE_COMMAND_WRAPPER,
+    WORKSPACE_COMMAND_WRAPPER_ARGV,
     clear_tmux_workspace_command_identity,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
@@ -1162,7 +1162,7 @@ class NodeRuntime:
                     f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
                     "-t",
                     window,
-                    WORKSPACE_COMMAND_WRAPPER,
+                    *WORKSPACE_COMMAND_WRAPPER_ARGV,
                     check=False,
                 )
                 if respawned.returncode:
@@ -1193,7 +1193,7 @@ class NodeRuntime:
                 f"run-{safe_slot + 1}",
                 "-c",
                 str(root),
-                WORKSPACE_COMMAND_WRAPPER,
+                *WORKSPACE_COMMAND_WRAPPER_ARGV,
             )
             window = created.stdout.strip()
             created_window = True

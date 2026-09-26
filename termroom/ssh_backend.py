@@ -74,9 +74,10 @@ from termroom.terminals import (
     TMUX_WORKSPACE_COMMAND_OPTIONS,
     TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
     TMUX_WORKSPACE_COMMAND_SLOT_OPTION,
+    TMUX_WORKSPACE_COMMAND_STATE_OPTION,
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
-    WORKSPACE_COMMAND_WRAPPER,
+    WORKSPACE_COMMAND_WRAPPER_ARGV,
     TerminalOutputDecoder,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
@@ -3953,7 +3954,7 @@ class SSHBackend:
                     process_options,
                     "-t",
                     shlex.quote(window),
-                    shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+                    " ".join(map(shlex.quote, WORKSPACE_COMMAND_WRAPPER_ARGV)),
                     "|| exit $?;",
                     f"window={shlex.quote(window)};",
                 )
@@ -3970,7 +3971,7 @@ class SSHBackend:
                     shlex.quote(f"run-{safe_slot + 1}"),
                     "-c",
                     shlex.quote(self._remote_root(workspace)),
-                    shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+                    " ".join(map(shlex.quote, WORKSPACE_COMMAND_WRAPPER_ARGV)),
                 )
             )
             launch = f"window=$({create}) || exit $?;"
@@ -3980,9 +3981,14 @@ class SSHBackend:
                 f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}",
                 f"#{{{TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION}}}",
                 f"#{{{TMUX_WORKSPACE_COMMAND_DIGEST_OPTION}}}",
+                f"#{{{TMUX_WORKSPACE_COMMAND_STATE_OPTION}}}",
             )
         )
         expected_readiness = f"{safe_slot}|{safe_launch}|{digest}"
+        ready_states = "|".join(
+            shlex.quote(f"{expected_readiness}|{state}")
+            for state in ("running", "settling", "shell")
+        )
         readiness_attempts = max(
             1,
             int(WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS / WORKSPACE_COMMAND_READY_POLL_SECONDS),
@@ -3993,8 +3999,8 @@ class SSHBackend:
             f'while test "$attempt" -lt {readiness_attempts}; do '
             'ready=$(tmux display-message -p -t "$window" '
             f"{shlex.quote(readiness_format)} 2>/dev/null || true); "
-            f'if test "$ready" = {shlex.quote(expected_readiness)}; then '
-            "printf '%s\\n' \"$window\"; exit 0; fi; "
+            f'case "$ready" in {ready_states}) '
+            "printf '%s\\n' \"$window\"; exit 0;; esac; "
             "attempt=$((attempt + 1)); "
             f"sleep {WORKSPACE_COMMAND_READY_POLL_SECONDS}; done; "
             f"{timeout_cleanup}; exit 1"
