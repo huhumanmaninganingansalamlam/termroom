@@ -312,12 +312,18 @@ def test_noninteractive_ssh_uses_configured_login_shell_command_path(tmp_path: P
         assert login_log.read_text(encoding="utf-8").splitlines() == ["login"]
 
 
-def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reuse_connections", [False, True])
+def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    reuse_connections: bool,
+) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     store = StateStore(state_dir / "termroom.sqlite3")
     store.initialize()
-    backend = SSHBackend(store, state_dir)
+    backend = SSHBackend(store, state_dir, reuse_connections=reuse_connections)
+    request.addfinalizer(backend.close)
 
     remote_path = tmp_path / "remote-path"
     remote_path.mkdir()
@@ -352,9 +358,23 @@ def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(tmp_path
             host_key_data=probe["host_key_data"],
             host_fingerprint=probe["host_fingerprint"],
         )
+        computer_id = str(computer["id"])
+        prior_success = "2000-01-01T00:00:00+00:00"
+        with store.connect() as db:
+            db.execute(
+                "UPDATE computers SET last_connected_at = ? WHERE id = ?",
+                (prior_success, computer_id),
+            )
 
         with pytest.raises(SSHBackendError, match="tmux is not installed") as raised:
             backend.test_connection(computer)
+        failed = store.get_computer(computer_id)
+        assert failed is not None
+        assert failed["last_connected_at"] == prior_success
+        assert str(failed["last_error"]).startswith("termroom-i18n:")
+        assert json.loads(str(failed["last_error"]).removeprefix("termroom-i18n:"))["key"] == (
+            "ssh.backend.tmux_missing"
+        )
 
         installed_path = tmp_path / "installed-path"
         installed_path.mkdir()
@@ -371,6 +391,10 @@ def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(tmp_path
             encoding="utf-8",
         )
         assert backend.test_connection(computer)["tmux"] == "tmux 3.6b"
+        recovered = store.get_computer(computer_id)
+        assert recovered is not None
+        assert recovered["last_connected_at"] != prior_success
+        assert recovered["last_error"] is None
 
     assert raised.value.locale_key == "ssh.backend.tmux_missing"
 

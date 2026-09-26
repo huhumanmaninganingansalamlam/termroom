@@ -3028,6 +3028,94 @@ async def test_persisted_ssh_error_renders_in_current_locale(
 
 
 @pytest.mark.asyncio
+async def test_ssh_prerequisite_retry_preserves_last_success_until_check_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="QA server",
+        ssh_alias="",
+        host="127.0.0.1",
+        port=22,
+        username="qa",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    computer_id = str(computer["id"])
+    app.state.store.update_computer_connection(computer_id)
+    last_success = app.state.store.get_computer(computer_id)["last_connected_at"]
+    failing = True
+
+    monkeypatch.setattr(
+        app.state.ssh,
+        "_connect",
+        lambda _computer, *, record_connection=True: object(),
+    )
+
+    def connection_info(
+        _client: object, _computer: object, **_kwargs: object
+    ) -> dict[str, str]:
+        if failing:
+            raise SSHBackendError(
+                "tmux is not installed on the remote computer",
+                locale_key="ssh.backend.tmux_missing",
+            )
+        return {"shell": "/bin/zsh", "tmux": "tmux 3.6"}
+
+    monkeypatch.setattr(app.state.ssh, "_connection_info", connection_info)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        client.cookies.set("termroom_locale", "en")
+        before = await client.get(f"/computers/{computer_id}")
+        assert "Available" in before.text
+        last_success = "2000-01-01T00:00:00+00:00"
+        with app.state.store.connect() as db:
+            db.execute(
+                "UPDATE computers SET last_connected_at = ? WHERE id = ?",
+                (last_success, computer_id),
+            )
+
+        failed = await client.post(
+            f"/computers/{computer_id}/test",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=True,
+        )
+        failed_record = app.state.store.get_computer(computer_id)
+        assert failed_record is not None
+        assert failed_record["last_connected_at"] == last_success
+        assert str(failed_record["last_error"]).startswith("termroom-i18n:")
+        assert 'state-chip remote unavailable' in failed.text
+        assert "tmux was not found" in failed.text
+        assert "Test connection again" in failed.text
+        assert "Last successful contact" in failed.text
+
+        failing = False
+        recovered = await client.post(
+            f"/computers/{computer_id}/test",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=True,
+        )
+
+    recovered_record = app.state.store.get_computer(computer_id)
+    assert recovered_record is not None
+    assert recovered_record["last_connected_at"] != last_success
+    assert recovered_record["last_error"] is None
+    assert 'state-chip remote available' in recovered.text
+    assert "Connection verified" in recovered.text
+
+
+@pytest.mark.asyncio
 async def test_ssh_password_update_verifies_before_replacing_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1059,13 +1059,31 @@ class SSHBackend:
 
     def test_connection(self, computer: dict[str, Any]) -> dict[str, str]:
         self._require_ssh_client()
-        client = self._connect(computer)
-        return self._connection_info(client, computer, refresh_command_path=True)
+        target = self._effective_connection_target(computer)
+        try:
+            client = self._connect(target, record_connection=False)
+            result = self._connection_info(
+                client, target, refresh_command_path=True
+            )
+        except SSHBackendError as exc:
+            self._record_connection(target, error=exc)
+            raise
+        self._record_connection(target)
+        return result
 
     def test_password_connection(self, computer: dict[str, Any], password: str) -> dict[str, str]:
         self._require_ssh_client()
-        client = self._connect_password(self._effective_connection_target(computer), password)
-        return self._connection_info(client, computer, refresh_command_path=True)
+        target = self._effective_connection_target(computer)
+        try:
+            client = self._connect_password(target, password)
+            result = self._connection_info(
+                client, target, refresh_command_path=True
+            )
+        except SSHBackendError as exc:
+            self._record_connection(target, error=exc)
+            raise
+        self._record_connection(target)
+        return result
 
     @staticmethod
     def _require_ssh_client() -> None:
@@ -5128,10 +5146,17 @@ class SSHBackend:
         if close_client:
             client.close()
 
-    def _connect(self, computer: dict[str, Any]) -> paramiko.SSHClient | _SSHClientLease:
+    def _connect(
+        self,
+        computer: dict[str, Any],
+        *,
+        record_connection: bool = True,
+    ) -> paramiko.SSHClient | _SSHClientLease:
         target = self._effective_connection_target(computer)
         if not self._reuse_connections:
-            client = self._connect_fresh(target)
+            client = self._connect_fresh(
+                target, record_connection=record_connection
+            )
             self._seed_client_remote_command_path(client, str(target.get("id") or ""))
             return client
         key = self._connection_cache_key(target)
@@ -5157,10 +5182,13 @@ class SSHBackend:
         self._close_clients(closing)
 
         if reused is not None:
-            self._record_connection(target)
+            if record_connection:
+                self._record_connection(target)
             return _SSHClientLease(self, key, computer_id, reused)
 
-        client = self._connect_fresh(target)
+        client = self._connect_fresh(
+            target, record_connection=record_connection
+        )
         self._seed_client_remote_command_path(client, computer_id)
         transport = client.get_transport()
         if transport is not None:
@@ -5198,14 +5226,21 @@ class SSHBackend:
                 continue
         return blobs
 
-    def _connect_fresh(self, computer: dict[str, Any]) -> paramiko.SSHClient:
+    def _connect_fresh(
+        self,
+        computer: dict[str, Any],
+        *,
+        record_connection: bool = True,
+    ) -> paramiko.SSHClient:
         if str(computer.get("auth_kind") or "key") == "password":
             try:
                 client = self._connect_password(computer, self._stored_password(computer))
             except SSHBackendError as exc:
-                self._record_connection(computer, error=exc)
+                if record_connection:
+                    self._record_connection(computer, error=exc)
                 raise
-            self._record_connection(computer)
+            if record_connection:
+                self._record_connection(computer)
             return client
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(
@@ -5230,7 +5265,8 @@ class SSHBackend:
                 error = SSHBackendError(
                     "Could not connect to the SSH agent configured for this alias"
                 )
-                self._record_connection(computer, error=error)
+                if record_connection:
+                    self._record_connection(computer, error=error)
                 client.close()
                 raise error from exc
             client._agent = custom_agent
@@ -5253,7 +5289,8 @@ class SSHBackend:
         try:
             client.connect(**connect_kwargs)
         except SSHHostKeyChanged as exc:
-            self._record_connection(computer, error=exc)
+            if record_connection:
+                self._record_connection(computer, error=exc)
             client.close()
             raise
         except paramiko.BadHostKeyException as exc:
@@ -5261,19 +5298,22 @@ class SSHBackend:
                 "SSH host key no longer matches the approved fingerprint",
                 locale_key="ssh.backend.host_key_changed",
             )
-            self._record_connection(computer, error=error)
+            if record_connection:
+                self._record_connection(computer, error=error)
             client.close()
             raise error from exc
         except (OSError, paramiko.SSHException) as exc:
             error = self.connection_error(exc, str(computer["host"]), int(computer["port"]))
-            self._record_connection(computer, error=error)
+            if record_connection:
+                self._record_connection(computer, error=error)
             client.close()
             raise error from exc
         finally:
             if custom_agent is not None:
                 custom_agent.close()
                 client._agent = None
-        self._record_connection(computer)
+        if record_connection:
+            self._record_connection(computer)
         return client
 
     def _connect_password(self, computer: dict[str, Any], password: str) -> paramiko.SSHClient:
@@ -5577,13 +5617,13 @@ class SSHBackend:
         if status < 0:
             raise SSHCommandStatusUnknown("SSH command completion status is unknown")
         if status:
-            if "__TERMROOM_NO_DIR__" in error:
-                raise SSHBackendError("Remote Workspace directory does not exist")
             if "__TERMROOM_NO_TMUX__" in error:
                 raise SSHBackendError(
                     "tmux is not installed on the remote computer",
                     locale_key="ssh.backend.tmux_missing",
                 )
+            if "__TERMROOM_NO_DIR__" in error:
+                raise SSHBackendError("Remote Workspace directory does not exist")
             if "__TERMROOM_NO_BASH__" in error:
                 raise SSHBackendError("/bin/bash is not installed on the remote computer")
             if "__TERMROOM_NO_GIT__" in error:
