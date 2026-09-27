@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gc
+import hashlib
 import json
 import shutil
 import subprocess
@@ -21,16 +22,20 @@ from termroom.node_agent import (
     NodeAgentError,
     NodeConfig,
     NodeRuntime,
+    ensure_node_identity,
     node_session_is_valid,
     normalize_allowed_roots,
+    save_node_config,
 )
 from termroom.node_core import NODE_STREAM_QUEUE_DEPTH, NodeCoreError
 from termroom.node_protocol import (
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
     NODE_REMOTE_RUN_SOURCE_VERSION,
+    NODE_REMOTE_RUN_VERSION,
     NODE_WORKSPACE_USAGE_VERSION,
     generate_private_key,
 )
+from termroom.node_remote_runs import NodeRemoteRunError
 from termroom.remote_access import (
     RemoteAccess,
     RemoteAccessError,
@@ -48,6 +53,29 @@ def _payload(workspace: Path, **values: Any) -> dict[str, Any]:
         "tmux_session": f"termroom-node-test-{uuid.uuid4().hex[:12]}",
         **values,
     }
+
+
+def _node_runtime_with_private_state(home: Path) -> tuple[NodeRuntime, Path]:
+    state_root = home / ".local" / "state" / "termroom" / "node"
+    ensure_node_identity(state_root)
+    config = NodeConfig(
+        "http://127.0.0.1:1",
+        "a" * 32,
+        "private-state-test",
+        (home,),
+        state_dir=state_root,
+        run_root=state_root / "runs",
+    )
+    save_node_config(state_root, config)
+    return (
+        NodeRuntime(
+            config.allowed_roots,
+            file_run_root=state_root / "file-runs",
+            remote_run_root=config.run_root,
+            private_state_root=state_root,
+        ),
+        state_root,
+    )
 
 
 def _wait_for_node_file_run(
@@ -217,6 +245,248 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
         },
     )
     assert (workspace / "new-dir").is_dir()
+
+
+def test_node_private_identity_cannot_be_previewed_from_allowed_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    runtime, _state_root = _node_runtime_with_private_state(home)
+
+    with pytest.raises(PathBoundaryError):
+        runtime._handle_sync(
+            "files.read_preview",
+            {
+                "workspace_path": str(home),
+                "path": ".local/state/termroom/node/node-key.pem",
+            },
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_node_workspace_admission_rejects_private_roots_but_allows_home_and_managed_runs(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    private_state = home / "node-state"
+    private_state.mkdir()
+    file_run_root = home / "file-runs"
+    remote_run_root = home / "remote-runs"
+    runtime = NodeRuntime(
+        [home],
+        private_state_root=private_state,
+        file_run_root=file_run_root,
+        remote_run_root=remote_run_root,
+    )
+    boundaries = runtime.source_private_boundaries
+    assert runtime._handle_sync("workspace.validate", {"path": str(home)})["path"] == str(
+        home
+    )
+
+    normal_payload = _payload(home)
+    session_names = [str(normal_payload["tmux_session"])]
+    remote_runs = runtime.remote_runs
+    assert remote_runs is not None
+    managed_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
+    managed_layouts = [
+        remote_runs.create(
+            {
+                "remote_run_version": NODE_REMOTE_RUN_VERSION,
+                "run_base": str(remote_runs.run_root),
+                "run_id": run_id,
+                "command": "true",
+            }
+        )
+        for run_id in managed_ids
+    ]
+    managed_path = Path(managed_layouts[0]["work"])
+    other_managed_path = Path(managed_layouts[1]["work"])
+    managed_payload = {
+        **_payload(managed_path),
+        "remote_run_id": managed_ids[0],
+    }
+    session_names.append(str(managed_payload["tmux_session"]))
+
+    try:
+        for index, boundary in enumerate(boundaries):
+            descendant = boundary / "nested"
+            descendant.mkdir()
+            alias = home / f"private-alias-{index}"
+            alias.symlink_to(boundary, target_is_directory=True)
+
+            for path in (boundary, descendant, alias):
+                with pytest.raises(PathBoundaryError):
+                    runtime._handle_sync("workspace.validate", {"path": str(path)})
+                blocked = _payload(path)
+                session_names.append(str(blocked["tmux_session"]))
+                with pytest.raises(PathBoundaryError):
+                    runtime._handle_sync("workspace.ensure", blocked)
+
+            with pytest.raises(PathBoundaryError):
+                runtime._handle_sync(
+                    "workspace.create_project",
+                    {"parent": str(boundary), "name": "must-not-create"},
+                )
+            with pytest.raises(PathBoundaryError):
+                runtime._handle_sync(
+                    "workspace.create_project",
+                    {"parent": str(home), "name": boundary.name},
+                )
+            assert not (boundary / "must-not-create").exists()
+
+        assert runtime._handle_sync("workspace.ensure", normal_payload)["terminals"]
+        created = runtime._handle_sync(
+            "workspace.create_project",
+            {"parent": str(home), "name": "ordinary-project"},
+        )
+        assert Path(str(created["path"])).is_dir()
+
+        assert runtime._handle_sync("workspace.validate", managed_payload)["path"] == str(
+            managed_path
+        )
+        assert runtime._handle_sync("workspace.ensure", managed_payload)["terminals"]
+        for mismatched in (
+            {**managed_payload, "workspace_path": str(other_managed_path)},
+            {**managed_payload, "remote_run_id": managed_ids[1]},
+        ):
+            with pytest.raises(NodeRemoteRunError):
+                runtime._handle_sync("workspace.validate", mismatched)
+            with pytest.raises(NodeRemoteRunError):
+                runtime._handle_sync("workspace.ensure", mismatched)
+    finally:
+        for session in session_names:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                check=False,
+                capture_output=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_node_private_state_is_excluded_from_files_and_file_run(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    visible = home / "visible.txt"
+    visible.write_text("ordinary sibling\n", encoding="utf-8")
+    runtime, state_root = _node_runtime_with_private_state(home)
+    state_sibling = state_root.parent / "ordinary-state.txt"
+    state_sibling.write_text("ordinary state sibling\n", encoding="utf-8")
+    private_files = (state_root / "node-key.pem", state_root / "node.json")
+
+    def private_fingerprint(path: Path) -> tuple[str, int, int]:
+        info = path.stat()
+        return (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            info.st_mode & 0o777,
+            info.st_mtime_ns,
+        )
+
+    before = tuple(private_fingerprint(path) for path in private_files)
+    alias = home / "private-alias"
+    alias.symlink_to(state_root, target_is_directory=True)
+    payload = _payload(home)
+    key_path = ".local/state/termroom/node/node-key.pem"
+    state_parent = ".local/state/termroom"
+
+    listed = runtime._handle_sync(
+        "files.list",
+        {**payload, "path": ".", "max_entries": 2, "max_metadata_bytes": 300},
+    )
+    siblings = runtime._handle_sync(
+        "files.list", {**payload, "path": state_parent, "max_entries": 1}
+    )
+    assert {entry["name"] for entry in listed["entries"]} == {".local", "visible.txt"}
+    assert [entry["name"] for entry in siblings["entries"]] == ["ordinary-state.txt"]
+    assert all(entry["name"] != alias.name for entry in listed["entries"])
+    recent = runtime._handle_sync("files.recent", {**payload, "limit": 20})
+    assert "visible.txt" in {entry["name"] for entry in recent["entries"]}
+    search = runtime._handle_sync(
+        "files.search",
+        {**payload, "path": ".", "query": "node-key", "include_noise": True},
+    )
+    assert search["entries"] == []
+
+    for operation, extra in (
+        ("files.list", {"path": ".local/state/termroom/node"}),
+        ("files.search", {"path": ".local/state/termroom/node", "query": "node-key"}),
+        ("files.stat", {"path": key_path}),
+        ("files.read_preview", {"path": key_path}),
+        ("files.stat", {"path": "private-alias/node-key.pem"}),
+        ("files.create", {"parent": ".local/state/termroom/node", "name": "new.txt"}),
+        ("files.create", {"parent": ".", "name": ".local"}),
+        ("files.rename", {"path": key_path, "new_name": "renamed.pem"}),
+        ("files.rename", {"path": state_parent, "new_name": "renamed-state"}),
+        ("files.delete", {"path": key_path}),
+        ("files.delete", {"path": state_parent}),
+        ("terminal.editor.open", {"path": key_path}),
+        (
+            "file_run.inspect",
+            {"path": key_path, "runner_registry_version": RUNNER_REGISTRY_VERSION},
+        ),
+        (
+            "file_run.start",
+            {
+                "path": key_path,
+                "runner_registry_version": RUNNER_REGISTRY_VERSION,
+            },
+        ),
+    ):
+        with pytest.raises(PathBoundaryError):
+            runtime._handle_sync(operation, {**payload, **extra})
+
+    assert visible.read_text(encoding="utf-8") == "ordinary sibling\n"
+    assert state_sibling.read_text(encoding="utf-8") == "ordinary state sibling\n"
+    assert tuple(private_fingerprint(path) for path in private_files) == before
+
+    async def send(_message: Any) -> None:
+        return None
+
+    remote_runs = runtime.remote_runs
+    assert remote_runs is not None
+    run_id = str(uuid.uuid4())
+    run_request = {
+        "remote_run_version": NODE_REMOTE_RUN_VERSION,
+        "run_base": str(remote_runs.run_root),
+        "run_id": run_id,
+        "command": "true",
+    }
+    layout = remote_runs.create(run_request)
+    run_work = Path(layout["work"])
+    (run_work / "ordinary.txt").write_text("managed output\n", encoding="utf-8")
+    run_alias = run_work / "private-alias"
+    run_alias.symlink_to(state_root, target_is_directory=True)
+    managed_payload = {
+        **payload,
+        "workspace_path": str(run_work),
+        "remote_run_id": run_id,
+    }
+    managed_entries = runtime._handle_sync(
+        "files.list", {**managed_payload, "path": "."}
+    )["entries"]
+    assert [entry["name"] for entry in managed_entries] == ["ordinary.txt"]
+    with pytest.raises(PathBoundaryError):
+        runtime._handle_sync(
+            "files.read_preview",
+            {**managed_payload, "path": "private-alias/node-key.pem"},
+        )
+
+    for operation, extra in (
+        ("files.read_text.open", {"path": key_path}),
+        ("files.write_text.open", {"path": key_path}),
+        ("files.download.open", {"path": key_path}),
+        (
+            "files.upload.open",
+            {"parent": ".local/state/termroom/node", "filename": "upload.txt"},
+        ),
+    ):
+        stream_id = uuid.uuid4().hex
+        with pytest.raises(PathBoundaryError):
+            await runtime.handle(
+                operation,
+                {**payload, **extra, "stream_id": stream_id},
+                send,
+            )
+        assert stream_id not in runtime.streams
 
 
 @pytest.mark.asyncio
@@ -967,8 +1237,10 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
     )
     stubborn = workspace / "stubborn.py"
     stubborn.write_text(
+        "from pathlib import Path\n"
         "import signal, time\n"
         "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "Path('stubborn-ready').write_text('ready')\n"
         "while True: time.sleep(0.1)\n",
         encoding="utf-8",
     )
@@ -1020,6 +1292,11 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
             },
         )
         _wait_for_node_file_run(runtime, {**base, "run_id": stubborn_id}, states={"running"})
+        readiness = workspace / "stubborn-ready"
+        deadline = time.monotonic() + 4
+        while not readiness.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert readiness.read_text(encoding="utf-8") == "ready"
         assert runtime._handle_sync("file_run.interrupt", {**base, "run_id": stubborn_id})["sent"]
         time.sleep(0.2)
         assert (

@@ -92,6 +92,7 @@ from termroom.security import (
     PathBoundaryError,
     ensure_private_directory,
     is_within,
+    resolve_inside,
     resolve_no_symlink_inside,
 )
 from termroom.terminals import (
@@ -464,6 +465,7 @@ class NodeRuntime:
             if boundary is not None
         ]
         self.source_private_boundaries = tuple(dict.fromkeys(private_boundaries))
+        self.files_private_boundaries = self.source_private_boundaries
         self._file_run_locks: dict[str, threading.RLock] = {}
         self._file_run_locks_guard = threading.Lock()
         self._workspace_command_locks: dict[str, threading.RLock] = {}
@@ -539,7 +541,9 @@ class NodeRuntime:
         if operation == "terminal.scrollback":
             return {"output": self._capture_scrollback(payload)}
         if operation == "files.list":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or ".")
+            self._require_files_path(root, relative_path)
             raw_max_entries = payload.get("max_entries")
             if raw_max_entries is None:
                 max_entries = NODE_FILE_LIST_MAX_ENTRIES
@@ -560,16 +564,19 @@ class NodeRuntime:
                 max_metadata_bytes = raw_metadata_bytes
             directory, entries = self.files.list_dir(
                 root,
-                str(payload.get("path") or "."),
+                relative_path,
                 max_entries=max_entries,
                 max_metadata_bytes=max_metadata_bytes,
+                excluded_paths=self._private_paths_relative_to(root),
             )
             return {
                 "directory": self._relative(root, directory),
                 "entries": [asdict(entry) for entry in entries],
             }
         if operation == "files.search":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or ".")
+            self._require_files_path(root, relative_path)
             raw_query = payload.get("query")
             if not isinstance(raw_query, str) or not raw_query.strip() or len(raw_query) > 256:
                 raise NodeAgentError("File search query is invalid", code="request_invalid")
@@ -578,12 +585,13 @@ class NodeRuntime:
                 raise NodeAgentError("File search visibility is invalid", code="request_invalid")
             search = self.files.search_files(
                 root,
-                str(payload.get("path") or "."),
+                relative_path,
                 raw_query,
                 include_noise=raw_include_noise,
                 max_matches=DEFAULT_FILE_SEARCH_MAX_MATCHES,
                 max_entries=DEFAULT_FILE_SEARCH_MAX_ENTRIES,
                 max_seconds=DEFAULT_FILE_SEARCH_MAX_SECONDS,
+                excluded_paths=self._private_paths_relative_to(root),
             )
             return {
                 "entries": [asdict(entry) for entry in search.entries],
@@ -592,46 +600,68 @@ class NodeRuntime:
                 "truncated": search.truncated,
             }
         if operation == "files.recent":
-            root = self._workspace_path(payload)
-            recent = self.files.recent_files(root, limit=int(payload.get("limit") or 50))
+            root = self._files_workspace_path(payload)
+            recent = self.files.recent_files(
+                root,
+                limit=int(payload.get("limit") or 50),
+                excluded_paths=self._private_paths_relative_to(root),
+            )
             return {
                 "entries": [asdict(entry) for entry in recent.entries],
                 "scanned_files": recent.scanned_files,
                 "truncated": recent.truncated,
             }
         if operation == "files.stat":
-            root = self._workspace_path(payload)
-            return {"entry": asdict(self.files.stat(root, str(payload.get("path") or "")))}
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            self._require_files_path(root, relative_path)
+            return {"entry": asdict(self.files.stat(root, relative_path))}
         if operation == "files.read_preview":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            self._require_files_path(root, relative_path)
             preview = self.files.read_text_preview(
                 root,
-                str(payload.get("path") or ""),
+                relative_path,
                 mode=str(payload.get("mode") or "head"),
                 offset=int(payload.get("offset") or 0),
                 max_bytes=int(payload.get("max_bytes") or 256 * 1024),
             )
             return {"preview": asdict(preview)}
         if operation == "files.create":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            parent = str(payload.get("parent") or ".")
+            name = str(payload.get("name") or "")
+            self._require_files_path(
+                root, Path(parent) / name, destructive=True, allow_missing=True
+            )
             self.files.create(
                 root,
-                str(payload.get("parent") or "."),
-                str(payload.get("name") or ""),
+                parent,
+                name,
                 directory=payload.get("directory") is True,
             )
             return {}
         if operation == "files.rename":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            source = self._require_files_path(root, relative_path, destructive=True)
+            new_name = str(payload.get("new_name") or "")
+            destination = source.relative_to(root).parent / new_name
+            self._require_files_path(
+                root, destination, destructive=True, allow_missing=True
+            )
             self.files.rename(
                 root,
-                str(payload.get("path") or ""),
-                str(payload.get("new_name") or ""),
+                relative_path,
+                new_name,
             )
             return {}
         if operation == "files.delete":
-            root = self._workspace_path(payload)
-            self.files.delete(root, str(payload.get("path") or ""))
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            self._require_files_path(root, relative_path, destructive=True)
+            self.files.delete(root, relative_path)
             return {}
         if operation == "file_run.inspect":
             return self._inspect_runnable(payload)
@@ -698,7 +728,46 @@ class NodeRuntime:
             raise PathBoundaryError("Workspace path must be a real directory")
         if not any(is_within(resolved, root) for root in self.allowed_roots):
             raise PathBoundaryError("Workspace path is outside the Node allowed roots")
+        self._require_persistent_workspace_path(resolved)
         return resolved
+
+    def _files_workspace_path(self, payload: Mapping[str, Any]) -> Path:
+        return self._workspace_path(payload)
+
+    def _require_persistent_workspace_path(self, path: Path) -> None:
+        if any(is_within(path, boundary) for boundary in self.source_private_boundaries):
+            raise PathBoundaryError("Workspace path overlaps Node private state")
+
+    def _private_paths_relative_to(self, root: Path) -> frozenset[str]:
+        return frozenset(
+            boundary.relative_to(root).as_posix()
+            for boundary in self.files_private_boundaries
+            if is_within(boundary, root)
+        )
+
+    def _require_files_path(
+        self,
+        root: Path,
+        relative_path: str | Path,
+        *,
+        destructive: bool = False,
+        allow_missing: bool = False,
+    ) -> Path:
+        target = resolve_inside(root, relative_path, must_exist=not allow_missing)
+        if allow_missing:
+            target = target.resolve(strict=False)
+        protected_descendants = tuple(
+            boundary
+            for boundary in self.files_private_boundaries
+            if is_within(boundary, root)
+        )
+        if any(
+            is_within(target, boundary)
+            or (destructive and is_within(boundary, target))
+            for boundary in protected_descendants
+        ):
+            raise PathBoundaryError("Path overlaps Node private state")
+        return target
 
     @staticmethod
     def _prepare_source_private_root(value: Path | None) -> Path | None:
@@ -979,6 +1048,7 @@ class NodeRuntime:
         parent = self._workspace_path({"path": payload.get("parent")})
         safe_name = validate_project_name(str(payload.get("name") or ""))
         target = parent / safe_name
+        self._require_persistent_workspace_path(target)
         try:
             info = target.lstat()
         except FileNotFoundError:
@@ -1298,13 +1368,14 @@ class NodeRuntime:
         return terminal
 
     def _open_terminal_editor(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         session = self._session(payload)
         try:
             normalized = normalize_terminal_editor_path(payload.get("path"))
         except ValueError as exc:
             raise NodeAgentError(str(exc), code="terminal_editor_invalid") from exc
         target = (root / normalized).resolve(strict=True)
+        self._require_files_path(root, normalized)
         if not is_within(target, root) or not target.is_file():
             raise NodeAgentError(
                 "Terminal editor target is not a Workspace file",
@@ -1594,8 +1665,9 @@ class NodeRuntime:
         payload: Mapping[str, Any],
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
     ) -> OperationResult:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path)
         max_bytes = min(
             self.files.max_edit_bytes,
             max(1, int(payload.get("max_bytes") or 1)),
@@ -1617,8 +1689,9 @@ class NodeRuntime:
         )
 
     async def _write_text_open(self, payload: Mapping[str, Any]) -> OperationResult:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path, destructive=True)
         expected_digest = str(payload.get("expected_digest") or "")
         expected_mtime_ns = int(payload.get("expected_mtime_ns") or 0)
         max_bytes = min(
@@ -1647,8 +1720,10 @@ class NodeRuntime:
         payload: Mapping[str, Any],
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
     ) -> OperationResult:
-        root = self._workspace_path(payload)
-        target = self.files.resolve_regular_file(root, str(payload.get("path") or ""))
+        root = self._files_workspace_path(payload)
+        relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path)
+        target = self.files.resolve_regular_file(root, relative_path)
         info = target.stat()
         offset = max(0, min(int(payload.get("offset") or 0), info.st_size))
         length_value = payload.get("length")
@@ -1659,11 +1734,14 @@ class NodeRuntime:
         return OperationResult({"stream_id": stream_id, "size": info.st_size}, start=stream.start)
 
     async def _upload_open(self, payload: Mapping[str, Any]) -> OperationResult:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         parent = str(payload.get("parent") or ".")
         filename = str(payload.get("filename") or "")
         overwrite = payload.get("overwrite") is True
         max_bytes = max(1, int(payload.get("max_bytes") or 1))
+        self._require_files_path(
+            root, Path(parent) / filename, destructive=True, allow_missing=True
+        )
         target = self.files.upload_target(root, parent, filename)
         if target.exists() and not overwrite:
             raise FileExistsError(filename)
@@ -1841,12 +1919,14 @@ class NodeRuntime:
 
     def _inspect_runnable(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         version = self._runner_registry_version(payload)
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
+        relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path)
         expected_value = payload.get("expected_digest")
         expected_digest = None if expected_value is None else self._file_run_digest(expected_value)
         runnable = self.files.inspect_runnable(
             root,
-            str(payload.get("path") or ""),
+            relative_path,
             expected_digest=expected_digest,
         )
         runner = resolve_runner(runnable)
@@ -1858,14 +1938,15 @@ class NodeRuntime:
 
     def _start_file_run(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._runner_registry_version(payload)
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
+        relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path, allow_missing=True)
         session = self._session(payload)
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))
         expected_digest = self._file_run_digest(payload.get("expected_digest"))
         expected_runner_id = str(payload.get("runner_id") or "")
         expected_runner_version = payload.get("runner_version")
-        relative_path = str(payload.get("path") or "")
         if isinstance(expected_runner_version, bool):
             raise NodeAgentError("File Run Runner version is invalid", code="runner_mismatch")
         try:

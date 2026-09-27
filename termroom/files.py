@@ -190,11 +190,36 @@ def file_browser_entry_is_noise(entry: FileEntry) -> bool:
     )
 
 
-def _file_search_path_is_excluded(relative_path: str, excluded_paths: frozenset[str]) -> bool:
+def _file_path_is_excluded(relative_path: str, excluded_paths: frozenset[str]) -> bool:
     return any(
         relative_path == excluded or relative_path.startswith(f"{excluded}/")
         for excluded in excluded_paths
     )
+
+
+def _normalize_excluded_paths(excluded_paths: frozenset[str]) -> frozenset[str]:
+    return frozenset(
+        value.removeprefix("./").strip("/")
+        for value in excluded_paths
+        if value not in {"", "."}
+    )
+
+
+def _entry_is_excluded(
+    target: Path, workspace_path: Path, relative_path: str, excluded_paths: frozenset[str]
+) -> bool:
+    if _file_path_is_excluded(relative_path, excluded_paths):
+        return True
+    if target.is_symlink():
+        try:
+            resolved = target.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return any(
+            is_within(resolved, (workspace_path / excluded).resolve(strict=False))
+            for excluded in excluded_paths
+        )
+    return False
 
 
 class FileService:
@@ -208,6 +233,7 @@ class FileService:
         *,
         max_entries: int | None = None,
         max_metadata_bytes: int | None = None,
+        excluded_paths: frozenset[str] = frozenset(),
     ) -> tuple[Path, list[FileEntry]]:
         if max_entries is not None and (type(max_entries) is not int or max_entries < 0):
             raise ValueError("Directory entry limit is invalid")
@@ -218,11 +244,19 @@ class FileService:
         directory = self._resolve_existing(workspace_path, relative_path)
         if not directory.is_dir():
             raise NotADirectoryError(directory)
+        normalized_excluded = _normalize_excluded_paths(excluded_paths)
+        directory_relative = directory.relative_to(workspace_path).as_posix()
+        if _file_path_is_excluded(directory_relative, normalized_excluded):
+            raise PathBoundaryError("Path is excluded from Files")
         entries: list[FileEntry] = []
         scanned = 0
         metadata_bytes = 0
         with os.scandir(directory) as children:
             for child in children:
+                target = Path(child.path)
+                relative = target.relative_to(workspace_path).as_posix()
+                if _entry_is_excluded(target, workspace_path, relative, normalized_excluded):
+                    continue
                 scanned += 1
                 if max_entries is not None and scanned > max_entries:
                     raise DirectoryListingLimitError(
@@ -232,8 +266,6 @@ class FileService:
                     if child.is_symlink():
                         continue
                     info = child.stat(follow_symlinks=False)
-                    target = Path(child.path)
-                    relative = target.relative_to(workspace_path).as_posix()
                     metadata_bytes += len(relative.encode("utf-8")) + 128
                     if (
                         max_metadata_bytes is not None
@@ -284,11 +316,10 @@ class FileService:
         start = self._resolve_existing(root, relative_path)
         if not start.is_dir():
             raise NotADirectoryError(start)
-        normalized_excluded = frozenset(
-            value.removeprefix("./").strip("/")
-            for value in excluded_paths
-            if value not in {"", "."}
-        )
+        normalized_excluded = _normalize_excluded_paths(excluded_paths)
+        start_relative = start.relative_to(root).as_posix()
+        if _file_path_is_excluded(start_relative, normalized_excluded):
+            raise PathBoundaryError("Path is excluded from Files")
         deadline = monotonic() + max(0.05, min(float(max_seconds), 10.0))
         scan_limit = min(max_entries, 100_000)
         match_limit = min(max_matches, 10_000)
@@ -307,6 +338,10 @@ class FileService:
             try:
                 with os.scandir(directory) as children:
                     for child in children:
+                        target = Path(child.path)
+                        relative = target.relative_to(root).as_posix()
+                        if _entry_is_excluded(target, root, relative, normalized_excluded):
+                            continue
                         if scanned >= scan_limit or monotonic() >= deadline:
                             truncated = True
                             stop = True
@@ -316,10 +351,6 @@ class FileService:
                             if child.is_symlink():
                                 continue
                             info = child.stat(follow_symlinks=False)
-                            target = Path(child.path)
-                            relative = target.relative_to(root).as_posix()
-                            if _file_search_path_is_excluded(relative, normalized_excluded):
-                                continue
                             is_dir = child.is_dir(follow_symlinks=False)
                             entry = FileEntry(
                                 name=child.name,
@@ -549,12 +580,14 @@ class FileService:
         max_files: int = 10_000,
         max_seconds: float = 1.5,
         excludes: frozenset[str] = DEFAULT_RECENT_EXCLUDES,
+        excluded_paths: frozenset[str] = frozenset(),
     ) -> RecentFiles:
         root = workspace_path.resolve(strict=True)
         patterns = self._recent_ignore_patterns(root)
         wanted = max(1, min(limit, 200))
         scan_limit = max(wanted, min(max_files, 100_000))
         deadline = monotonic() + max(0.05, min(max_seconds, 10.0))
+        normalized_excluded = _normalize_excluded_paths(excluded_paths)
         heap: list[tuple[int, str, FileEntry]] = []
         scanned = 0
         truncated = False
@@ -568,15 +601,19 @@ class FileService:
             try:
                 with os.scandir(directory) as iterator:
                     for item in iterator:
+                        if item.name in excludes or item.name == RECENT_IGNORE_FILE:
+                            continue
+                        relative = Path(item.path).relative_to(root).as_posix()
+                        if _entry_is_excluded(
+                            Path(item.path), root, relative, normalized_excluded
+                        ):
+                            continue
                         if scanned >= scan_limit or monotonic() >= deadline:
                             truncated = True
                             break
-                        if item.name in excludes or item.name == RECENT_IGNORE_FILE:
-                            continue
                         try:
                             if item.is_symlink():
                                 continue
-                            relative = Path(item.path).relative_to(root).as_posix()
                             if recent_path_ignored(relative, patterns):
                                 continue
                             if item.is_dir(follow_symlinks=False):

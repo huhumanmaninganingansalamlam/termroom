@@ -562,10 +562,15 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
     core_root = tmp_path / "core-root"
     node_root = tmp_path / "node-root"
     core_state = tmp_path / "core-state"
-    node_state = tmp_path / "node-state"
+    archive_root = node_root / "container"
+    node_state = archive_root / ".local" / "state" / "termroom" / "node"
     editor_limit = 1024 * 1024
     core_root.mkdir()
     node_root.mkdir()
+    archive_root.mkdir()
+    (archive_root / "archive-visible.txt").write_text(
+        "ordinary archive sibling\n", encoding="utf-8"
+    )
     source_root = core_root / "source-project"
     source_root.mkdir()
     (source_root / "source.txt").write_text("workspace-source\n", encoding="utf-8")
@@ -811,11 +816,55 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         files_page = client.get(f"/w/{workspace_id}/files")
         assert files_page.status_code == 200
         assert "hello.txt" in files_page.text
+        assert "node-key.pem" not in files_page.text
         recent_page = client.get(f"/w/{workspace_id}/recent")
         assert recent_page.status_code == 200
         assert "hello.txt" in recent_page.text
+        assert "node-key.pem" not in recent_page.text
         assert "shell" in recent_page.text
         assert "Run this location on another Remote" in files_page.text
+
+        private_relative = "container/.local/state/termroom/node/node-key.pem"
+        for route in (
+            f"/w/{workspace_id}/view/{private_relative}",
+            f"/w/{workspace_id}/download/{private_relative}",
+        ):
+            denied = client.get(route)
+            assert denied.status_code >= 400
+
+        folder_archive = client.get(f"/w/{workspace_id}/archive/container")
+        assert folder_archive.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(folder_archive.content)) as archive:
+            archive_names = archive.namelist()
+            assert "container/archive-visible.txt" in archive_names
+            assert not any("node-key.pem" in name for name in archive_names)
+            assert not any("/termroom/node/" in name for name in archive_names)
+            assert archive.read("container/archive-visible.txt") == b"ordinary archive sibling\n"
+
+        denied_archive = client.post(
+            f"/w/{workspace_id}/files/archive",
+            data={
+                "_csrf": csrf,
+                "parent": "container/.local/state/termroom",
+                "paths": "container/.local/state/termroom/node",
+            },
+        )
+        assert denied_archive.status_code == 303
+        assert "error=" in denied_archive.headers["location"]
+
+        denied_create = client.post(
+            f"/w/{workspace_id}/files/create",
+            data={
+                "_csrf": csrf,
+                "parent": "container/.local/state/termroom/node",
+                "kind": "file",
+                "name": "must-not-create.txt",
+            },
+        )
+        assert denied_create.status_code == 303
+        assert "error=" in denied_create.headers["location"]
+        assert not (node_state / "must-not-create.txt").exists()
+
         editor = client.get(f"/w/{workspace_id}/edit/hello.txt")
         digest = re.search(r'name="digest" value="([a-f0-9]{64})"', editor.text)
         mtime = re.search(r'name="mtime_ns" value="([0-9]+)"', editor.text)
