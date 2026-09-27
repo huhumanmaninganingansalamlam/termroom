@@ -752,8 +752,19 @@ class NodeRuntime:
         *,
         destructive: bool = False,
         allow_missing: bool = False,
+        allow_missing_parents: bool = False,
     ) -> Path:
-        target = resolve_inside(root, relative_path, must_exist=not allow_missing)
+        try:
+            target = resolve_inside(root, relative_path, must_exist=not allow_missing)
+        except FileNotFoundError:
+            if not allow_missing_parents:
+                raise
+            raw = Path(relative_path)
+            if raw.is_absolute():
+                raise PathBoundaryError("Absolute paths are not allowed") from None
+            target = (root / raw).resolve(strict=False)
+            if not is_within(target, root):
+                raise PathBoundaryError("Path escapes the allowed boundary") from None
         if allow_missing:
             target = target.resolve(strict=False)
         protected_descendants = tuple(
@@ -1940,7 +1951,12 @@ class NodeRuntime:
         self._runner_registry_version(payload)
         root = self._files_workspace_path(payload)
         relative_path = str(payload.get("path") or "")
-        self._require_files_path(root, relative_path, allow_missing=True)
+        self._require_files_path(
+            root,
+            relative_path,
+            allow_missing=True,
+            allow_missing_parents=True,
+        )
         session = self._session(payload)
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))

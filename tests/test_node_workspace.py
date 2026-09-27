@@ -1143,10 +1143,13 @@ def test_node_workspace_usage_is_versioned_fixed_and_tracks_descendants(
 def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "allowed" / "project"
-    workspace.mkdir(parents=True)
+    workspace = tmp_path / "allowed"
+    source_parent = workspace / "project"
+    source_parent.mkdir(parents=True)
+    private_state = workspace / ".node-private"
+    private_state.mkdir()
     script_name = "한글 ;$(touch NODE_FILE_RUN_PWNED).py"
-    script = workspace / script_name
+    script = source_parent / script_name
     script.write_text(
         "from pathlib import Path\n"
         "path = Path('count.txt')\n"
@@ -1156,8 +1159,9 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         encoding="utf-8",
     )
     runtime = NodeRuntime(
-        [tmp_path / "allowed"],
+        [workspace],
         file_run_root=tmp_path / "node-state" / "file-runs",
+        private_state_root=private_state,
     )
     base = _payload(
         workspace,
@@ -1166,7 +1170,9 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
     )
     session = str(base["tmux_session"])
     try:
-        inspected = runtime._handle_sync("file_run.inspect", {**base, "path": script_name})
+        inspected = runtime._handle_sync(
+            "file_run.inspect", {**base, "path": f"project/{script_name}"}
+        )
         assert inspected["runner"] == {
             "id": "python3",
             "version": RUNNER_REGISTRY_VERSION,
@@ -1176,7 +1182,7 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         start_payload = {
             **base,
             "run_id": run_id,
-            "path": script_name,
+            "path": f"project/{script_name}",
             "expected_digest": digest,
             "runner_id": "python3",
             "runner_version": RUNNER_REGISTRY_VERSION,
@@ -1210,12 +1216,39 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         assert replayed["observation"]["state"] == "finished"
         assert (workspace / "count.txt").read_text(encoding="utf-8") == "1"
 
+        shutil.rmtree(source_parent)
+        replayed_after_source_removal = runtime._handle_sync("file_run.start", start_payload)
+        assert replayed_after_source_removal["replayed"] is True
+        assert replayed_after_source_removal["observation"]["state"] == "finished"
+        assert (workspace / "count.txt").read_text(encoding="utf-8") == "1"
+
+        with pytest.raises(PathBoundaryError):
+            runtime._handle_sync(
+                "file_run.start",
+                {**start_payload, "path": ".node-private/secret.py"},
+            )
+
         with pytest.raises(NodeAgentError) as conflict:
             runtime._handle_sync(
                 "file_run.start",
                 {**start_payload, "path": "different.py"},
             )
         assert conflict.value.code == "idempotency_conflict"
+
+        with pytest.raises(NodeAgentError) as digest_conflict:
+            runtime._handle_sync(
+                "file_run.start",
+                {**start_payload, "expected_digest": "0" * 64},
+            )
+        assert digest_conflict.value.code == "idempotency_conflict"
+
+        with pytest.raises(NodeAgentError) as runner_conflict:
+            runtime._handle_sync(
+                "file_run.start",
+                {**start_payload, "runner_id": "nodejs"},
+            )
+        assert runner_conflict.value.code == "idempotency_conflict"
+        assert (workspace / "count.txt").read_text(encoding="utf-8") == "1"
 
         metadata = tmp_path / "node-state" / "file-runs"
         assert metadata.is_dir()
