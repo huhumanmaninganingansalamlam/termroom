@@ -585,6 +585,7 @@
   "ssh.backend.password_auth": "SSH 비밀번호 인증에 실패했습니다.",
   "ssh.backend.host_key_changed": "SSH host key가 승인한 fingerprint와 달라졌습니다. 다시 연결하기 전에 서버를 확인하세요.",
   "ssh.backend.ssh_missing": "Termroom Core에 OpenSSH client(ssh)가 없습니다. ssh를 설치한 뒤 다시 시도하세요.",
+  "ssh.backend.bash_missing": "원격 컴퓨터에서 실행 가능한 /bin/bash가 필요합니다. /bin/bash 위치에 Bash를 설치하거나 복구한 뒤 일반 SSH 로그인에서 실행되는지 확인하세요.",
   "ssh.backend.tmux_missing": "원격 계정의 login 환경에서 tmux를 찾지 못했습니다. macOS에서는 Homebrew로 설치한 뒤 일반 SSH 로그인에서 tmux -V가 실행되는지 확인하세요.",
   "ssh.backend.ssh_keygen_missing": "Termroom 공개키를 만들려면 ssh-keygen이 필요합니다. OpenSSH client 도구를 설치한 뒤 다시 시도하세요.",
   "ssh.backend.dns": "SSH 주소를 찾을 수 없습니다: {host}",

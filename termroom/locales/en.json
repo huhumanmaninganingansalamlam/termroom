@@ -585,6 +585,7 @@
   "ssh.backend.password_auth": "SSH password authentication failed.",
   "ssh.backend.host_key_changed": "The SSH host key no longer matches the approved fingerprint. Verify the server before reconnecting.",
   "ssh.backend.ssh_missing": "The Termroom Core does not have the OpenSSH client (ssh). Install it and retry.",
+  "ssh.backend.bash_missing": "An executable /bin/bash is required on the remote computer. Install or restore Bash at /bin/bash, then confirm it runs after a normal SSH login.",
   "ssh.backend.tmux_missing": "tmux was not found in the remote account's login environment. On macOS, install it with Homebrew and confirm that tmux -V works after a normal SSH login.",
   "ssh.backend.ssh_keygen_missing": "ssh-keygen is required to create the Termroom public key. Install the OpenSSH client tools and retry.",
   "ssh.backend.dns": "Could not resolve the SSH address: {host}",

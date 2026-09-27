@@ -80,6 +80,7 @@ def _test_sshd(
     log_level: str = "ERROR",
     remote_path: str | None = None,
     login_shell: Path | None = None,
+    missing_bash_flag: Path | None = None,
 ) -> Iterator[dict[str, object]]:
     qa = tmp_path / "sshd"
     qa.mkdir()
@@ -116,14 +117,24 @@ def _test_sshd(
         f"AllowUsers {username}",
         f"SetEnv TMUX_TMPDIR={remote_tmux_root}",
     ]
-    if remote_path is not None or login_shell is not None:
+    if remote_path is not None or login_shell is not None or missing_bash_flag is not None:
         command_wrapper = qa / "force-command"
         command_lines = ["#!/bin/sh"]
         if remote_path is not None:
             command_lines.extend((f"PATH={shlex.quote(remote_path)}", "export PATH"))
         if login_shell is not None:
             command_lines.extend((f"SHELL={shlex.quote(str(login_shell))}", "export SHELL"))
-        command_lines.append('exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"')
+        command_lines.append('command=$SSH_ORIGINAL_COMMAND')
+        if missing_bash_flag is not None:
+            command_lines.extend(
+                (
+                    f"if test -e {shlex.quote(str(missing_bash_flag))}; then",
+                    f"  command=$(printf '%s' \"$command\" | "
+                    f"/bin/sed 's@/bin/bash@{qa / 'missing-bash'}@g')",
+                    "fi",
+                )
+            )
+        command_lines.append('exec /bin/sh -c "$command"')
         command_wrapper.write_text("\n".join(command_lines) + "\n", encoding="utf-8")
         command_wrapper.chmod(0o755)
         lines.append(f"ForceCommand {command_wrapper}")
@@ -397,6 +408,113 @@ def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(
         assert recovered["last_error"] is None
 
     assert raised.value.locale_key == "ssh.backend.tmux_missing"
+
+
+@pytest.mark.parametrize("reuse_connections", [False, True])
+@pytest.mark.parametrize("auth_kind", ["key", "password"])
+def test_noninteractive_ssh_requires_bin_bash_before_connection_success(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    reuse_connections: bool,
+    auth_kind: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir, reuse_connections=reuse_connections)
+    request.addfinalizer(backend.close)
+
+    login_bin = tmp_path / "login-bin"
+    login_bin.mkdir()
+    fake_tmux = login_bin / "tmux"
+    fake_tmux.write_text("#!/bin/sh\nprintf 'tmux 3.6b\\n'\n", encoding="utf-8")
+    fake_tmux.chmod(0o755)
+    login_shell = tmp_path / "login-shell"
+    login_shell.write_text(
+        "#!/bin/sh\n"
+        f"PATH={shlex.quote(str(login_bin))}\n"
+        "export PATH\n"
+        'exec /bin/sh -c "$3"\n',
+        encoding="utf-8",
+    )
+    login_shell.chmod(0o755)
+    missing_bash_flag = tmp_path / "mask-bash"
+    missing_bash_flag.touch()
+
+    with _test_sshd(
+        tmp_path,
+        remote_path=str(login_bin),
+        login_shell=login_shell,
+        missing_bash_flag=missing_bash_flag,
+    ) as server:
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Missing Bash QA",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            auth_kind=auth_kind,
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        computer_id = str(computer["id"])
+        if auth_kind == "password":
+            backend.save_password(computer_id, "qa-password")
+
+            def authenticated_with_qa_key(target, password):  # type: ignore[no-untyped-def]
+                assert password == "qa-password"
+                return backend._connect_fresh(
+                    {**target, "auth_kind": "key"}, record_connection=False
+                )
+
+            monkeypatch.setattr(backend, "_connect_password", authenticated_with_qa_key)
+        prior_success = "2000-01-01T00:00:00+00:00"
+        with store.connect() as db:
+            db.execute(
+                "UPDATE computers SET last_connected_at = ? WHERE id = ?",
+                (prior_success, computer_id),
+            )
+
+        client = backend._connect(computer, record_connection=False)
+        try:
+            assert backend._exec_client(client, "tmux -V", remote_path=str(login_bin)).strip() == (
+                "tmux 3.6b"
+            )
+        finally:
+            client.close()
+        for _ in range(2):
+            with pytest.raises(SSHBackendError, match="/bin/bash is not executable") as raised:
+                backend.test_connection(computer)
+            assert raised.value.locale_key == "ssh.backend.bash_missing"
+        if auth_kind == "password":
+            with pytest.raises(SSHBackendError, match="/bin/bash is not executable"):
+                backend.test_password_connection(computer, "qa-password")
+        failed = store.get_computer(computer_id)
+        assert failed is not None
+        assert failed["last_connected_at"] == prior_success
+        assert failed["last_seen_at"] is None
+        assert json.loads(str(failed["last_error"]).removeprefix("termroom-i18n:"))["key"] == (
+            "ssh.backend.bash_missing"
+        )
+        with store.connect() as db:
+            assert db.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 0
+            assert db.execute("SELECT count(*) FROM terminals").fetchone()[0] == 0
+
+        missing_bash_flag.unlink()
+        assert backend.test_connection(computer)["tmux"] == "tmux 3.6b"
+        if auth_kind == "password":
+            assert backend.test_password_connection(computer, "qa-password")["tmux"] == (
+                "tmux 3.6b"
+            )
+        recovered = store.get_computer(computer_id)
+        assert recovered is not None
+        assert recovered["last_connected_at"] != prior_success
+        assert recovered["last_error"] is None
 
 
 def test_ssh_backend_uses_alias_specific_agent_socket(

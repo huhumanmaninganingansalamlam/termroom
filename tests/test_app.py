@@ -3028,8 +3028,27 @@ async def test_persisted_ssh_error_renders_in_current_locale(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_key", "english_error", "korean_error"),
+    [
+        (
+            "ssh.backend.tmux_missing",
+            "tmux was not found",
+            "원격 계정의 login 환경에서 tmux를 찾지 못했습니다",
+        ),
+        (
+            "ssh.backend.bash_missing",
+            "An executable /bin/bash is required",
+            "원격 컴퓨터에서 실행 가능한 /bin/bash가 필요합니다",
+        ),
+    ],
+)
 async def test_ssh_prerequisite_retry_preserves_last_success_until_check_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_key: str,
+    english_error: str,
+    korean_error: str,
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -3053,7 +3072,7 @@ async def test_ssh_prerequisite_retry_preserves_last_success_until_check_succeed
     )
     computer_id = str(computer["id"])
     app.state.store.update_computer_connection(computer_id)
-    last_success = app.state.store.get_computer(computer_id)["last_connected_at"]
+    last_seen = app.state.store.get_computer(computer_id)["last_seen_at"]
     failing = True
 
     monkeypatch.setattr(
@@ -3067,8 +3086,8 @@ async def test_ssh_prerequisite_retry_preserves_last_success_until_check_succeed
     ) -> dict[str, str]:
         if failing:
             raise SSHBackendError(
-                "tmux is not installed on the remote computer",
-                locale_key="ssh.backend.tmux_missing",
+                "Remote prerequisite is missing",
+                locale_key=error_key,
             )
         return {"shell": "/bin/zsh", "tmux": "tmux 3.6"}
 
@@ -3086,19 +3105,29 @@ async def test_ssh_prerequisite_retry_preserves_last_success_until_check_succeed
                 (last_success, computer_id),
             )
 
-        failed = await client.post(
-            f"/computers/{computer_id}/test",
-            data={"_csrf": settings.csrf_token},
-            follow_redirects=True,
-        )
+        for _ in range(2):
+            failed = await client.post(
+                f"/computers/{computer_id}/test",
+                data={"_csrf": settings.csrf_token},
+                follow_redirects=True,
+            )
+            assert 'state-chip remote unavailable' in failed.text
+            assert english_error in failed.text
+            assert "Test connection again" in failed.text
+            assert "Last successful contact" in failed.text
+            assert "SSH + /bin/bash + tmux" in failed.text
         failed_record = app.state.store.get_computer(computer_id)
         assert failed_record is not None
         assert failed_record["last_connected_at"] == last_success
+        assert failed_record["last_seen_at"] == last_seen
         assert str(failed_record["last_error"]).startswith("termroom-i18n:")
-        assert 'state-chip remote unavailable' in failed.text
-        assert "tmux was not found" in failed.text
-        assert "Test connection again" in failed.text
-        assert "Last successful contact" in failed.text
+        with app.state.store.connect() as db:
+            assert db.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 0
+            assert db.execute("SELECT count(*) FROM terminals").fetchone()[0] == 0
+        client.cookies.set("termroom_locale", "ko")
+        korean = await client.get(f"/computers/{computer_id}")
+        assert korean_error in korean.text
+        client.cookies.set("termroom_locale", "en")
 
         failing = False
         recovered = await client.post(

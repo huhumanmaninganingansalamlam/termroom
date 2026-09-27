@@ -1108,6 +1108,8 @@ class SSHBackend:
             )
             script = (
                 "printf 'shell=%s\\n' \"${SHELL:-unknown}\"; "
+                "test -f /bin/bash && test -x /bin/bash || "
+                "{ echo '__TERMROOM_NO_BASH__' >&2; exit 47; }; "
                 "command -v tmux >/dev/null 2>&1 || "
                 "{ echo '__TERMROOM_NO_TMUX__' >&2; exit 45; }; "
                 "tmux -V"
@@ -5625,7 +5627,10 @@ class SSHBackend:
             if "__TERMROOM_NO_DIR__" in error:
                 raise SSHBackendError("Remote Workspace directory does not exist")
             if "__TERMROOM_NO_BASH__" in error:
-                raise SSHBackendError("/bin/bash is not installed on the remote computer")
+                raise SSHBackendError(
+                    "/bin/bash is not executable on the remote computer",
+                    locale_key="ssh.backend.bash_missing",
+                )
             if "__TERMROOM_NO_GIT__" in error:
                 raise SSHBackendError("git is not installed on the remote computer")
             if "__TERMROOM_RUN_EXISTS__" in error:
