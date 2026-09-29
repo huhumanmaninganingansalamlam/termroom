@@ -11,7 +11,6 @@ import json
 import os
 import re
 import secrets
-import shlex
 import shutil
 import signal
 import socket
@@ -3506,10 +3505,15 @@ class NodeRuntime:
                 },
                 separators=(",", ":"),
             )
-            launcher = shlex.join(
-                [sys.executable, "-c", _TMUX_DESCRIPTOR_LAUNCHER, endpoint, config]
+            result = self._tmux(
+                *tmux_args,
+                sys.executable,
+                "-c",
+                _TMUX_DESCRIPTOR_LAUNCHER,
+                endpoint,
+                config,
+                check=False,
             )
-            result = self._tmux(*tmux_args, launcher, check=False)
             if result.returncode:
                 if check:
                     raise NodeAgentError(
