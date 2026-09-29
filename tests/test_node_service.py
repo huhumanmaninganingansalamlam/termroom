@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import signal
 import stat
@@ -14,14 +15,16 @@ import pytest
 from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
 
-from termroom import cli
+from termroom import cli, node_agent
 from termroom.node_agent import (
     NodeAgent,
     NodeAgentError,
     NodeConfig,
     NodePermanentError,
+    ensure_node_identity,
     load_node_config,
     load_node_identity,
+    pair_node,
     save_node_config,
 )
 from termroom.node_protocol import generate_private_key
@@ -204,6 +207,623 @@ def test_loading_missing_node_identity_does_not_create_a_new_key(tmp_path: Path)
         load_node_identity(state_dir)
 
     assert exc_info.value.code == "identity_missing"
+    assert list(state_dir.iterdir()) == []
+
+
+def test_node_identity_rejects_state_root_replaced_by_symlink_during_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "node"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_state = tmp_path / "original-node-state"
+    original_open = node_agent._open_directory_components
+    replaced = False
+
+    def replace_before_open(
+        path: Path, *, create: bool, mode: int | None
+    ) -> tuple[int, Path]:
+        nonlocal replaced
+        if path == state_dir and create and not replaced:
+            descriptor, candidate = original_open(path, create=create, mode=mode)
+            replaced = True
+            path.rename(moved_state)
+            path.symlink_to(outside, target_is_directory=True)
+            return descriptor, candidate
+        return original_open(path, create=create, mode=mode)
+
+    monkeypatch.setattr(node_agent, "_open_directory_components", replace_before_open)
+    with pytest.raises(NodeAgentError) as invalid:
+        ensure_node_identity(state_dir)
+
+    assert invalid.value.code == "identity_invalid"
+    assert replaced
+    assert outside.is_dir()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_identity_rejects_symlinked_ancestor_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        ensure_node_identity(alias / "node")
+
+    assert invalid.value.code == "identity_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_identity_rejects_leaf_symlink_replacement_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "node"
+    ensure_node_identity(state_dir)
+    key_path = state_dir / node_agent.NODE_PRIVATE_KEY_FILE
+    moved_key = tmp_path / "original-key"
+    outside_key = tmp_path / "outside-key"
+    outside_key.write_bytes(key_path.read_bytes())
+    outside_key.chmod(0o644)
+    original_bytes = outside_key.read_bytes()
+    original_open = node_agent._open_private_state_file
+    replaced = False
+
+    def replace_key_at_open(directory_fd: int, name: str, flags: int) -> int:
+        nonlocal replaced
+        if name == node_agent.NODE_PRIVATE_KEY_FILE and not replaced:
+            replaced = True
+            key_path.rename(moved_key)
+            key_path.symlink_to(outside_key)
+        return original_open(directory_fd, name, flags)
+
+    monkeypatch.setattr(node_agent, "_open_private_state_file", replace_key_at_open)
+    with pytest.raises(NodeAgentError) as invalid:
+        load_node_identity(state_dir)
+
+    assert invalid.value.code == "identity_invalid"
+    assert replaced
+    assert outside_key.read_bytes() == original_bytes
+    assert stat.S_IMODE(outside_key.stat().st_mode) == 0o644
+
+
+def test_node_identity_load_rejects_symlink_state_root(tmp_path: Path) -> None:
+    real_state = tmp_path / "real-node"
+    ensure_node_identity(real_state)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    outside_key = outside / node_agent.NODE_PRIVATE_KEY_FILE
+    outside_key.write_bytes((real_state / node_agent.NODE_PRIVATE_KEY_FILE).read_bytes())
+    outside_key.chmod(0o644)
+    outside.chmod(0o755)
+    state_dir = tmp_path / "node"
+    state_dir.symlink_to(outside, target_is_directory=True)
+    original_bytes = outside_key.read_bytes()
+
+    with pytest.raises(NodeAgentError) as invalid:
+        load_node_identity(state_dir)
+
+    assert invalid.value.code == "identity_invalid"
+    assert outside_key.read_bytes() == original_bytes
+    assert stat.S_IMODE(outside_key.stat().st_mode) == 0o644
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+
+
+def test_node_config_rejects_symlink_state_root_without_touching_target(tmp_path: Path) -> None:
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    config_file = outside / "node.json"
+    config_file.write_text("{}", encoding="utf-8")
+    config_file.chmod(0o640)
+    outside.chmod(0o755)
+    state_dir = tmp_path / "node"
+    state_dir.symlink_to(outside, target_is_directory=True)
+    config = NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,))
+
+    with pytest.raises(NodeAgentError) as save_invalid:
+        save_node_config(state_dir, config)
+    with pytest.raises(NodeAgentError) as load_invalid:
+        load_node_config(state_dir)
+
+    assert save_invalid.value.code == "config_invalid"
+    assert load_invalid.value.code == "config_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert config_file.read_text(encoding="utf-8") == "{}"
+    assert stat.S_IMODE(config_file.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["node.json"]
+
+
+def test_node_config_load_rejects_state_root_replaced_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    state_dir = tmp_path / "node"
+    config = NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,))
+    save_node_config(state_dir, config)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_state = tmp_path / "original-node-state"
+    original_open = node_agent._open_private_state_file
+    replaced = False
+
+    def replace_before_config_open(directory_fd: int, name: str, flags: int) -> int:
+        nonlocal replaced
+        if name == node_agent.NODE_CONFIG_FILE and not replaced:
+            replaced = True
+            state_dir.rename(moved_state)
+            state_dir.symlink_to(outside, target_is_directory=True)
+        return original_open(directory_fd, name, flags)
+
+    monkeypatch.setattr(node_agent, "_open_private_state_file", replace_before_config_open)
+    with pytest.raises(NodeAgentError) as invalid:
+        load_node_config(state_dir)
+
+    assert invalid.value.code == "config_invalid"
+    assert replaced
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_save_node_config_rejects_leaf_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "node"
+    state_dir.mkdir()
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    outside_config = tmp_path / "outside-config"
+    outside_config.write_bytes(b"keep")
+    outside_config.chmod(0o640)
+    config_path = state_dir / node_agent.NODE_CONFIG_FILE
+    config_path.symlink_to(outside_config)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        save_node_config(
+            state_dir,
+            NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,)),
+        )
+
+    assert invalid.value.code == "config_invalid"
+    assert config_path.is_symlink()
+    assert outside_config.read_bytes() == b"keep"
+    assert stat.S_IMODE(outside_config.stat().st_mode) == 0o640
+
+
+def test_node_config_rejects_hardlinked_leaf_before_read_or_write(tmp_path: Path) -> None:
+    state_dir = tmp_path / "node"
+    state_dir.mkdir(mode=0o700)
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    outside_config = tmp_path / "outside-config"
+    outside_config.write_text("{}", encoding="utf-8")
+    outside_config.chmod(0o640)
+    config_path = state_dir / node_agent.NODE_CONFIG_FILE
+    os.link(outside_config, config_path)
+    original = outside_config.read_bytes()
+    config = NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,))
+
+    with pytest.raises(NodeAgentError) as save_invalid:
+        save_node_config(state_dir, config)
+    with pytest.raises(NodeAgentError) as load_invalid:
+        load_node_config(state_dir)
+
+    assert save_invalid.value.code == "config_invalid"
+    assert load_invalid.value.code == "config_invalid"
+    assert outside_config.read_bytes() == original
+    assert stat.S_IMODE(outside_config.stat().st_mode) == 0o640
+    assert config_path.stat().st_nlink == 2
+
+
+def test_node_identity_rejects_hardlinked_leaf_before_permission_change(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "node"
+    state_dir.mkdir(mode=0o700)
+    outside_key = tmp_path / "outside-key"
+    outside_key.write_bytes(b"identity bytes")
+    outside_key.chmod(0o644)
+    os.link(outside_key, state_dir / node_agent.NODE_PRIVATE_KEY_FILE)
+    original = outside_key.read_bytes()
+
+    with pytest.raises(NodeAgentError) as invalid:
+        load_node_identity(state_dir)
+
+    assert invalid.value.code == "identity_invalid"
+    assert outside_key.read_bytes() == original
+    assert stat.S_IMODE(outside_key.stat().st_mode) == 0o644
+    assert (state_dir / node_agent.NODE_PRIVATE_KEY_FILE).stat().st_nlink == 2
+
+
+@pytest.mark.parametrize(
+    ("operation", "code"),
+    [("identity", "identity_invalid"), ("config", "config_invalid")],
+)
+def test_node_private_state_rejects_wrong_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    code: str,
+) -> None:
+    state_dir = tmp_path / "node"
+    state_dir.mkdir(mode=0o755)
+    state_dir.chmod(0o755)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+
+    operation_fn = ensure_node_identity if operation == "identity" else load_node_config
+    with pytest.raises(NodeAgentError) as invalid:
+        operation_fn(state_dir)
+
+    assert invalid.value.code == code
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o755
+    assert list(state_dir.iterdir()) == []
+
+
+def test_node_identity_creation_does_not_clobber_a_leaf_that_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "node"
+    state_dir.mkdir(mode=0o700)
+    key_path = state_dir / node_agent.NODE_PRIVATE_KEY_FILE
+    raced_bytes = b"different identity"
+    original_link = os.link
+
+    def install_before_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if destination == node_agent.NODE_PRIVATE_KEY_FILE:
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(descriptor, raced_bytes)
+            finally:
+                os.close(descriptor)
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(node_agent.os, "link", install_before_link)
+    with pytest.raises(NodeAgentError) as invalid:
+        ensure_node_identity(state_dir)
+
+    assert invalid.value.code == "identity_invalid"
+    assert key_path.read_bytes() == raced_bytes
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert sorted(path.name for path in state_dir.iterdir()) == [
+        node_agent.NODE_PRIVATE_KEY_FILE
+    ]
+
+
+def test_save_node_config_rejects_replacement_before_atomic_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    outside = tmp_path / "outside-config"
+    state_dir.mkdir(mode=0o700)
+    allowed.mkdir()
+    outside.write_bytes(b"outside sentinel")
+    outside.chmod(0o640)
+    ensure_node_identity(state_dir)
+    config = NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,))
+    save_node_config(state_dir, config)
+    path = state_dir / node_agent.NODE_CONFIG_FILE
+    original = path.read_bytes()
+    moved = tmp_path / "original-config"
+    original_state = node_agent._private_state_leaf_state
+    calls = 0
+
+    def replace_before_publication(
+        directory_fd: int,
+        name: str,
+        *,
+        code: str,
+        label: str,
+        mode: int,
+    ) -> tuple[int, ...] | None:
+        nonlocal calls
+        if name == node_agent.NODE_CONFIG_FILE:
+            calls += 1
+            if calls == 2:
+                path.rename(moved)
+                path.symlink_to(outside)
+        return original_state(
+            directory_fd, name, code=code, label=label, mode=mode
+        )
+
+    monkeypatch.setattr(node_agent, "_private_state_leaf_state", replace_before_publication)
+    with pytest.raises(NodeAgentError) as invalid:
+        save_node_config(state_dir, config)
+
+    assert invalid.value.code == "config_invalid"
+    assert calls == 2
+    assert path.is_symlink()
+    assert moved.read_bytes() == original
+    assert outside.read_bytes() == b"outside sentinel"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+    assert sorted(item.name for item in state_dir.iterdir()) == sorted(
+        [node_agent.NODE_PRIVATE_KEY_FILE, node_agent.NODE_CONFIG_FILE]
+    )
+
+
+@pytest.mark.parametrize(
+    ("leaf", "code"),
+    [
+        (node_agent.NODE_PRIVATE_KEY_FILE, "identity_invalid"),
+        (node_agent.NODE_CONFIG_FILE, "config_invalid"),
+    ],
+)
+def test_node_private_state_read_rejects_leaf_replaced_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf: str,
+    code: str,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    ensure_node_identity(state_dir)
+    save_node_config(
+        state_dir,
+        NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,)),
+    )
+    path = state_dir / leaf
+    original = path.read_bytes()
+    moved = tmp_path / f"original-{leaf}"
+    original_open = node_agent._open_private_state_file
+    replaced = False
+
+    def replace_after_open(directory_fd: int, name: str, flags: int) -> int:
+        nonlocal replaced
+        descriptor = original_open(directory_fd, name, flags)
+        if name == leaf and not replaced:
+            replaced = True
+            path.rename(moved)
+            path.write_bytes(b"replacement")
+            path.chmod(0o600)
+        return descriptor
+
+    monkeypatch.setattr(node_agent, "_open_private_state_file", replace_after_open)
+    loader = load_node_identity if leaf == node_agent.NODE_PRIVATE_KEY_FILE else load_node_config
+    with pytest.raises(NodeAgentError) as invalid:
+        loader(state_dir)
+
+    assert invalid.value.code == code
+    assert replaced
+    assert moved.read_bytes() == original
+    assert path.read_bytes() == b"replacement"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("leaf", "code"),
+    [
+        (node_agent.NODE_PRIVATE_KEY_FILE, "identity_invalid"),
+        (node_agent.NODE_CONFIG_FILE, "config_invalid"),
+    ],
+)
+def test_node_private_state_read_rejects_hardlink_added_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf: str,
+    code: str,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    ensure_node_identity(state_dir)
+    save_node_config(
+        state_dir,
+        NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,)),
+    )
+    path = state_dir / leaf
+    outside_alias = tmp_path / f"outside-{leaf}"
+    original_open = node_agent._open_private_state_file
+    linked = False
+
+    def link_after_open(directory_fd: int, name: str, flags: int) -> int:
+        nonlocal linked
+        descriptor = original_open(directory_fd, name, flags)
+        if name == leaf and not linked:
+            linked = True
+            os.link(path, outside_alias)
+        return descriptor
+
+    monkeypatch.setattr(node_agent, "_open_private_state_file", link_after_open)
+    loader = load_node_identity if leaf == node_agent.NODE_PRIVATE_KEY_FILE else load_node_config
+    with pytest.raises(NodeAgentError) as invalid:
+        loader(state_dir)
+
+    assert invalid.value.code == code
+    assert linked
+    assert outside_alias.read_bytes() == path.read_bytes()
+    assert stat.S_IMODE(outside_alias.stat().st_mode) == 0o600
+    assert path.stat().st_nlink == 2
+
+
+@pytest.mark.parametrize(
+    ("leaf", "code"),
+    [
+        (node_agent.NODE_PRIVATE_KEY_FILE, "identity_invalid"),
+        (node_agent.NODE_CONFIG_FILE, "config_invalid"),
+    ],
+)
+def test_node_private_state_read_rejects_insecure_mode_without_chmod(
+    tmp_path: Path,
+    leaf: str,
+    code: str,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    ensure_node_identity(state_dir)
+    save_node_config(
+        state_dir,
+        NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,)),
+    )
+    path = state_dir / leaf
+    original = path.read_bytes()
+    path.chmod(0o644)
+    loader = load_node_identity if leaf == node_agent.NODE_PRIVATE_KEY_FILE else load_node_config
+
+    with pytest.raises(NodeAgentError) as invalid:
+        loader(state_dir)
+
+    assert invalid.value.code == code
+    assert path.read_bytes() == original
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_pairing_approval_rejects_state_root_replaced_before_config_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_state = tmp_path / "original-node-state"
+    responses = iter(({"enrollment_id": "pending"}, {"status": "approved", "node_id": "a" * 32}))
+
+    def approve_then_replace(*_args: object, **_kwargs: object) -> dict[str, str]:
+        response = next(responses)
+        if response.get("status") == "approved":
+            state_dir.rename(moved_state)
+            state_dir.symlink_to(outside, target_is_directory=True)
+        return response
+
+    monkeypatch.setattr(node_agent, "_json_post", approve_then_replace)
+    with pytest.raises(NodeAgentError) as invalid:
+        pair_node(
+            state_dir=state_dir,
+            core_url="http://127.0.0.1:9000",
+            code="one-time-code",
+            allowed_roots=(allowed,),
+            timeout_seconds=1,
+        )
+
+    assert invalid.value.code == "config_invalid"
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_pairing_approval_rejects_real_state_root_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    moved_state = tmp_path / "original-node-state"
+    replacement = tmp_path / "replacement"
+    sentinel = replacement / "sentinel"
+    responses = iter(({"enrollment_id": "pending"}, {"status": "approved", "node_id": "a" * 32}))
+
+    def approve_then_replace(*_args: object, **_kwargs: object) -> dict[str, str]:
+        response = next(responses)
+        if response.get("status") == "approved":
+            state_dir.rename(moved_state)
+            replacement.mkdir(mode=0o755)
+            sentinel.write_bytes(b"keep")
+            sentinel.chmod(0o640)
+            state_dir.mkdir(mode=0o755)
+        return response
+
+    monkeypatch.setattr(node_agent, "_json_post", approve_then_replace)
+    with pytest.raises(NodeAgentError) as invalid:
+        pair_node(
+            state_dir=state_dir,
+            core_url="http://127.0.0.1:9000",
+            code="one-time-code",
+            allowed_roots=(allowed,),
+            timeout_seconds=1,
+        )
+
+    assert invalid.value.code == "config_invalid"
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o755
+    assert stat.S_IMODE(replacement.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in replacement.iterdir()) == ["sentinel"]
+
+
+def test_node_startup_rejects_replaced_real_state_root_before_child_roots(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "node"
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    config = NodeConfig("http://127.0.0.1:1", "a" * 32, "Node", (allowed,))
+    save_node_config(state_dir, config)
+    loaded = load_node_config(state_dir)
+    moved_state = tmp_path / "original-node-state"
+    state_dir.rename(moved_state)
+    state_dir.mkdir(mode=0o755)
+    file_run_root = state_dir / "file-runs"
+    remote_run_root = state_dir / "runs"
+
+    with pytest.raises(NodeAgentError) as invalid:
+        node_agent.NodeRuntime(
+            loaded.allowed_roots,
+            private_state_root=loaded.state_dir,
+            private_state_identity=loaded.state_dir_identity,
+            file_run_root=file_run_root,
+            remote_run_root=loaded.run_root,
+        )
+
+    assert invalid.value.code == "node_state_invalid"
+    assert not file_run_root.exists()
+    assert not remote_run_root.exists()
     assert list(state_dir.iterdir()) == []
 
 

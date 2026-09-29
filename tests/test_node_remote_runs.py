@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
 import shutil
+import stat
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -12,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from termroom import node_remote_runs
 from termroom.node_agent import NodeRuntime
 from termroom.node_protocol import (
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
@@ -20,6 +24,7 @@ from termroom.node_protocol import (
 from termroom.node_remote_runs import (
     NodeRemoteRunClient,
     NodeRemoteRunError,
+    NodeRemoteRunRuntime,
     NodeWorkspaceSnapshotSource,
 )
 from termroom.remote_runs import RemoteRunError, RemoteRunManager
@@ -87,6 +92,1102 @@ async def _write_snapshot_file(
     await stream.feed(content[:2])
     await stream.feed(content[2:])
     assert await stream.close() == {"size": len(content)}
+
+
+def test_node_remote_run_root_rejects_symlink_before_touching_target(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    root = tmp_path / "managed-runs"
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        NodeRemoteRunRuntime(root)
+
+    assert invalid.value.code == "run_root_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_remote_run_root_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        NodeRemoteRunRuntime(alias / "managed-runs")
+
+    assert invalid.value.code == "run_root_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_remote_run_root_rejects_swap_at_permission_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_root = tmp_path / "original-managed-runs"
+    original_open = node_remote_runs._open_directory_components
+    replaced = False
+
+    def replace_after_open(
+        path: Path,
+        *,
+        create: bool,
+        parent_fd: int | None = None,
+        parent_path: Path | None = None,
+        mode: int | None = 0o700,
+    ) -> tuple[int, Path]:
+        nonlocal replaced
+        descriptor, candidate = original_open(
+            path,
+            create=create,
+            parent_fd=parent_fd,
+            parent_path=parent_path,
+            mode=mode,
+        )
+        if path == root and create and not replaced:
+            replaced = True
+            path.rename(moved_root)
+            path.symlink_to(outside, target_is_directory=True)
+        return descriptor, candidate
+
+    monkeypatch.setattr(node_remote_runs, "_open_directory_components", replace_after_open)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        NodeRemoteRunRuntime(root)
+
+    assert invalid.value.code == "run_root_invalid"
+    assert replaced
+    assert root.is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_remote_run_root_rejects_wrong_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_remote_runs.os, "geteuid", lambda: actual_euid + 1)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        NodeRemoteRunRuntime(root)
+
+    assert invalid.value.code == "run_root_invalid"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+    assert list(root.iterdir()) == []
+
+
+def test_node_remote_run_rejects_wrong_owner_descendant_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    runtime.create({**_payload(root, run_id), "command": "true", "cwd_rel": "."})
+    metadata = root / run_id / ".termroom"
+    original_entries = sorted(path.name for path in metadata.iterdir())
+    metadata.chmod(0o755)
+    sentinel = metadata / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    metadata.chmod(0o755)
+    run_fd = os.open(root / run_id, os.O_RDONLY | os.O_DIRECTORY)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_remote_runs.os, "geteuid", lambda: actual_euid + 1)
+    try:
+        with pytest.raises(OSError):
+            node_remote_runs._open_directory_at(
+                run_fd, (".termroom",), create=False, mode=0o700
+            )
+    finally:
+        os.close(run_fd)
+
+    assert stat.S_IMODE(metadata.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in metadata.iterdir()) == sorted(
+        [*original_entries, "sentinel"]
+    )
+
+
+def test_node_remote_run_root_preserves_real_directory_behavior(tmp_path: Path) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    assert runtime.run_root == root
+    assert root.is_dir()
+    assert not root.is_symlink()
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+    root.chmod(0o755)
+    accepted = NodeRemoteRunRuntime(root)
+    assert accepted.run_root == root
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "real"])
+def test_node_remote_run_root_rejects_replacement_after_directory_validation(
+    tmp_path: Path,
+    replacement_kind: str,
+) -> None:
+    root = tmp_path / "managed-runs"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_root = tmp_path / "original-managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    root.rename(moved_root)
+    if replacement_kind == "symlink":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir(mode=0o755)
+        (root / "replacement-sentinel").write_bytes(b"keep")
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.preflight({"remote_run_version": NODE_REMOTE_RUN_VERSION})
+
+    assert invalid.value.code == "run_root_invalid"
+    assert runtime.run_root == root
+    assert root.is_symlink() is (replacement_kind == "symlink")
+    if replacement_kind == "real":
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+        assert (root / "replacement-sentinel").read_bytes() == b"keep"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_remote_run_rejects_replaced_metadata_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    metadata = root / run_id / ".termroom"
+    moved = tmp_path / "original-metadata"
+    metadata.rename(moved)
+    metadata.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.write_metadata({**payload, "name": "inputs.json", "value": {}})
+
+    assert invalid.value.code == "layout_invalid"
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_remote_run_rejects_real_metadata_replacement_without_chmod(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    metadata = root / run_id / ".termroom"
+    metadata.rename(tmp_path / "original-metadata")
+    replacement = tmp_path / "replacement-metadata"
+    replacement.mkdir(mode=0o755)
+    sentinel = replacement / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    replacement.chmod(0o755)
+    replacement.rename(metadata)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.write_metadata({**payload, "name": "inputs.json", "value": {}})
+
+    assert invalid.value.code == "layout_invalid"
+    assert stat.S_IMODE(metadata.stat().st_mode) == 0o755
+    replacement_sentinel = metadata / "sentinel"
+    assert replacement_sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(replacement_sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in metadata.iterdir()) == ["sentinel"]
+
+
+def test_remote_run_start_rejects_replaced_output_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    outside = tmp_path / "outside-output"
+    outside.write_bytes(b"keep")
+    outside.chmod(0o640)
+    output = root / run_id / ".termroom" / "output.log"
+    output.symlink_to(outside)
+    runtime._tmux = lambda *args, check=True: subprocess.CompletedProcess(  # type: ignore[method-assign]
+        args, 1 if args[0] == "has-session" else 0, "", ""
+    )
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.start(payload)
+
+    assert invalid.value.code == "metadata_invalid"
+    assert output.is_symlink()
+    assert outside.read_bytes() == b"keep"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.parent.iterdir()) == [
+        "managed-runs", "outside-output"
+    ]
+    assert not list(output.parent.glob(".output.log.tmp-*"))
+
+
+@pytest.mark.parametrize("action", ["interrupt", "kill", "observe"])
+def test_remote_run_rejects_substituted_stop_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    stop = root / run_id / ".termroom" / "stop-requested-at"
+    stop.symlink_to(sentinel)
+    metadata_entries = sorted(path.name for path in stop.parent.iterdir())
+    outside_entries = sorted(path.name for path in outside.iterdir())
+    monkeypatch.setattr(
+        runtime,
+        "_tmux",
+        lambda *args, check=True: subprocess.CompletedProcess(args, 1, "", ""),
+    )
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        getattr(runtime, action)(payload)
+
+    assert invalid.value.code == "metadata_invalid"
+    assert stop.is_symlink()
+    assert stop.resolve() == sentinel
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sorted(path.name for path in stop.parent.iterdir()) == metadata_entries
+    assert sorted(path.name for path in outside.iterdir()) == outside_entries
+    assert not list(stop.parent.glob(".stop-requested-at.tmp-*"))
+
+
+def test_remote_run_metadata_write_rejects_replaced_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    runtime.write_metadata({**payload, "name": "inputs.json", "value": {"v": 1}})
+
+    metadata = root / run_id / ".termroom"
+    record = metadata / "inputs.json"
+    record_original = record.read_bytes()
+    moved = tmp_path / "original-inputs.json"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    original_write = node_remote_runs._atomic_private_write_at
+
+    def replace_after_validation(
+        directory_fd: int,
+        name: str,
+        content: bytes,
+        *,
+        mode: int = 0o600,
+        expected_state: object = node_remote_runs._PRIVATE_WRITE_UNSPECIFIED,
+    ) -> tuple[int, ...]:
+        assert name == "inputs.json"
+        assert expected_state is not None
+        record.rename(moved)
+        record.symlink_to(sentinel)
+        return original_write(
+            directory_fd,
+            name,
+            content,
+            mode=mode,
+            expected_state=expected_state,
+        )
+
+    monkeypatch.setattr(node_remote_runs, "_atomic_private_write_at", replace_after_validation)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.write_metadata({**payload, "name": "inputs.json", "value": {"v": 2}})
+
+    assert invalid.value.code == "metadata_invalid"
+    assert record.is_symlink()
+    assert record.resolve() == sentinel
+    assert moved.read_bytes() == record_original
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+    assert not list(metadata.glob(".inputs.json.tmp-*"))
+
+
+def test_remote_run_work_identity_rejects_replacement_before_write(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    runtime.create({**_payload(root, run_id), "command": "true", "cwd_rel": "."})
+    _run_fd, metadata_fd = runtime._layout_handles(run_id)
+    work_fd = runtime._work_dir_fds[run_id]
+    identity = root / run_id / ".termroom" / "work.identity"
+    original = identity.read_bytes()
+    moved = tmp_path / "original-work-identity"
+    identity.rename(moved)
+    identity.write_bytes(b"replacement")
+    identity.chmod(0o600)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime._write_work_identity(metadata_fd, work_fd, "stable")
+
+    assert invalid.value.code == "metadata_invalid"
+    assert identity.read_bytes() == b"replacement"
+    assert stat.S_IMODE(identity.stat().st_mode) == 0o600
+    assert moved.read_bytes() == original
+    assert not list(identity.parent.glob(".work.identity.tmp-*"))
+
+
+def test_remote_run_private_write_does_not_clobber_new_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    path = tmp_path / "record"
+    raced_bytes = b"preserve competing entry"
+    original_link = os.link
+
+    def install_before_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if destination == "record":
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(descriptor, raced_bytes)
+            finally:
+                os.close(descriptor)
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(node_remote_runs.os, "link", install_before_link)
+    try:
+        with pytest.raises(NodeRemoteRunError) as invalid:
+            node_remote_runs._atomic_private_write_at(
+                directory_fd, "record", b"new value", expected_state=None
+            )
+    finally:
+        os.close(directory_fd)
+
+    assert invalid.value.code == "metadata_invalid"
+    assert path.read_bytes() == raced_bytes
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["record"]
+
+
+def test_remote_run_workspace_identity_rejects_real_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    root = tmp_path / "managed-runs"
+    runtime = NodeRuntime([allowed], remote_run_root=root)
+    assert runtime.remote_runs is not None
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.remote_runs.create({**payload, "command": "true", "cwd_rel": "."})
+    runtime.remote_runs.snapshot_begin(payload)
+    result = runtime.remote_runs.snapshot_commit(payload)
+    work = Path(result["work_path"])
+    assert runtime.remote_runs.validate_workspace(
+        {"remote_run_id": run_id, "workspace_path": str(work)}
+    ) == work
+
+    moved = work.with_name("work-original")
+    work.rename(moved)
+    work.mkdir(mode=0o755)
+    sentinel = work / "replacement-sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+
+    workspace_payload = {
+        "remote_run_id": run_id,
+        "workspace_path": str(work),
+        "tmux_session": f"termroom-node-test-{run_id[:12]}",
+    }
+    operations = (
+        lambda: runtime._workspace_path(workspace_payload),
+        lambda: runtime._handle_sync("files.list", workspace_payload),
+        lambda: runtime._handle_sync("workspace.ensure", workspace_payload),
+    )
+    for operation in operations:
+        with pytest.raises(NodeRemoteRunError) as invalid:
+            operation()
+        assert invalid.value.code == "layout_invalid"
+
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+
+
+def test_remote_run_snapshot_promotion_rejects_replaced_staging_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    runtime._tmux = lambda *args, check=True: subprocess.CompletedProcess(  # type: ignore[method-assign]
+        args, 1 if args[0] == "has-session" else 0, "", ""
+    )
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    runtime.snapshot_begin(payload)
+    runtime.snapshot_directory({**payload, "path": "approved"})
+    run_fd = runtime._run_dir_fds[run_id]
+    metadata_fd = runtime._metadata_dir_fds[run_id]
+    staging_fd = runtime._work_staging_dir_fds[run_id]
+    old_work_fd = runtime._work_dir_fds[run_id]
+    expected_staging = os.fstat(staging_fd)
+    expected_work = os.fstat(old_work_fd)
+    original_copy = node_remote_runs._copy_snapshot_tree
+    replaced = False
+
+    def replace_staging(
+        source_directory_fd: int,
+        destination_directory_fd: int,
+        parent: str = "",
+    ) -> None:
+        nonlocal replaced
+        if source_directory_fd == staging_fd and not replaced:
+            os.rename(
+                "work.tmp",
+                "work.tmp.original",
+                src_dir_fd=run_fd,
+                dst_dir_fd=run_fd,
+            )
+            os.mkdir("work.tmp", 0o700, dir_fd=run_fd)
+            replacement_fd = os.open(
+                "work.tmp", os.O_RDONLY | os.O_DIRECTORY, dir_fd=run_fd
+            )
+            try:
+                sentinel_fd = os.open(
+                    "sentinel",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=replacement_fd,
+                )
+                os.write(sentinel_fd, b"replacement")
+                os.close(sentinel_fd)
+            finally:
+                os.close(replacement_fd)
+            replaced = True
+        original_copy(source_directory_fd, destination_directory_fd, parent)
+
+    monkeypatch.setattr(node_remote_runs, "_copy_snapshot_tree", replace_staging)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.snapshot_commit(payload)
+
+    assert invalid.value.code == "layout_invalid"
+    assert replaced
+    moved_stage = os.stat("work.tmp.original", dir_fd=run_fd, follow_symlinks=False)
+    assert (moved_stage.st_dev, moved_stage.st_ino) == (
+        expected_staging.st_dev,
+        expected_staging.st_ino,
+    )
+    current_work = os.stat("work", dir_fd=run_fd, follow_symlinks=False)
+    assert (current_work.st_dev, current_work.st_ino) == (
+        expected_work.st_dev,
+        expected_work.st_ino,
+    )
+    assert os.listdir(old_work_fd) == []
+    replacement_fd = os.open(
+        "work.tmp", os.O_RDONLY | os.O_DIRECTORY, dir_fd=run_fd
+    )
+    try:
+        sentinel_fd = os.open("sentinel", os.O_RDONLY, dir_fd=replacement_fd)
+        try:
+            assert os.read(sentinel_fd, 32) == b"replacement"
+        finally:
+            os.close(sentinel_fd)
+    finally:
+        os.close(replacement_fd)
+    state, recorded_work, pending_stage = runtime._parse_work_identity(
+        node_remote_runs._read_regular_at(metadata_fd, "work.identity", 128)
+    )
+    assert state == "stable"
+    assert recorded_work == (expected_work.st_dev, expected_work.st_ino)
+    assert pending_stage is None
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime._assert_layout(run_id)
+    assert invalid.value.code == "layout_invalid"
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "git"])
+def test_remote_run_staging_creation_rejects_symlink_before_first_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    original_open = os.open
+    replaced = False
+
+    def replace_before_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        if path == "work.tmp" and not replaced:
+            parent_fd = kwargs["dir_fd"]
+            os.rename(
+                "work.tmp",
+                "work.tmp.original",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.symlink(outside, "work.tmp", dir_fd=parent_fd)
+            replaced = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(node_remote_runs.os, "open", replace_before_open)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        if operation == "snapshot":
+            runtime.snapshot_begin(payload)
+        else:
+            runtime._create_git_work_staging(run_id)
+
+    assert invalid.value.code == "layout_invalid"
+    assert replaced
+    assert (root / run_id / "work.tmp").is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+    assert run_id in runtime._invalid_run_ids
+
+
+def test_remote_run_git_pending_rejects_replacement_after_agent_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    run_fd, metadata_fd = runtime._layout_handles(run_id)
+    staging_fd = runtime._create_git_work_staging(run_id)
+    runtime._work_staging_dir_fds[run_id] = staging_fd
+    runtime._set_work_identity_state(run_id, "git-pending", staging_fd=staging_fd)
+    paths = runtime._paths(run_id)
+    runtime._write_private(
+        paths["git_revision"], b"a" * 40 + b"\n", expected_state=None
+    )
+    staged = os.fstat(staging_fd)
+    os.rename("work.tmp", "work", src_dir_fd=run_fd, dst_dir_fd=run_fd)
+    work = root / run_id / "work"
+    work.rename(root / run_id / "work.original")
+    work.mkdir(mode=0o700)
+    sentinel = work / "replacement-sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    replacement = work.stat()
+    assert (replacement.st_dev, replacement.st_ino) != (staged.st_dev, staged.st_ino)
+    # Model inode reuse: the replacement now has the old pending work identity.
+    replacement_fd = os.open(work, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        runtime._write_work_identity(
+            metadata_fd, replacement_fd, "git-pending", staging_fd=staging_fd
+        )
+    finally:
+        os.close(replacement_fd)
+    runtime._forget_layout_handles(run_id)
+
+    restarted = NodeRemoteRunRuntime(root)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        restarted.validate_workspace(
+            {"remote_run_id": run_id, "workspace_path": str(work)}
+        )
+    assert invalid.value.code == "layout_invalid"
+    assert restarted.observe(payload)["layout_error"] == "layout_invalid"
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        restarted.ensure_shell(payload)
+    assert invalid.value.code == "layout_invalid"
+
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+
+
+def test_remote_run_snapshot_pending_rejects_restart_even_with_git_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    runtime.snapshot_begin(payload)
+    run_fd = runtime._run_dir_fds[run_id]
+    metadata_fd = runtime._metadata_dir_fds[run_id]
+    staging_fd = runtime._work_staging_dir_fds[run_id]
+    staging_sentinel = os.open(
+        "sentinel",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=staging_fd,
+    )
+    os.write(staging_sentinel, b"keep")
+    os.close(staging_sentinel)
+
+    original_write = runtime._write_work_identity
+
+    def fail_stable_write(
+        current_metadata_fd: int,
+        work_fd: int,
+        state: str,
+        *,
+        staging_fd: int | None = None,
+    ) -> None:
+        if state == "stable":
+            raise OSError("simulated interruption before stable identity")
+        original_write(
+            current_metadata_fd, work_fd, state, staging_fd=staging_fd
+        )
+
+    def interrupt_copy(
+        _source_fd: int, _destination_fd: int, _parent: str = ""
+    ) -> None:
+        raise OSError("simulated snapshot interruption")
+
+    monkeypatch.setattr(runtime, "_write_work_identity", fail_stable_write)
+    monkeypatch.setattr(node_remote_runs, "_copy_snapshot_tree", interrupt_copy)
+    with pytest.raises(OSError, match="snapshot interruption"):
+        runtime.snapshot_commit(payload)
+
+    identity = node_remote_runs._read_regular_at(metadata_fd, "work.identity", 128)
+    state, _work_identity, _staging_identity = runtime._parse_work_identity(identity)
+    assert state == "snapshot-pending"
+
+    os.rmdir("work", dir_fd=run_fd)
+    os.rename("work.tmp", "work", src_dir_fd=run_fd, dst_dir_fd=run_fd)
+    paths = runtime._paths(run_id)
+    runtime._write_private(
+        paths["git_revision"], b"a" * 40 + b"\n", expected_state=None
+    )
+    runtime._forget_layout_handles(run_id)
+
+    restarted = NodeRemoteRunRuntime(root)
+    work = root / run_id / "work"
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        restarted.validate_workspace(
+            {"remote_run_id": run_id, "workspace_path": str(work)}
+        )
+    assert invalid.value.code == "layout_invalid"
+    assert restarted.observe(payload)["layout_error"] == "layout_invalid"
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        restarted.ensure_shell(payload)
+    assert invalid.value.code == "layout_invalid"
+    assert (work / "sentinel").read_bytes() == b"keep"
+
+
+def test_remote_run_missing_work_identity_rejects_replacement_after_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    run_fd, metadata_fd = runtime._layout_handles(run_id)
+    staging_fd = runtime._create_git_work_staging(run_id)
+    runtime._work_staging_dir_fds[run_id] = staging_fd
+    runtime._set_work_identity_state(run_id, "git-pending", staging_fd=staging_fd)
+    paths = runtime._paths(run_id)
+    runtime._write_private(
+        paths["git_revision"], b"b" * 40 + b"\n", expected_state=None
+    )
+    os.rename("work.tmp", "work", src_dir_fd=run_fd, dst_dir_fd=run_fd)
+    runtime._layout_handles(run_id)
+    os.unlink("work.identity", dir_fd=metadata_fd)
+
+    work = root / run_id / "work"
+    work.rename(root / run_id / "work.original")
+    work.mkdir(mode=0o700)
+    sentinel = work / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    runtime._forget_layout_handles(run_id)
+    restarted = NodeRemoteRunRuntime(root)
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        restarted.validate_workspace(
+            {"remote_run_id": run_id, "workspace_path": str(work)}
+        )
+    assert invalid.value.code == "layout_invalid"
+    assert restarted.observe(payload)["layout_error"] == "layout_invalid"
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        restarted.ensure_shell(payload)
+    assert invalid.value.code == "layout_invalid"
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+
+
+def test_remote_run_create_rejects_work_replacement_at_publication(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    work = root / run_id / "work"
+    original_work = root / run_id / "work.original"
+    sentinel = work / "sentinel"
+    original_replace = runtime._replace
+    replaced = False
+
+    def replace_then_swap(source: Path, destination: Path) -> None:
+        nonlocal replaced
+        original_replace(source, destination)
+        if source.name == f".termroom-creating-{run_id}" and destination.name == run_id:
+            work.rename(original_work)
+            work.mkdir(mode=0o700)
+            sentinel.write_bytes(b"replacement")
+            replaced = True
+
+    runtime._replace = replace_then_swap  # type: ignore[method-assign]
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.create({**payload, "command": "true", "cwd_rel": "."})
+
+    assert invalid.value.code == "layout_invalid"
+    assert replaced
+    metadata_fd = os.open(
+        root / run_id / ".termroom", os.O_RDONLY | os.O_DIRECTORY
+    )
+    try:
+        identity = node_remote_runs._read_regular_at(
+            metadata_fd, "work.identity", 128
+        )
+    finally:
+        os.close(metadata_fd)
+    state, recorded_work, staging = runtime._parse_work_identity(identity)
+    replacement = work.stat()
+    original = original_work.stat()
+    assert state == "stable"
+    assert staging is None
+    assert recorded_work == (original.st_dev, original.st_ino)
+    assert recorded_work != (replacement.st_dev, replacement.st_ino)
+    assert sentinel.read_bytes() == b"replacement"
+    assert run_id not in runtime._run_dir_fds
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.validate_workspace(
+            {"remote_run_id": run_id, "workspace_path": str(work)}
+        )
+    assert invalid.value.code == "layout_invalid"
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.start(payload)
+    assert invalid.value.code == "layout_invalid"
+
+
+def test_remote_run_create_rejects_work_symlink_before_first_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    original_open = os.open
+    replaced = False
+
+    def replace_before_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        if path == "work" and not replaced:
+            parent_fd = kwargs["dir_fd"]
+            os.rename("work", "work.original", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.symlink(outside, "work", dir_fd=parent_fd)
+            replaced = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(node_remote_runs.os, "open", replace_before_open)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.create({**payload, "command": "true", "cwd_rel": "."})
+
+    assert invalid.value.code == "layout_invalid"
+    assert replaced
+    creating_root = root / f".termroom-creating-{run_id}"
+    assert not creating_root.exists()
+    assert not (root / run_id).exists()
+    assert run_id in runtime._invalid_run_ids
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+@pytest.mark.parametrize("boundary", ["publication-check", "final-layout-check"])
+def test_remote_run_create_rejects_replaced_published_root_on_retry(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    published = root / run_id
+    detached = tmp_path / "detached-original-run"
+    original_replace = runtime._replace
+    replaced = False
+
+    def replace_full_root() -> None:
+        nonlocal replaced
+        published.rename(detached)
+        shutil.copytree(detached, published)
+        sentinel = published / "work" / "sentinel"
+        sentinel.write_bytes(b"replacement")
+        metadata_fd = os.open(
+            published / ".termroom", os.O_RDONLY | os.O_DIRECTORY
+        )
+        work_fd = os.open(published / "work", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            runtime._write_work_identity(metadata_fd, work_fd, "stable")
+        finally:
+            os.close(metadata_fd)
+            os.close(work_fd)
+        replaced = True
+
+    if boundary == "publication-check":
+        def replace_before_publication_check(source: Path, destination: Path) -> None:
+            original_replace(source, destination)
+            if destination.name == run_id and not replaced:
+                replace_full_root()
+
+        runtime._replace = replace_before_publication_check  # type: ignore[method-assign]
+    else:
+        original_assert_layout = runtime._assert_layout
+
+        def replace_before_final_layout_check(candidate_run_id: str) -> dict[str, Path]:
+            if candidate_run_id == run_id and run_id in runtime._run_dir_fds and not replaced:
+                replace_full_root()
+            return original_assert_layout(candidate_run_id)
+
+        runtime._assert_layout = replace_before_final_layout_check  # type: ignore[method-assign]
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    assert invalid.value.code == "layout_invalid"
+    assert replaced
+    assert run_id in runtime._invalid_run_ids
+
+    sentinel = published / "work" / "sentinel"
+    assert sentinel.read_bytes() == b"replacement"
+    with pytest.raises(NodeRemoteRunError) as retry:
+        runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    assert retry.value.code == "layout_invalid"
+    assert sentinel.read_bytes() == b"replacement"
+
+
+@pytest.mark.parametrize(
+    ("mode", "leaf", "descriptor_index"),
+    [
+        ("run", "command.sh", 4),
+        ("git", "git-argv", 7),
+        ("git", "git-path", 8),
+        ("git", "git-askpass", 9),
+    ],
+)
+def test_remote_run_handoff_uses_sealed_metadata_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    leaf: str,
+    descriptor_index: int,
+) -> None:
+    root = tmp_path / "managed-runs"
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    sentinel = tmp_path / "attacker-ran"
+    observed: list[bytes] = []
+
+    def handoff(
+        tmux_args: tuple[str, ...],
+        descriptors: tuple[int, ...],
+        _command: tuple[str, ...] = (),
+        **_kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        path = root / run_id / ".termroom" / leaf
+        original = path.read_bytes()
+        before = path.stat()
+        descriptor = descriptors[descriptor_index]
+        seals = fcntl.fcntl(descriptor, getattr(fcntl, "F_GET_SEALS", 1034))
+        required = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        assert seals & required == required
+        with path.open("r+b") as handle:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"touch {sentinel}\n".encode())
+        after = path.stat()
+        assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        sealed_content = os.read(descriptor, 1024 * 1024)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        assert sealed_content == original
+        observed.append(sealed_content)
+        return subprocess.CompletedProcess(tmux_args, 0, "", "")
+
+    runtime = NodeRemoteRunRuntime(root, descriptor_handoff=handoff)
+    runtime._tmux = lambda *args, check=True: subprocess.CompletedProcess(  # type: ignore[method-assign]
+        args, 1 if args[0] == "has-session" else 0, "", ""
+    )
+    runtime.create({**payload, "command": "printf 'approved\\n'", "cwd_rel": "."})
+    if mode == "git":
+        fake_git = tmp_path / "fake-git"
+        fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_git.chmod(0o700)
+        monkeypatch.setattr(node_remote_runs.shutil, "which", lambda _name: str(fake_git))
+        runtime.start_git({**payload, "url": "https://example.test/public.git"})
+    else:
+        runtime.start(payload)
+
+    assert len(observed) == 1
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("mutation", ["replace", "hardlink"])
+def test_remote_run_metadata_read_rejects_leaf_change_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    path = tmp_path / "record"
+    path.write_bytes(b"admitted")
+    path.chmod(0o600)
+    moved = tmp_path / "original-record"
+    alias = tmp_path / "outside-record"
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_open = os.open
+    original_read = os.read
+    opened: set[int] = set()
+    changed = False
+
+    def track_open(*args: Any, **kwargs: Any) -> int:
+        descriptor = original_open(*args, **kwargs)
+        if args[0] == "record":
+            opened.add(descriptor)
+        return descriptor
+
+    def mutate_after_read(descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        content = original_read(descriptor, size)
+        if descriptor in opened and not changed:
+            changed = True
+            if mutation == "replace":
+                path.rename(moved)
+                path.write_bytes(b"replacement")
+                path.chmod(0o600)
+            else:
+                os.link(path, alias)
+        return content
+
+    monkeypatch.setattr(node_remote_runs.os, "open", track_open)
+    monkeypatch.setattr(node_remote_runs.os, "read", mutate_after_read)
+    try:
+        with pytest.raises(NodeRemoteRunError) as invalid:
+            node_remote_runs._read_regular_at(directory_fd, "record", 1024)
+    finally:
+        os.close(directory_fd)
+
+    assert invalid.value.code == "metadata_invalid"
+    assert changed
+    if mutation == "replace":
+        assert moved.read_bytes() == b"admitted"
+        assert path.read_bytes() == b"replacement"
+    else:
+        assert alias.read_bytes() == b"admitted"
+        assert path.stat().st_nlink == 2
+        assert stat.S_IMODE(alias.stat().st_mode) == 0o600
 
 
 def _large_source_manifest() -> list[dict[str, Any]]:
@@ -404,7 +1505,7 @@ async def test_node_remote_run_streams_large_metadata_and_cleans_aborted_upload(
     )
     assert aborted.value == {"stream_id": aborted_id}
     aborted_stream = runtime.streams[aborted_id]
-    temporary = aborted_stream.temporary  # type: ignore[attr-defined]
+    temporary = run_root / run_id / ".termroom" / aborted_stream.temporary_name
     await aborted_stream.feed(encoded[:64])
     await aborted_stream.abort()
     assert aborted_id not in runtime.streams

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import gc
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -15,6 +18,7 @@ from typing import Any
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
+from termroom import node_agent
 from termroom.file_runs import RUNNER_REGISTRY_VERSION
 from termroom.files import DirectoryListingLimitError
 from termroom.node_agent import (
@@ -122,6 +126,67 @@ def test_node_accepts_supported_workspace_session_names(session: str) -> None:
 )
 def test_node_rejects_invalid_workspace_session_names(session: str) -> None:
     assert not node_session_is_valid(session)
+
+
+def test_node_rejects_replaced_allowed_root_directory(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    workspace = allowed / "project"
+    workspace.mkdir(parents=True)
+    runtime = NodeRuntime([allowed])
+    moved = tmp_path / "original-allowed"
+    allowed.rename(moved)
+    workspace.mkdir(parents=True)
+
+    with pytest.raises(PathBoundaryError):
+        runtime._workspace_path({"workspace_path": str(workspace)})
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "real"])
+def test_node_workspace_replacement_is_rejected_before_tmux_launch(
+    tmp_path: Path,
+    replacement_kind: str,
+) -> None:
+    allowed = tmp_path / "allowed"
+    workspace = allowed / "project"
+    outside = tmp_path / "outside"
+    workspace.mkdir(parents=True)
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    runtime = NodeRuntime([allowed])
+    payload = _payload(workspace)
+    runtime._workspace_path(payload)
+    moved = allowed / "project-original"
+    calls: list[tuple[str, ...]] = []
+
+    def replace_before_new_session(
+        *arguments: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[0] == "has-session":
+            workspace.rename(moved)
+            if replacement_kind == "symlink":
+                workspace.symlink_to(outside, target_is_directory=True)
+            else:
+                workspace.mkdir(mode=0o755)
+                replacement_sentinel = workspace / "sentinel"
+                replacement_sentinel.write_bytes(b"replacement")
+                replacement_sentinel.chmod(0o640)
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        if arguments[0] == "list-sessions":
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    runtime._tmux = replace_before_new_session  # type: ignore[method-assign]
+    with pytest.raises(PathBoundaryError):
+        runtime._ensure_workspace(payload)
+
+    assert not any(arguments[0] == "new-session" for arguments in calls)
+    assert sentinel.read_bytes() == b"keep"
+    if replacement_kind == "real":
+        replacement_sentinel = workspace / "sentinel"
+        assert replacement_sentinel.read_bytes() == b"replacement"
+        assert stat.S_IMODE(replacement_sentinel.stat().st_mode) == 0o640
 
 
 @pytest.mark.asyncio
@@ -843,6 +908,408 @@ def test_node_identity_rejects_symlink_allowed_root(tmp_path: Path) -> None:
     assert exc_info.value.code == "root_invalid"
 
 
+def test_node_file_run_root_rejects_symlink_replaced_during_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "file-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_root = tmp_path / "original-file-runs"
+    original_open = node_agent._open_directory_components
+    replaced = False
+
+    def replace_after_open(
+        path: Path, *, create: bool, mode: int | None
+    ) -> tuple[int, Path]:
+        nonlocal replaced
+        descriptor, candidate = original_open(path, create=create, mode=mode)
+        if path == root and create and not replaced:
+            replaced = True
+            path.rename(moved_root)
+            path.symlink_to(outside, target_is_directory=True)
+        return descriptor, candidate
+
+    monkeypatch.setattr(node_agent, "_open_directory_components", replace_after_open)
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime([tmp_path], file_run_root=root)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert replaced
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_rejects_symlink_present_at_entry(tmp_path: Path) -> None:
+    root = tmp_path / "file-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime([tmp_path], file_run_root=root)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime([tmp_path], file_run_root=alias / "file-runs")
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "real"])
+def test_node_file_run_root_rejects_replacement_after_directory_validation(
+    tmp_path: Path,
+    replacement_kind: str,
+) -> None:
+    root = tmp_path / "file-runs"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    runtime = NodeRuntime([tmp_path], file_run_root=root)
+    moved_root = tmp_path / "original-file-runs"
+    root.rename(moved_root)
+    if replacement_kind == "symlink":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir(mode=0o755)
+        (root / "replacement-sentinel").write_bytes(b"keep")
+    with pytest.raises(NodeAgentError) as invalid:
+        runtime._file_run_metadata_dir("workspace", str(uuid.uuid4()), create=True)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert runtime.file_run_root == root
+    assert root.is_symlink() is (replacement_kind == "symlink")
+    if replacement_kind == "real":
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+        assert (root / "replacement-sentinel").read_bytes() == b"keep"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_metadata_rejects_replaced_descendant_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "file-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    runtime = NodeRuntime([tmp_path], file_run_root=root)
+    run_id = str(uuid.uuid4())
+    metadata = runtime._file_run_metadata_dir("workspace", run_id, create=True)
+    moved = tmp_path / "original-metadata"
+    metadata.rename(moved)
+    metadata.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        runtime._file_run_metadata_dir("workspace", run_id, create=True)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_metadata_rejects_real_directory_replacement_without_chmod(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "file-runs"
+    runtime = NodeRuntime([tmp_path], file_run_root=root)
+    run_id = str(uuid.uuid4())
+    metadata = runtime._file_run_metadata_dir("workspace", run_id, create=True)
+    moved = tmp_path / "original-metadata"
+    metadata.rename(moved)
+    replacement = tmp_path / "replacement-metadata"
+    replacement.mkdir(mode=0o755)
+    sentinel = replacement / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    replacement.chmod(0o755)
+    replacement.rename(metadata)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        runtime._file_run_metadata_dir("workspace", run_id, create=True)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(metadata.stat().st_mode) == 0o755
+    replacement_sentinel = metadata / "sentinel"
+    assert replacement_sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(replacement_sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in metadata.iterdir()) == ["sentinel"]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.parametrize("mutation", ["replace", "in_place"])
+def test_node_file_run_runner_change_before_respawn(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    workspace = tmp_path / "allowed"
+    workspace.mkdir()
+    source = workspace / "script.py"
+    source.write_text("print('approved')\n", encoding="utf-8")
+    outside_sentinel = tmp_path / "outside-sentinel"
+    runtime = NodeRuntime(
+        [workspace], file_run_root=tmp_path / "private" / "file-runs"
+    )
+    base = _payload(
+        workspace,
+        workspace_id="workspace-runner-replacement",
+        runner_registry_version=RUNNER_REGISTRY_VERSION,
+    )
+    inspected = runtime._handle_sync("file_run.inspect", {**base, "path": source.name})
+    run_id = str(uuid.uuid4())
+    start_payload = {
+        **base,
+        "run_id": run_id,
+        "path": source.name,
+        "expected_digest": inspected["runnable"]["digest"],
+        "runner_id": "python3",
+        "runner_version": RUNNER_REGISTRY_VERSION,
+    }
+    metadata = runtime.file_run_root / str(base["workspace_id"]) / run_id
+    moved_runner = tmp_path / "approved-runner"
+    original_tmux = runtime._tmux
+    original_handoff = runtime._tmux_with_descriptors
+    calls: list[tuple[str, ...]] = []
+    replaced = False
+    source_changed = False
+
+    def replace_runner_before_respawn(
+        *arguments: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal replaced
+        calls.append(arguments)
+        if arguments[0] == "set-window-option" and not replaced:
+            replaced = True
+            runner_path = metadata / "runner.sh"
+            if mutation == "replace":
+                runner_path.rename(moved_runner)
+                runner_path.write_text(
+                    f"#!/bin/sh\ntouch {outside_sentinel}\n", encoding="utf-8"
+                )
+                runner_path.chmod(0o700)
+            else:
+                before = runner_path.stat()
+                with runner_path.open("r+b") as runner_file:
+                    runner_file.write(f"#!/bin/sh\ntouch {outside_sentinel}\n".encode())
+                    runner_file.truncate()
+                after = runner_path.stat()
+                assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        return original_tmux(*arguments, check=check)
+
+    def mutate_source_before_handoff(
+        tmux_args: tuple[str, ...],
+        descriptors: tuple[int, ...],
+        command: tuple[str, ...] = (),
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal source_changed
+        if mutation == "in_place" and tmux_args[0] == "respawn-pane":
+            source_fd = descriptors[3]
+            before = source.stat()
+            with source.open("r+b") as source_file:
+                source_file.seek(0)
+                source_file.write(
+                    (
+                        "from pathlib import Path\n"
+                        f"Path({str(outside_sentinel)!r}).write_text('pwned')\n"
+                    ).encode()
+                )
+                source_file.truncate()
+            after = source.stat()
+            assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+            required_seals = (
+                getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+                | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+            )
+            assert fcntl.fcntl(
+                source_fd, getattr(fcntl, "F_GET_SEALS", 1034)
+            ) & required_seals == required_seals
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            assert os.read(source_fd, 1024) == b"print('approved')\n"
+            source_changed = True
+        return original_handoff(tmux_args, descriptors, command, **kwargs)
+
+    runtime._tmux = replace_runner_before_respawn  # type: ignore[method-assign]
+    runtime._tmux_with_descriptors = mutate_source_before_handoff  # type: ignore[method-assign]
+    try:
+        if mutation == "replace":
+            with pytest.raises(NodeAgentError) as invalid:
+                runtime._handle_sync("file_run.start", start_payload)
+            assert invalid.value.code == "file_run_state_invalid"
+            assert not any(arguments[0] == "respawn-pane" for arguments in calls)
+        else:
+            started = runtime._handle_sync("file_run.start", start_payload)
+            assert any(arguments[0] == "respawn-pane" for arguments in calls)
+            assert source_changed
+            completed = _wait_for_node_file_run(
+                runtime, {**base, "run_id": run_id}, states={"finished"}
+            )
+            assert completed["observation"]["exit_code"] == 0
+            output = runtime._handle_sync(
+                "terminal.scrollback",
+                {
+                    **base,
+                    "tmux_window": started["terminal"]["tmux_window"],
+                    "lines": 200,
+                },
+            )["output"]
+            assert "approved" in output
+        assert replaced
+        assert not outside_sentinel.exists()
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(base["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+def test_node_file_run_root_rejects_wrong_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "file-runs"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime._prepare_file_run_root(root)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+    assert list(root.iterdir()) == []
+
+
+def test_node_file_run_rejects_wrong_owner_descendant_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "file-runs"
+    workspace = root / "workspace"
+    root.mkdir(mode=0o700)
+    workspace.mkdir(mode=0o755)
+    sentinel = workspace / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    workspace.chmod(0o755)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+    try:
+        with pytest.raises(OSError):
+            node_agent._open_directory_at(
+                root_fd,
+                ("workspace",),
+                create=False,
+                mode=0o700,
+                require_owner=True,
+            )
+    finally:
+        os.close(root_fd)
+
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in workspace.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_under_private_state_rejects_wrong_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_state_root = tmp_path / "node-state"
+    file_run_root = private_state_root / "file-runs"
+    private_state_root.mkdir(mode=0o700)
+    file_run_root.mkdir(mode=0o755)
+    sentinel = file_run_root / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    file_run_root.chmod(0o755)
+    private_state_fd = os.open(private_state_root, os.O_RDONLY | os.O_DIRECTORY)
+    actual_euid = os.geteuid()
+    try:
+        with monkeypatch.context() as ownership:
+            ownership.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+            with pytest.raises(NodeAgentError) as invalid:
+                NodeRuntime._open_file_run_root(
+                    file_run_root,
+                    private_state_fd=private_state_fd,
+                    private_state_root=private_state_root,
+                )
+        assert invalid.value.code == "file_run_state_invalid"
+    finally:
+        os.close(private_state_fd)
+
+    assert stat.S_IMODE(file_run_root.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in file_run_root.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_preserves_real_directory_behavior(tmp_path: Path) -> None:
+    assert NodeRuntime([tmp_path], file_run_root=None).file_run_root is None
+
+    missing_root = tmp_path / "new-file-runs"
+    runtime = NodeRuntime([tmp_path], file_run_root=missing_root)
+    assert runtime.file_run_root == missing_root
+    assert missing_root.is_dir()
+    assert not missing_root.is_symlink()
+    assert stat.S_IMODE(missing_root.stat().st_mode) == 0o700
+
+    existing_root = tmp_path / "existing-file-runs"
+    existing_root.mkdir(mode=0o755)
+    existing_root.chmod(0o755)
+    accepted = NodeRuntime([tmp_path], file_run_root=existing_root)
+    assert accepted.file_run_root == existing_root
+    assert not existing_root.is_symlink()
+    assert stat.S_IMODE(existing_root.stat().st_mode) == 0o700
+
+
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
@@ -1430,6 +1897,80 @@ async def test_node_file_streams_are_chunked_atomic_and_abortable(tmp_path: Path
     await runtime.close_streams()
     assert not (workspace / "partial.txt").exists()
     assert not list(workspace.glob(".partial.txt.termroom-*"))
+
+
+@pytest.mark.asyncio
+async def test_node_download_rejects_replaced_leaf_before_streaming(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    source = workspace / "source.txt"
+    source.write_bytes(b"admitted")
+    outside = tmp_path / "outside-secret"
+    outside.write_bytes(b"must not leak")
+    runtime = NodeRuntime([tmp_path])
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: Any) -> None:
+        sent.append(dict(message))
+
+    opened = await runtime.handle(
+        "files.download.open",
+        {
+            "workspace_path": str(workspace),
+            "path": source.name,
+            "stream_id": "a" * 32,
+        },
+        send,
+    )
+    source.unlink()
+    source.symlink_to(outside)
+
+    assert opened.start is not None
+    await opened.start()
+    assert not any(message["type"] == "stream.data" for message in sent)
+    assert sent[-1]["type"] == "stream.error"
+    assert sent[-1]["code"] == "path_changed"
+    assert outside.read_bytes() == b"must not leak"
+
+
+@pytest.mark.asyncio
+async def test_node_upload_finishes_in_open_parent_after_parent_replacement(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    parent = workspace / "nested"
+    workspace.mkdir()
+    parent.mkdir()
+    runtime = NodeRuntime([tmp_path])
+    stream_id = "b" * 32
+
+    async def send(_message: Any) -> None:
+        raise AssertionError("This operation must not send an unsolicited frame")
+
+    await runtime.handle(
+        "files.upload.open",
+        {
+            "workspace_path": str(workspace),
+            "parent": "nested",
+            "filename": "uploaded.txt",
+            "overwrite": False,
+            "max_bytes": 100,
+            "stream_id": stream_id,
+        },
+        send,
+    )
+    await runtime.streams[stream_id].feed(b"pinned parent")
+    moved = workspace / "nested-original"
+    parent.rename(moved)
+    parent.mkdir()
+
+    await runtime.streams[stream_id].close()
+
+    assert (moved / "uploaded.txt").read_bytes() == b"pinned parent"
+    assert not (parent / "uploaded.txt").exists()
+    assert not list(parent.glob(".uploaded.txt.termroom-*"))
 
 
 def test_node_operation_set_does_not_expose_arbitrary_shell(tmp_path: Path) -> None:
