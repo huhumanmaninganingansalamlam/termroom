@@ -124,7 +124,7 @@ def _test_sshd(
             command_lines.extend((f"PATH={shlex.quote(remote_path)}", "export PATH"))
         if login_shell is not None:
             command_lines.extend((f"SHELL={shlex.quote(str(login_shell))}", "export SHELL"))
-        command_lines.append('command=$SSH_ORIGINAL_COMMAND')
+        command_lines.append("command=$SSH_ORIGINAL_COMMAND")
         if missing_bash_flag is not None:
             command_lines.extend(
                 (
@@ -288,8 +288,8 @@ def test_noninteractive_ssh_uses_configured_login_shell_command_path(tmp_path: P
     login_shell = tmp_path / "login-shell"
     login_shell.write_text(
         "#!/bin/sh\n"
-        "test \"$1\" = -l || exit 81\n"
-        "test \"$2\" = -c || exit 82\n"
+        'test "$1" = -l || exit 81\n'
+        'test "$2" = -c || exit 82\n'
         f"printf 'login\\n' >> {shlex.quote(str(login_log))}\n"
         "printf 'profile stdout noise\\n'\n"
         "printf 'profile stderr noise\\n' >&2\n"
@@ -343,8 +343,8 @@ def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(
     login_shell = tmp_path / "login-shell"
     login_shell.write_text(
         "#!/bin/sh\n"
-        "test \"$1\" = -l || exit 81\n"
-        "test \"$2\" = -c || exit 82\n"
+        'test "$1" = -l || exit 81\n'
+        'test "$2" = -c || exit 82\n'
         f"PATH={shlex.quote(str(login_path))}\n"
         "export PATH\n"
         'exec /bin/sh -c "$3"\n',
@@ -394,8 +394,8 @@ def test_noninteractive_ssh_reports_missing_tmux_from_login_environment(
         fake_tmux.chmod(0o755)
         login_shell.write_text(
             "#!/bin/sh\n"
-            "test \"$1\" = -l || exit 81\n"
-            "test \"$2\" = -c || exit 82\n"
+            'test "$1" = -l || exit 81\n'
+            'test "$2" = -c || exit 82\n'
             f"PATH={shlex.quote(str(installed_path))}\n"
             "export PATH\n"
             'exec /bin/sh -c "$3"\n',
@@ -433,10 +433,7 @@ def test_noninteractive_ssh_requires_bin_bash_before_connection_success(
     fake_tmux.chmod(0o755)
     login_shell = tmp_path / "login-shell"
     login_shell.write_text(
-        "#!/bin/sh\n"
-        f"PATH={shlex.quote(str(login_bin))}\n"
-        "export PATH\n"
-        'exec /bin/sh -c "$3"\n',
+        f'#!/bin/sh\nPATH={shlex.quote(str(login_bin))}\nexport PATH\nexec /bin/sh -c "$3"\n',
         encoding="utf-8",
     )
     login_shell.chmod(0o755)
@@ -739,9 +736,7 @@ def test_ssh_grid_owner_retries_promotion_without_losing_previous_owner(
     outcomes = iter((False, True))
     attempts: list[bool] = []
 
-    def set_grid_role(
-        _workspace: dict[str, object], _view_session: str, *, enabled: bool
-    ) -> bool:
+    def set_grid_role(_workspace: dict[str, object], _view_session: str, *, enabled: bool) -> bool:
         attempts.append(enabled)
         return next(outcomes)
 
@@ -782,9 +777,7 @@ def test_ssh_grid_owner_is_forgotten_only_after_demotion_succeeds(
     backend._browser_grid_owners[terminal_id] = client_id
     outcomes = iter((False, True))
 
-    def set_grid_role(
-        _workspace: dict[str, object], _view_session: str, *, enabled: bool
-    ) -> bool:
+    def set_grid_role(_workspace: dict[str, object], _view_session: str, *, enabled: bool) -> bool:
         assert not enabled
         return next(outcomes)
 
@@ -824,7 +817,7 @@ def test_ssh_grid_promotion_allows_peer_that_disconnected_during_demotion(
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
         "#!/bin/sh\n"
-        "printf '%s\\n' \"$*\" >> \"$TERMROOM_TEST_TMUX_LOG\"\n"
+        'printf \'%s\\n\' "$*" >> "$TERMROOM_TEST_TMUX_LOG"\n'
         "if [ \"$1\" = 'list-clients' ]; then\n"
         "  if [ \"$2\" = '-t' ]; then printf 'target|@1\\n';\n"
         "  else printf 'peer|termroom-view-peer|@1\\ntarget|termroom-view-target|@1\\n'; fi\n"
@@ -833,6 +826,7 @@ def test_ssh_grid_promotion_allows_peer_that_disconnected_during_demotion(
         "if [ \"$1\" = 'refresh-client' ] && [ \"$3\" = 'peer' ]; then exit 1; fi\n"
         "if [ \"$1\" = 'display-message' ] && [ \"$4\" = 'peer' ]; then exit 1; fi\n"
         "if [ \"$1\" = 'refresh-client' ] && [ \"$3\" = 'target' ]; then exit 0; fi\n"
+        "if [ \"$1\" = 'set-window-option' ]; then exit 0; fi\n"
         "exit 92\n",
         encoding="utf-8",
     )
@@ -1104,6 +1098,208 @@ async def test_public_key_setup_route_uses_persistent_termroom_key(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("promotion_failure", [False, True])
+async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, promotion_failure: bool
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    store = StateStore(state / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state)
+    with _test_sshd(tmp_path) as server:
+        probe = backend.probe_host_key("127.0.0.1", int(server["port"]))
+        computer = store.create_computer(
+            name="Bootstrap loopback",
+            ssh_alias="",
+            host="127.0.0.1",
+            port=int(server["port"]),
+            username=str(server["username"]),
+            identity_file=str(server["client_key"]),
+            host_key_type=probe["host_key_type"],
+            host_key_data=probe["host_key_data"],
+            host_fingerprint=probe["host_fingerprint"],
+        )
+        backend.remember_host_key(computer)
+        workspace = WorkspaceManager(RootManager(tmp_path), store).open_remote(
+            str(computer["id"]), str(project), "bootstrap-loopback"
+        )
+        terminal = backend.ensure_workspace(workspace)[0]
+        terminal_id = str(terminal["id"])
+        target = shlex.quote(str(terminal["tmux_window"]))
+        effect = project / "effect"
+        ready = project / "ready"
+        script = (
+            f"printf ready > {shlex.quote(str(ready))}; "
+            f"IFS= read -r -n 1 value; printf '%s' \"$value\" > {shlex.quote(str(effect))}"
+        )
+        command = f"/bin/bash --noprofile --norc -c {shlex.quote(script)}"
+        backend._exec(
+            computer,
+            f"tmux send-keys -t {target} -l {shlex.quote(command)}; "
+            f"tmux send-keys -t {target} Enter",
+        )
+
+        def grid() -> str:
+            return backend._exec(
+                computer,
+                f"tmux display-message -p -t {target} '#{{window_width}}x#{{window_height}}'",
+            ).strip()
+
+        original_role = backend._set_ssh_browser_view_grid_resize
+        original_wait = backend._wait_ssh_browser_view_size
+        original_write = os.write
+        failed = False
+        input_writes: list[bytes] = []
+        input_applies: list[tuple[int, int]] = []
+
+        def role(workspace, view, *, enabled):  # type: ignore[no-untyped-def]
+            nonlocal failed
+            if (
+                promotion_failure
+                and not failed
+                and enabled
+                and backend.control.presence(terminal_id)["input_revision"] > 0
+            ):
+                failed = True
+                return False
+            return original_role(workspace, view, enabled=enabled)
+
+        def wait(workspace, view, *, rows, cols):  # type: ignore[no-untyped-def]
+            result = original_wait(workspace, view, rows=rows, cols=cols)
+            if rows == 18 and result:
+                input_applies.append((rows, cols))
+            return result
+
+        def write(fd: int, data: bytes) -> int:
+            if data == b"z":
+                assert grid() == "124x17"
+                assert input_applies == [(18, 124)]
+                input_writes.append(data)
+            return original_write(fd, data)
+
+        monkeypatch.setattr(backend, "_set_ssh_browser_view_grid_resize", role)
+        monkeypatch.setattr(backend, "_wait_ssh_browser_view_size", wait)
+        monkeypatch.setattr(os, "write", write)
+
+        class Browser:
+            def __init__(self, reconnect: bool = False) -> None:
+                self.step = 0
+                self.reconnect = reconnect
+
+            async def receive(self) -> dict[str, object]:
+                step = self.step
+                self.step += 1
+                if self.reconnect:
+                    if step == 0:
+                        return {
+                            "type": "websocket.receive",
+                            "text": json.dumps(
+                                {
+                                    "kind": "resize",
+                                    "rows": 30,
+                                    "cols": 90,
+                                }
+                            ),
+                        }
+                    assert grid() == "124x17"
+                    assert effect.read_text() == "z"
+                    return {"type": "websocket.disconnect", "code": 1000}
+                if step == 0:
+                    return {
+                        "type": "websocket.receive",
+                        "text": json.dumps(
+                            {
+                                "kind": "resize",
+                                "rows": 23,
+                                "cols": 124,
+                            }
+                        ),
+                    }
+                if step == 1:
+                    assert grid() == "124x22"
+                    client_id = backend.control._clients[terminal_id][0]
+                    assert not backend.control.can_resize(terminal_id, client_id)
+                    assert backend.control.presence(terminal_id)["input_revision"] == 0
+                    return {
+                        "type": "websocket.receive",
+                        "text": json.dumps(
+                            {
+                                "kind": "resize",
+                                "rows": 18,
+                                "cols": 124,
+                            }
+                        ),
+                    }
+                if step == 2:
+                    assert grid() == "124x22"
+                    return {
+                        "type": "websocket.receive",
+                        "text": json.dumps(
+                            {
+                                "kind": "input",
+                                "data": "z",
+                                "rows": 18,
+                                "cols": 124,
+                                "user_input": True,
+                            }
+                        ),
+                    }
+                if promotion_failure and step == 3:
+                    await asyncio.sleep(0.1)
+                    assert failed
+                    assert not effect.exists() and not input_writes and not input_applies
+                    assert grid() == "124x22"
+                    client_id = backend.control._clients[terminal_id][0]
+                    assert backend.control.can_resize(terminal_id, client_id)
+                    assert backend.control.presence(terminal_id)["input_revision"] == 1
+                    return {
+                        "type": "websocket.receive",
+                        "text": json.dumps(
+                            {
+                                "kind": "input",
+                                "data": "z",
+                                "rows": 18,
+                                "cols": 124,
+                                "user_input": True,
+                            }
+                        ),
+                    }
+                deadline = time.monotonic() + 3
+                while not effect.exists() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert effect.read_text() == "z"
+                assert grid() == "124x17"
+                assert input_writes == [b"z"] and input_applies == [(18, 124)]
+                assert backend.control.presence(terminal_id)["input_revision"] == (
+                    2 if promotion_failure else 1
+                )
+                if step == (4 if promotion_failure else 3):
+                    return {
+                        "type": "websocket.receive",
+                        "text": json.dumps({"kind": "resize", "rows": 18, "cols": 124}),
+                    }
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def send_text(self, _data: str) -> None:
+                return None
+
+        try:
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert ready.exists()
+            await backend.bridge(Browser(), workspace, terminal)  # type: ignore[arg-type]
+            await backend.bridge(Browser(reconnect=True), workspace, terminal)  # type: ignore[arg-type]
+        finally:
+            backend._exec(
+                computer, f"tmux kill-session -t {shlex.quote(workspace['tmux_session'])}"
+            )
+
+
+@pytest.mark.asyncio
 async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
     project = tmp_path / "remote-project"
     project.mkdir()
@@ -1205,9 +1401,7 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
 
             assert backend.read_text(workspace, "readme.txt", 1024).content == "hello remote\n"
             search = backend.search_files(workspace, ".", "needle")
-            assert [entry.relative_path for entry in search.entries] == [
-                "src/deep/ssh-needle.txt"
-            ]
+            assert [entry.relative_path for entry in search.entries] == ["src/deep/ssh-needle.txt"]
             assert search.skipped_noise == 1
             assert search.truncated is False
             search_with_noise = backend.search_files(

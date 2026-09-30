@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-NODE_PROTOCOL_VERSION = 2
+NODE_PROTOCOL_VERSION = 3
 NODE_REMOTE_RUN_VERSION = 1
 NODE_REMOTE_RUN_SOURCE_VERSION = 1
 NODE_WORKSPACE_USAGE_VERSION = 1
@@ -53,6 +53,7 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "terminal.activity",
         "terminal.scrollback",
         "terminal.attach",
+        "terminal.resize",
         "files.list",
         "files.search",
         "files.recent",

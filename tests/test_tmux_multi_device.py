@@ -17,6 +17,7 @@ from termroom.db import StateStore
 from termroom.node_agent import NodeRuntime
 from termroom.terminals import (
     TerminalManager,
+    freeze_tmux_window_size,
     set_tmux_browser_view_grid_resize,
     terminal_input_claims_grid,
     tmux_browser_view_session,
@@ -87,8 +88,7 @@ def test_local_grid_promotion_allows_peer_that_disappears_during_demotion() -> N
         if args[0] == "list-clients":
             listings += 1
             output = (
-                "peer\ttermroom-view-peer\t@1\n"
-                "target\ttermroom-view-target\t@1\n"
+                "peer\ttermroom-view-peer\t@1\ntarget\ttermroom-view-target\t@1\n"
                 if listings == 1
                 else "target\ttermroom-view-target\t@1\n"
             )
@@ -96,6 +96,8 @@ def test_local_grid_promotion_allows_peer_that_disappears_during_demotion() -> N
         if args[:3] == ("refresh-client", "-t", "peer"):
             return subprocess.CompletedProcess(["tmux", *args], 1, "", "gone")
         if args[:3] == ("refresh-client", "-t", "target"):
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+        if args == ("set-window-option", "-t", "@1", "window-size", "latest"):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
         raise AssertionError(args)
 
@@ -109,6 +111,7 @@ def test_local_grid_promotion_allows_peer_that_disappears_during_demotion() -> N
         ("refresh-client", "-t", "peer", "-f", "ignore-size"),
         ("list-clients", "-F", "#{client_name}\t#{session_name}\t#{window_id}"),
         ("refresh-client", "-t", "target", "-f", "!ignore-size"),
+        ("set-window-option", "-t", "@1", "window-size", "latest"),
     ]
 
 
@@ -168,26 +171,18 @@ def test_local_workspace_recovers_missing_canonical_session_from_browser_view(
         manager.control.unregister(terminal_id, previous_owner)
         manager._prepare_browser_view(workspace, original, stale_view)
         original_window = str(original["tmux_window"])
-        manager._run_tmux(
-            "kill-session", "-t", str(workspace["tmux_session"]), check=False
-        )
-        assert manager._run_tmux(
-            "has-session", "-t", stale_view, check=False
-        ).returncode == 0
+        manager._run_tmux("kill-session", "-t", str(workspace["tmux_session"]), check=False)
+        assert manager._run_tmux("has-session", "-t", stale_view, check=False).returncode == 0
 
         terminal = manager.ensure_workspace(workspace)[0]
         assert terminal["tmux_window"] == original_window
-        assert manager._run_tmux(
-            "has-session", "-t", stale_view, check=False
-        ).returncode != 0
+        assert manager._run_tmux("has-session", "-t", stale_view, check=False).returncode != 0
         passive = manager.control.register(terminal_id)
         assert not manager.control.can_resize(terminal_id, passive)
         manager.control.unregister(terminal_id, passive)
     finally:
         manager._run_tmux("kill-session", "-t", stale_view, check=False)
-        manager._run_tmux(
-            "kill-session", "-t", str(workspace["tmux_session"]), check=False
-        )
+        manager._run_tmux("kill-session", "-t", str(workspace["tmux_session"]), check=False)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -211,9 +206,8 @@ def test_new_local_tmux_session_bootstraps_the_first_browser_grid(tmp_path: Path
         manager._prepare_browser_view(workspace, terminal, active_view)
         process = manager._spawn_tmux_client(workspace, active_view)
 
-        assert manager.control.resize_plan(
-            terminal_id, first, rows=33, cols=162
-        ) == (True, True)
+        plan = manager.control.begin_resize(terminal_id, first, rows=33, cols=162)
+        assert plan is not None and plan.bootstrap
         assert not manager.control.can_resize(terminal_id, observer)
         assert manager._sync_browser_grid_role(
             terminal_id,
@@ -223,6 +217,16 @@ def test_new_local_tmux_session_bootstraps_the_first_browser_grid(tmp_path: Path
         )
         manager._set_window_size(process[1], rows=33, cols=162)
         os.killpg(process[0], signal.SIGWINCH)
+        _wait_for_window_size(manager, str(terminal["tmux_window"]), "162x32")
+        assert manager.control.resize_applied(plan)
+        assert freeze_tmux_window_size(manager._run_tmux, str(terminal["tmux_window"]))
+        assert manager._sync_browser_grid_role(terminal_id, first, active_view, enabled=False)
+        assert manager.control.commit_resize(plan)
+        assert not manager.control.can_resize(terminal_id, first)
+        assert "ignore-size" in _client_flags(manager, active_view)
+        manager._set_window_size(process[1], rows=17, cols=162)
+        os.killpg(process[0], signal.SIGWINCH)
+        _wait_for_client_size(manager, active_view, "162x17")
         _wait_for_window_size(manager, str(terminal["tmux_window"]), "162x32")
 
         manager.control.unregister(terminal_id, first)
@@ -241,9 +245,7 @@ def test_new_local_tmux_session_bootstraps_the_first_browser_grid(tmp_path: Path
                 os.close(process[1])
         if active_view:
             manager._run_tmux("kill-session", "-t", active_view, check=False)
-        manager._run_tmux(
-            "kill-session", "-t", str(workspace["tmux_session"]), check=False
-        )
+        manager._run_tmux("kill-session", "-t", str(workspace["tmux_session"]), check=False)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
@@ -388,9 +390,19 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
         )
         assert active_result.value["stream_id"] == active_stream_id
         assert active_result.value["bootstrap_grid"] is True
-        await runtime.streams[active_stream_id].control(
-            "resize", {"rows": 37, "cols": 111, "affects_grid": True}
+        resized = await runtime.handle(
+            "terminal.resize",
+            {
+                "stream_id": active_stream_id,
+                "revision": 1,
+                "rows": 37,
+                "cols": 111,
+                "affects_grid": True,
+                "bootstrap": False,
+            },
+            send,
         )
+        assert resized.value["ok"]
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             size = runtime._tmux(
@@ -431,9 +443,19 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
         )
 
         view_session = tmux_browser_view_session(passive_stream_id)
-        await runtime.streams[passive_stream_id].control(
-            "resize", {"rows": 28, "cols": 51}
+        resized = await runtime.handle(
+            "terminal.resize",
+            {
+                "stream_id": passive_stream_id,
+                "revision": 1,
+                "rows": 28,
+                "cols": 51,
+                "affects_grid": False,
+                "bootstrap": False,
+            },
+            send,
         )
+        assert resized.value["ok"]
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             client_size = runtime._tmux(
@@ -467,9 +489,19 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
         assert canonical_window == first["tmux_window"]
         assert view_window == second["tmux_window"]
 
-        await runtime.streams[passive_stream_id].control(
-            "resize", {"rows": 28, "cols": 51, "affects_grid": True}
+        resized = await runtime.handle(
+            "terminal.resize",
+            {
+                "stream_id": passive_stream_id,
+                "revision": 2,
+                "rows": 28,
+                "cols": 51,
+                "affects_grid": True,
+                "bootstrap": False,
+            },
+            send,
         )
+        assert resized.value["ok"]
         active_view_session = tmux_browser_view_session(active_stream_id)
         assert "ignore-size" in set(
             runtime._tmux(
@@ -478,7 +510,9 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
                 active_view_session,
                 "-F",
                 "#{client_flags}",
-            ).stdout.strip().split(",")
+            )
+            .stdout.strip()
+            .split(",")
         )
         assert "ignore-size" not in set(
             runtime._tmux(
@@ -487,7 +521,9 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
                 view_session,
                 "-F",
                 "#{client_flags}",
-            ).stdout.strip().split(",")
+            )
+            .stdout.strip()
+            .split(",")
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -503,9 +539,19 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
             await asyncio.sleep(0.02)
         assert size == "51x27"
 
-        await runtime.streams[active_stream_id].control(
-            "resize", {"rows": 29, "cols": 77, "affects_grid": True}
+        resized = await runtime.handle(
+            "terminal.resize",
+            {
+                "stream_id": active_stream_id,
+                "revision": 2,
+                "rows": 29,
+                "cols": 77,
+                "affects_grid": True,
+                "bootstrap": False,
+            },
+            send,
         )
+        assert resized.value["ok"]
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             client_size = runtime._tmux(
@@ -526,7 +572,9 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
                 active_view_session,
                 "-F",
                 "#{client_flags}",
-            ).stdout.strip().split(",")
+            )
+            .stdout.strip()
+            .split(",")
         )
         assert "ignore-size" in set(
             runtime._tmux(
@@ -535,7 +583,9 @@ async def test_node_passive_attach_preserves_grid_and_grouped_window_selection(
                 view_session,
                 "-F",
                 "#{client_flags}",
-            ).stdout.strip().split(",")
+            )
+            .stdout.strip()
+            .split(",")
         )
         assert (
             runtime._tmux(
@@ -576,9 +626,7 @@ def test_node_recovers_missing_canonical_session_from_browser_view(tmp_path: Pat
 
         assert recovered["tmux_window"] == original_window
         assert not runtime._fresh_grid_window(original_window)
-        assert runtime._tmux(
-            "has-session", "-t", stale_view, check=False
-        ).returncode != 0
+        assert runtime._tmux("has-session", "-t", stale_view, check=False).returncode != 0
     finally:
         runtime._tmux("kill-session", "-t", stale_view, check=False)
         runtime._tmux("kill-session", "-t", session, check=False)

@@ -100,6 +100,7 @@ from termroom.security import (
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
     TERMINAL_EDITOR_WRAPPER,
+    TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
     TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
@@ -114,6 +115,7 @@ from termroom.terminals import (
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
+    freeze_tmux_window_size,
     normalize_terminal_editor_path,
     normalize_terminal_name,
     normalize_workspace_command,
@@ -125,6 +127,7 @@ from termroom.terminals import (
     tmux_browser_view_session,
     validate_workspace_command_launch,
     validate_workspace_command_slot,
+    wait_tmux_browser_grid_size,
     workspace_command_digest,
     workspace_command_history_name,
     workspace_command_record_is_ready,
@@ -160,7 +163,7 @@ NODE_LEGACY_SESSION_PATTERN = re.compile(r"^termroom-[A-Za-z0-9_-]{1,112}$")
 NODE_WINDOW_PATTERN = re.compile(r"^@[0-9]+$")
 NODE_WORKSPACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 FILE_RUN_DIGEST_PATTERN = re.compile(r"^[a-f0-9]{64}$")
-_TMUX_DESCRIPTOR_LAUNCHER = r'''import array, json, os, socket, sys
+_TMUX_DESCRIPTOR_LAUNCHER = r"""import array, json, os, socket, sys
 endpoint, config_json = sys.argv[1:]
 channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
@@ -207,7 +210,7 @@ except BaseException:
     except OSError:
         pass
     raise
-'''
+"""
 
 
 def node_session_is_valid(session: str) -> bool:
@@ -462,9 +465,7 @@ def _private_state_leaf_state(
 def _validate_private_state_leaf(
     directory_fd: int, name: str, *, code: str, label: str
 ) -> tuple[int, ...] | None:
-    return _private_state_leaf_state(
-        directory_fd, name, code=code, label=label, mode=0o600
-    )
+    return _private_state_leaf_state(directory_fd, name, code=code, label=label, mode=0o600)
 
 
 def _read_private_state_file(
@@ -642,9 +643,7 @@ def load_node_config(state_dir: Path) -> NodeConfig:
         try:
             value = json.loads(content)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise NodeAgentError(
-                "Node configuration is invalid", code="config_invalid"
-            ) from exc
+            raise NodeAgentError("Node configuration is invalid", code="config_invalid") from exc
         try:
             _assert_directory_path_matches(state_dir, directory_fd)
         except (OSError, RuntimeError) as exc:
@@ -680,9 +679,7 @@ def save_node_config(
     owns_directory_fd = directory_fd is None
     if directory_fd is None:
         try:
-            directory_fd, _resolved_state_dir = _open_private_directory(
-                state_dir, create=True
-            )
+            directory_fd, _resolved_state_dir = _open_private_directory(state_dir, create=True)
         except (OSError, RuntimeError) as exc:
             raise NodeAgentError(
                 "Node configuration state path is invalid", code="config_invalid"
@@ -866,9 +863,7 @@ def pair_node(
                     ca_file=trusted_ca,
                     state_dir_identity=state_identity,
                 )
-                save_node_config(
-                    resolved_state_dir, config, directory_fd=directory_fd
-                )
+                save_node_config(resolved_state_dir, config, directory_fd=directory_fd)
                 try:
                     _assert_directory_path_matches(resolved_state_dir, directory_fd)
                 except (OSError, RuntimeError) as exc:
@@ -899,9 +894,7 @@ class NodeRuntime:
         self.allowed_roots = normalize_allowed_roots(list(allowed_roots))
         self._allowed_root_ids: dict[Path, tuple[int, int]] = {}
         for root in self.allowed_roots:
-            descriptor, _ = _open_directory_components(
-                root, create=False, mode=None
-            )
+            descriptor, _ = _open_directory_components(root, create=False, mode=None)
             try:
                 info = os.fstat(descriptor)
                 self._allowed_root_ids[root] = (info.st_dev, info.st_ino)
@@ -958,6 +951,7 @@ class NodeRuntime:
         self._browser_grid_resize_lock = threading.RLock()
         self._fresh_grid_windows: set[str] = set()
         self._fresh_grid_windows_lock = threading.Lock()
+        self._closed_terminal_streams: dict[str, TerminalAgentStream] = {}
 
     async def handle(
         self,
@@ -968,6 +962,17 @@ class NodeRuntime:
         operation = validate_request_operation(operation)
         if operation == "terminal.attach":
             return await self._terminal_attach(payload, send)
+        if operation == "terminal.resize":
+            stream_id = validate_request_id(str(payload.get("stream_id") or ""))
+            stream = self.streams.get(stream_id) or self._closed_terminal_streams.get(stream_id)
+            if not isinstance(stream, TerminalAgentStream):
+                raise NodeAgentError("Terminal stream is unavailable", code="terminal_stream_stale")
+            result = await stream.resize(payload)
+            if stream.closed:
+                self._closed_terminal_streams[stream_id] = stream
+                if len(self._closed_terminal_streams) > 64:
+                    self._closed_terminal_streams.pop(next(iter(self._closed_terminal_streams)))
+            return OperationResult(result)
         if operation == "files.read_text.open":
             return await self._read_text_open(payload, send)
         if operation == "files.write_text.open":
@@ -1133,9 +1138,7 @@ class NodeRuntime:
             source = self._require_files_path(root, relative_path, destructive=True)
             new_name = str(payload.get("new_name") or "")
             destination = source.relative_to(root).parent / new_name
-            self._require_files_path(
-                root, destination, destructive=True, allow_missing=True
-            )
+            self._require_files_path(root, destination, destructive=True, allow_missing=True)
             self.files.rename(
                 root,
                 relative_path,
@@ -1245,9 +1248,7 @@ class NodeRuntime:
                 root_info = os.fstat(root_fd)
                 if (root_info.st_dev, root_info.st_ino) != self._allowed_root_ids[root]:
                     raise OSError("Node allowed root was replaced")
-                descriptor = _open_directory_at(
-                    root_fd, relative.parts, create=False, mode=None
-                )
+                descriptor = _open_directory_at(root_fd, relative.parts, create=False, mode=None)
             finally:
                 os.close(root_fd)
             try:
@@ -1259,13 +1260,9 @@ class NodeRuntime:
         raise OSError("Workspace is outside Node allowed roots")
 
     @contextlib.contextmanager
-    def _workspace_tmux_cwd(
-        self, path: Path, *, remote_run_id: object = None
-    ) -> Iterator[int]:
+    def _workspace_tmux_cwd(self, path: Path, *, remote_run_id: object = None) -> Iterator[int]:
         if remote_run_id is not None:
-            descriptor = os.dup(
-                self._remote_run_runtime().workspace_fd(str(remote_run_id), path)
-            )
+            descriptor = os.dup(self._remote_run_runtime().workspace_fd(str(remote_run_id), path))
             try:
                 yield descriptor
             finally:
@@ -1339,13 +1336,10 @@ class NodeRuntime:
         if allow_missing:
             target = target.resolve(strict=False)
         protected_descendants = tuple(
-            boundary
-            for boundary in self.files_private_boundaries
-            if is_within(boundary, root)
+            boundary for boundary in self.files_private_boundaries if is_within(boundary, root)
         )
         if any(
-            is_within(target, boundary)
-            or (destructive and is_within(boundary, target))
+            is_within(target, boundary) or (destructive and is_within(boundary, target))
             for boundary in protected_descendants
         ):
             raise PathBoundaryError("Path overlaps Node private state")
@@ -1366,10 +1360,14 @@ class NodeRuntime:
                 mode=None,
             )
             info = os.fstat(descriptor)
-            if expected_identity is not None and (
-                info.st_dev,
-                info.st_ino,
-            ) != expected_identity:
+            if (
+                expected_identity is not None
+                and (
+                    info.st_dev,
+                    info.st_ino,
+                )
+                != expected_identity
+            ):
                 raise OSError("Node private state directory was replaced")
             _assert_directory_path_matches(candidate, descriptor)
             os.fchmod(descriptor, 0o700)
@@ -1692,9 +1690,7 @@ class NodeRuntime:
     def _ensure_workspace(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         root = self._workspace_path(payload)
         session = self._session(payload)
-        session_missing = bool(
-            self._tmux("has-session", "-t", session, check=False).returncode
-        )
+        session_missing = bool(self._tmux("has-session", "-t", session, check=False).returncode)
         created_session = False
         if session_missing and not self._recover_workspace_from_browser_view(session):
             with self._workspace_tmux_cwd(
@@ -1703,12 +1699,11 @@ class NodeRuntime:
                 self._tmux_with_descriptors(
                     ("new-session", "-d", "-s", session, "-c", "/", "-n", "shell"),
                     (cwd_fd,),
-                    rollback=lambda _result: self._tmux(
-                        "kill-session", "-t", session, check=False
-                    ),
+                    rollback=lambda _result: self._tmux("kill-session", "-t", session, check=False),
                 )
             created_session = True
-        self._tmux("set-window-option", "-t", session, "window-size", "latest", check=False)
+        if created_session:
+            self._tmux("set-window-option", "-t", session, "window-size", "latest", check=False)
         terminals = self._list_terminals(session)
         if created_session:
             self._mark_fresh_grid_windows(terminals)
@@ -1759,9 +1754,7 @@ class NodeRuntime:
 
     def _mark_fresh_grid_windows(self, terminals: Iterable[Mapping[str, Any]]) -> None:
         with self._fresh_grid_windows_lock:
-            self._fresh_grid_windows.update(
-                str(terminal["tmux_window"]) for terminal in terminals
-            )
+            self._fresh_grid_windows.update(str(terminal["tmux_window"]) for terminal in terminals)
 
     def _fresh_grid_window(self, window: str) -> bool:
         with self._fresh_grid_windows_lock:
@@ -1843,9 +1836,7 @@ class NodeRuntime:
                         "rename-window",
                         "-t",
                         str(existing["tmux_window"]),
-                        workspace_command_history_name(
-                            safe_slot, str(existing["launch_id"])
-                        ),
+                        workspace_command_history_name(safe_slot, str(existing["launch_id"])),
                         check=False,
                     )
                 existing = None
@@ -1860,12 +1851,20 @@ class NodeRuntime:
                 ) as cwd_fd:
                     respawned = self._tmux_with_descriptors(
                         (
-                            "respawn-pane", "-k", "-c", "/",
-                            "-e", f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
-                            "-e", f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
-                            "-e", f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
-                            "-e", f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
-                            "-t", window,
+                            "respawn-pane",
+                            "-k",
+                            "-c",
+                            "/",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                            "-t",
+                            window,
                         ),
                         (cwd_fd,),
                         WORKSPACE_COMMAND_WRAPPER_ARGV,
@@ -1876,8 +1875,7 @@ class NodeRuntime:
                     )
                 if respawned.returncode:
                     raise NodeAgentError(
-                        respawned.stderr.strip()
-                        or "Workspace command Terminal could not restart",
+                        respawned.stderr.strip() or "Workspace command Terminal could not restart",
                         code="workspace_command_invalid",
                     )
 
@@ -1887,13 +1885,25 @@ class NodeRuntime:
             ) as cwd_fd:
                 created = self._tmux_with_descriptors(
                     (
-                        "new-window", "-d", "-P", "-F", "#{window_id}",
-                        "-e", f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
-                        "-e", f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
-                        "-e", f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
-                        "-e", f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
-                        "-t", session, "-n", f"run-{safe_slot + 1}",
-                        "-c", "/",
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                        "-t",
+                        session,
+                        "-n",
+                        f"run-{safe_slot + 1}",
+                        "-c",
+                        "/",
                     ),
                     (cwd_fd,),
                     WORKSPACE_COMMAND_WRAPPER_ARGV,
@@ -1983,13 +1993,20 @@ class NodeRuntime:
         session = self._session(payload)
         self._ensure_workspace(payload)
         safe_name = normalize_terminal_name(str(payload.get("name") or "shell"))
-        with self._workspace_tmux_cwd(
-            root, remote_run_id=payload.get("remote_run_id")
-        ) as cwd_fd:
+        with self._workspace_tmux_cwd(root, remote_run_id=payload.get("remote_run_id")) as cwd_fd:
             result = self._tmux_with_descriptors(
                 (
-                    "new-window", "-d", "-P", "-F", "#{window_id}",
-                    "-t", session, "-n", safe_name, "-c", "/",
+                    "new-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                    "-t",
+                    session,
+                    "-n",
+                    safe_name,
+                    "-c",
+                    "/",
                 ),
                 (cwd_fd,),
                 rollback=lambda created: self._tmux(
@@ -2036,23 +2053,15 @@ class NodeRuntime:
             try:
                 records = parse_tmux_terminal_editor_records(listed.stdout)
             except ValueError as exc:
-                raise NodeAgentError(
-                    str(exc), code="terminal_editor_invalid"
-                ) from exc
+                raise NodeAgentError(str(exc), code="terminal_editor_invalid") from exc
             existing = next((item for item in records if item["digest"] == digest), None)
             if existing is not None and not existing["dead"]:
                 terminal = next(
-                    (
-                        item
-                        for item in terminals
-                        if item["tmux_window"] == existing["tmux_window"]
-                    ),
+                    (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
                     None,
                 )
                 if terminal is None:
-                    raise NodeAgentError(
-                        "Vim Terminal is missing", code="terminal_editor_invalid"
-                    )
+                    raise NodeAgentError("Vim Terminal is missing", code="terminal_editor_invalid")
                 return {"terminal": terminal, "terminals": terminals}
             if existing is not None:
                 self._tmux("kill-window", "-t", str(existing["tmux_window"]))
@@ -2062,12 +2071,21 @@ class NodeRuntime:
             ) as cwd_fd:
                 created = self._tmux_with_descriptors(
                     (
-                        "new-window", "-d", "-P", "-F", "#{window_id}",
-                        "-e", f"TERMROOM_TERMINAL_EDITOR_FILE={normalized}",
-                        "-e", f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}",
-                        "-t", session, "-n",
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-e",
+                        f"TERMROOM_TERMINAL_EDITOR_FILE={normalized}",
+                        "-e",
+                        f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}",
+                        "-t",
+                        session,
+                        "-n",
                         normalize_terminal_name(f"vim-{Path(normalized).name}"),
-                        "-c", "/",
+                        "-c",
+                        "/",
                     ),
                     (cwd_fd,),
                     ("/bin/sh", "-c", TERMINAL_EDITOR_WRAPPER),
@@ -2099,9 +2117,7 @@ class NodeRuntime:
                 self._tmux("kill-window", "-t", window, check=False)
                 raise
             terminals = self._ensure_workspace(payload)
-            terminal = next(
-                (item for item in terminals if item["tmux_window"] == window), None
-            )
+            terminal = next((item for item in terminals if item["tmux_window"] == window), None)
             if terminal is None:
                 raise NodeAgentError(
                     "Vim Terminal disappeared while starting",
@@ -2266,6 +2282,19 @@ class NodeRuntime:
         except Exception:
             self._tmux("kill-session", "-t", view_session, check=False)
             raise
+
+        def cleanup_view() -> bool:
+            self._tmux("kill-session", "-t", view_session, check=False)
+            return self._tmux("has-session", "-t", view_session, check=False).returncode != 0
+
+        def freeze_view_grid() -> bool:
+            flags = self._tmux(
+                "list-clients", "-t", view_session, "-F", "#{client_flags}", check=False
+            ).stdout
+            if "ignore-size" in flags.strip().split(","):
+                return True
+            return freeze_tmux_window_size(self._tmux, window)
+
         stream = TerminalAgentStream(
             stream_id,
             process_pid,
@@ -2276,11 +2305,19 @@ class NodeRuntime:
                 view_session, enabled=enabled
             ),
             grid_resize_applied=(
-                lambda: self._complete_fresh_grid_window(window)
-                if bootstrap_grid
-                else None
+                (lambda: self._complete_fresh_grid_window(window)) if bootstrap_grid else None
             ),
-            cleanup=lambda: self._tmux("kill-session", "-t", view_session, check=False),
+            cleanup=cleanup_view,
+            freeze_grid=freeze_view_grid,
+            wait_grid_resize=lambda rows, cols: wait_tmux_browser_grid_size(
+                lambda: (
+                    self._tmux(
+                        "list-clients", "-t", view_session, "-F", TMUX_BROWSER_SIZE_FORMAT
+                    ).stdout
+                ),
+                rows=rows,
+                cols=cols,
+            ),
         )
         self.streams[stream_id] = stream
         return OperationResult(
@@ -2360,21 +2397,15 @@ class NodeRuntime:
         relative_path = str(payload.get("path") or "")
         self._require_files_path(root, relative_path)
         target = self.files.resolve_regular_file(root, relative_path)
-        parent_fd, _ = _open_directory_components(
-            target.parent, create=False, mode=None
-        )
+        parent_fd, _ = _open_directory_components(target.parent, create=False, mode=None)
         file_fd = -1
         try:
-            file_fd = os.open(
-                target.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
-            )
+            file_fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
             info = os.fstat(file_fd)
-            current = os.stat(
-                target.name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if (
-                not stat_module.S_ISREG(info.st_mode)
-                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+            current = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat_module.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (
+                current.st_dev,
+                current.st_ino,
             ):
                 raise NodeAgentError("Download path changed", code="path_changed")
             offset = max(0, min(int(payload.get("offset") or 0), info.st_size))
@@ -2405,14 +2436,10 @@ class NodeRuntime:
             root, Path(parent) / filename, destructive=True, allow_missing=True
         )
         target = self.files.upload_target(root, parent, filename)
-        parent_fd, _ = _open_directory_components(
-            target.parent, create=False, mode=None
-        )
+        parent_fd, _ = _open_directory_components(target.parent, create=False, mode=None)
         try:
             try:
-                existing = os.stat(
-                    target.name, dir_fd=parent_fd, follow_symlinks=False
-                )
+                existing = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 existing = None
             if existing is not None and not stat_module.S_ISREG(existing.st_mode):
@@ -2526,9 +2553,7 @@ class NodeRuntime:
             if current >= 0:
                 os.close(current)
 
-    def _file_run_metadata_fd(
-        self, workspace_id: str, run_id: str, *, create: bool
-    ) -> int | None:
+    def _file_run_metadata_fd(self, workspace_id: str, run_id: str, *, create: bool) -> int | None:
         self._assert_file_run_root()
         root_fd = self.file_run_root_fd
         assert root_fd is not None
@@ -2658,15 +2683,11 @@ class NodeRuntime:
         return True
 
     def _file_run_dispatch_time(self, metadata_dir: Path, run_id: str) -> float | None:
-        directory_fd = self._file_run_metadata_fd(
-            metadata_dir.parent.name, run_id, create=False
-        )
+        directory_fd = self._file_run_metadata_fd(metadata_dir.parent.name, run_id, create=False)
         if directory_fd is None:
             return None
         try:
-            _content, modified_at = self._read_file_run_leaf(
-                directory_fd, "request-id", limit=4096
-            )
+            _content, modified_at = self._read_file_run_leaf(directory_fd, "request-id", limit=4096)
             return modified_at
         except (FileNotFoundError, OSError, NodeAgentError):
             return None
@@ -2709,9 +2730,7 @@ class NodeRuntime:
             raise UnsupportedFileError("File Run path must be Workspace-relative")
         with self._workspace_tmux_cwd(root, remote_run_id=remote_run_id) as workspace_fd:
             parent_fd = (
-                _open_directory_at(
-                    workspace_fd, components[:-1], create=False, mode=None
-                )
+                _open_directory_at(workspace_fd, components[:-1], create=False, mode=None)
                 if len(components) > 1
                 else os.dup(workspace_fd)
             )
@@ -2741,13 +2760,10 @@ class NodeRuntime:
                 try:
                     bytes(content).decode("utf-8")
                 except UnicodeDecodeError as exc:
-                    raise UnsupportedFileError(
-                        "Only UTF-8 text files can be executed"
-                    ) from exc
+                    raise UnsupportedFileError("Only UTF-8 text files can be executed") from exc
                 after = os.fstat(source_fd)
-                current = os.stat(
-                    components[-1], dir_fd=parent_fd, follow_symlinks=False
-                )
+                current = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
+
                 def signature(info: os.stat_result) -> tuple[int, ...]:
                     return (
                         info.st_dev,
@@ -2759,9 +2775,8 @@ class NodeRuntime:
                         info.st_mtime_ns,
                         info.st_ctime_ns,
                     )
-                if signature(before) != signature(after) or signature(after) != signature(
-                    current
-                ):
+
+                if signature(before) != signature(after) or signature(after) != signature(current):
                     raise FileConflictError("The file changed before execution")
                 digest = hashlib.sha256(content).hexdigest()
                 if digest != expected_digest:
@@ -2800,9 +2815,7 @@ class NodeRuntime:
         runner_fd = -1
         try:
             try:
-                content, _ = self._read_file_run_leaf(
-                    directory_fd, "request-id", limit=4096
-                )
+                content, _ = self._read_file_run_leaf(directory_fd, "request-id", limit=4096)
             except FileNotFoundError:
                 content = None
             if content is not None and content.decode("utf-8").strip() != run_id:
@@ -2811,23 +2824,26 @@ class NodeRuntime:
                     code="file_run_state_invalid",
                 )
             _atomic_private_write(
-                Path("request-id"), (run_id + "\n").encode("utf-8"),
-                mode=0o600, directory_fd=directory_fd,
+                Path("request-id"),
+                (run_id + "\n").encode("utf-8"),
+                mode=0o600,
+                directory_fd=directory_fd,
             )
             _atomic_private_write(
                 Path("request.json"),
                 json.dumps(dict(request_record), ensure_ascii=False, separators=(",", ":")).encode(
                     "utf-8"
                 ),
-                mode=0o600, directory_fd=directory_fd,
+                mode=0o600,
+                directory_fd=directory_fd,
             )
             _atomic_private_write(
-                Path("runner.sh"), FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"),
-                mode=0o700, directory_fd=directory_fd,
+                Path("runner.sh"),
+                FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"),
+                mode=0o700,
+                directory_fd=directory_fd,
             )
-            runner_fd = _open_private_state_file(
-                directory_fd, "runner.sh", os.O_RDONLY
-            )
+            runner_fd = _open_private_state_file(directory_fd, "runner.sh", os.O_RDONLY)
             info = os.fstat(runner_fd)
             if (
                 not stat_module.S_ISREG(info.st_mode)
@@ -2881,9 +2897,7 @@ class NodeRuntime:
             relative = path.parent.relative_to(self.file_run_root) if self.file_run_root else None
             if relative is None or len(relative.parts) != 2:
                 return None
-            directory_fd = self._file_run_metadata_fd(
-                relative.parts[0], run_id, create=False
-            )
+            directory_fd = self._file_run_metadata_fd(relative.parts[0], run_id, create=False)
             if directory_fd is None:
                 return None
             content, _ = self._read_file_run_leaf(directory_fd, path.name)
@@ -2960,9 +2974,7 @@ class NodeRuntime:
 
         with self._file_run_lock(workspace_id):
             metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
-            existing_metadata_fd = self._file_run_metadata_fd(
-                workspace_id, run_id, create=False
-            )
+            existing_metadata_fd = self._file_run_metadata_fd(workspace_id, run_id, create=False)
             if existing_metadata_fd is not None:
                 os.close(existing_metadata_fd)
                 stored_request = self._read_file_run_record(metadata_dir / "request.json", run_id)
@@ -3025,18 +3037,23 @@ class NodeRuntime:
                 raise
             try:
                 self._ensure_workspace(payload)
-                self._assert_file_run_execution_handles(
-                    metadata_dir, metadata_fd, runner_fd
-                )
+                self._assert_file_run_execution_handles(metadata_dir, metadata_fd, runner_fd)
                 windows = self._list_terminals(session)
-                terminal = next(
-                    (item for item in windows if item.get("role") == "file_run"), None
-                )
+                terminal = next((item for item in windows if item.get("role") == "file_run"), None)
                 created = terminal is None
                 if terminal is None:
                     result = self._tmux(
-                        "new-window", "-d", "-P", "-F", "#{window_id}",
-                        "-t", session, "-n", "Run", "-c", "/",
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-t",
+                        session,
+                        "-n",
+                        "Run",
+                        "-c",
+                        "/",
                     )
                     terminal = {
                         "tmux_window": result.stdout.strip(),
@@ -3079,9 +3096,7 @@ class NodeRuntime:
                 with self._workspace_tmux_cwd(
                     root, remote_run_id=payload.get("remote_run_id")
                 ) as cwd_fd:
-                    self._assert_file_run_execution_handles(
-                        metadata_dir, metadata_fd, runner_fd
-                    )
+                    self._assert_file_run_execution_handles(metadata_dir, metadata_fd, runner_fd)
                     runner_exec_fd = _make_sealed_memfd(
                         FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"),
                         "termroom-file-runner",
@@ -3226,9 +3241,7 @@ class NodeRuntime:
                 },
                 windows,
             )
-        metadata_fd = self._file_run_metadata_fd(
-            metadata_dir.parent.name, run_id, create=False
-        )
+        metadata_fd = self._file_run_metadata_fd(metadata_dir.parent.name, run_id, create=False)
         force_stopped = False
         if metadata_fd is not None:
             try:
@@ -3273,9 +3286,7 @@ class NodeRuntime:
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))
         with self._file_run_lock(workspace_id):
-            metadata_fd = self._file_run_metadata_fd(
-                workspace_id, run_id, create=False
-            )
+            metadata_fd = self._file_run_metadata_fd(workspace_id, run_id, create=False)
             if metadata_fd is None:
                 return False
             with contextlib.ExitStack() as cleanup:
@@ -3295,8 +3306,7 @@ class NodeRuntime:
                     (
                         item
                         for item in self._list_terminals(session)
-                        if item.get("role") == "file_run"
-                        and item.get("managed_run_id") == run_id
+                        if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
                     ),
                     None,
                 )
@@ -3832,6 +3842,8 @@ class TerminalAgentStream:
         set_grid_resize: Callable[[bool], bool] | None = None,
         grid_resize_applied: Callable[[], object] | None = None,
         cleanup: Callable[[], object] | None = None,
+        wait_grid_resize: Callable[[int, int], bool] | None = None,
+        freeze_grid: Callable[[], bool] | None = None,
     ) -> None:
         self.stream_id = stream_id
         self.process_pid = process_pid
@@ -3841,9 +3853,129 @@ class TerminalAgentStream:
         self.set_grid_resize = set_grid_resize
         self.grid_resize_applied = grid_resize_applied
         self.cleanup = cleanup
+        self.wait_grid_resize = wait_grid_resize
+        self.freeze_grid = freeze_grid
         self.grid_active = False
         self.last_viewport: tuple[int, int] | None = None
         self.closed = False
+        self.resize_lock = asyncio.Lock()
+        self.resize_revision = 0
+        self.resize_payload: dict[str, Any] | None = None
+        self.resize_result: dict[str, Any] | None = None
+        self.cleanup_confirmed = False
+
+    async def resize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        values = {
+            key: payload.get(key)
+            for key in ("stream_id", "revision", "rows", "cols", "affects_grid", "bootstrap")
+        }
+        revision, rows, cols = values["revision"], values["rows"], values["cols"]
+        if (
+            values["stream_id"] != self.stream_id
+            or type(revision) is not int
+            or not 1 <= revision <= 2**31 - 1
+            or type(rows) is not int
+            or not 4 <= rows <= 500
+            or type(cols) is not int
+            or not 20 <= cols <= 1000
+            or type(values["affects_grid"]) is not bool
+            or type(values["bootstrap"]) is not bool
+            or (values["bootstrap"] and not values["affects_grid"])
+        ):
+            raise NodeAgentError("Terminal resize is invalid", code="terminal_resize_invalid")
+        async with self.resize_lock:
+            if revision == self.resize_revision and values == self.resize_payload:
+                assert self.resize_result is not None
+                return dict(self.resize_result)
+            if revision <= self.resize_revision or self.closed:
+                raise NodeAgentError("Terminal resize is stale", code="terminal_resize_stale")
+            if values["bootstrap"] and self.grid_resize_applied is None:
+                raise NodeAgentError("Terminal bootstrap is stale", code="terminal_resize_stale")
+            self.resize_revision = revision
+            self.resize_payload = values
+            outcome = {
+                **values,
+                "ok": False,
+                "shared_applied": False,
+                "viewport_applied": False,
+                "passive_restored": False,
+                "bootstrap_consumed": False,
+                "grid_active": self.grid_active,
+                "retryable": True,
+                "cleanup_confirmed": False,
+            }
+            self.resize_result = outcome
+            affects_grid = values["affects_grid"]
+            try:
+                if affects_grid != self.grid_active or affects_grid:
+                    if self.set_grid_resize is not None and not await asyncio.to_thread(
+                        self.set_grid_resize, affects_grid
+                    ):
+                        if self.grid_active and not affects_grid:
+                            await self.close()
+                            outcome.update(
+                                retryable=False,
+                                cleanup_confirmed=self.cleanup_confirmed,
+                                grid_active=self.grid_active and not self.cleanup_confirmed,
+                            )
+                        return dict(outcome)
+                    self.grid_active = affects_grid
+                viewport = (rows, cols)
+                if viewport != self.last_viewport:
+                    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                    await asyncio.to_thread(
+                        fcntl.ioctl, self.master_fd, termios.TIOCSWINSZ, winsize
+                    )
+                    os.killpg(self.process_pid, signal.SIGWINCH)
+                    self.last_viewport = viewport
+                outcome["viewport_applied"] = True
+                if (
+                    affects_grid
+                    and self.wait_grid_resize is not None
+                    and not await asyncio.to_thread(self.wait_grid_resize, rows, cols)
+                ):
+                    raise NodeAgentError(
+                        "Terminal grid resize was not applied", code="terminal_resize_failed"
+                    )
+                outcome["shared_applied"] = affects_grid
+                if affects_grid and self.grid_resize_applied is not None:
+                    await asyncio.to_thread(self.grid_resize_applied)
+                    self.grid_resize_applied = None
+                    outcome["bootstrap_consumed"] = True
+                if values["bootstrap"]:
+                    if self.freeze_grid is not None and not await asyncio.to_thread(
+                        self.freeze_grid
+                    ):
+                        raise NodeAgentError(
+                            "Terminal grid freeze failed", code="terminal_resize_failed"
+                        )
+                    if self.set_grid_resize is not None and not await asyncio.to_thread(
+                        self.set_grid_resize, False
+                    ):
+                        await self.close()
+                        outcome.update(
+                            retryable=False,
+                            cleanup_confirmed=self.cleanup_confirmed,
+                            grid_active=self.grid_active and not self.cleanup_confirmed,
+                        )
+                        return dict(outcome)
+                    self.grid_active = False
+                outcome.update(ok=True, passive_restored=not self.grid_active, retryable=False)
+            except (OSError, NodeAgentError):
+                if outcome["shared_applied"]:
+                    await self.close()
+                    outcome.update(retryable=False, cleanup_confirmed=self.cleanup_confirmed)
+                elif self.grid_active:
+                    if self.set_grid_resize is not None and await asyncio.to_thread(
+                        self.set_grid_resize, False
+                    ):
+                        self.grid_active = False
+                    else:
+                        await self.close()
+                        outcome.update(retryable=False, cleanup_confirmed=self.cleanup_confirmed)
+            finally:
+                outcome["grid_active"] = self.grid_active and not self.cleanup_confirmed
+            return dict(outcome)
 
     async def start(self) -> None:
         try:
@@ -3868,49 +4000,34 @@ class TerminalAgentStream:
             await asyncio.to_thread(os.write, self.master_fd, chunk)
 
     async def control(self, kind: str, values: Mapping[str, Any]) -> None:
-        if self.closed or kind != "resize":
-            return
-        affects_grid = values.get("affects_grid", False)
-        if type(affects_grid) is not bool:
+        if kind == "resize":
             raise NodeAgentError(
-                "Terminal resize control is invalid", code="stream_control_invalid"
+                "Terminal resize requires an acknowledged request",
+                code="terminal_resize_unacknowledged",
             )
-        role_changed = affects_grid != self.grid_active
-        sync_grid_role = role_changed or affects_grid
-        if sync_grid_role:
-            if self.set_grid_resize is not None and not await asyncio.to_thread(
-                self.set_grid_resize, affects_grid
-            ):
-                return
-            self.grid_active = affects_grid
-        rows = max(4, min(int(values.get("rows") or 24), 500))
-        cols = max(20, min(int(values.get("cols") or 80), 1000))
-        viewport = (rows, cols)
-        if viewport == self.last_viewport and not (sync_grid_role and affects_grid):
-            return
-        winsize = struct.pack("HHHH", rows, cols, 0, 0)
-        await asyncio.to_thread(fcntl.ioctl, self.master_fd, termios.TIOCSWINSZ, winsize)
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(self.process_pid, signal.SIGWINCH)
-        self.last_viewport = viewport
-        if affects_grid and self.grid_resize_applied is not None:
-            callback = self.grid_resize_applied
-            self.grid_resize_applied = None
-            await asyncio.to_thread(callback)
 
     async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
         self.registry.pop(self.stream_id, None)
+        if self.grid_active and self.freeze_grid is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.freeze_grid)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(self.process_pid, signal.SIGTERM)
-        await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0)
+        if not await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process_pid, signal.SIGKILL)
+            await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0)
         with contextlib.suppress(OSError):
             os.close(self.master_fd)
         if self.cleanup is not None:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(self.cleanup)
+            try:
+                result = await asyncio.to_thread(self.cleanup)
+                self.cleanup_confirmed = result is True
+            except Exception:
+                self.cleanup_confirmed = False
 
 
 class TextDownloadAgentStream:
@@ -3991,9 +4108,9 @@ class DownloadAgentStream:
         try:
             opened = os.fstat(self.file_fd)
             current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
-            if (
-                not stat_module.S_ISREG(current.st_mode)
-                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            if not stat_module.S_ISREG(current.st_mode) or (opened.st_dev, opened.st_ino) != (
+                current.st_dev,
+                current.st_ino,
             ):
                 raise NodeAgentError("Download path changed", code="path_changed")
             descriptor = self.file_fd
@@ -4115,9 +4232,7 @@ class UploadAgentStream:
                 )
             except FileNotFoundError:
                 current = None
-            identity = (
-                (current.st_dev, current.st_ino) if current is not None else None
-            )
+            identity = (current.st_dev, current.st_ino) if current is not None else None
             if identity != self.existing_identity:
                 if not self.overwrite and current is not None:
                     raise FileExistsError(self.target_name)
@@ -4514,6 +4629,15 @@ class NodeAgent:
                         "result": result.value,
                     }
                 )
+                if (
+                    operation == "terminal.resize"
+                    and result.value.get("ok") is False
+                    and result.value.get("retryable") is False
+                    and result.value.get("grid_active") is True
+                    and result.value.get("cleanup_confirmed") is False
+                    and self._socket is not None
+                ):
+                    await self._socket.close(code=1011, reason="Terminal view cleanup failed")
                 if result.start is not None:
                     self._start_request_task(result.start())
             finally:
@@ -4696,9 +4820,7 @@ def _atomic_private_write(
             mode=mode,
         )
         if current_state != expected_state:
-            raise NodeAgentError(
-                "Private state file changed during write", code=error_code
-            )
+            raise NodeAgentError("Private state file changed during write", code=error_code)
         if expected_state is None:
             try:
                 os.link(
@@ -4732,9 +4854,7 @@ def _atomic_private_write(
             written_info.st_dev,
             written_info.st_ino,
         ):
-            raise NodeAgentError(
-                "Private state file changed during publication", code=error_code
-            )
+            raise NodeAgentError("Private state file changed during publication", code=error_code)
         os.fsync(directory_fd)
     finally:
         if fd >= 0:

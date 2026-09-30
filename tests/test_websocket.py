@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -128,9 +131,7 @@ def test_terminal_presence_deduplicates_tabs_in_same_session(tmp_path: Path) -> 
             assert login.status_code == 200
             headers = {"origin": "http://testserver"}
 
-            with client.websocket_connect(
-                f"/ws/terminal/{terminal_id}", headers=headers
-            ) as first:
+            with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as first:
                 first.receive_text()
                 assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
 
@@ -139,10 +140,7 @@ def test_terminal_presence_deduplicates_tabs_in_same_session(tmp_path: Path) -> 
                 ) as second:
                     second.receive_text()
                     assert app.state.terminals.control.client_count(terminal_id) == 2
-                    assert (
-                        client.get(f"/api/terminals/{terminal_id}/presence").json()["count"]
-                        == 1
-                    )
+                    assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
 
                 assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
     finally:
@@ -169,9 +167,7 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
         with TestClient(app, base_url="http://testserver") as client:
             client.post("/login", data={"password": "correct-password"})
             headers = {"origin": "http://testserver"}
-            with client.websocket_connect(
-                f"/ws/terminal/{terminal_id}", headers=headers
-            ) as first:
+            with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as first:
                 first.receive_text()
                 with client.websocket_connect(
                     f"/ws/terminal/{terminal_id}", headers=headers
@@ -199,9 +195,7 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
 
                     second.send_text(f"printf '%s\\n' '{marker}'\r")
                     deadline = time.monotonic() + 2
-                    while marker not in app.state.terminals.capture_scrollback(
-                        workspace, terminal
-                    ):
+                    while marker not in app.state.terminals.capture_scrollback(workspace, terminal):
                         assert time.monotonic() < deadline
                         time.sleep(0.01)
                     assert control.can_resize(terminal_id, first_id)
@@ -234,6 +228,7 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
         return True
 
     monkeypatch.setattr(app.state.terminals, "_set_window_size", record_size)
+    monkeypatch.setattr(app.state.terminals, "_wait_browser_view_size", lambda *a, **kw: True)
     monkeypatch.setattr(
         app.state.terminals,
         "_set_browser_view_grid_resize",
@@ -291,10 +286,8 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
                         }
                     )
                     time.sleep(0.05)
-                    # The first browser already owns a freshly created grid for
-                    # its one bootstrap resize. Typing on that same browser
-                    # converts bootstrap ownership into input ownership without
-                    # needlessly applying the identical PTY size a second time.
+                    # Completed bootstrap is passive. Input promotes its role,
+                    # but the already-applied identical dimensions are a no-op.
                     assert applied_sizes.count((37, 111)) == 1
 
                     second.send_json({"kind": "resize", "rows": 30, "cols": 90})
@@ -318,7 +311,244 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
                     # Promotion now demotes the previous tmux peer atomically inside
                     # the True transition, so the passive bridge does not need a
                     # later, separate False transition of its own.
-                    assert grid_roles == [True, True]
+                    assert grid_roles == [True, False, True, True]
+    finally:
+        _cleanup(app, workspace)
+
+
+def test_terminal_one_shot_bootstrap_passive_resize_input_and_reconnect(tmp_path: Path) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    terminal_id = str(terminal["id"])
+    ready = tmp_path / "ready"
+    effect = tmp_path / "effect"
+    command = (
+        f"printf ready > {shlex.quote(str(ready))}; "
+        f"IFS= read -r -n 1 value; printf '%s' \"$value\" > {shlex.quote(str(effect))}"
+    )
+    manager._run_tmux(
+        "send-keys",
+        "-t",
+        str(terminal["tmux_window"]),
+        "-l",
+        f"/bin/bash --noprofile --norc -c {shlex.quote(command)}",
+    )
+    manager._run_tmux("send-keys", "-t", str(terminal["tmux_window"]), "Enter")
+
+    def wait_for(predicate) -> None:  # type: ignore[no-untyped-def]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError("Terminal state did not settle")
+
+    def grid() -> str:
+        return manager._run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            terminal["tmux_window"],
+            "#{window_width}x#{window_height}",
+        ).stdout.strip()
+
+    try:
+        wait_for(ready.exists)
+        with TestClient(app, base_url="http://testserver") as client:
+            client.post("/login", data={"password": "correct-password"})
+            headers = {"origin": "http://testserver"}
+            with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws:
+                ws.receive_text()
+                owner = manager.control._clients[terminal_id][0]
+                # tmux reserves one status row: viewport 124x23 -> pane 124x22.
+                ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
+                wait_for(
+                    lambda: (
+                        grid() == "124x22" and not manager.control.can_resize(terminal_id, owner)
+                    )
+                )
+                assert manager.control.presence(terminal_id)["input_revision"] == 0
+                ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
+                ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
+                time.sleep(0.1)
+                assert grid() == "124x22"
+                assert (
+                    "ignore-size"
+                    in manager._run_tmux(
+                        "list-clients", "-t", f"termroom-view-{owner}", "-F", "#{client_flags}"
+                    ).stdout
+                )
+                ws.send_json(
+                    {"kind": "input", "data": "z", "rows": 18, "cols": 124, "user_input": True}
+                )
+                wait_for(lambda: effect.exists() and grid() == "124x17")
+                assert effect.read_text() == "z"
+                assert manager.control.presence(terminal_id)["input_revision"] == 1
+                assert manager.control.can_resize(terminal_id, owner)
+            with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws:
+                ws.receive_text()
+                ws.send_json({"kind": "resize", "rows": 30, "cols": 90})
+                time.sleep(0.1)
+                assert grid() == "124x17"
+                assert effect.read_text() == "z"
+    finally:
+        _cleanup(app, workspace)
+
+
+@pytest.mark.parametrize("failure", ["enable", "demote"])
+def test_terminal_bootstrap_role_failure_retry_or_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    terminal_id = str(terminal["id"])
+    original = manager._set_browser_view_grid_resize
+    attempts: list[bool] = []
+
+    def role(view: str, *, enabled: bool) -> bool:
+        attempts.append(enabled)
+        if failure == "enable" and len(attempts) == 1:
+            return False
+        if failure == "demote" and not enabled:
+            return False
+        return original(view, enabled=enabled)
+
+    monkeypatch.setattr(manager, "_set_browser_view_grid_resize", role)
+    try:
+        with TestClient(app, base_url="http://testserver") as client:
+            client.post("/login", data={"password": "correct-password"})
+            headers = {"origin": "http://testserver"}
+            expected_error = (
+                pytest.raises(WebSocketDisconnect)
+                if failure == "demote"
+                else contextlib.nullcontext()
+            )
+            with (
+                expected_error,
+                client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws,
+            ):
+                ws.receive_text()
+                ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
+                deadline = time.monotonic() + 3
+                while not attempts and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if failure == "enable":
+                    assert manager.control.can_resize(
+                        terminal_id, manager.control._clients[terminal_id][0]
+                    )
+                    ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
+                deadline = time.monotonic() + 3
+                while False not in attempts and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert False in attempts
+                if failure == "demote":
+                    while True:
+                        ws.receive_text()
+            with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws:
+                ws.receive_text()
+                assert not manager.control.can_resize(
+                    terminal_id, manager.control._clients[terminal_id][0]
+                )
+                ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
+                time.sleep(0.1)
+                size = manager._run_tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    terminal["tmux_window"],
+                    "#{window_width}x#{window_height}",
+                ).stdout.strip()
+                assert size == "124x22"
+    finally:
+        _cleanup(app, workspace)
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_terminal_input_waits_for_grid_promotion_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binary: bool
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    terminal_id = str(terminal["id"])
+    effect = tmp_path / "effect"
+    ready = tmp_path / "ready"
+    command = "bash -c " + shlex.quote(
+        f"printf ready > {shlex.quote(str(ready))}; "
+        f'read -r -n1 value; printf %s "$value" > {shlex.quote(str(effect))}'
+    )
+    manager._run_tmux("send-keys", "-t", terminal["tmux_window"], command, "Enter")
+    original_role = manager._set_browser_view_grid_resize
+    original_write = os.write
+    failed = False
+    writes: list[bytes] = []
+
+    def grid() -> str:
+        return manager._run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            terminal["tmux_window"],
+            "#{window_width}x#{window_height}",
+        ).stdout.strip()
+
+    def role(view: str, *, enabled: bool) -> bool:
+        nonlocal failed
+        if enabled and not failed and manager.control.presence(terminal_id)["input_revision"]:
+            failed = True
+            return False
+        return original_role(view, enabled=enabled)
+
+    def write(fd: int, data: bytes) -> int:
+        if data == b"z":
+            assert grid() == "124x17"
+            writes.append(data)
+        return original_write(fd, data)
+
+    monkeypatch.setattr(manager, "_set_browser_view_grid_resize", role)
+    monkeypatch.setattr(os, "write", write)
+    try:
+        with TestClient(app, base_url="http://testserver") as client:
+            client.post("/login", data={"password": "correct-password"})
+            with client.websocket_connect(
+                f"/ws/terminal/{terminal_id}", headers={"origin": "http://testserver"}
+            ) as ws:
+                ws.receive_text()
+                ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
+                deadline = time.monotonic() + 3
+                while (grid() != "124x22" or not ready.exists()) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert grid() == "124x22" and ready.exists()
+                ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
+                payload = {
+                    "kind": "input",
+                    "data": "z",
+                    "rows": 18,
+                    "cols": 124,
+                    "user_input": True,
+                }
+                if binary:
+                    ws.send_bytes(b"z")
+                else:
+                    ws.send_json(payload)
+                deadline = time.monotonic() + 3
+                while not failed and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                time.sleep(0.1)
+                assert failed and not effect.exists() and not writes
+                assert grid() == "124x22"
+                assert manager.control.presence(terminal_id)["input_revision"] == 1
+                if binary:
+                    ws.send_bytes(b"z")
+                else:
+                    ws.send_json(payload)
+                deadline = time.monotonic() + 3
+                while not effect.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert effect.read_text() == "z" and writes == [b"z"]
+                assert manager.control.presence(terminal_id)["input_revision"] == 2
+                ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
+                time.sleep(0.1)
+                assert grid() == "124x17" and writes == [b"z"]
     finally:
         _cleanup(app, workspace)
 

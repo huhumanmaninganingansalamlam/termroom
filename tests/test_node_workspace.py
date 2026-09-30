@@ -26,6 +26,7 @@ from termroom.node_agent import (
     NodeAgentError,
     NodeConfig,
     NodeRuntime,
+    TerminalAgentStream,
     ensure_node_identity,
     node_session_is_valid,
     normalize_allowed_roots,
@@ -57,6 +58,143 @@ def _payload(workspace: Path, **values: Any) -> dict[str, Any]:
         "tmux_session": f"termroom-node-test-{uuid.uuid4().hex[:12]}",
         **values,
     }
+
+
+def _terminal_resize_ack(payload: dict[str, Any]) -> dict[str, Any]:
+    active = payload["affects_grid"] and not payload["bootstrap"]
+    return {
+        **payload,
+        "ok": True,
+        "shared_applied": payload["affects_grid"],
+        "viewport_applied": True,
+        "passive_restored": not active,
+        "bootstrap_consumed": payload["bootstrap"],
+        "grid_active": active,
+        "retryable": False,
+        "cleanup_confirmed": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["none", "enable", "apply", "demote", "cleanup"])
+async def test_node_terminal_resize_bootstrap_ack_failure_retry_and_idempotency(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    events: list[Any] = []
+    failed_once = False
+
+    def role(enabled: bool) -> bool:
+        nonlocal failed_once
+        events.append(("role", enabled))
+        if failure == "enable" and enabled and not failed_once:
+            failed_once = True
+            return False
+        return enabled or failure not in {"demote", "cleanup"}
+
+    def ioctl(*_args: Any) -> None:
+        nonlocal failed_once
+        events.append("apply")
+        if failure == "apply" and not failed_once:
+            failed_once = True
+            raise OSError("resize failed before apply")
+
+    async def send(_message: Any) -> None:
+        return None
+
+    monkeypatch.setattr(node_agent.fcntl, "ioctl", ioctl)
+    monkeypatch.setattr(node_agent.os, "killpg", lambda *args: events.append(("signal", args)))
+    monkeypatch.setattr(node_agent, "_wait_for_pid", lambda *_args: True)
+    stream = TerminalAgentStream(
+        "d" * 32,
+        -1,
+        -1,
+        send,
+        {},
+        set_grid_resize=role,
+        grid_resize_applied=lambda: events.append("consumed"),
+        cleanup=lambda: failure != "cleanup",
+        wait_grid_resize=lambda *_args: True,
+    )
+    payload = {
+        "stream_id": stream.stream_id,
+        "revision": 1,
+        "rows": 22,
+        "cols": 124,
+        "affects_grid": True,
+        "bootstrap": True,
+    }
+    result = await stream.resize(payload)
+    before_duplicate = list(events)
+    assert await stream.resize(payload) == result
+    assert events == before_duplicate
+    with pytest.raises(NodeAgentError, match="stale"):
+        await stream.resize({**payload, "cols": 125})
+    if failure in {"enable", "apply"}:
+        assert not result["ok"] and result["retryable"]
+        assert not result["shared_applied"] and not result["bootstrap_consumed"]
+        assert stream.grid_resize_applied is not None
+        result = await stream.resize({**payload, "revision": 2})
+        assert result["ok"]
+    elif failure in {"demote", "cleanup"}:
+        assert not result["ok"] and not result["retryable"]
+        assert result["shared_applied"] and result["bootstrap_consumed"]
+        assert not result["passive_restored"] and stream.closed
+        assert result["cleanup_confirmed"] == (failure == "demote")
+        assert result["grid_active"] == (failure == "cleanup")
+        return
+    assert result["ok"] and result["shared_applied"]
+    assert result["passive_restored"] and not result["grid_active"]
+    assert events.index("consumed") < len(events) - 1
+    assert events[-1] == ("role", False)
+    with pytest.raises(NodeAgentError) as unacknowledged:
+        await stream.control("resize", payload)
+    assert unacknowledged.value.code == "terminal_resize_unacknowledged"
+    passive = await stream.resize(
+        {**payload, "revision": 3, "rows": 17, "affects_grid": False, "bootstrap": False}
+    )
+    assert passive["ok"] and not passive["shared_applied"]
+    active = await stream.resize({**payload, "revision": 4, "rows": 17, "bootstrap": False})
+    assert active["ok"] and active["grid_active"]
+    with pytest.raises(NodeAgentError) as stale:
+        await stream.resize({**payload, "revision": 3})
+    assert stale.value.code == "terminal_resize_stale"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rows", 3),
+        ("rows", True),
+        ("cols", 1001),
+        ("revision", 2**31),
+        ("revision", True),
+        ("affects_grid", "true"),
+        ("stream_id", "wrong"),
+    ],
+)
+async def test_node_terminal_resize_rejects_invalid_identity_without_backend_effect(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    async def send(_message: Any) -> None:
+        return None
+
+    def unexpected(*_args: Any) -> bool:
+        raise AssertionError("Invalid request reached backend")
+
+    stream = TerminalAgentStream("e" * 32, -1, -1, send, {}, set_grid_resize=unexpected)
+    payload = {
+        "stream_id": stream.stream_id,
+        "revision": 1,
+        "rows": 22,
+        "cols": 124,
+        "affects_grid": True,
+        "bootstrap": False,
+        field: value,
+    }
+    with pytest.raises(NodeAgentError) as invalid:
+        await stream.resize(payload)
+    assert invalid.value.code == "terminal_resize_invalid"
 
 
 def _node_runtime_with_private_state(home: Path) -> tuple[NodeRuntime, Path]:
@@ -231,9 +369,7 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
             "include_noise": False,
         },
     )
-    assert [entry["relative_path"] for entry in search["entries"]] == [
-        "src/deep/node-needle.txt"
-    ]
+    assert [entry["relative_path"] for entry in search["entries"]] == ["src/deep/node-needle.txt"]
     assert search["skipped_noise"] == 1
     assert search["truncated"] is False
     recent = runtime._handle_sync("files.recent", {"workspace_path": str(workspace), "limit": 5})
@@ -344,9 +480,7 @@ def test_node_workspace_admission_rejects_private_roots_but_allows_home_and_mana
         remote_run_root=remote_run_root,
     )
     boundaries = runtime.source_private_boundaries
-    assert runtime._handle_sync("workspace.validate", {"path": str(home)})["path"] == str(
-        home
-    )
+    assert runtime._handle_sync("workspace.validate", {"path": str(home)})["path"] == str(home)
 
     normal_payload = _payload(home)
     session_names = [str(normal_payload["tmux_session"])]
@@ -525,9 +659,9 @@ async def test_node_private_state_is_excluded_from_files_and_file_run(tmp_path: 
         "workspace_path": str(run_work),
         "remote_run_id": run_id,
     }
-    managed_entries = runtime._handle_sync(
-        "files.list", {**managed_payload, "path": "."}
-    )["entries"]
+    managed_entries = runtime._handle_sync("files.list", {**managed_payload, "path": "."})[
+        "entries"
+    ]
     assert [entry["name"] for entry in managed_entries] == ["ordinary.txt"]
     with pytest.raises(PathBoundaryError):
         runtime._handle_sync(
@@ -923,9 +1057,7 @@ def test_node_file_run_root_rejects_symlink_replaced_during_creation(
     original_open = node_agent._open_directory_components
     replaced = False
 
-    def replace_after_open(
-        path: Path, *, create: bool, mode: int | None
-    ) -> tuple[int, Path]:
+    def replace_after_open(path: Path, *, create: bool, mode: int | None) -> tuple[int, Path]:
         nonlocal replaced
         descriptor, candidate = original_open(path, create=create, mode=mode)
         if path == root and create and not replaced:
@@ -1088,9 +1220,7 @@ def test_node_file_run_runner_change_before_respawn(
     source = workspace / "script.py"
     source.write_text("print('approved')\n", encoding="utf-8")
     outside_sentinel = tmp_path / "outside-sentinel"
-    runtime = NodeRuntime(
-        [workspace], file_run_root=tmp_path / "private" / "file-runs"
-    )
+    runtime = NodeRuntime([workspace], file_run_root=tmp_path / "private" / "file-runs")
     base = _payload(
         workspace,
         workspace_id="workspace-runner-replacement",
@@ -1124,9 +1254,7 @@ def test_node_file_run_runner_change_before_respawn(
             runner_path = metadata / "runner.sh"
             if mutation == "replace":
                 runner_path.rename(moved_runner)
-                runner_path.write_text(
-                    f"#!/bin/sh\ntouch {outside_sentinel}\n", encoding="utf-8"
-                )
+                runner_path.write_text(f"#!/bin/sh\ntouch {outside_sentinel}\n", encoding="utf-8")
                 runner_path.chmod(0o700)
             else:
                 before = runner_path.stat()
@@ -1164,9 +1292,10 @@ def test_node_file_run_runner_change_before_respawn(
                 | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
                 | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
             )
-            assert fcntl.fcntl(
-                source_fd, getattr(fcntl, "F_GET_SEALS", 1034)
-            ) & required_seals == required_seals
+            assert (
+                fcntl.fcntl(source_fd, getattr(fcntl, "F_GET_SEALS", 1034)) & required_seals
+                == required_seals
+            )
             os.lseek(source_fd, 0, os.SEEK_SET)
             assert os.read(source_fd, 1024) == b"print('approved')\n"
             source_changed = True
@@ -1360,11 +1489,11 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
             "send-keys",
             "-t",
             window,
-                (
-                    "printf '\\033[31mNODE_HISTORY_OLD\\033[0m\\n'; "
-                    "seq -f 'NODE_HISTORY_%02g' 1 24; "
-                    "printf 'NODE_HISTORY_%s\\n' LIVE"
-                ),
+            (
+                "printf '\\033[31mNODE_HISTORY_OLD\\033[0m\\n'; "
+                "seq -f 'NODE_HISTORY_%02g' 1 24; "
+                "printf 'NODE_HISTORY_%s\\n' LIVE"
+            ),
             "Enter",
         )
         deadline = time.monotonic() + 4
@@ -1384,10 +1513,7 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
                     "history_only": True,
                 },
             )["output"]
-            if (
-                live_marker in full.splitlines()
-                and old_marker in history.splitlines()
-            ):
+            if live_marker in full.splitlines() and old_marker in history.splitlines():
                 break
             time.sleep(0.05)
 
@@ -1526,9 +1652,7 @@ async def test_remote_access_falls_back_to_recursive_listing_for_older_nodes() -
     access._workspace_request = request  # type: ignore[method-assign]
     result = await access.search_files(workspace, ".", "needle")
 
-    assert [entry.relative_path for entry in result.entries] == [
-        "src/deep/node-needle.txt"
-    ]
+    assert [entry.relative_path for entry in result.entries] == ["src/deep/node-needle.txt"]
     assert result.skipped_noise == 1
     assert result.truncated is False
     assert [payload["path"] for operation, payload in calls if operation == "files.list"] == [
@@ -1551,12 +1675,8 @@ def test_node_terminal_editor_reuses_the_live_file_window(tmp_path: Path) -> Non
     payload = _payload(workspace)
     session = str(payload["tmux_session"])
     try:
-        first = runtime._handle_sync(
-            "terminal.editor.open", {**payload, "path": "note.txt"}
-        )
-        second = runtime._handle_sync(
-            "terminal.editor.open", {**payload, "path": "note.txt"}
-        )
+        first = runtime._handle_sync("terminal.editor.open", {**payload, "path": "note.txt"})
+        second = runtime._handle_sync("terminal.editor.open", {**payload, "path": "note.txt"})
         assert first["terminal"]["tmux_window"] == second["terminal"]["tmux_window"]
         assert first["terminal"]["name"] == "vim-note.txt"
     finally:
@@ -2089,7 +2209,19 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            stream.stream_id = "a" * 32
             return {}, stream
+
+        async def request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "terminal.resize"
+            events.append(
+                (
+                    "control",
+                    "resize",
+                    {key: payload[key] for key in ("rows", "cols", "affects_grid")},
+                )
+            )
+            return _terminal_resize_ack(payload)
 
     class FakeNodes:
         def connection(self, _computer_id: str) -> FakeConnection:
@@ -2241,7 +2373,16 @@ async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            stream.stream_id = "b" * 32
             return {"bootstrap_grid": True}, stream
+
+        async def request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "terminal.resize"
+            assert payload["bootstrap"] is True
+            events.append(
+                ("resize", {key: payload[key] for key in ("rows", "cols", "affects_grid")})
+            )
+            return _terminal_resize_ack(payload)
 
     class FakeNodes:
         def connection(self, _computer_id: str) -> FakeConnection:
@@ -2290,9 +2431,7 @@ async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
         device_id="device",
     )
 
-    assert events == [
-        ("resize", {"rows": 33, "cols": 162, "affects_grid": True})
-    ]
+    assert events == [("resize", {"rows": 33, "cols": 162, "affects_grid": True})]
     assert control.presence("terminal")["input_revision"] == 0
 
 
@@ -2334,7 +2473,17 @@ async def test_node_terminal_bridge_demotes_owner_that_changes_during_control() 
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            stream.stream_id = "c" * 32
             return {}, stream
+
+        async def request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "terminal.resize"
+            events.append(
+                ("resize", {key: payload[key] for key in ("rows", "cols", "affects_grid")})
+            )
+            if len(events) == 1:
+                control.mark_input("terminal", competing_client)
+            return _terminal_resize_ack(payload)
 
     class FakeNodes:
         def connection(self, _computer_id: str) -> FakeConnection:

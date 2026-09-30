@@ -1,4 +1,13 @@
+from dataclasses import replace
+
 from termroom.terminal_control import TerminalControl
+
+
+def _apply(control: TerminalControl, client: str, *, rows: int, cols: int) -> None:
+    plan = control.begin_resize("term", client, rows=rows, cols=cols)
+    assert plan is not None
+    assert control.resize_applied(plan)
+    assert control.commit_resize(plan)
 
 
 def test_only_last_input_client_owns_resize() -> None:
@@ -50,6 +59,9 @@ def test_fresh_grid_bootstraps_only_its_first_browser_client() -> None:
     assert not control.can_resize("term", second)
     assert control.presence("term")["input_revision"] == 0
     assert control.resize_plan("term", first, rows=33, cols=162) == (True, True)
+    _apply(control, first, rows=33, cols=162)
+    assert not control.can_resize("term", first)
+    assert control.resize_plan("term", first, rows=17, cols=162) == (False, False)
 
     control.unregister("term", first)
     assert not control.can_resize("term", second)
@@ -125,10 +137,96 @@ def test_resize_is_applied_only_when_owner_or_dimensions_change() -> None:
     assert not control.should_resize("term", second, rows=24, cols=80)
     control.mark_input("term", second)
     assert control.should_resize("term", second, rows=24, cols=80)
+    _apply(control, second, rows=24, cols=80)
     assert not control.should_resize("term", second, rows=24, cols=80)
     assert control.should_resize("term", second, rows=25, cols=80)
+    _apply(control, second, rows=25, cols=80)
 
     control.mark_input("term", first)
     assert control.should_resize("term", first, rows=25, cols=80)
+    _apply(control, first, rows=25, cols=80)
     assert not control.should_resize("term", second, rows=30, cols=100)
     assert not control.should_resize("term", first, rows=25, cols=80)
+
+
+def test_bootstrap_plan_does_not_consume_permission_before_backend_success() -> None:
+    control = TerminalControl()
+    control.mark_grid_fresh("term")
+    first = control.register("term")
+    second = control.register("term")
+    plan = control.begin_resize("term", first, rows=22, cols=124)
+    assert plan is not None and plan.bootstrap and plan.apply
+    assert not control.commit_resize(plan)
+    assert control.can_resize("term", first)
+    assert control.begin_resize("term", second, rows=17, cols=124) is None
+    control.abort_resize(plan)
+    _apply(control, first, rows=22, cols=124)
+    assert control.presence("term")["input_revision"] == 0
+    assert not control.can_resize("term", first)
+    assert not control.can_resize("term", second)
+    control.mark_input("term", second)
+    assert control.can_resize("term", second)
+    _apply(control, second, rows=17, cols=124)
+    assert control.resize_plan("term", second, rows=17, cols=124) == (True, False)
+    assert control.presence("term")["input_revision"] == 1
+
+
+def test_disconnect_before_apply_retries_on_existing_peer_and_rejects_old_plan() -> None:
+    control = TerminalControl()
+    control.mark_grid_fresh("term")
+    first = control.register("term")
+    second = control.register("term")
+    plan = control.begin_resize("term", first, rows=22, cols=124)
+    assert plan is not None
+    control.unregister("term", first)
+    assert not control.commit_resize(plan)
+    control.abort_resize(plan)
+    assert control.can_resize("term", second)
+    _apply(control, second, rows=22, cols=124)
+    control.unregister("term", second)
+    third = control.register("term")
+    assert not control.can_resize("term", third)
+
+
+def test_applied_bootstrap_with_failed_demotion_never_reopens() -> None:
+    control = TerminalControl()
+    control.mark_grid_fresh("term")
+    first = control.register("term")
+    plan = control.begin_resize("term", first, rows=22, cols=124)
+    assert plan is not None
+    assert control.resize_applied(plan)
+    assert not control.can_resize("term", first)
+    assert control.begin_resize("term", first, rows=17, cols=124) is None
+    control.abort_resize(plan)
+    control.unregister("term", first)
+    second = control.register("term")
+    assert not control.can_resize("term", second)
+    assert control.presence("term")["input_revision"] == 0
+
+
+def test_wrong_token_and_superseded_input_revision_cannot_commit() -> None:
+    control = TerminalControl()
+    first = control.register("term")
+    second = control.register("term")
+    control.mark_input("term", first)
+    plan = control.begin_resize("term", first, rows=22, cols=124)
+    assert plan is not None
+    assert not control.resize_applied(replace(plan, token="stale"))
+    assert not control.commit_resize(replace(plan, token="stale"))
+    control.mark_input("term", second)
+    assert not control.resize_plan_current(plan)
+    assert not control.commit_resize(plan)
+    control.abort_resize(plan)
+    assert control.can_resize("term", second)
+    _apply(control, second, rows=17, cols=124)
+
+
+def test_node_existing_grid_reconciles_an_unacknowledged_bootstrap() -> None:
+    control = TerminalControl()
+    control.mark_grid_fresh("term")
+    first = control.register("term")
+    control.unregister("term", first)
+    second = control.register("term")
+    assert control.can_resize("term", second)
+    control.mark_grid_existing("term")
+    assert not control.can_resize("term", second)
