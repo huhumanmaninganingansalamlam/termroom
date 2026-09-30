@@ -15,6 +15,7 @@ import sys
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -160,12 +161,98 @@ def _node_remote_run_script() -> str:
         ':',
     )
     script = script.replace('"$meta_dir/output.log"', '"$output_path"')
-    script = script.replace(
-        'if test -n "${TMUX_PANE:-}" && command -v tmux >/dev/null 2>&1; then',
-        'if test "${TERMROOM_REMOTE_RUN_PIPE:-}" = true && '
-        'test -n "${TMUX_PANE:-}" && command -v tmux >/dev/null 2>&1; then',
-        1,
+    script = _replace_script_once(
+        script,
+        r'''started_at=$(utc_now)
+printf '{"phase":"running","started_at":"%s"}\n' "$started_at" \
+    | atomic_record "$meta_dir/state.json" || exit 120''',
+        r'''cd -- "$work_dir" || prepare_failed cwd_missing
+if test "${TERMROOM_REMOTE_RUN_PIPE:-}" != true || \
+    test -z "${TMUX_PANE:-}" || ! command -v tmux >/dev/null 2>&1; then
+    prepare_failed output_pipe_unavailable
+fi
+case "$meta_dir" in
+    /proc/self/fd/*) metadata_fd=${meta_dir##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$output_path" in
+    /proc/self/fd/*) output_fd=${output_path##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$metadata_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+case "$output_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+pipe_pid=$BASHPID
+metadata_path="/proc/$pipe_pid/fd/$metadata_fd"
+output_file="/proc/$pipe_pid/fd/$output_fd"
+channel_path=${TERMROOM_REMOTE_RUN_LOG_CHANNEL:?}
+channel_write=${TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE:?}
+case "$channel_path" in
+    /proc/self/fd/*) channel_read_fd=${channel_path##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$channel_read_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+case "$channel_write" in
+    /proc/self/fd/*) channel_fd=${channel_write##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$channel_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+printf -v pipe_command \
+    '%q -I -c %q %q %q %q' \
+    "$TERMROOM_NODE_PYTHON" "$TERMROOM_REMOTE_RUN_LOG_HELPER_CODE" \
+    "$metadata_path" "$output_file" "/proc/$pipe_pid/fd/$channel_fd"
+if ! tmux pipe-pane -o -t "$TMUX_PANE" "$pipe_command"; then
+    prepare_failed output_pipe_unavailable
+fi
+if ! IFS= read -r -t 5 pipe_ready < "$channel_path" || test "$pipe_ready" != ready; then
+    tmux pipe-pane -t "$TMUX_PANE" || true
+    prepare_failed output_pipe_unavailable
+fi
+started_at=$(utc_now)
+printf '{"phase":"running","started_at":"%s"}\n' "$started_at" \
+    | atomic_record "$meta_dir/state.json" || exit 120''',
     )
+    script = _replace_script_once(
+        script,
+        r'''cd -- "$work_dir" || prepare_failed cwd_missing
+
+status=0
+pipe_active=false
+if test -n "${TMUX_PANE:-}" && command -v tmux >/dev/null 2>&1; then
+    printf -v pipe_command '/bin/bash --noprofile --norc %q' "$meta_dir/log-pipe.sh"
+    if tmux pipe-pane -o -t "$TMUX_PANE" "$pipe_command"; then
+        pipe_active=true
+    fi
+fi''',
+        'status=0',
+    )
+    script = _replace_script_once(script, 'rm -f -- "$meta_dir/output-seal.json"', ':')
+    drain_start = script.index('if test "$pipe_active" = true; then')
+    drain_end = script.index('\nstop_requested=false', drain_start)
+    script = script[:drain_start] + r'''(
+    exec {channel_fd}>&- {channel_read_fd}<&-
+    unset TERMROOM_REMOTE_RUN_LOG_CHANNEL TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE
+    exec /bin/bash --noprofile --norc -- "$command_path"
+) </dev/null 2>&1 || status=$?
+tmux pipe-pane -t "$TMUX_PANE" || true
+log_incomplete=true
+log_size=$(wc -c < "$output_path")
+log_size=${log_size//[[:space:]]/}
+if IFS= read -r -t 2 pipe_receipt < "$channel_path"; then
+    if admitted_size=$("$TERMROOM_NODE_PYTHON" -I -c \
+        "$TERMROOM_REMOTE_RUN_LOG_VERIFY_CODE" "$meta_dir" "$output_path" "$pipe_receipt"); then
+        log_size=$admitted_size
+        log_incomplete=false
+    fi
+fi
+''' + script[drain_end:]
     return script
 
 
@@ -620,6 +707,115 @@ def _open_owned_regular_at(
         os.close(descriptor)
         raise NodeRemoteRunError("Remote Run metadata is invalid", code="metadata_invalid")
     return descriptor
+
+
+def _node_remote_run_output_state(metadata_fd: int, output_fd: int) -> tuple[int, ...]:
+    state = _private_leaf_state_at(metadata_fd, "output.log", mode=0o600)
+    info = os.fstat(output_fd)
+    if state is None or state != (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    ):
+        raise NodeRemoteRunError("Remote Run output changed", code="metadata_invalid")
+    return state
+
+
+def _node_remote_run_log_helper(metadata_path: str, output_path: str, channel_path: str) -> int:
+    descriptors: list[int] = []
+    channel_fd = -1
+    try:
+        channel_fd = os.open(channel_path, os.O_WRONLY | os.O_NONBLOCK)
+        descriptors.append(channel_fd)
+        metadata_fd = os.open(metadata_path, os.O_RDONLY | os.O_DIRECTORY)
+        descriptors.append(metadata_fd)
+        info = os.fstat(metadata_fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise NodeRemoteRunError("Remote Run metadata is invalid", code="metadata_invalid")
+        output_fd = os.open(output_path, os.O_WRONLY | os.O_APPEND)
+        descriptors.append(output_fd)
+        _node_remote_run_output_state(metadata_fd, output_fd)
+        if _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) is not None:
+            raise NodeRemoteRunError("Remote Run seal already exists", code="metadata_invalid")
+        os.write(channel_fd, b"ready\n")
+        while chunk := os.read(0, 64 * 1024):
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(output_fd, remaining)
+                if written <= 0:
+                    raise OSError("short write to Remote Run output")
+                remaining = remaining[written:]
+        os.fsync(output_fd)
+        output_state = _node_remote_run_output_state(metadata_fd, output_fd)
+        content = json.dumps({
+            "size": output_state[5],
+            "sealed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }).encode() + b"\n"
+        seal_state = _atomic_private_write_at(
+            metadata_fd, "output-seal.json", content, expected_state=None,
+        )
+        os.write(channel_fd, b"sealed " + json.dumps(seal_state).encode() + b"\n")
+        return 0
+    except (OSError, NodeRemoteRunError):
+        if channel_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.write(channel_fd, b"failed\n")
+        return 120
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def _node_remote_run_log_size(metadata_path: str, output_path: str, receipt: str) -> int:
+    if not receipt.startswith("sealed "):
+        raise NodeRemoteRunError("Remote Run output did not drain", code="metadata_invalid")
+    expected = tuple(json.loads(receipt.removeprefix("sealed ")))
+    metadata_fd = os.open(metadata_path, os.O_RDONLY | os.O_DIRECTORY)
+    seal_fd = output_fd = -1
+    try:
+        # NONBLOCK prevents a raced FIFO from hanging admission; never read a
+        # leaf until its no-follow descriptor matches the helper's receipt.
+        seal_fd = os.open(
+            "output-seal.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=metadata_fd,
+        )
+        info = os.fstat(seal_fd)
+        if (
+            _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) != expected
+            or expected[:2] != (info.st_dev, info.st_ino)
+            or not stat.S_ISREG(info.st_mode)
+            or not 0 < info.st_size <= 4096
+        ):
+            raise NodeRemoteRunError("Remote Run seal changed", code="metadata_invalid")
+        seal = json.loads(os.read(seal_fd, 4097))
+        output_fd = os.open(output_path, os.O_WRONLY | os.O_APPEND)
+        output_state = _node_remote_run_output_state(metadata_fd, output_fd)
+        if (
+            set(seal) != {"size", "sealed_at"}
+            or type(seal["size"]) is not int
+            or seal["size"] != output_state[5]
+            or not isinstance(seal["sealed_at"], str)
+            or not seal["sealed_at"]
+            or _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) != expected
+        ):
+            raise NodeRemoteRunError("Remote Run seal is incomplete", code="metadata_invalid")
+        return seal["size"]
+    finally:
+        for descriptor in (seal_fd, output_fd, metadata_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+_NODE_REMOTE_RUN_LOG_HELPER_CODE = (
+    "import sys; from termroom.node_remote_runs import _node_remote_run_log_helper; "
+    "sys.exit(_node_remote_run_log_helper(*sys.argv[1:]))"
+)
+_NODE_REMOTE_RUN_LOG_VERIFY_CODE = '''import sys
+from termroom.node_remote_runs import _node_remote_run_log_size
+try:
+    print(_node_remote_run_log_size(*sys.argv[1:]))
+except Exception:
+    sys.exit(120)
+'''
 
 
 def _remove_directory_contents(directory_fd: int) -> None:
@@ -2541,6 +2737,10 @@ class NodeRemoteRunRuntime:
                 metadata_fd, "command.sh", 256 * 1024
             )
             launch_fds.append(command_fd)
+            if _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) is not None:
+                raise NodeRemoteRunError(
+                    "Remote Run seal already exists", code="metadata_invalid"
+                )
             self._write_private(paths["output"], b"", expected_state=None)
             output_fd = _open_owned_regular_at(
                 metadata_fd, "output.log", flags=os.O_WRONLY | os.O_APPEND
@@ -2555,7 +2755,10 @@ class NodeRemoteRunRuntime:
                 "TERMROOM_REMOTE_RUN_CWD_DIR": "{fd:0}",
                 "TERMROOM_REMOTE_RUN_OUTPUT_FILE": "{fd:5}",
                 "TERMROOM_REMOTE_RUN_CWD_REL": cwd_rel,
-                "TERMROOM_REMOTE_RUN_PIPE": "false",
+                "TERMROOM_REMOTE_RUN_PIPE": "true",
+                "TERMROOM_NODE_PYTHON": sys.executable,
+                "TERMROOM_REMOTE_RUN_LOG_HELPER_CODE": _NODE_REMOTE_RUN_LOG_HELPER_CODE,
+                "TERMROOM_REMOTE_RUN_LOG_VERIFY_CODE": _NODE_REMOTE_RUN_LOG_VERIFY_CODE,
             }
             command = (
                 "/bin/bash", "--noprofile", "--norc", "-c",
@@ -2607,6 +2810,13 @@ class NodeRemoteRunRuntime:
                     _node_git_bootstrap_script(), "termroom-node-remote-git", run_id,
                 )
 
+            # Append after Git descriptors to preserve their existing handoff indices.
+            channel_index = len(launch_fds)
+            launch_fds.extend(os.pipe())
+            environment.update({
+                "TERMROOM_REMOTE_RUN_LOG_CHANNEL": f"{{fd:{channel_index}}}",
+                "TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE": f"{{fd:{channel_index + 1}}}",
+            })
             session = self._session_name(run_id)
             self._tmux(
                 "new-session", "-d", "-s", session, "-c", "/", "-n", "run",

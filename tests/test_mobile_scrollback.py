@@ -12,6 +12,173 @@ from termroom.config import Settings
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize(
+    ("history", "live", "overlap"),
+    [
+        ("alpha\nmarker", ["marker", "beta"], 1),
+        ("marker\nmarker", ["marker", "beta"], 1),
+        ("alpha\nmarker", ["marker", "marker", "beta"], 1),
+        ("alpha\nmarker", ["other", "beta"], 0),
+        ("alpha\none\ntwo", ["one", "two", "beta"], 2),
+        ("marker\nother", ["marker", "beta"], 0),
+        ("alpha\n\nmarker", ["", "marker", "beta"], 2),
+        ("alpha\r\nmarker\u00a0", ["marker   ", "beta"], 1),
+        ("alpha\n한글界e\u0301", ["한글界e\u0301", "beta"], 1),
+        ("\n", ["", ""], 0),
+        ("alpha\n" + "x" * 2049, ["x" * 2049], 0),
+        ("alpha\nmarker", ["marker"] * 7, 0),
+        ("\n".join(["x" * 2048] * 6), ["x" * 2048] * 6, 0),
+    ],
+)
+def test_history_live_boundary_behavior(history: str, live: list[str], overlap: int) -> None:
+    import json
+
+    script = (ROOT / "termroom/static/mobile_scrollback.js").read_text()
+    helper = script[
+        script.index("  const boundaryRowText =") : script.index(
+            "  const liveBoundarySnapshot ="
+        )
+    ]
+    probe = f"""
+const assert = require('node:assert/strict');
+const HISTORY_BOUNDARY_ROW_COUNT = 6;
+const HISTORY_BOUNDARY_MAX_CHARS = 8192;
+const HISTORY_BOUNDARY_MAX_ROW_CHARS = 2048;
+const normalizeText = value => String(value).replace(/\\r\\n?/g, '\\n').replace(/\\u00a0/g, ' ');
+{helper}
+assert.equal(
+  historyBoundaryOverlap(normalizeText({json.dumps(history)}), {json.dumps(live)}), {overlap}
+);
+"""
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("live_revisions", [0, 1000])
+def test_history_boundary_styles_revisions_and_304(live_revisions: int) -> None:
+    script = (ROOT / "termroom/static/mobile_scrollback.js").read_text()
+    constants = script[script.index("  const SCROLL_BOTTOM") : script.index("  const surface =")]
+    parser = script[
+        script.index("  const normalizeText =") : script.index("  const applySelectionOwnership =")
+    ]
+    parser = parser.replace(
+        "const parseAnsiHistory = (value) => {",
+        "const parseAnsiHistory = (value) => { parserBuildCalls++;",
+        1,
+    )
+    boundary = script[
+        script.index("  const boundaryRowText =") : script.index("  const isFullViewportRedraw =")
+    ]
+    loader = script[
+        script.index("  const loadHistory =") : script.index("  const scheduleHistoryRefresh =")
+    ]
+    probe = r"""
+const assert = require('node:assert/strict');
+class Node {
+  constructor(type = 1, text = '') {
+    this.nodeType = type; this.data = text; this.children = []; this.style = {setProperty(){}};
+  }
+  append(...nodes) { for (const node of nodes) { node.parent = this; this.children.push(node); } }
+  get lastChild() { return this.children.at(-1); }
+  get textContent() {
+    return this.nodeType === 3 ? this.data : this.children.map(n => n.textContent).join('');
+  }
+  set textContent(text) {
+    this.data = text; this.children = [];
+    if (this.nodeType !== 3 && text) this.append(new Node(3, text));
+  }
+  remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
+}
+let parserBuildCalls = 0, fragmentBuildCalls = 0;
+const document = {
+  createDocumentFragment: () => { fragmentBuildCalls++; return new Node(); },
+  createElement: () => new Node(),
+  createTextNode: text => new Node(3, text)
+};
+const historyGraphemeSegmenter = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
+const historyCellWidthCache = new Map();
+let live = ['marker', 'beta'];
+const terminalHost = {
+  dataset: {terminalId: 'run'},
+  querySelector: () => ({children: live.map(textContent => ({textContent}))})
+};
+let terminalRevision = 0, switchGeneration = 0, renderedHistoryOverlap = -1;
+let renderedHistoryText = '';
+let renderedHistoryPlainText = '';
+let refreshQueued = false, urgentRefreshQueued = false, forceNextHistoryRefresh = false;
+let loading = false, historyChangeRevision = 0, historyEtag = '', historyDirty = true;
+let historyDirtySince = 0, lastHistoryChangeAt = 0, nativeCopySelectionActive = false;
+let liveFollowing = true, userScrollRevision = 0, historyRenderRevision = 0;
+let commits = 0;
+const history = {dataset: {}, replaceChildren(fragment) { commits++; this.fragment = fragment; }};
+const syncHistoryMetrics = () => {};
+const surface = {dataset: {}, scrollTop: 0};
+const atLiveBottom = () => true, maxScrollTop = () => 0;
+const afterLayout = () => {}, syncLiveHeight = () => {}, updateScrollState = () => {};
+const clearHistoryDirty = () => { historyDirty = false; };
+const scheduleHistoryRefresh = () => {};
+const historyOnlyUrl = () => '/history';
+""" + constants + parser + boundary + loader + r"""
+(async () => {
+  const text = '\x1b[31malpha 한글界e\u0301\x1b[0m\nmarker';
+  assert.equal(commitHistoryBoundary(text, liveBoundarySnapshot()), true);
+  assert.equal(history.fragment.textContent, 'alpha 한글界e\u0301');
+  assert.equal(history.dataset.rendering, 'ansi');
+  assert.equal(history.fragment.children[0].style.color, 'var(--terminal-red)');
+  const stale = liveBoundarySnapshot();
+  terminalRevision++;
+  assert.equal(commitHistoryBoundary('wrong', stale), false);
+  assert.equal(commits, 1);
+  const switched = liveBoundarySnapshot();
+  switchGeneration++;
+  terminalHost.dataset.terminalId = 'shell';
+  assert.equal(commitHistoryBoundary('wrong', switched), false);
+  assert.equal(commits, 1);
+  live = ['other'];
+  globalThis.fetch = async () => ({status: 304, headers: {get: () => 'same'}});
+  await loadHistory();
+  assert.equal(history.fragment.textContent, 'alpha 한글界e\u0301\nmarker');
+  assert.equal(commits, 2);
+  globalThis.fetch = async () => {
+    terminalRevision++;
+    return {status: 200, ok: true, headers: {get: () => 'new'}, text: async () => 'wrong'};
+  };
+  await loadHistory();
+  assert.equal(commits, 2);
+  globalThis.fetch = async () => ({
+    status: 200, ok: true, headers: {get: () => 'new'},
+    text: async () => {switchGeneration++; return 'wrong';}
+  });
+  await loadHistory();
+  assert.equal(commits, 2);
+  assert.equal(historyEtag, 'same');
+  const large = ('\x1b[31m' + 'x'.repeat(100) + '\x1b[0m\n').repeat(2000) + 'boundary';
+  live = ['other'];
+  assert.equal(commitHistoryBoundary(large, liveBoundarySnapshot()), true);
+  const parsed = parserBuildCalls, built = fragmentBuildCalls, committed = commits;
+  for (let index = 0; index < LIVE_REVISIONS; index++) {
+    terminalRevision++;
+    live = ['revision-' + index];
+    assert.equal(commitHistoryBoundary(large, liveBoundarySnapshot()), false);
+  }
+  assert.equal(parserBuildCalls, parsed);
+  assert.equal(fragmentBuildCalls, built);
+  assert.equal(commits, committed);
+  live = ['boundary', 'next'];
+  assert.equal(commitHistoryBoundary(large, liveBoundarySnapshot()), true);
+  assert.equal(parserBuildCalls, parsed + 1);
+  assert.equal(fragmentBuildCalls, built + 1);
+  live = ['other'];
+  assert.equal(commitHistoryBoundary(large, liveBoundarySnapshot()), true);
+  assert.equal(parserBuildCalls, parsed + 2);
+  assert.equal(history.fragment.textContent.endsWith('boundary'), true);
+})().catch(error => {console.error(error); process.exitCode = 1;});
+"""
+    probe = probe.replace("LIVE_REVISIONS", str(live_revisions))
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_base_loads_mobile_scrollback_assets() -> None:
     template = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
     terminal_template = (ROOT / "termroom/templates/terminal.html").read_text(
@@ -20,7 +187,7 @@ def test_base_loads_mobile_scrollback_assets() -> None:
 
     assert "mobile_scrollback.css') }}?v=15" in template
     assert "terminal_selection.js') }}?v=1\" defer" in template
-    assert "mobile_scrollback.js') }}?v=36\" defer" in template
+    assert "mobile_scrollback.js') }}?v=37\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
     assert "terminal.js') }}?v=57" in terminal_template
 
@@ -41,12 +208,12 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
         page = await client.get("/")
         stylesheet = await client.get("/static/mobile_scrollback.css?v=15")
         ownership = await client.get("/static/terminal_selection.js?v=1")
-        script = await client.get("/static/mobile_scrollback.js?v=36")
+        script = await client.get("/static/mobile_scrollback.js?v=37")
 
     assert page.status_code == 401
     assert "/static/mobile_scrollback.css?v=15" in page.text
     assert "/static/terminal_selection.js?v=1" in page.text
-    assert "/static/mobile_scrollback.js?v=36" in page.text
+    assert "/static/mobile_scrollback.js?v=37" in page.text
     assert ownership.status_code == 200
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text

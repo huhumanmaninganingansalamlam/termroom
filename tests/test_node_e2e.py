@@ -9,13 +9,14 @@ import re
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import time
 import uuid
 import zipfile
 from collections.abc import Callable, Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -23,9 +24,13 @@ import httpx
 import pytest
 from websockets.sync.client import connect as websocket_connect
 
+from termroom import node_remote_runs
 from termroom.db import StateStore
+from termroom.node_agent import NodeRuntime
+from termroom.node_protocol import NODE_REMOTE_RUN_VERSION
+from termroom.node_remote_runs import NodeRemoteRunError
 from termroom.node_service import NODE_SERVICE_UNIT_NAME, NodeServiceManager
-from termroom.ssh_backend import SSHBackend
+from termroom.ssh_backend import REMOTE_RUN_SESSION_PREFIX, SSHBackend
 
 
 def _free_port() -> int:
@@ -1279,6 +1284,875 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
                 check=False,
                 capture_output=True,
             )
+        for handle in handles:
+            handle.close()
+
+
+def _install_output_seal_leaf(leaf: Path, kind: str, sentinel: Path) -> None:
+    if kind == "symlink":
+        leaf.symlink_to(sentinel)
+    elif kind == "hardlink":
+        os.link(sentinel, leaf)
+    elif kind == "fifo":
+        os.mkfifo(leaf, 0o600)
+    elif kind == "directory":
+        leaf.mkdir(mode=0o700)
+    else:
+        leaf.write_text('{"size":0,"sealed_at":"premature"}\n', encoding="utf-8")
+        leaf.chmod(0o640 if kind == "wrong-mode" else 0o600)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.parametrize("phase", ["before-start", "handoff", "running"])
+@pytest.mark.parametrize(
+    "kind", ["symlink", "hardlink", "fifo", "directory", "wrong-mode", "competing"]
+)
+def test_real_node_output_seal_substitution_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, phase: str,
+) -> None:
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    root = tmp_path / "runs"
+    node = NodeRuntime([allowed], remote_run_root=root)
+    runtime = node.remote_runs
+    assert runtime is not None
+    run_id = str(uuid.uuid4())
+    payload = {
+        "remote_run_version": NODE_REMOTE_RUN_VERSION,
+        "run_base": str(root), "run_id": run_id,
+    }
+    runtime.create({
+        **payload, "cwd_rel": ".", "command": "\n".join((
+            "test -t 1 && test -t 2 || exit 19",
+            'test -z "${TERMROOM_REMOTE_RUN_LOG_CHANNEL+x}" || exit 20',
+            'test -z "${TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE+x}" || exit 20',
+            "printf 'executed\\n' >> ../executions",
+            "printf 'seal-start\\n' >&2",
+            "while test ! -f ../release; do sleep 0.05; done",
+            "printf 'seal-end\\n'",
+        )),
+    })
+    runtime.snapshot_begin(payload)
+    runtime.snapshot_commit(payload)
+    run = root / run_id
+    metadata = run / ".termroom"
+    leaf = metadata / "output-seal.json"
+    output = metadata / "output.log"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"outside must survive\n")
+    sentinel.chmod(0o640)
+    session = f"{REMOTE_RUN_SESSION_PREFIX}{run_id}"
+    installed: list[os.stat_result] = []
+
+    def install() -> None:
+        _install_output_seal_leaf(leaf, kind, sentinel)
+        installed.append(leaf.lstat())
+
+    original_handoff = runtime._descriptor_handoff
+    assert original_handoff is not None
+
+    def substitute_at_handoff(*args: Any, **kwargs: Any) -> Any:
+        install()
+        return original_handoff(*args, **kwargs)
+
+    def terminal_record() -> dict[str, Any] | None:
+        observed = runtime.observe(payload)
+        return observed if observed["state"] in {"finished", "failed", "lost"} else None
+
+    try:
+        if phase == "before-start":
+            install()
+            with pytest.raises(NodeRemoteRunError) as invalid:
+                runtime.start(payload)
+            assert invalid.value.code == "metadata_invalid"
+            assert not output.exists()
+        else:
+            if phase == "handoff":
+                monkeypatch.setattr(runtime, "_descriptor_handoff", substitute_at_handoff)
+            runtime.start(payload)
+            if phase == "running":
+                _wait_until(
+                    lambda: output.exists() and b"seal-start" in output.read_bytes(),
+                    timeout=8, description="seal-test command output",
+                )
+                assert runtime.observe(payload)["state"] == "running"
+                install()
+                assert not (metadata / "completion.json").exists()
+                (run / "release").touch()
+            completed = _wait_until(
+                terminal_record, timeout=8, description="bounded seal failure",
+            )
+            if phase == "handoff":
+                assert completed["state"] == "failed"
+                assert completed["error_code"] == "output_pipe_unavailable"
+            else:
+                assert completed["state"] == "finished"
+                assert completed["exit_code"] == 0
+                assert completed["log_incomplete"] is True
+                record = json.loads((metadata / "completion.json").read_bytes())
+                assert record["log_incomplete"] is True
+                assert record["log_size"] == output.stat().st_size
+                assert output.read_bytes() == b"seal-start\r\nseal-end\r\n"
+                pane = subprocess.run(
+                    ["tmux", "capture-pane", "-p", "-t", f"{session}:run.0"],
+                    capture_output=True, text=True, check=True, timeout=3,
+                ).stdout.splitlines()
+                assert pane.count("seal-start") == pane.count("seal-end") == 1
+                assert (run / "executions").read_text().splitlines() == ["executed"]
+                assert runtime.start(payload)["replayed"] is True
+                assert (run / "executions").read_text().splitlines() == ["executed"]
+        if phase != "running":
+            assert not (run / "executions").exists()
+        assert installed == [leaf.lstat()]
+        assert sentinel.read_bytes() == b"outside must survive\n"
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+        assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+        assert not list(metadata.glob(".output-seal.json.tmp-*"))
+    finally:
+        (run / "release").touch()
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session],
+            capture_output=True, check=False, timeout=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "kind", ["symlink", "hardlink", "fifo", "directory", "wrong-mode", "competing"]
+)
+def test_node_output_seal_competing_publication_preserves_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    metadata = tmp_path / "metadata"
+    metadata.mkdir(mode=0o700)
+    output = metadata / "output.log"
+    output.write_bytes(b"")
+    output.chmod(0o600)
+    sentinel = tmp_path / "outside"
+    sentinel.write_bytes(b"preserve outside\n")
+    sentinel.chmod(0o640)
+    leaf = metadata / "output-seal.json"
+    metadata_fd = os.open(metadata, os.O_RDONLY | os.O_DIRECTORY)
+    output_fd = os.open(output, os.O_WRONLY | os.O_APPEND)
+    reader, writer = os.pipe()
+    original_link = os.link
+    original_read = os.read
+    chunks = iter((b"complete pane bytes\r\n", b""))
+    installed: list[os.stat_result] = []
+
+    def competing_link(source: Any, destination: Any, **kwargs: Any) -> None:
+        if destination == "output-seal.json":
+            _install_output_seal_leaf(leaf, kind, sentinel)
+            installed.append(leaf.lstat())
+        original_link(source, destination, **kwargs)
+
+    monkeypatch.setattr(node_remote_runs.os, "link", competing_link)
+    monkeypatch.setattr(
+        node_remote_runs.os, "read",
+        lambda fd, size: next(chunks) if fd == 0 else original_read(fd, size),
+    )
+    try:
+        assert node_remote_runs._node_remote_run_log_helper(
+            f"/proc/self/fd/{metadata_fd}", f"/proc/self/fd/{output_fd}",
+            f"/proc/self/fd/{writer}",
+        ) == 120
+        assert original_read(reader, 4096) == b"ready\nfailed\n"
+        assert output.read_bytes() == b"complete pane bytes\r\n"
+        assert installed == [leaf.lstat()]
+        assert sentinel.read_bytes() == b"preserve outside\n"
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+        assert not list(metadata.glob(".output-seal.json.tmp-*"))
+    finally:
+        for descriptor in (metadata_fd, output_fd, reader, writer):
+            os.close(descriptor)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_real_node_output_seal_premature_leaf_cannot_acknowledge_delayed_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    allowed = tmp_path / "projects"
+    allowed.mkdir()
+    root = tmp_path / "runs"
+    node = NodeRuntime([allowed], remote_run_root=root)
+    runtime = node.remote_runs
+    assert runtime is not None
+    run_id = str(uuid.uuid4())
+    payload = {
+        "remote_run_version": NODE_REMOTE_RUN_VERSION,
+        "run_base": str(root), "run_id": run_id,
+    }
+    runtime.create({
+        **payload, "cwd_rel": ".", "command": "\n".join((
+            "test -t 1 && test -t 2 || exit 19",
+            "printf 'executed\\n' >> ../executions",
+            "printf 'delayed-start\\n'",
+            "while test ! -f ../release; do sleep 0.05; done",
+            "printf 'delayed-end\\n' >&2",
+        )),
+    })
+    runtime.snapshot_begin(payload)
+    runtime.snapshot_commit(payload)
+    run = root / run_id
+    metadata = run / ".termroom"
+    output = metadata / "output.log"
+    seal = metadata / "output-seal.json"
+    original_handoff = runtime._descriptor_handoff
+    assert original_handoff is not None
+
+    def delay_helper(*args: Any, **kwargs: Any) -> Any:
+        environment = dict(kwargs["environment"])
+        delayed_code = '''import os, sys, time
+from termroom.node_remote_runs import _node_remote_run_log_helper
+original_write = os.write
+def delayed_write(fd, data):
+    result = original_write(fd, data)
+    if data == b"ready\\n":
+        time.sleep(4)
+    return result
+os.write = delayed_write
+sys.exit(_node_remote_run_log_helper(*sys.argv[1:]))
+'''
+        environment["TERMROOM_REMOTE_RUN_LOG_HELPER_CODE"] = f"exec({delayed_code!r})"
+        kwargs["environment"] = environment
+        return original_handoff(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_descriptor_handoff", delay_helper)
+    session = f"{REMOTE_RUN_SESSION_PREFIX}{run_id}"
+    try:
+        runtime.start(payload)
+        _wait_until(lambda: (run / "executions").exists(), timeout=8,
+                    description="delayed helper's command")
+        assert output.read_bytes() == b""
+        seal.write_text('{"size":0,"sealed_at":"premature"}\n', encoding="utf-8")
+        seal.chmod(0o600)
+        premature = seal.read_bytes(), seal.lstat()
+        start = time.monotonic()
+        (run / "release").touch()
+        completed = _wait_until(
+            lambda: value if (value := runtime.observe(payload))["state"] == "finished" else None,
+            timeout=3.5, description="bounded incomplete drain",
+        )
+        assert time.monotonic() - start < 3.5
+        assert completed["exit_code"] == 0
+        assert completed["log_incomplete"] is True
+        assert (seal.read_bytes(), seal.lstat()) == premature
+        record = json.loads((metadata / "completion.json").read_bytes())
+        assert record["log_incomplete"] is True
+        assert record["log_size"] == 0
+        _wait_until(lambda: output.read_bytes() == b"delayed-start\r\ndelayed-end\r\n",
+                    timeout=6, description="late pipe bytes")
+        assert (seal.read_bytes(), seal.lstat()) == premature
+        assert json.loads((metadata / "completion.json").read_bytes()) == record
+        assert (run / "executions").read_text().splitlines() == ["executed"]
+    finally:
+        (run / "release").touch()
+        subprocess.run(["tmux", "kill-session", "-t", session],
+                       capture_output=True, check=False, timeout=3)
+
+
+@pytest.mark.parametrize("kind", [
+    "symlink", "hardlink", "fifo", "directory", "wrong-mode", "competing",
+    "same-content", "size-mismatch", "wrong-owner",
+])
+def test_node_output_seal_admission_requires_receipt_identity_and_pinned_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    metadata = tmp_path / "metadata"
+    metadata.mkdir(mode=0o700)
+    output = metadata / "output.log"
+    output.write_bytes(b"pane output\r\n")
+    output.chmod(0o600)
+    sentinel = tmp_path / "outside"
+    sentinel.write_bytes(b"outside is unchanged\n")
+    sentinel.chmod(0o640)
+    leaf = metadata / "output-seal.json"
+    metadata_fd = os.open(metadata, os.O_RDONLY | os.O_DIRECTORY)
+    output_fd = os.open(output, os.O_WRONLY | os.O_APPEND)
+    try:
+        content = json.dumps({"size": output.stat().st_size, "sealed_at": "valid"}).encode()
+        state = node_remote_runs._atomic_private_write_at(
+            metadata_fd, "output-seal.json", content, expected_state=None,
+        )
+        receipt = "sealed " + json.dumps(state)
+        assert node_remote_runs._node_remote_run_log_size(
+            f"/proc/self/fd/{metadata_fd}", f"/proc/self/fd/{output_fd}", receipt,
+        ) == output.stat().st_size
+        if kind == "size-mismatch":
+            os.write(output_fd, b"late output\r\n")
+        elif kind == "wrong-owner":
+            euid = os.geteuid()
+            monkeypatch.setattr(node_remote_runs.os, "geteuid", lambda: euid + 1)
+        else:
+            # Keep the original inode alive so an allocator cannot reuse it.
+            leaf.rename(metadata / "original-seal")
+            if kind == "same-content":
+                leaf.write_bytes(content)
+                leaf.chmod(0o600)
+            else:
+                _install_output_seal_leaf(leaf, kind, sentinel)
+        before = leaf.lstat()
+        with pytest.raises((OSError, NodeRemoteRunError)) as invalid:
+            node_remote_runs._node_remote_run_log_size(
+                f"/proc/self/fd/{metadata_fd}", f"/proc/self/fd/{output_fd}", receipt,
+            )
+        if isinstance(invalid.value, NodeRemoteRunError):
+            assert invalid.value.code == "metadata_invalid"
+        assert leaf.lstat() == before
+        assert sentinel.read_bytes() == b"outside is unchanged\n"
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    finally:
+        os.close(metadata_fd)
+        os.close(output_fd)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_real_node_remote_run_result_zip_conflict_apply_survives_core_restart(
+    tmp_path: Path,
+) -> None:
+    core_root = tmp_path / "core-root"
+    core_state = tmp_path / "core-state"
+    source_root = core_root / "source-project"
+    node_root = tmp_path / "node-root"
+    node_state = tmp_path / "node-state"
+    for path in (source_root, node_root):
+        path.mkdir(parents=True)
+    (source_root / "eligible.txt").write_text("source eligible\n", encoding="utf-8")
+    (source_root / "conflict.txt").write_text("source conflict\n", encoding="utf-8")
+    (source_root / "delete-sentinel.txt").write_text(
+        "keep in source\n", encoding="utf-8"
+    )
+    (source_root / "existing-parent").mkdir()
+
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    environment = os.environ.copy()
+    environment["TERMROOM_PASSWORD"] = "node-collect-e2e-password"
+    environment["TERMROOM_LOCALE"] = "en"
+    core: subprocess.Popen[bytes] | None = None
+    node: subprocess.Popen[bytes] | None = None
+    pair: subprocess.Popen[bytes] | None = None
+    handles: list[Any] = []
+    client: httpx.Client | None = None
+
+    try:
+        core, handle = _start_process(
+            _core_command(core_root, core_state, port),
+            environment,
+            tmp_path / "core.log",
+        )
+        handles.append(handle)
+        _wait_until(
+            lambda: httpx.get(f"{base_url}/health", timeout=1).status_code == 200,
+            description="Core startup",
+        )
+        client, csrf = _login(base_url, "node-collect-e2e-password")
+
+        created = client.post("/computers/node/pair", data={"_csrf": csrf})
+        assert created.status_code == 201
+        code_match = re.search(r'class="node-pairing-code">([^<]+)<', created.text)
+        pairing_match = re.search(
+            r'name="pairing_id" value="([a-f0-9]{32})"', created.text
+        )
+        assert code_match is not None and pairing_match is not None
+        pair, handle = _start_process(
+            [
+                *_node_prefix(node_state),
+                "pair",
+                "--core",
+                base_url,
+                "--code",
+                code_match.group(1),
+                "--allow-root",
+                str(node_root),
+                "--name",
+                "Node Collection E2E",
+                "--timeout",
+                "20",
+            ],
+            environment,
+            tmp_path / "pair.log",
+        )
+        handles.append(handle)
+        review_url = f"/computers/node/pair?pairing_id={pairing_match.group(1)}"
+        review = _wait_until(
+            lambda: (
+                response
+                if (response := client.get(review_url)).status_code == 200
+                and "SHA256:" in response.text
+                else None
+            ),
+            description="Node fingerprint submission",
+        )
+        enrollment_match = re.search(
+            r"/computers/node/pair/([a-f0-9]{32})/approve", review.text
+        )
+        assert enrollment_match is not None
+        approved = client.post(
+            f"/computers/node/pair/{enrollment_match.group(1)}/approve",
+            data={"_csrf": csrf},
+        )
+        assert approved.status_code == 303
+        node_id = approved.headers["location"].split("/")[2].split("?")[0]
+        assert pair.wait(timeout=10) == 0
+        node, handle = _start_process(
+            _node_prefix(node_state), environment, tmp_path / "node.log"
+        )
+        handles.append(handle)
+        _wait_until(
+            lambda: _remote_connection_state_is(client, node_id, "available"),
+            description="Node control connection",
+        )
+
+        store = StateStore(core_state / "termroom.sqlite3")
+        local_root = next(
+            item
+            for item in store.list_local_roots()
+            if Path(str(item["path"])) == core_root
+        )
+        opened_source = client.post(
+            "/api/workspaces",
+            data={
+                "_csrf": csrf,
+                "root_id": local_root["id"],
+                "path": "source-project",
+            },
+        )
+        assert opened_source.status_code == 303
+        source_workspace_id = opened_source.headers["location"].split("/")[2]
+
+        execution_marker = f"executed-{uuid.uuid4()}"
+        start_output_marker = f"remote-run-start-{uuid.uuid4()}"
+        completion_output_marker = f"remote-run-complete-{uuid.uuid4()}"
+        command = "\n".join(
+            (
+                "test -t 1 && test -t 2 || exit 19",
+                'test -z "${TERMROOM_REMOTE_RUN_LOG_CHANNEL+x}" || exit 20',
+                'test -z "${TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE+x}" || exit 20',
+                f"printf '%s\\n' '{start_output_marker}' >&2",
+                f"printf '%s\\n' '{execution_marker}' >> ../execution-marker.txt",
+                "printf '%s\\n' 'remote eligible' > eligible.txt",
+                "printf '%s\\n' 'remote conflict' > conflict.txt",
+                "printf '%s\\n' '원격 텍스트 결과' > existing-parent/new-result.txt",
+                "rm -- delete-sentinel.txt",
+                "printf '\\000binary\\n' > binary.dat",
+                "mkdir -- missing-parent",
+                "printf '%s\\n' 'parent absent from source' > missing-parent/new-file.txt",
+                "ln -s -- eligible.txt symlink-result.txt",
+                "while test ! -f ../.test-release; do sleep 0.1; done",
+                f"printf '%s\\n' '{completion_output_marker}'",
+            )
+        )
+        run_id = _create_remote_run(
+            client,
+            csrf,
+            source_kind="workspace",
+            target_id=node_id,
+            command=command,
+            source_workspace_id=source_workspace_id,
+            source_path=".",
+        )
+        running = _wait_until(
+            lambda: _remote_run_status_is(
+                client, run_id, "running", connection="online"
+            ),
+            description="active Workspace-source Node Remote Run",
+        )
+        assert running["workspace_id"]
+        transient_workspace_id = str(running["workspace_id"])
+        node_config = json.loads((node_state / "node.json").read_text(encoding="utf-8"))
+        managed_root = Path(str(node_config["run_root"]))
+        run_root = managed_root / run_id
+        work_root = run_root / "work"
+        private_output_path = run_root / ".termroom" / "output.log"
+        private_output_seal_path = run_root / ".termroom" / "output-seal.json"
+        completion_record_path = run_root / ".termroom" / "completion.json"
+        marker_path = run_root / "execution-marker.txt"
+        symlink_path = work_root / "symlink-result.txt"
+        _wait_until(
+            lambda: marker_path.exists() and symlink_path.is_symlink(),
+            description="Node command side effects and symlink result",
+        )
+        assert marker_path.read_text(encoding="utf-8").splitlines() == [execution_marker]
+        assert (work_root / "binary.dat").read_bytes() == b"\x00binary\n"
+        assert node.poll() is None
+
+        tmux_session = f"{REMOTE_RUN_SESSION_PREFIX}{run_id}"
+
+        def owned_run_session_exists() -> bool:
+            exists = subprocess.run(
+                ["tmux", "has-session", "-t", tmux_session],
+                capture_output=True,
+                check=False,
+            )
+            owner = subprocess.run(
+                [
+                    "tmux",
+                    "show-option",
+                    "-v",
+                    "-t",
+                    tmux_session,
+                    "@termroom_remote_run_id",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return exists.returncode == 0 and owner.stdout.strip() == run_id
+
+        def run_tmux_identity() -> tuple[str, str, str, str]:
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "list-panes",
+                    "-s",
+                    "-t",
+                    tmux_session,
+                    "-F",
+                    "#{session_name}|#{session_id}|#{window_name}|#{window_id}|#{pane_id}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            rows = [line.split("|") for line in result.stdout.splitlines()]
+            run_windows = [row for row in rows if len(row) == 5 and row[2] == "run"]
+            assert len(run_windows) == 1 and len(run_windows[0]) == 5
+            return (
+                run_windows[0][0],
+                run_windows[0][1],
+                run_windows[0][3],
+                run_windows[0][4],
+            )
+
+        assert owned_run_session_exists()
+        node_pid = node.pid
+        tmux_identity_before_restart = run_tmux_identity()
+        assert tmux_identity_before_restart[0] == tmux_session
+        run_terminal = next(
+            item
+            for item in store.list_terminals(transient_workspace_id)
+            if item.get("role") == "remote_run"
+            and item.get("managed_run_id") == run_id
+        )
+        assert run_terminal["tmux_window"] == tmux_identity_before_restart[2]
+
+        def capture_run_output() -> str:
+            response = client.get(
+                f"/w/{transient_workspace_id}/terminal/{run_terminal['id']}/scrollback?recent=2000",
+                headers={"Accept": "text/plain"},
+            )
+            assert response.status_code == 200, response.text
+            return response.text
+
+        output_before_restart = capture_run_output()
+        assert start_output_marker in output_before_restart, repr(output_before_restart)
+        assert output_before_restart.splitlines().count(start_output_marker) == 1
+        assert completion_output_marker not in output_before_restart
+        start_marker_bytes = start_output_marker.encode()
+        completion_marker_bytes = completion_output_marker.encode()
+        private_output_before_restart = _wait_until(
+            lambda: (
+                output
+                if start_marker_bytes in (output := private_output_path.read_bytes())
+                else None
+            ),
+            description="start output in the private Node log",
+        )
+        assert private_output_before_restart.count(start_marker_bytes) == 1
+        assert completion_marker_bytes not in private_output_before_restart
+
+        _stop_process(core)
+        core = None
+        client.close()
+        client = None
+        core, handle = _start_process(
+            _core_command(core_root, core_state, port),
+            environment,
+            tmp_path / "core-restart.log",
+        )
+        handles.append(handle)
+        _wait_until(
+            lambda: httpx.get(f"{base_url}/health", timeout=1).status_code == 200,
+            description="Core restart",
+        )
+        client, csrf = _login(base_url, "node-collect-e2e-password")
+        store = StateStore(core_state / "termroom.sqlite3")
+        _wait_until(
+            lambda: _remote_connection_state_is(client, node_id, "available"),
+            timeout=20,
+            description="Node reconnect after Core restart",
+        )
+        restored = _wait_until(
+            lambda: _remote_run_status_is(
+                client, run_id, "running", connection="online"
+            ),
+            description="same Remote Run after Core restart",
+        )
+        assert restored["workspace_id"] == running["workspace_id"]
+        assert node.poll() is None and node.pid == node_pid
+        assert owned_run_session_exists()
+        assert run_tmux_identity() == tmux_identity_before_restart
+        output_after_reconnect = capture_run_output()
+        assert output_after_reconnect == output_before_restart
+        assert output_after_reconnect.splitlines().count(start_output_marker) == 1
+        assert completion_output_marker not in output_after_reconnect
+        assert private_output_path.read_bytes() == private_output_before_restart
+        assert marker_path.read_text(encoding="utf-8").splitlines() == [execution_marker]
+
+        (run_root / ".test-release").write_text("continue\n", encoding="utf-8")
+        finished = _wait_until(
+            lambda: _remote_run_status_is(client, run_id, "finished"),
+            description="Remote Run completion after Core recovery",
+        )
+        assert finished["exit_code"] == 0
+        assert marker_path.read_text(encoding="utf-8").splitlines() == [execution_marker]
+        assert node.poll() is None
+        completed_output = _wait_until(
+            lambda: (
+                output
+                if completion_output_marker in (output := capture_run_output())
+                else None
+            ),
+            description="Remote Run completion output",
+        )
+        assert completed_output.splitlines().count(start_output_marker) == 1
+        assert completed_output.splitlines().count(completion_output_marker) == 1
+        private_output = private_output_path.read_bytes()
+        assert private_output.count(start_marker_bytes) == 1
+        assert private_output.count(completion_marker_bytes) == 1
+        output_seal = json.loads(private_output_seal_path.read_text(encoding="utf-8"))
+        completion_record = json.loads(completion_record_path.read_text(encoding="utf-8"))
+        assert set(output_seal) == {"size", "sealed_at"}
+        assert isinstance(output_seal["sealed_at"], str) and output_seal["sealed_at"]
+        assert output_seal["size"] == len(private_output)
+        assert completion_record["log_size"] == len(private_output)
+        assert completion_record["log_incomplete"] is False
+
+        downloaded = client.get(f"/remote-runs/{run_id}/result.zip")
+        assert downloaded.status_code == 200
+        assert downloaded.headers["content-type"] == "application/zip"
+        archive_digest = hashlib.sha256(downloaded.content).hexdigest()
+        assert downloaded.content and re.fullmatch(r"[0-9a-f]{64}", archive_digest)
+        with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+            infos = archive.infolist()
+            assert infos
+            for info in infos:
+                posix_path = PurePosixPath(info.filename)
+                windows_path = PureWindowsPath(info.filename)
+                assert info.filename == posix_path.as_posix()
+                assert not posix_path.is_absolute()
+                assert not windows_path.drive and not windows_path.root
+                assert "\\" not in info.filename
+                assert all(part not in {"", ".", ".."} for part in posix_path.parts)
+                assert ".termroom" not in posix_path.parts
+                assert stat.S_ISREG(info.external_attr >> 16)
+                assert not info.is_dir()
+            result_names = {info.filename for info in infos}
+            assert result_names == {
+                "eligible.txt",
+                "conflict.txt",
+                "existing-parent/new-result.txt",
+                "binary.dat",
+                "missing-parent/new-file.txt",
+            }
+            assert archive.read("eligible.txt") == b"remote eligible\n"
+            assert archive.read("conflict.txt") == b"remote conflict\n"
+            assert archive.read("existing-parent/new-result.txt") == (
+                "원격 텍스트 결과\n".encode()
+            )
+            assert b"\x00" in archive.read("binary.dat")
+            assert "delete-sentinel.txt" not in result_names
+            assert "symlink-result.txt" not in result_names
+
+        def collection_rows(page: str) -> dict[str, str]:
+            return {
+                path: status
+                for status, path in re.findall(
+                    r'<article class="remote-run-collect-row ([^"]+)">\s*'
+                    r'<code title="([^"]+)">',
+                    page,
+                )
+            }
+
+        first_review = client.get(f"/remote-runs/{run_id}/collect")
+        assert first_review.status_code == 200
+        assert collection_rows(first_review.text)["conflict.txt"] == "ready"
+        (source_root / "conflict.txt").write_text(
+            "user edit after review\n", encoding="utf-8"
+        )
+        reviewed = client.get(f"/remote-runs/{run_id}/collect")
+        assert reviewed.status_code == 200
+        review_rows = collection_rows(reviewed.text)
+        assert review_rows == {
+            "eligible.txt": "ready",
+            "conflict.txt": "conflict",
+            "existing-parent/new-result.txt": "ready",
+            "binary.dat": "skipped",
+            "missing-parent/new-file.txt": "conflict",
+            "delete-sentinel.txt": "skipped",
+        }
+        revision_match = re.search(
+            r'name="revision" value="([^"]+)"', reviewed.text
+        )
+        assert revision_match is not None
+        applied = client.post(
+            f"/remote-runs/{run_id}/collect",
+            data={"_csrf": csrf, "revision": revision_match.group(1)},
+            follow_redirects=False,
+        )
+        assert applied.status_code == 303
+        report_url = applied.headers["location"]
+        report_page = client.get(report_url)
+        assert report_page.status_code == 200
+        expected_report_rows = {
+            "eligible.txt": "applied",
+            "conflict.txt": "conflict",
+            "existing-parent/new-result.txt": "applied",
+            "binary.dat": "skipped",
+            "missing-parent/new-file.txt": "conflict",
+            "delete-sentinel.txt": "skipped",
+        }
+        report_rows = collection_rows(report_page.text)
+        assert report_rows == expected_report_rows
+        assert (source_root / "eligible.txt").read_text(encoding="utf-8") == (
+            "remote eligible\n"
+        )
+        assert (source_root / "conflict.txt").read_text(encoding="utf-8") == (
+            "user edit after review\n"
+        )
+        assert (
+            source_root / "existing-parent" / "new-result.txt"
+        ).read_text(encoding="utf-8") == "원격 텍스트 결과\n"
+        assert (source_root / "delete-sentinel.txt").read_text(encoding="utf-8") == (
+            "keep in source\n"
+        )
+        assert not (source_root / "binary.dat").exists()
+        assert not (source_root / "missing-parent").exists()
+        assert not (source_root / "symlink-result.txt").exists()
+
+        def source_snapshot() -> dict[str, tuple[bytes, str]]:
+            snapshot = {}
+            for path in source_root.rglob("*"):
+                if path.is_file():
+                    content = path.read_bytes()
+                    snapshot[path.relative_to(source_root).as_posix()] = (
+                        content,
+                        hashlib.sha256(content).hexdigest(),
+                    )
+            return snapshot
+
+        source_state_after_apply = source_snapshot()
+        reloaded_report = client.get(report_url)
+        assert reloaded_report.status_code == 200
+        assert collection_rows(reloaded_report.text) == report_rows == expected_report_rows
+        assert source_snapshot() == source_state_after_apply
+
+        run_activity_events = [
+            item
+            for item in store.list_activity_events(limit=200)
+            if item.get("subject_id") == run_id
+        ]
+        terminal_events = [
+            item
+            for item in run_activity_events
+            if item.get("kind")
+            in {
+                "remote_run.completed",
+                "remote_run.failed",
+                "remote_run.stopped",
+                "remote_run.attention",
+            }
+        ]
+        assert len(terminal_events) == 1
+        assert terminal_events[0].get("kind") == "remote_run.completed"
+        event = _wait_until(
+            lambda: terminal_events[0],
+            description="Remote Run Activity event",
+        )
+        activity = client.get("/activity")
+        assert activity.status_code == 200
+        assert "Remote Run completed" in activity.text
+        opened_activity = client.post(
+            f"/activity/{event['id']}/open",
+            data={"_csrf": csrf},
+            follow_redirects=False,
+        )
+        assert opened_activity.status_code == 303
+        assert opened_activity.headers["location"] == f"/remote-runs/{run_id}"
+
+        sibling = managed_root / "keep-sibling.txt"
+        sibling.write_text("must survive managed deletion\n", encoding="utf-8")
+        source_workspace_record = store.get_workspace(source_workspace_id)
+        transient_workspace_record = store.get_workspace(transient_workspace_id)
+        assert source_workspace_record is not None
+        assert source_workspace_record["root_id"] == local_root["id"]
+        assert source_workspace_record["root_path"] == str(core_root)
+        assert source_workspace_record["relative_path"] == "source-project"
+        assert (
+            Path(source_workspace_record["root_path"])
+            / source_workspace_record["relative_path"]
+        ).resolve() == source_root.resolve()
+        assert transient_workspace_record is not None
+        assert transient_workspace_record["root_path"] == f"ssh://{node_id}"
+        assert transient_workspace_record["relative_path"] == str(work_root)
+        assert transient_workspace_record["canonical_path"] == str(work_root)
+        source_workspace_ids = {
+            str(item["id"]) for item in store.list_workspaces_for_root(local_root["id"])
+        }
+        node_workspace_ids = {
+            str(item["id"])
+            for item in store.list_registered_workspaces_for_computer(node_id)
+        }
+        remote_run_ids = {
+            str(item["id"]) for item in store.list_remote_runs_for_computer(node_id)
+        }
+        assert source_workspace_id in source_workspace_ids
+        assert transient_workspace_id in node_workspace_ids
+        assert run_id in remote_run_ids
+        source_state_before_delete = source_snapshot()
+        assert source_state_before_delete == source_state_after_apply
+        entries_before_delete = {path.name for path in managed_root.iterdir()}
+        deleted = client.post(
+            f"/remote-runs/{run_id}/delete", data={"_csrf": csrf}
+        )
+        assert deleted.status_code == 303
+        assert store.get_remote_run(run_id) is None
+        assert store.get_workspace(transient_workspace_id) is None
+        assert store.get_workspace(source_workspace_id) == source_workspace_record
+        assert {
+            str(item["id"]) for item in store.list_workspaces_for_root(local_root["id"])
+        } == source_workspace_ids
+        assert {
+            str(item["id"])
+            for item in store.list_registered_workspaces_for_computer(node_id)
+        } == node_workspace_ids - {transient_workspace_id}
+        assert {
+            str(item["id"]) for item in store.list_remote_runs_for_computer(node_id)
+        } == remote_run_ids - {run_id}
+        assert not run_root.exists()
+        assert source_root.is_dir()
+        assert source_snapshot() == source_state_before_delete
+        assert (source_root / "conflict.txt").read_bytes() == b"user edit after review\n"
+        assert (source_root / "delete-sentinel.txt").read_bytes() == b"keep in source\n"
+        assert not (source_root / "binary.dat").exists()
+        assert not (source_root / "missing-parent").exists()
+        assert not (source_root / "symlink-result.txt").exists()
+        assert sibling.is_file()
+        assert sibling.read_text(encoding="utf-8") == "must survive managed deletion\n"
+        assert {path.name for path in managed_root.iterdir()} == entries_before_delete - {
+            run_id
+        }
+    finally:
+        if client is not None:
+            client.close()
+        _stop_process(pair)
+        _stop_process(node)
+        _stop_process(core)
         for handle in handles:
             handle.close()
 
