@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from termroom.app import create_app
 from termroom.config import Settings
+from termroom.terminals import TerminalError
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 
@@ -39,6 +45,516 @@ def _cleanup(app, workspace) -> None:  # type: ignore[no-untyped-def]
         check=False,
         capture_output=True,
     )
+
+
+class _BridgeWebSocket:
+    def __init__(self, *messages: dict[str, object]) -> None:
+        self.messages = list(messages)
+
+    async def receive(self) -> dict[str, object]:
+        return self.messages.pop(0)
+
+    async def send_text(self, _value: str) -> None:
+        return None
+
+    async def close(self, *, code: int, reason: str) -> None:
+        raise AssertionError((code, reason))
+
+
+async def _assert_bridge_barrier_keeps_loop_live(
+    app,
+    bridge,
+    second_terminal_progress: Callable[[], Awaitable[None]],
+    entered: threading.Event,
+    release: threading.Event,
+) -> tuple[list[str], dict[str, bool]]:  # type: ignore[no-untyped-def]
+    loop = asyncio.get_running_loop()
+    scheduled = asyncio.Event()
+    ready: set[str] = set()
+    ready_event = asyncio.Event()
+    progress = {
+        name: threading.Event()
+        for name in ("heartbeat", "health", "navigation", "second_terminal")
+    }
+    trace: list[str] = []
+    trace_lock = threading.Lock()
+
+    def record(event: str) -> None:
+        with trace_lock:
+            trace.append(event)
+
+    async def probe(name: str) -> None:
+        ready.add(name)
+        if len(ready) == len(progress):
+            ready_event.set()
+        await scheduled.wait()
+        if name == "health":
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.get("/health")
+            assert response.status_code == 200 and response.text == "ok"
+        elif name == "navigation":
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.get("/")
+            assert response.status_code in {200, 401}
+        elif name == "second_terminal":
+            await second_terminal_progress()
+        else:
+            await asyncio.sleep(0)
+        progress[name].set()
+        record(f"probe_completed:{name}")
+
+    probes = [asyncio.create_task(probe(name)) for name in progress]
+    await ready_event.wait()
+    bridge_task = asyncio.create_task(bridge())
+    bridge_done = threading.Event()
+    bridge_task.add_done_callback(lambda _task: bridge_done.set())
+    before_release: dict[str, bool] = {}
+
+    def watchdog() -> None:
+        try:
+            if not entered.wait(2):
+                record("barrier_not_entered")
+                return
+            record("barrier_entered")
+            record("heartbeat_scheduled")
+            record("health_scheduled")
+            record("navigation_scheduled")
+            record("second_terminal_progress_scheduled")
+            loop.call_soon_threadsafe(scheduled.set)
+            deadline = time.monotonic() + 0.4
+            while time.monotonic() < deadline and not all(
+                event.is_set() for event in progress.values()
+            ):
+                time.sleep(0.005)
+            before_release.update({name: event.is_set() for name, event in progress.items()})
+            before_release["bridge_done"] = bridge_done.is_set()
+            record("progress_before_release")
+        finally:
+            record("watchdog_release")
+            release.set()
+
+    watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+    watchdog_thread.start()
+    try:
+        await asyncio.wait_for(bridge_task, timeout=6)
+    finally:
+        release.set()
+        if bridge_task.done() and bridge_task.exception() is None:
+            await asyncio.wait_for(asyncio.gather(*probes), timeout=2)
+        else:
+            for task in probes:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*probes, return_exceptions=True)
+        await asyncio.to_thread(watchdog_thread.join, 2)
+    record("bridge_complete")
+    assert not watchdog_thread.is_alive()
+    assert bridge_done.is_set()
+    assert all(event.is_set() for event in progress.values())
+    assert trace.index("barrier_entered") < trace.index("heartbeat_scheduled")
+    assert trace.index("heartbeat_scheduled") < trace.index("health_scheduled")
+    assert trace.index("health_scheduled") < trace.index("navigation_scheduled")
+    assert trace.index("navigation_scheduled") < trace.index("second_terminal_progress_scheduled")
+    assert (
+        trace.index("second_terminal_progress_scheduled")
+        < trace.index("progress_before_release")
+    )
+    assert trace.index("progress_before_release") < trace.index("watchdog_release")
+    assert max(
+        trace.index(f"probe_completed:{name}") for name in progress
+    ) < trace.index("bridge_complete")
+    return trace, before_release
+
+
+def _terminal_disconnect() -> dict[str, object]:
+    return {"type": "websocket.disconnect", "code": 1000}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_terminal_setup_tmux_barrier_does_not_stall_shared_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    second_terminal = manager.create_terminal(workspace, "second")
+    entered, release = threading.Event(), threading.Event()
+    original = manager._prepare_browser_view
+    original_spawn = manager._spawn_tmux_client
+    owned_view = ""
+    owned_process: tuple[int, int] | None = None
+
+    def blocked_setup(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        nonlocal owned_view
+        if str(args[1]["id"]) != str(terminal["id"]):
+            original(*args, **kwargs)
+            return
+        owned_view = args[2]
+        assert not manager.session_exists(owned_view)
+        assert manager.session_exists(str(workspace["tmux_session"]))
+        entered.set()
+        if not release.wait(4):
+            raise AssertionError("setup barrier was not released")
+        original(*args, **kwargs)
+
+    async def second_terminal_progress() -> None:
+        await manager.bridge(
+            _BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal
+        )
+
+    def record_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal owned_process
+        owned_process = original_spawn(*args, **kwargs)
+        return owned_process
+
+    monkeypatch.setattr(manager, "_prepare_browser_view", blocked_setup)
+    monkeypatch.setattr(manager, "_spawn_tmux_client", record_spawn)
+    try:
+        trace, before_release = await _assert_bridge_barrier_keeps_loop_live(
+            app,
+            lambda: manager.bridge(
+                _BridgeWebSocket(_terminal_disconnect()), workspace, terminal
+            ),
+            second_terminal_progress,
+            entered,
+            release,
+        )
+        assert before_release == {
+            "heartbeat": True,
+            "health": True,
+            "navigation": True,
+            "second_terminal": True,
+            "bridge_done": False,
+        }, trace
+        assert owned_view and owned_process
+        assert manager._run_tmux("has-session", "-t", owned_view, check=False).returncode != 0
+        with pytest.raises(ProcessLookupError):
+            os.kill(owned_process[0], 0)
+        with pytest.raises(OSError):
+            os.fstat(owned_process[1])
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+async def test_terminal_setup_cancellation_cleans_owned_view_process_and_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    entered, release = threading.Event(), threading.Event()
+    original_prepare = manager._prepare_browser_view
+    original_spawn = manager._spawn_tmux_client
+    view_session = ""
+    process: tuple[int, int] | None = None
+
+    def blocked_setup(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        nonlocal view_session
+        view_session = args[2]
+        entered.set()
+        if not release.wait(4):
+            raise AssertionError("setup cancellation barrier was not released")
+        original_prepare(*args, **kwargs)
+
+    def record_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal process
+        process = original_spawn(*args, **kwargs)
+        return process
+
+    monkeypatch.setattr(manager, "_prepare_browser_view", blocked_setup)
+    monkeypatch.setattr(manager, "_spawn_tmux_client", record_spawn)
+    bridge_task = asyncio.create_task(
+        manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, terminal)
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        bridge_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(bridge_task, timeout=6)
+        assert view_session and process
+        assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
+        with pytest.raises(ProcessLookupError):
+            os.kill(process[0], 0)
+        with pytest.raises(OSError):
+            os.fstat(process[1])
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        release.set()
+        if not bridge_task.done():
+            bridge_task.cancel()
+            await asyncio.gather(bridge_task, return_exceptions=True)
+        _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+async def test_terminal_pty_readiness_failure_removes_only_owned_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    original_prepare = manager._prepare_browser_view
+    view_session = ""
+
+    def capture_view(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        nonlocal view_session
+        view_session = args[2]
+        original_prepare(*args, **kwargs)
+
+    def readiness_timeout(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("PTY child did not become ready")
+
+    monkeypatch.setattr(manager, "_prepare_browser_view", capture_view)
+    monkeypatch.setattr(manager, "_spawn_tmux_client", readiness_timeout)
+    try:
+        with pytest.raises(TerminalError, match="PTY child did not become ready"):
+            await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, terminal)
+        assert view_session
+        assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+async def test_terminal_tmux_setup_timeout_removes_partial_view_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    original = manager._run_tmux
+    timed_out_view = ""
+
+    def timeout_selection(*args: str, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal timed_out_view
+        if args[:1] == ("select-window",):
+            assert kwargs.get("timeout") == 5.0
+            timed_out_view = args[1].split(":", 1)[0]
+            raise TerminalError("tmux command timed out after 5 seconds")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_run_tmux", timeout_selection)
+    try:
+        with pytest.raises(TerminalError, match="tmux command timed out"):
+            await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, terminal)
+        assert timed_out_view
+        assert manager._run_tmux("has-session", "-t", timed_out_view, check=False).returncode != 0
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_retries_timed_out_exact_view_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    disconnected = threading.Event()
+    original = manager._run_tmux
+    view_session = ""
+    timed_out = False
+
+    def timeout_once(*args: str, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal timed_out, view_session
+        if (
+            disconnected.is_set()
+            and len(args) >= 3
+            and args[:2] == ("kill-session", "-t")
+            and args[2].startswith("termroom-view-")
+            and not timed_out
+        ):
+            timed_out = True
+            view_session = args[2]
+            raise TerminalError("tmux command timed out after 5 seconds")
+        return original(*args, **kwargs)
+
+    class DisconnectWebSocket(_BridgeWebSocket):
+        async def receive(self) -> dict[str, object]:
+            disconnected.set()
+            return await super().receive()
+
+    monkeypatch.setattr(manager, "_run_tmux", timeout_once)
+    try:
+        await manager.bridge(
+            DisconnectWebSocket(_terminal_disconnect()), workspace, terminal
+        )
+        assert timed_out and view_session
+        assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_terminal_cleanup_tmux_barrier_does_not_stall_shared_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    second_terminal = manager.create_terminal(workspace, "second")
+    entered, release = threading.Event(), threading.Event()
+    disconnected = threading.Event()
+    original = manager._run_tmux
+    view_session = ""
+
+    def blocked_tmux(*args: str, **kwargs):  # type: ignore[no-untyped-def]
+        if (
+            disconnected.is_set()
+            and len(args) >= 3
+            and args[:2] == ("kill-session", "-t")
+            and args[2].startswith("termroom-view-")
+        ):
+            nonlocal view_session
+            if not view_session or args[2] == view_session:
+                view_session = args[2]
+                entered.set()
+                if not release.wait(4):
+                    raise AssertionError("cleanup barrier was not released")
+        return original(*args, **kwargs)
+
+    class DisconnectWebSocket(_BridgeWebSocket):
+        async def receive(self) -> dict[str, object]:
+            disconnected.set()
+            return await super().receive()
+
+    async def second_terminal_progress() -> None:
+        await manager.bridge(
+            _BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal
+        )
+
+    monkeypatch.setattr(manager, "_run_tmux", blocked_tmux)
+    try:
+        trace, before_release = await _assert_bridge_barrier_keeps_loop_live(
+            app,
+            lambda: manager.bridge(
+                DisconnectWebSocket(_terminal_disconnect()), workspace, terminal
+            ),
+            second_terminal_progress,
+            entered,
+            release,
+        )
+        assert before_release == {
+            "heartbeat": True,
+            "health": True,
+            "navigation": True,
+            "second_terminal": True,
+            "bridge_done": False,
+        }, trace
+        assert view_session
+        assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        release.set()
+        _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_terminal_blocked_pty_write_does_not_stall_shared_loop_or_duplicate_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    second_terminal = manager.create_terminal(workspace, "second")
+    entered, release = threading.Event(), threading.Event()
+    original_write = os.write
+    target_fd: int | None = None
+    writes: list[bytes] = []
+    marker = "TERMROOM_BLOCKED_WRITE_ONCE"
+    command = f"printf '%s\\n' '{marker}'\r"
+
+    def record_write(fd: int, data: bytes) -> int:
+        if fd == target_fd:
+            writes.append(data)
+            entered.set()
+            if not release.wait(4):
+                raise AssertionError("PTY write barrier was not released")
+        return original_write(fd, data)
+
+    original_spawn = manager._spawn_tmux_client
+
+    def record_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal target_fd
+        process_pid, master_fd = original_spawn(*args, **kwargs)
+        if target_fd is None:
+            target_fd = master_fd
+        return process_pid, master_fd
+
+    async def second_terminal_progress() -> None:
+        await manager.bridge(
+            _BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal
+        )
+
+    monkeypatch.setattr(manager, "_spawn_tmux_client", record_spawn)
+    monkeypatch.setattr(os, "write", record_write)
+    try:
+        trace, before_release = await _assert_bridge_barrier_keeps_loop_live(
+            app,
+            lambda: manager.bridge(
+                _BridgeWebSocket(
+                    {
+                        "type": "websocket.receive",
+                        "text": json.dumps(
+                            {
+                                "kind": "input",
+                                "data": command,
+                                "rows": 24,
+                                "cols": 80,
+                                "user_input": True,
+                            }
+                        ),
+                    },
+                    _terminal_disconnect(),
+                ),
+                workspace,
+                terminal,
+            ),
+            second_terminal_progress,
+            entered,
+            release,
+        )
+        assert before_release == {
+            "heartbeat": True,
+            "health": True,
+            "navigation": True,
+            "second_terminal": True,
+            "bridge_done": False,
+        }, trace
+        assert writes == [command.encode()]
+        deadline = time.monotonic() + 2
+        while (
+            marker not in manager.capture_scrollback(workspace, terminal)
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        scrollback = manager.capture_scrollback(workspace, terminal)
+        assert scrollback.count(marker) == 1
+        assert writes == [command.encode()]
+        assert manager._run_tmux(
+            "has-session", "-t", str(workspace["tmux_session"]), check=False
+        ).returncode == 0
+    finally:
+        release.set()
+        _cleanup(app, workspace)
 
 
 def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Path) -> None:
@@ -223,7 +739,9 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
     def record_size(_fd: int, *, rows: int, cols: int) -> None:
         applied_sizes.append((rows, cols))
 
-    def record_grid_role(_view_session: str, *, enabled: bool) -> bool:
+    def record_grid_role(
+        _view_session: str, *, enabled: bool, tmux_timeout: float | None = None
+    ) -> bool:
         grid_roles.append(enabled)
         return True
 
@@ -405,13 +923,15 @@ def test_terminal_bootstrap_role_failure_retry_or_fail_closed(
     original = manager._set_browser_view_grid_resize
     attempts: list[bool] = []
 
-    def role(view: str, *, enabled: bool) -> bool:
+    def role(
+        view: str, *, enabled: bool, tmux_timeout: float | None = None
+    ) -> bool:
         attempts.append(enabled)
         if failure == "enable" and len(attempts) == 1:
             return False
         if failure == "demote" and not enabled:
             return False
-        return original(view, enabled=enabled)
+        return original(view, enabled=enabled, tmux_timeout=tmux_timeout)
 
     monkeypatch.setattr(manager, "_set_browser_view_grid_resize", role)
     try:
@@ -491,12 +1011,14 @@ def test_terminal_input_waits_for_grid_promotion_retry(
             "#{window_width}x#{window_height}",
         ).stdout.strip()
 
-    def role(view: str, *, enabled: bool) -> bool:
+    def role(
+        view: str, *, enabled: bool, tmux_timeout: float | None = None
+    ) -> bool:
         nonlocal failed
         if enabled and not failed and manager.control.presence(terminal_id)["input_revision"]:
             failed = True
             return False
-        return original_role(view, enabled=enabled)
+        return original_role(view, enabled=enabled, tmux_timeout=tmux_timeout)
 
     def write(fd: int, data: bytes) -> int:
         if data == b"z":

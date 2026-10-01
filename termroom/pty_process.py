@@ -57,6 +57,8 @@ def spawn_pty_process(
                 os.kill(process_pid, signal.SIGKILL)
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(process_pid, 0)
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
             raise RuntimeError("PTY child did not become ready")
         readiness = os.read(ready_read_fd, 4096)
     finally:
