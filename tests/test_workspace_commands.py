@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -62,6 +64,216 @@ def _wait_until(predicate: Any, message: str, timeout: float = 4.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError(message)
+
+
+def _zsh_startup_diagnostic(
+    *,
+    manager: TerminalManager,
+    window: str,
+    launch_id: str,
+    digest: str,
+    shell_tmpdir: Path,
+    markers: dict[str, Path],
+    shell: str,
+) -> str:
+    def fact(path: Path) -> dict[str, Any]:
+        try:
+            stat = path.stat()
+            return {"exists": path.is_file(), "size": stat.st_size if path.is_file() else None}
+        except Exception:
+            return {"exists": "unavailable", "size": "unavailable"}
+
+    def tmux(*args: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return manager._run_tmux(*args, check=False, timeout=0.5)
+        except Exception:
+            return None
+
+    identity = {
+        key: "unavailable"
+        for key in (
+            "pane_id", "pane_dead", "pane_dead_status", "pane_pid",
+            "pane_current_command", "workspace_command_state", "launch_matches", "slot_matches",
+            "digest_matches",
+        )
+    }
+    try:
+        result = tmux(
+            "display-message",
+            "-p",
+            "-t",
+            window,
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t"
+            "#{pane_current_command}\t#{@termroom_workspace_command_state}\t"
+            "#{@termroom_workspace_command_launch}\t#{@termroom_workspace_command_slot}\t"
+            "#{@termroom_workspace_command_digest}",
+        )
+        fields = result.stdout.rstrip("\n").split("\t") if result and not result.returncode else []
+        if len(fields) == 9:
+            pane_id, dead, dead_status, pid, current, state, launch, slot, pane_digest = fields
+            identity = {
+                "pane_id": pane_id if re.fullmatch(r"%\d+", pane_id) else "unavailable",
+                "pane_dead": dead if dead in {"0", "1"} else "unavailable",
+                "pane_dead_status": (
+                    dead_status if re.fullmatch(r"-?\d+", dead_status) else "unavailable"
+                ),
+                "pane_pid": pid if pid.isdigit() else "unavailable",
+                "pane_current_command": (
+                    current if re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", current) else "other"
+                ),
+                "workspace_command_state": (
+                    state if state in {"running", "settling", "shell"} else "unavailable"
+                ),
+                "launch_matches": str(launch == launch_id).lower(),
+                "slot_matches": str(slot == "0").lower(),
+                "digest_matches": str(pane_digest == digest).lower(),
+            }
+    except Exception:
+        pass
+
+    processes: list[dict[str, str]] = []
+    pending = [identity.get("pane_pid", "unavailable")]
+    queried: set[str] = set()
+    recorded: set[str] = set()
+    truncated = False
+    process_collection = "available"
+    while pending and len(processes) < 8:
+        parent = pending.pop(0)
+        if not parent.isdigit() or parent in queried:
+            continue
+        queried.add(parent)
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "pid=,ppid=,stat=,comm=", "-p", parent, "--ppid", parent],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=0.35,
+            )
+        except Exception:
+            process_collection = "unavailable"
+            continue
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 3)
+            if len(fields) != 4 or not fields[0].isdigit() or not fields[1].isdigit():
+                continue
+            pid, ppid, state, comm = fields
+            if pid not in recorded and len(processes) < 8:
+                recorded.add(pid)
+                processes.append({
+                    "pid": pid,
+                    "ppid": ppid,
+                    "stat": state[:16] if re.fullmatch(r"[A-Za-z<>=+?-]+", state) else "other",
+                    "comm": comm[:32] if re.fullmatch(r"[A-Za-z0-9_.+-]{1,32}", comm) else "other",
+                })
+            if pid != parent and pid not in queried:
+                pending.append(pid)
+        if result.returncode:
+            process_collection = "unavailable"
+    if pending:
+        truncated = True
+
+    artifacts = {name: fact(path) for name, path in markers.items()}
+    startup_dirs: list[dict[str, Any]] = []
+    try:
+        for directory in shell_tmpdir.glob("termroom-zsh.*"):
+            if directory.is_dir():
+                startup_dirs.append({
+                    "basename": "termroom-zsh.*",
+                    "exists": True,
+                    ".zshenv": fact(directory / ".zshenv"),
+                    ".zshrc": fact(directory / ".zshrc"),
+                })
+                if len(startup_dirs) == 4:
+                    break
+        if not startup_dirs:
+            startup_dirs = [{"basename": "termroom-zsh.*", "exists": False}]
+    except Exception:
+        startup_dirs = [{"status": "unavailable"}]
+
+    pane_tail: list[str] | str = "unavailable"
+    try:
+        result = tmux("capture-pane", "-p", "-t", window, "-S", "-80")
+        if result and not result.returncode:
+            classified = []
+            for line in result.stdout.splitlines()[-80:]:
+                lowered = line.casefold()
+                if line.strip() == "command-finished":
+                    classified.append("command-finished")
+                elif "command not found" in lowered:
+                    classified.append("command-not-found")
+                elif "permission denied" in lowered:
+                    classified.append("permission-denied")
+                elif "no such file" in lowered:
+                    classified.append("missing-file")
+                elif "syntax error" in lowered or "parse error" in lowered:
+                    classified.append("syntax-error")
+                elif "bad option" in lowered or "unknown option" in lowered:
+                    classified.append("invalid-option")
+                elif "error" in lowered or "failed" in lowered:
+                    classified.append("startup-error")
+                elif line.strip() in {"✓", "✕ 0", "✕ 7"}:
+                    classified.append("completion-visible")
+            pane_tail = classified[-32:]
+    except Exception:
+        pass
+
+    def version(command: list[str], pattern: str) -> str:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False, timeout=0.5
+            )
+            match = re.search(pattern, result.stdout + result.stderr)
+            return match.group(0)[:80] if result.returncode == 0 and match else "unavailable"
+        except Exception:
+            return "unavailable"
+
+    os_identity: dict[str, str] = {"id": "unavailable", "version_id": "unavailable"}
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in {"ID", "VERSION_ID"}:
+                value = value.strip('"\'')
+                if re.fullmatch(r"[A-Za-z0-9_.+-]{1,40}", value):
+                    os_identity["id" if key == "ID" else "version_id"] = value
+    except Exception:
+        pass
+
+    def python_version() -> str:
+        try:
+            return platform.python_version()
+        except Exception:
+            return "unavailable"
+
+    payload: dict[str, Any] = {
+        "completion_visible": True,
+        "shell_ready": artifacts.get("shell_ready", {}).get("exists", "unavailable"),
+        "startup_marker": artifacts.get("shell_startup_entered", {}).get("exists", "unavailable"),
+        "tmux": identity,
+        "processes": processes or [{"status": "unavailable"}],
+        "process_collection": process_collection,
+        "process_tree_truncated": truncated,
+        "artifacts": artifacts,
+        "startup_dirs": startup_dirs,
+        "pane_tail": pane_tail,
+        "runtime": {
+            "zsh": version([shell, "--version"], r"zsh [0-9][A-Za-z0-9.+_-]*"),
+            "tmux": version(["tmux", "-V"], r"tmux [0-9A-Za-z.+_-]+"),
+            "python": python_version(),
+            "os": os_identity,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(encoded.encode("utf-8")) > 2048:
+        payload["pane_tail"] = "unavailable"
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    message = "zsh_startup_diagnostic=" + encoded
+    if len(message.encode("utf-8")) > 4000:
+        encoded = json.dumps(
+            {"diagnostic": "bounded evidence exceeded limit"}, separators=(",", ":")
+        )
+        message = "zsh_startup_diagnostic=" + encoded
+    return message
 
 
 async def _login(client: httpx.AsyncClient) -> None:
@@ -776,7 +988,34 @@ def test_delayed_shell_startup_retry_preserves_first_input(
             time.sleep(0.01)
         assert completion_visible, "Workspace command completion was not visible"
         assert not shell_ready.exists()
-        _wait_until(shell_startup_entered.is_file, "Shell startup barrier was not entered")
+        try:
+            _wait_until(shell_startup_entered.is_file, "Shell startup barrier was not entered")
+        except AssertionError:
+            if shell_name != "zsh":
+                raise
+            try:
+                diagnostic = _zsh_startup_diagnostic(
+                    manager=manager,
+                    window=window,
+                    launch_id=launch_id,
+                    digest=workspace_command_digest(command),
+                    shell_tmpdir=shell_tmpdir,
+                    markers={
+                        "shell_startup_entered": shell_startup_entered,
+                        "shell_startup_released": shell_startup_released,
+                        "shell_ready": shell_ready,
+                        "precmd_entered": precmd_entered,
+                        "zsh_precmd_released": zsh_precmd_released,
+                    },
+                    shell=shell,
+                )
+            except Exception:
+                pytest.fail(
+                    "zsh_startup_diagnostic={\"diagnostic\":\"unavailable\","
+                    "\"failure\":\"Shell startup barrier was not entered\"}",
+                    pytrace=False,
+                )
+            pytest.fail(diagnostic, pytrace=False)
 
         pane = manager._run_tmux(
             "display-message", "-p", "-t", window, "#{pane_id}"
