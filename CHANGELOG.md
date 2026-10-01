@@ -2,6 +2,21 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.0] - 2026-10-02
+
+### Changed
+
+- Require Core and Termroom Node to use the same Node protocol v3 generation; update both together.
+- Keep Remote Run output and result recovery available across reconnects, and preserve the boundary between terminal history and live output.
+- Give the first active terminal viewport one-shot ownership of the shared tmux grid, and apply input only after a successful resize.
+- Keep file and run operations within their validated local, remote, and managed-root boundaries. Recheck source conflicts before applying results, never propagate remote deletions to the source, and delete managed data only when its exact ownership identity matches.
+- Keep Local terminal setup, PTY writes, and cleanup from blocking the Core event loop.
+
+### Compatibility and validation
+
+- Certificate-dependent Safari validation is excluded from this release and is not a release claim. No TLS or trust bypass is introduced.
+- These changes do not establish the cause of the earlier production incident.
+
 ## [0.3.18] - 2026-08-30
 
 ### Added
