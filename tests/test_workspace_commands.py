@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import json
 import os
 import platform
@@ -13,6 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from stat import S_ISREG
 from types import SimpleNamespace
 from typing import Any
 
@@ -66,6 +68,207 @@ def _wait_until(predicate: Any, message: str, timeout: float = 4.0) -> None:
     raise AssertionError(message)
 
 
+def _marker_error_state(error: OSError) -> str:
+    if isinstance(error, FileNotFoundError):
+        return "absent"
+    if isinstance(error, PermissionError):
+        return "inaccessible"
+    name = errno.errorcode.get(error.errno, "OSError")
+    return f"error:{name[:24]}"
+
+
+def _marker_fact(path: Path) -> dict[str, Any]:
+    try:
+        result = path.stat()
+        return {"state": "present", "size": result.st_size} if S_ISREG(result.st_mode) else {
+            "state": "error:not-file"
+        }
+    except OSError as exc:
+        return {"state": _marker_error_state(exc)}
+    except Exception:
+        return {"state": "unavailable"}
+
+
+def _fixed_marker_value(path: Path) -> str:
+    fact = _marker_fact(path)
+    if fact["state"] != "present":
+        return fact["state"]
+    try:
+        with path.open("rb") as marker:
+            value = marker.read(4)
+    except PermissionError:
+        return "inaccessible"
+    except OSError as exc:
+        return _marker_error_state(exc)
+    except Exception:
+        return "unavailable"
+    return {b"on\n": "on", b"off\n": "off"}.get(value, "error:invalid-token")
+
+
+def _zsh_startup_stage(
+    markers: dict[str, dict[str, Any]],
+    generated_files: dict[str, dict[str, Any]],
+    options: dict[str, str],
+) -> str:
+    if markers["precmd_entered"]["state"] == "present":
+        return "precmd_entered"
+    if markers["user_zshrc_entered"]["state"] == "present":
+        return "user_zshrc_entered"
+    later_states = [
+        markers["precmd_entered"]["state"],
+        markers["user_zshrc_entered"]["state"],
+    ]
+    if "inaccessible" in later_states:
+        return "marker_inaccessible"
+    if any(state.startswith("error:") or state == "unavailable" for state in later_states):
+        return "collector_error"
+    entered = markers["fixture_zshenv_entered"]["state"]
+    completed = markers["fixture_zshenv_completed"]["state"]
+    if "inaccessible" in {entered, completed}:
+        return "marker_inaccessible"
+    if any(
+        state.startswith("error:") or state == "unavailable"
+        for state in (entered, completed)
+    ):
+        return "collector_error"
+    if entered == "present" and completed == "absent":
+        return "fixture_zshenv_entered_not_completed"
+    if completed == "present":
+        option_states = list(options.values())
+        if "inaccessible" in option_states:
+            return "marker_inaccessible"
+        if any(
+            state.startswith("error:") or state == "unavailable"
+            for state in option_states
+        ) or any(state not in {"on", "off"} for state in option_states):
+            return "collector_error"
+        if options["interactive"] == "off":
+            return "fixture_zshenv_completed_noninteractive"
+        if options["rcs"] == "off":
+            return "fixture_zshenv_completed_rcs_off"
+        return "fixture_zshenv_completed_user_zshrc_not_entered"
+    if entered != "absent" or completed != "absent":
+        return "collector_error"
+    generated_states = [item["state"] for item in generated_files.values()]
+    if "inaccessible" in generated_states:
+        return "marker_inaccessible"
+    if any(state.startswith("error:") or state == "unavailable" for state in generated_states):
+        return "collector_error"
+    if "absent" in generated_states:
+        return "generated_files_missing"
+    return "generated_zshenv_not_entered"
+
+
+def _zsh_plain_control(
+    manager: TerminalManager,
+    shell: str,
+    tmp_path: Path,
+) -> dict[str, str]:
+    started = time.monotonic()
+    deadline = started + 2.0
+    poll_deadline = started + 1.5
+    control_home = tmp_path / f"zsh-control-{uuid.uuid4().hex}"
+    env_entered = control_home / "env-entered"
+    rc_entered = control_home / "rc-entered"
+    session = f"termroom-zsh-control-{uuid.uuid4().hex[:12]}"
+    result = {
+        "zshenv_entered": "unavailable",
+        "zshrc_entered": "unavailable",
+        "pane_alive": "unavailable",
+        "pane_command": "unavailable",
+        "cleanup": "pass",
+    }
+
+    def marker_result(path: Path) -> str:
+        return {"present": "true", "absent": "false"}.get(
+            _marker_fact(path)["state"], "unavailable"
+        )
+
+    attempted = False
+    owned = False
+    try:
+        control_home.mkdir(mode=0o700)
+        (control_home / ".zshenv").write_text(
+            f"print -r -- entered > {shlex.quote(str(env_entered))}\n",
+            encoding="ascii",
+        )
+        (control_home / ".zshrc").write_text(
+            f"print -r -- entered > {shlex.quote(str(rc_entered))}\n",
+            encoding="ascii",
+        )
+        attempted = True
+        create = manager._run_tmux(
+            "new-session", "-d", "-P", "-F", "#{window_id}",
+            "-s", session, "-c", str(control_home),
+            "-e", f"HOME={control_home}",
+            "-e", f"ZDOTDIR={control_home}",
+            "-e", f"TMPDIR={control_home}",
+            shlex.join((shell,)),
+            check=False,
+            timeout=min(0.3, max(0.01, deadline - time.monotonic())),
+        )
+        if create.returncode:
+            return result
+        owned = True
+        window = create.stdout.strip()
+        if not re.fullmatch(r"@\d+", window):
+            return result
+        while time.monotonic() < poll_deadline:
+            result["zshenv_entered"] = marker_result(env_entered)
+            result["zshrc_entered"] = marker_result(rc_entered)
+            remaining = poll_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            pane = manager._run_tmux(
+                "display-message", "-p", "-t", window,
+                "#{pane_dead}|#{pane_current_command}",
+                check=False,
+                timeout=max(0.01, min(0.1, remaining)),
+            )
+            fields = pane.stdout.strip().split("|", 1) if not pane.returncode else []
+            if len(fields) == 2 and fields[0] in {"0", "1"}:
+                result["pane_alive"] = "true" if fields[0] == "0" else "false"
+                result["pane_command"] = (
+                    "zsh" if fields[1] == Path(shell).name else "other"
+                )
+            if result["zshenv_entered"] == result["zshrc_entered"] == "true":
+                break
+            time.sleep(min(0.02, max(0, poll_deadline - time.monotonic())))
+    except Exception:
+        pass
+    finally:
+        if attempted:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    cleanup = manager._run_tmux(
+                        "kill-session", "-t", session, check=False,
+                        timeout=max(0.01, min(0.2, remaining)),
+                    )
+                    if cleanup.returncode == 0:
+                        result["cleanup"] = "pass"
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            exists = manager._run_tmux(
+                                "has-session", "-t", session, check=False,
+                                timeout=min(0.1, remaining),
+                            )
+                            result["cleanup"] = (
+                                "pass" if exists.returncode != 0 else "fail"
+                            )
+                        else:
+                            result["cleanup"] = "fail"
+                except Exception:
+                    result["cleanup"] = "fail"
+            else:
+                result["cleanup"] = "fail"
+    if owned:
+        result["zshenv_entered"] = marker_result(env_entered)
+        result["zshrc_entered"] = marker_result(rc_entered)
+    return result
+
+
 def _zsh_startup_diagnostic(
     *,
     manager: TerminalManager,
@@ -74,20 +277,76 @@ def _zsh_startup_diagnostic(
     digest: str,
     shell_tmpdir: Path,
     markers: dict[str, Path],
+    option_markers: dict[str, Path],
     shell: str,
+    tmp_path: Path,
 ) -> str:
-    def fact(path: Path) -> dict[str, Any]:
+    def tmux(
+        *args: str, timeout: float = 0.5
+    ) -> subprocess.CompletedProcess[str] | None:
         try:
-            stat = path.stat()
-            return {"exists": path.is_file(), "size": stat.st_size if path.is_file() else None}
-        except Exception:
-            return {"exists": "unavailable", "size": "unavailable"}
-
-    def tmux(*args: str) -> subprocess.CompletedProcess[str] | None:
-        try:
-            return manager._run_tmux(*args, check=False, timeout=0.5)
+            return manager._run_tmux(*args, check=False, timeout=timeout)
         except Exception:
             return None
+
+    artifacts = {name: _marker_fact(path) for name, path in markers.items()}
+    option_values = {name: _fixed_marker_value(path) for name, path in option_markers.items()}
+    generated_files: dict[str, dict[str, Any]] = {}
+    startup_dirs: list[dict[str, Any]] = []
+    try:
+        for directory in shell_tmpdir.glob("termroom-zsh.*"):
+            if not directory.is_dir():
+                continue
+            generated_files = {
+                ".zshenv": _marker_fact(directory / ".zshenv"),
+                ".zshrc": _marker_fact(directory / ".zshrc"),
+            }
+            startup_dirs = [{
+                "basename": "termroom-zsh.*",
+                "exists": True,
+                **generated_files,
+            }]
+            break
+        if not startup_dirs:
+            generated_files = {
+                ".zshenv": {"state": "absent"},
+                ".zshrc": {"state": "absent"},
+            }
+            startup_dirs = [{"basename": "termroom-zsh.*", "exists": False}]
+    except Exception:
+        generated_files = {
+            ".zshenv": {"state": "unavailable"},
+            ".zshrc": {"state": "unavailable"},
+        }
+        startup_dirs = [{"status": "unavailable"}]
+
+    fixture_state = "unavailable"
+    if artifacts["fixture_zshenv_completed"]["state"] == "present":
+        fixture_state = "completed"
+    elif any(
+        artifacts[name]["state"] == "inaccessible"
+        for name in ("fixture_zshenv_entered", "fixture_zshenv_completed")
+    ):
+        fixture_state = "inaccessible"
+    elif any(
+        artifacts[name]["state"].startswith("error:")
+        for name in ("fixture_zshenv_entered", "fixture_zshenv_completed")
+    ):
+        fixture_state = "collector_error"
+    elif artifacts["fixture_zshenv_entered"]["state"] in {"present", "absent"}:
+        fixture_state = (
+            "entered"
+            if artifacts["fixture_zshenv_entered"]["state"] == "present"
+            else artifacts["fixture_zshenv_entered"]["state"]
+        )
+    stage_markers = {
+        key: artifacts[key]
+        for key in (
+            "fixture_zshenv_entered", "fixture_zshenv_completed", "user_zshrc_entered",
+            "precmd_entered",
+        )
+    }
+    stage = _zsh_startup_stage(stage_markers, generated_files, option_values)
 
     identity = {
         key: "unavailable"
@@ -173,24 +432,6 @@ def _zsh_startup_diagnostic(
     if pending:
         truncated = True
 
-    artifacts = {name: fact(path) for name, path in markers.items()}
-    startup_dirs: list[dict[str, Any]] = []
-    try:
-        for directory in shell_tmpdir.glob("termroom-zsh.*"):
-            if directory.is_dir():
-                startup_dirs.append({
-                    "basename": "termroom-zsh.*",
-                    "exists": True,
-                    ".zshenv": fact(directory / ".zshenv"),
-                    ".zshrc": fact(directory / ".zshrc"),
-                })
-                if len(startup_dirs) == 4:
-                    break
-        if not startup_dirs:
-            startup_dirs = [{"basename": "termroom-zsh.*", "exists": False}]
-    except Exception:
-        startup_dirs = [{"status": "unavailable"}]
-
     pane_tail: list[str] | str = "unavailable"
     try:
         result = tmux("capture-pane", "-p", "-t", window, "-S", "-80")
@@ -247,8 +488,12 @@ def _zsh_startup_diagnostic(
 
     payload: dict[str, Any] = {
         "completion_visible": True,
-        "shell_ready": artifacts.get("shell_ready", {}).get("exists", "unavailable"),
-        "startup_marker": artifacts.get("shell_startup_entered", {}).get("exists", "unavailable"),
+        "startup_stage": stage,
+        "fixture_zshenv_state": fixture_state,
+        "zsh_options": option_values,
+        "control": _zsh_plain_control(manager, shell, tmp_path),
+        "shell_ready": artifacts.get("shell_ready", {}).get("state", "unavailable"),
+        "startup_marker": artifacts.get("shell_startup_entered", {}).get("state", "unavailable"),
         "tmux": identity,
         "processes": processes or [{"status": "unavailable"}],
         "process_collection": process_collection,
@@ -274,6 +519,97 @@ def _zsh_startup_diagnostic(
         )
         message = "zsh_startup_diagnostic=" + encoded
     return message
+
+
+def test_zsh_startup_diagnostic_classifies_marker_states(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "marker"
+    assert _marker_fact(marker) == {"state": "absent"}
+    marker.write_bytes(b"on\n")
+    assert _marker_fact(marker) == {"state": "present", "size": 3}
+    assert _fixed_marker_value(marker) == "on"
+
+    original_stat = Path.stat
+
+    def denied(path: Path, *args, **kwargs):
+        if path == marker:
+            raise PermissionError(errno.EACCES, "denied")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+    assert _marker_fact(marker) == {"state": "inaccessible"}
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda path, *args, **kwargs: (
+            (_ for _ in ()).throw(OSError(errno.ELOOP, "loop"))
+            if path == marker
+            else original_stat(path, *args, **kwargs)
+        ),
+    )
+    assert _marker_fact(marker) == {"state": "error:ELOOP"}
+    monkeypatch.setattr(Path, "stat", original_stat)
+    marker.write_bytes(b"invalid")
+    assert _fixed_marker_value(marker) == "error:invalid-token"
+
+    absent = {"state": "absent"}
+    present = {"state": "present", "size": 1}
+    files = {".zshenv": present, ".zshrc": present}
+    markers = {
+        "fixture_zshenv_entered": absent,
+        "fixture_zshenv_completed": absent,
+        "user_zshrc_entered": absent,
+        "precmd_entered": absent,
+    }
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "off", "rcs": "off", "globalrcs": "on"}
+    ) == "generated_zshenv_not_entered"
+    markers["fixture_zshenv_entered"] = present
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "off", "rcs": "off", "globalrcs": "on"}
+    ) == "fixture_zshenv_entered_not_completed"
+    markers["fixture_zshenv_completed"] = present
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "off", "rcs": "on", "globalrcs": "on"}
+    ) == "fixture_zshenv_completed_noninteractive"
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "off", "globalrcs": "on"}
+    ) == "fixture_zshenv_completed_rcs_off"
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "on", "globalrcs": "inaccessible"}
+    ) == "marker_inaccessible"
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "on", "globalrcs": "error:ELOOP"}
+    ) == "collector_error"
+    markers["fixture_zshenv_entered"] = {"state": "inaccessible"}
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "on", "globalrcs": "on"}
+    ) == "marker_inaccessible"
+    markers["fixture_zshenv_entered"] = present
+    markers["user_zshrc_entered"] = present
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "on", "globalrcs": "on"}
+    ) == "user_zshrc_entered"
+    markers["precmd_entered"] = present
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "on", "globalrcs": "on"}
+    ) == "precmd_entered"
+    markers["precmd_entered"] = absent
+    markers["user_zshrc_entered"] = absent
+    markers["fixture_zshenv_completed"] = absent
+    markers["fixture_zshenv_entered"] = {"state": "inaccessible"}
+    assert _zsh_startup_stage(
+        markers, files, {"interactive": "on", "rcs": "on", "globalrcs": "on"}
+    ) == "marker_inaccessible"
+    markers["fixture_zshenv_entered"] = absent
+    assert _zsh_startup_stage(
+        markers, {".zshenv": {"state": "present"}, ".zshrc": present},
+        {"interactive": "on", "rcs": "on", "globalrcs": "on"},
+    ) == "generated_zshenv_not_entered"
+    assert _zsh_startup_stage(
+        markers, {".zshenv": {"state": "absent"}, ".zshrc": present},
+        {"interactive": "on", "rcs": "on", "globalrcs": "on"},
+    ) == "generated_files_missing"
+    assert "denied" not in json.dumps(_marker_fact(tmp_path / "absent"))
 
 
 async def _login(client: httpx.AsyncClient) -> None:
@@ -850,6 +1186,14 @@ def test_delayed_shell_startup_retry_preserves_first_input(
 
     shell_ready = tmp_path / "shell-ready"
     precmd_entered = tmp_path / "precmd-entered"
+    fixture_zshenv_entered = tmp_path / "fixture-zshenv-entered"
+    fixture_zshenv_completed = tmp_path / "fixture-zshenv-completed"
+    user_zshrc_entered = tmp_path / "user-zshrc-entered"
+    option_markers = {
+        "interactive": tmp_path / "zsh-option-interactive",
+        "rcs": tmp_path / "zsh-option-rcs",
+        "globalrcs": tmp_path / "zsh-option-globalrcs",
+    }
     followup = tmp_path / "first-followup.txt"
     fake_tmux_calls = tmp_path / "fake-tmux-calls.txt"
     bash_env_calls = tmp_path / "bash-env-calls.txt"
@@ -869,8 +1213,26 @@ def test_delayed_shell_startup_retry_preserves_first_input(
     if shell_name == "zsh":
         zshenv = shell_home / ".zshenv"
         zshrc = shell_home / ".zshrc"
-        zshenv_bytes = b"typeset -gx TERMROOM_TEST_ZSHENV=loaded\n"
+        def option_marker(option: str, marker: Path) -> str:
+            quoted_marker = shlex.quote(str(marker))
+            return (
+                f"if [[ -o {option} ]]; then\n"
+                f"  print -r -- on > {quoted_marker}\n"
+                "else\n"
+                f"  print -r -- off > {quoted_marker}\n"
+                "fi\n"
+            )
+
+        zshenv_bytes = (
+            f"print -r -- entered > {shlex.quote(str(fixture_zshenv_entered))}\n"
+            + option_marker("interactive", option_markers["interactive"])
+            + option_marker("RCS", option_markers["rcs"])
+            + option_marker("GLOBAL_RCS", option_markers["globalrcs"])
+            + "typeset -gx TERMROOM_TEST_ZSHENV=loaded\n"
+            + f"print -r -- completed > {shlex.quote(str(fixture_zshenv_completed))}\n"
+        ).encode()
         zshrc_bytes = (
+            f"print -r -- entered > {shlex.quote(str(user_zshrc_entered))}\n"
             f"if test ! -e {shlex.quote(str(shell_startup_released))}; then\n"
             f"  printf 'entered\\n' >> {shlex.quote(str(shell_startup_entered))}\n"
             f"  IFS= read -r termroom_release < {shlex.quote(str(shell_startup_fifo))}\n"
@@ -988,6 +1350,19 @@ def test_delayed_shell_startup_retry_preserves_first_input(
             time.sleep(0.01)
         assert completion_visible, "Workspace command completion was not visible"
         assert not shell_ready.exists()
+        diagnostic_markers = {
+            "shell_startup_entered": shell_startup_entered,
+            "shell_startup_released": shell_startup_released,
+            "shell_ready": shell_ready,
+            "precmd_entered": precmd_entered,
+            "zsh_precmd_released": zsh_precmd_released,
+        }
+        if shell_name == "zsh":
+            diagnostic_markers.update({
+                "fixture_zshenv_entered": fixture_zshenv_entered,
+                "fixture_zshenv_completed": fixture_zshenv_completed,
+                "user_zshrc_entered": user_zshrc_entered,
+            })
         try:
             _wait_until(shell_startup_entered.is_file, "Shell startup barrier was not entered")
         except AssertionError:
@@ -1000,14 +1375,10 @@ def test_delayed_shell_startup_retry_preserves_first_input(
                     launch_id=launch_id,
                     digest=workspace_command_digest(command),
                     shell_tmpdir=shell_tmpdir,
-                    markers={
-                        "shell_startup_entered": shell_startup_entered,
-                        "shell_startup_released": shell_startup_released,
-                        "shell_ready": shell_ready,
-                        "precmd_entered": precmd_entered,
-                        "zsh_precmd_released": zsh_precmd_released,
-                    },
+                    markers=diagnostic_markers,
+                    option_markers=option_markers,
                     shell=shell,
+                    tmp_path=tmp_path,
                 )
             except Exception:
                 pytest.fail(
@@ -1126,6 +1497,13 @@ def test_delayed_shell_startup_retry_preserves_first_input(
             )
             assert zshenv.read_bytes() == zshenv_bytes
             assert zshrc.read_bytes() == zshrc_bytes
+            assert fixture_zshenv_entered.read_bytes() == b"entered\n"
+            assert fixture_zshenv_completed.read_bytes() == b"completed\n"
+            assert user_zshrc_entered.read_bytes() == b"entered\n"
+            assert all(
+                marker.read_bytes() in {b"on\n", b"off\n"}
+                for marker in option_markers.values()
+            )
         else:
             assert rc_path.read_bytes() == rc_bytes
             if shell_name == "sh":
