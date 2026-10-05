@@ -1026,7 +1026,12 @@
     const redrawState = new WeakMap();
     terminalPrototype.write = function termroomScrollbackWrite(value, callback) {
       const text = typeof value === "string" ? value : "";
-      const state = redrawState.get(this) || { fullViewport: false };
+      const terminalId = terminalHost.dataset.terminalId;
+      const epoch = terminalHost.termroomConnectionEpoch;
+      const generation = switchGeneration;
+      const previousState = redrawState.get(this);
+      const state = previousState && previousState.epoch === epoch
+        ? previousState : { epoch, fullViewport: false };
       if (isFullViewportRedraw(text)) state.fullViewport = true;
       const suppressHistoryRefresh = state.fullViewport;
       if (state.fullViewport && text.includes(CURSOR_SHOW_SEQUENCE)) {
@@ -1034,12 +1039,14 @@
       }
       redrawState.set(this, state);
       return nativeWrite.call(this, value, () => {
-        if (this.element && terminalHost.contains(this.element)) terminalRevision += 1;
-        if (
-          this.element
-          && terminalHost.contains(this.element)
-          && !suppressHistoryRefresh
-        ) {
+        const current = text.length > 0
+          && terminalId === terminalHost.dataset.terminalId
+          && epoch === terminalHost.termroomConnectionEpoch
+          && generation === switchGeneration
+          && this.element
+          && terminalHost.contains(this.element);
+        if (current) terminalRevision += 1;
+        if (current && !suppressHistoryRefresh) {
           markHistoryDirty();
           if (!document.hidden && liveFollowing && !mouseTrackingActive()) {
             scheduleHistoryRefresh();
@@ -1052,6 +1059,13 @@
 
   const mouseTrackingActive = () =>
     Boolean(terminalHost.querySelector(".xterm.enable-mouse-events"));
+
+  const terminalOwnsWheel = () =>
+    terminalHost.dataset.paneModeCapable === "true"
+      ? !terminalHost.termroomPaneMode
+        || terminalHost.termroomPaneMode.alternate
+        || terminalHost.termroomPaneMode.mouse_tracking
+      : mouseTrackingActive();
 
   const bindMouseTrackingOwnership = () => {
     const xterm = terminalHost.querySelector(".xterm");
@@ -1096,7 +1110,7 @@
     (event) => {
       if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
       const target = event.target instanceof Node ? event.target : null;
-      if (target && terminalHost.contains(target) && mouseTrackingActive()) return;
+      if (target && terminalHost.contains(target) && terminalOwnsWheel()) return;
       applySelectionOwnership({ type: "wheel" });
       noteUserScrollIntent({ revealHistory: event.deltaY < 0 });
     },
@@ -1237,12 +1251,20 @@
   // xterm consumes wheel events even when the attached tmux view has no xterm
   // scrollback. In the normal shell case, stop the event before xterm handles
   // it and let the browser's default action scroll the outer native surface.
-  // Mouse-reporting TUIs keep ownership of the wheel unchanged.
+  // Alternate-screen and mouse-reporting TUIs keep xterm's wheel handling.
   terminalHost.addEventListener(
     "wheel",
     (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      if (terminalHost.dataset.paneModeCapable === "true" && !terminalHost.termroomPaneMode) {
+        // Local capability is known at page render; never guess before its
+        // first authoritative control, or during reconnect.
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        return;
+      }
       if (
-        mouseTrackingActive()
+        terminalOwnsWheel()
         || event.ctrlKey
         || event.metaKey
         || event.altKey
@@ -1250,7 +1272,7 @@
       ) return;
       event.stopPropagation();
     },
-    { capture: true, passive: true },
+    { capture: true, passive: false },
   );
 
   // On touch devices, preserve long-press selection and horizontal gestures.

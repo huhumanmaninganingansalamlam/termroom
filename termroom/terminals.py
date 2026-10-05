@@ -114,6 +114,7 @@ WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS = 2.0
 WORKSPACE_COMMAND_READY_POLL_SECONDS = 0.01
 FILE_RUN_COMPLETION_GRACE_SECONDS = 2.0
 TERMINAL_TMUX_TIMEOUT_SECONDS = 5.0
+PANE_MODE_REFRESH_INTERVAL_SECONDS = 0.1
 _LOCAL_BRIDGE_TMUX_TIMEOUT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "local_bridge_tmux_timeout", default=None
 )
@@ -1748,36 +1749,91 @@ class TerminalManager:
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
-            while True:
-                try:
-                    if master_fd is None:
+            # Bounded backpressure and output-triggered coalescing: no idle polling
+            # and at most ten mode queries/second, regardless of PTY chunk size.
+            chunks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
+
+            async def read_output() -> None:
+                loop = asyncio.get_running_loop()
+                while master_fd is not None:
+                    readable = loop.create_future()
+
+                    def ready(waiter: asyncio.Future[None] = readable) -> None:
+                        if not waiter.done():
+                            waiter.set_result(None)
+
+                    try:
+                        # One reader owns this PTY: only read after readiness,
+                        # leaving shared executor capacity free while idle.
+                        loop.add_reader(master_fd, ready)
+                        await readable
+                        chunk = os.read(master_fd, 65536)
+                    except OSError:
+                        chunk = b""
+                    finally:
+                        loop.remove_reader(master_fd)
+                    await chunks.put(chunk)
+                    if not chunk:
                         return
-                    read_task = asyncio.create_task(asyncio.to_thread(os.read, master_fd, 65536))
-                    chunk, cancelled = await _await_owned_task(read_task)
-                    if cancelled:
-                        raise asyncio.CancelledError
-                except OSError:
-                    tail = decoder.feed(b"", final=True)
-                    if tail:
+
+            reader = asyncio.create_task(read_output())
+            last_refresh = asyncio.get_running_loop().time()
+            try:
+                while True:
+                    batch = [await chunks.get()]
+                    loop = asyncio.get_running_loop()
+                    delay = last_refresh + PANE_MODE_REFRESH_INTERVAL_SECONDS - loop.time()
+                    if delay > 0:
+                        ready = loop.create_future()
+                        timer = loop.call_later(delay, ready.set_result, None)
+                        try:
+                            await ready
+                        finally:
+                            timer.cancel()
+                    while not chunks.empty() and len(batch) < 16 and batch[-1]:
+                        batch.append(chunks.get_nowait())
+                    await send_pane_mode()
+                    last_refresh = loop.time()
+                    decoded = decoder.feed(b"".join(batch), final=not batch[-1])
+                    if decoded:
                         await asyncio.to_thread(
                             touch_terminal_output_if_present, self.store, terminal_id
                         )
-                        await websocket.send_text(tail)
-                    return
-                if not chunk:
-                    tail = decoder.feed(b"", final=True)
-                    if tail:
-                        await asyncio.to_thread(
-                            touch_terminal_output_if_present, self.store, terminal_id
-                        )
-                        await websocket.send_text(tail)
-                    return
-                decoded = decoder.feed(chunk)
-                if decoded:
-                    await asyncio.to_thread(
-                        touch_terminal_output_if_present, self.store, terminal_id
-                    )
-                    await websocket.send_text(decoded)
+                        await websocket.send_text(decoded)
+                    if not batch[-1]:
+                        return
+            finally:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+
+        mode_revision = 0
+        previous_mode: dict[str, Any] | None = None
+
+        async def send_pane_mode() -> None:
+            nonlocal mode_revision, previous_mode
+            query = asyncio.create_task(
+                asyncio.to_thread(self.current_pane_mode, workspace, terminal)
+            )
+            mode, cancelled = await _await_owned_task(query)
+            if cancelled:
+                raise asyncio.CancelledError
+            if mode == previous_mode:
+                return
+            previous_mode = mode
+            mode_revision += 1
+            # Binary control frames cannot collide with application output (text).
+            # A single output task orders state before the associated output batch.
+            await websocket.send_bytes(
+                json.dumps(
+                    {
+                        "kind": "pane_mode",
+                        "terminal_id": terminal_id,
+                        "generation": client_id,
+                        "revision": mode_revision,
+                        **mode,
+                    }
+                ).encode("utf-8")
+            )
 
         async def apply_browser_resize(payload: dict[str, Any]) -> bool:
             nonlocal last_viewport
@@ -1934,6 +1990,7 @@ class TerminalManager:
             (process_pid, master_fd), cancelled = await _await_owned_task(setup_task)
             if cancelled:
                 raise asyncio.CancelledError
+            await send_pane_mode()
             output_task = asyncio.create_task(output_to_browser())
             input_task = asyncio.create_task(browser_to_input())
             done, pending = await asyncio.wait(
@@ -1969,6 +2026,39 @@ class TerminalManager:
                 if isinstance(cleanup_error, TerminalError):
                     raise cleanup_error
                 raise TerminalError("Local Terminal cleanup failed") from cleanup_error
+
+    def current_pane_mode(
+        self, workspace: dict[str, Any], terminal: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Query the selected canonical pane, never the connection's tmux screen."""
+        result = self._tmux_runner(TERMINAL_TMUX_TIMEOUT_SECONDS)(
+            "display-message",
+            "-p",
+            "-t",
+            f"{workspace['tmux_session']}:{terminal['tmux_window']}",
+            "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
+            "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
+            "#{mouse_all_flag}|#{mouse_sgr_flag}",
+        )
+        fields = result.stdout.strip().split("|")
+        if (
+            len(fields) != 10
+            or fields[0] != str(workspace["tmux_session"])
+            or not fields[1].startswith("@")
+            or not fields[2].startswith("%")
+            or not fields[3].isdigit()
+            or any(flag not in {"0", "1"} for flag in fields[4:])
+        ):
+            raise TerminalError("Current Terminal pane mode is unavailable")
+        return {
+            "session": fields[0],
+            "window": fields[1],
+            "pane": fields[2],
+            "pane_pid": int(fields[3]),
+            "alternate": fields[4] == "1",
+            "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
+            "mouse_flags": [int(flag) for flag in fields[5:]],
+        }
 
     def _setup_browser_terminal(
         self,
@@ -2130,9 +2220,7 @@ class TerminalManager:
         run_tmux = self._tmux_runner(tmux_timeout)
         return wait_tmux_browser_grid_size(
             lambda: (
-                run_tmux(
-                    "list-clients", "-t", view_session, "-F", TMUX_BROWSER_SIZE_FORMAT
-                ).stdout
+                run_tmux("list-clients", "-t", view_session, "-F", TMUX_BROWSER_SIZE_FORMAT).stdout
             ),
             rows=rows,
             cols=cols,

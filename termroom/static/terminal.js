@@ -151,6 +151,30 @@
     }
   }
   term.open(host);
+  Object.defineProperty(host, "termroomActiveBufferType", {
+    configurable: true,
+    get: () => term.buffer.active.type,
+  });
+  let paneMode = null;
+  Object.defineProperty(host, "termroomPaneMode", {
+    configurable: true,
+    get: () => paneMode,
+  });
+  const acceptPaneMode = (value) => {
+    if (
+      host.dataset.paneModeCapable !== "true"
+      || value?.kind !== "pane_mode"
+      || value.terminal_id !== host.dataset.terminalId
+      || typeof value.generation !== "string"
+      || !Number.isSafeInteger(value.revision)
+      || value.revision < 1
+      || typeof value.alternate !== "boolean"
+      || typeof value.mouse_tracking !== "boolean"
+      || (paneMode && (value.generation !== paneMode.generation
+        || value.revision <= paneMode.revision))
+    ) return;
+    paneMode = Object.freeze(value);
+  };
   term.options.screenReaderMode = false;
   screenReaderModeToggle?.addEventListener("change", () => {
     term.options.screenReaderMode = screenReaderModeToggle.checked;
@@ -249,6 +273,10 @@
   let reconnectDelay = 500;
   let reconnectAllowed = true;
   let connectionEpoch = 0;
+  let pendingTerminalId = "";
+  Object.defineProperty(host, "termroomConnectionEpoch", {
+    get: () => connectionEpoch,
+  });
   let isConnected = false;
   let lastInputRevision = 0;
   let presenceInitialized = false;
@@ -342,6 +370,8 @@
     shellTerminal
     && document.visibilityState === "visible"
     && document.hasFocus()
+    && document.querySelector(".terminal-scroll-live")?.hidden !== false
+    && !document.body.classList.contains("terminal-scroll-native-selection")
     && terminalAtBottom();
   const terminalActivityPayload = (result) => {
     const payload = result?.data && typeof result.data === "object" ? result.data : result;
@@ -522,11 +552,13 @@
   const connect = () => {
     window.clearTimeout(reconnectTimer);
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    const epoch = connectionEpoch;
+    const epoch = ++connectionEpoch;
     const terminalId = host.dataset.terminalId;
     const nextSocket = new WebSocket(
       `${scheme}://${location.host}/ws/terminal/${terminalId}`,
     );
+    nextSocket.binaryType = "arraybuffer";
+    paneMode = null;
     socket = nextSocket;
     setStatus(tr("terminal.status.connecting"));
 
@@ -543,8 +575,17 @@
     });
     nextSocket.addEventListener("message", (event) => {
       if (epoch !== connectionEpoch || nextSocket !== socket) return;
+      if (event.data instanceof ArrayBuffer) {
+        try {
+          acceptPaneMode(JSON.parse(new TextDecoder().decode(event.data)));
+        } catch {
+          // Invalid controls are never rendered or forwarded as terminal input.
+        }
+        return;
+      }
       if (typeof event.data !== "string") return;
       term.write(event.data, () => {
+        if (epoch !== connectionEpoch || nextSocket !== socket) return;
         outputRenderSequence += 1;
         if (pendingActivityAt > acknowledgedActivityAt) {
           renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
@@ -833,10 +874,12 @@
     const targetId = tab.dataset.terminalSwitch || "";
     const targetRole = tab.dataset.terminalRole || "shell";
     if (!targetId || !shellTerminal || targetRole !== "shell") return false;
-    if (targetId === host.dataset.terminalId) return true;
+    if (targetId === (pendingTerminalId || host.dataset.terminalId)) return true;
     const previousTerminalId = host.dataset.terminalId || "";
 
     connectionEpoch += 1;
+    const epoch = connectionEpoch;
+    pendingTerminalId = targetId;
     window.clearTimeout(reconnectTimer);
     window.clearTimeout(otherInputTimer);
     const previousSocket = socket;
@@ -855,51 +898,56 @@
     closeTerminalPopovers();
     document.body.classList.remove("terminal-keyboard-open");
 
-    host.dataset.terminalId = targetId;
-    host.dataset.terminalRole = targetRole;
-    shellTerminal = true;
-    terminalTabs.forEach((candidate) => {
-      const active = candidate === tab;
-      candidate.classList.toggle("active", active);
-      if (active) candidate.setAttribute("aria-current", "page");
-      else candidate.removeAttribute("aria-current");
-    });
-
-    const workspaceId = host.dataset.workspaceId || "";
-    terminalOutputLink?.setAttribute(
-      "href",
-      `/w/${encodeURIComponent(workspaceId)}/terminal/${encodeURIComponent(targetId)}/scrollback`,
-    );
-    terminalManageForm?.setAttribute(
-      "action",
-      `/w/${encodeURIComponent(workspaceId)}/terminals/${encodeURIComponent(targetId)}`,
-    );
-    if (terminalNameInput) {
-      terminalNameInput.value = tab.dataset.terminalName || "shell";
-    }
-    if (terminalCommandClearTarget) terminalCommandClearTarget.value = targetId;
-    document.querySelector(".terminal-error-banner")?.remove();
-
-    term.reset();
-    term.clearSelection?.();
-    window.dispatchEvent(
-      new CustomEvent("termroom:terminal-switched", {
-        detail: {
-          workspace_id: workspaceId,
-          previous_terminal_id: previousTerminalId,
-          terminal_id: targetId,
-        },
-      }),
-    );
     setStatus(tr("terminal.status.connecting"));
-    if (historyMode === "push") {
-      history.pushState(
-        terminalHistoryState(targetId),
-        "",
-        tab.getAttribute("href") || location.href,
+    // reset() does not cancel xterm's asynchronous write queue. Drain old
+    // writes under their old identity before reusing the terminal for a tab.
+    term.write("", () => {
+      if (epoch !== connectionEpoch) return;
+      term.reset();
+      term.clearSelection?.();
+      host.dataset.terminalId = targetId;
+      host.dataset.terminalRole = targetRole;
+      shellTerminal = true;
+      terminalTabs.forEach((candidate) => {
+        const active = candidate === tab;
+        candidate.classList.toggle("active", active);
+        if (active) candidate.setAttribute("aria-current", "page");
+        else candidate.removeAttribute("aria-current");
+      });
+
+      const workspaceId = host.dataset.workspaceId || "";
+      terminalOutputLink?.setAttribute(
+        "href",
+        `/w/${encodeURIComponent(workspaceId)}/terminal/${encodeURIComponent(targetId)}/scrollback`,
       );
-    }
-    connect();
+      terminalManageForm?.setAttribute(
+        "action",
+        `/w/${encodeURIComponent(workspaceId)}/terminals/${encodeURIComponent(targetId)}`,
+      );
+      if (terminalNameInput) {
+        terminalNameInput.value = tab.dataset.terminalName || "shell";
+      }
+      if (terminalCommandClearTarget) terminalCommandClearTarget.value = targetId;
+      document.querySelector(".terminal-error-banner")?.remove();
+      window.dispatchEvent(
+        new CustomEvent("termroom:terminal-switched", {
+          detail: {
+            workspace_id: workspaceId,
+            previous_terminal_id: previousTerminalId,
+            terminal_id: targetId,
+          },
+        }),
+      );
+      if (historyMode === "push") {
+        history.pushState(
+          terminalHistoryState(targetId),
+          "",
+          tab.getAttribute("href") || location.href,
+        );
+      }
+      pendingTerminalId = "";
+      connect();
+    });
     return true;
   };
 

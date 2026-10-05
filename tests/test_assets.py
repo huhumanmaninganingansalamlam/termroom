@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -45,9 +46,8 @@ def test_vendored_xterm_matches_declared_scoped_release() -> None:
     assert (VENDOR_DIR / "addon-unicode11.js").stat().st_size > 12_000
     for filename in ("xterm.js", "xterm.css"):
         assert f"@xterm/xterm@{XTERM_VERSION}" in str(ASSETS[filename]["url"])
-    assert (
-        f"@xterm/addon-unicode11@{XTERM_UNICODE11_VERSION}"
-        in str(ASSETS["addon-unicode11.js"]["url"])
+    assert f"@xterm/addon-unicode11@{XTERM_UNICODE11_VERSION}" in str(
+        ASSETS["addon-unicode11.js"]["url"]
     )
     for filename, details in ASSETS.items():
         digest = hashlib.sha256((VENDOR_DIR / filename).read_bytes()).hexdigest()
@@ -180,16 +180,12 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         "U+EC60-EC84, U+ED00-EFCF, U+F000-F385, U+F400-F533, "
         "U+F900-FFFF, U+F0001-F1AF0"
     )
-    korean_ranges = (
-        "U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF, U+FFA0-FFDC"
-    )
+    korean_ranges = "U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF, U+FFA0-FFDC"
 
     faces = re.findall(r"@font-face\s*\{(.*?)\}", stylesheet, flags=re.DOTALL)
     assert len(faces) == 5
     korean_face = next(
-        candidate
-        for candidate in faces
-        if 'font-family: "Termroom Korean Terminal"' in candidate
+        candidate for candidate in faces if 'font-family: "Termroom Korean Terminal"' in candidate
     )
     assert stylesheet.count('font-family: "Termroom D2Koding Nerd Mono"') == 4
     assert stylesheet.count('font-family: "Termroom Korean Terminal"') == 1
@@ -273,7 +269,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
         assert str(TERMINAL_FONT_ASSETS[key]["filename"]) not in terminal_template
     terminal_script = (VENDOR_DIR.parent / "terminal.js").read_text(encoding="utf-8")
-    assert 'KOREAN_TERMINAL_FONT_FAMILY = \'"Termroom Korean Terminal"\'' in terminal_script
+    assert "KOREAN_TERMINAL_FONT_FAMILY = '\"Termroom Korean Terminal\"'" in terminal_script
     assert 'BUNDLED_TERMINAL_FONT_PROBE = "M"' in terminal_script
     assert (
         "`${KOREAN_TERMINAL_FONT_FAMILY}, ${BUNDLED_TERMINAL_FONT_FAMILY}, "
@@ -293,7 +289,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
     assert "screenReaderMode: false," in terminal_script
     assert (
-        'const screenReaderModeToggle = document.querySelector('
+        "const screenReaderModeToggle = document.querySelector("
         '"#terminal-screen-reader-mode");' in terminal_script
     )
     assert "screenReaderModeToggle.checked = false;" in terminal_script
@@ -306,7 +302,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         terminal_script,
     )
     screen_reader_query_at = terminal_script.index(
-        'const screenReaderModeToggle = document.querySelector('
+        "const screenReaderModeToggle = document.querySelector("
     )
     screen_reader_checked_reset_at = terminal_script.index(
         "screenReaderModeToggle.checked = false;"
@@ -314,9 +310,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     first_font_await_at = terminal_script.index("await bundledTerminalFontLoad.initial")
     terminal_constructor_at = terminal_script.index("new window.Terminal(")
     terminal_open_at = terminal_script.index("term.open(host);")
-    screen_reader_option_reset_at = terminal_script.index(
-        "term.options.screenReaderMode = false;"
-    )
+    screen_reader_option_reset_at = terminal_script.index("term.options.screenReaderMode = false;")
     screen_reader_listener_at = terminal_script.index(
         'screenReaderModeToggle?.addEventListener("change"'
     )
@@ -334,6 +328,30 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "const terminalStringCellWidth = (value) =>" in terminal_script
     assert 'service.getStringCellWidth(String(value || ""))' in terminal_script
     assert 'Object.defineProperty(host, "termroomStringCellWidth"' in terminal_script
+    buffer_mode_property = re.search(
+        r'Object\.defineProperty\(host, "termroomActiveBufferType", \{.*?\n  \}\);',
+        terminal_script,
+        re.S,
+    )
+    assert buffer_mode_property is not None
+    mode_probe = (
+        """
+const assert = require('node:assert/strict');
+const host = {};
+const term = {buffer:{active:{type:'normal'}}};
+"""
+        + buffer_mode_property.group()
+        + """
+assert.equal(host.termroomActiveBufferType, 'normal');
+term.buffer.active = {type:'alternate'};
+assert.equal(host.termroomActiveBufferType, 'alternate');
+const descriptor = Object.getOwnPropertyDescriptor(host, 'termroomActiveBufferType');
+assert.equal(descriptor.set, undefined);
+assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
+"""
+    )
+    mode_result = subprocess.run(["node", "-e", mode_probe], capture_output=True, text=True)
+    assert mode_result.returncode == 0, mode_result.stderr
     assert "const publishTerminalMetrics = (cell) =>" in terminal_script
     assert 'new CustomEvent("termroom:terminal-metrics"' in terminal_script
     assert "publishTerminalMetrics(cell);" in terminal_script
@@ -350,10 +368,9 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert 'kind: "command"' in terminal_script
     assert "rows: term.rows" in terminal_script
     assert "cols: term.cols" in terminal_script
-    assert 'const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;' in terminal_script
+    assert "const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;" in terminal_script
     assert (
-        'const unicode11Available = typeof Unicode11AddonClass === "function";'
-        in terminal_script
+        'const unicode11Available = typeof Unicode11AddonClass === "function";' in terminal_script
     )
     assert "allowProposedApi: unicode11Available" in terminal_script
     assert 'host.dataset.terminalUnicode = "default";' in terminal_script
@@ -387,14 +404,14 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert re.search(
         r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
         r'if \(document\.visibilityState !== "visible"\) return;\s*'
-        r'if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{',
+        r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{",
         terminal_script,
     )
     assert re.search(
         r'window\.addEventListener\("focus", \(\) => \{\s*'
-        r'if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{\s*'
-        r'connect\(\);\s*return;\s*\}\s*'
-        r'scheduleActivityAcknowledge\(\);\s*\}\);',
+        r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{\s*"
+        r"connect\(\);\s*return;\s*\}\s*"
+        r"scheduleActivityAcknowledge\(\);\s*\}\);",
         terminal_script,
     )
 
@@ -413,7 +430,126 @@ def test_template_static_asset_versions_are_consistent() -> None:
     assert versions["remote_run.js"] == {"14"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"57"}
+    assert versions["terminal.js"] == {"59"}
+    assert versions["mobile_scrollback.js"] == {"39"}
+
+
+def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> None:
+    ROOT = Path(__file__).resolve().parents[1]
+    script = (ROOT / "termroom/static/terminal.js").read_text()
+    handler = script[
+        script.index("  const acceptPaneMode =") : script.index(
+            "  term.options.screenReaderMode", script.index("  const acceptPaneMode =")
+        )
+    ]
+    probe = (
+        """
+const assert = require('node:assert/strict');
+const host = {dataset:{paneModeCapable:'true',terminalId:'t'}};
+let paneMode = null;
+"""
+        + handler
+        + """
+const mode = {kind:'pane_mode',terminal_id:'t',generation:'a',revision:1,
+ alternate:true,mouse_tracking:false};
+acceptPaneMode(mode);
+assert.equal(paneMode.alternate, true);
+assert.ok(Object.isFrozen(paneMode));
+acceptPaneMode({...mode,revision:2,alternate:false});
+assert.equal(paneMode.alternate, false);
+acceptPaneMode(mode);
+acceptPaneMode({...mode,generation:'old',revision:99});
+acceptPaneMode({...mode,terminal_id:'other',revision:99});
+assert.equal(paneMode.revision, 2);
+paneMode = null; // each new socket resets state, socket/epoch guards reject old events
+acceptPaneMode({...mode,generation:'b'});
+assert.equal(paneMode.generation, 'b');
+host.dataset.paneModeCapable = 'false';
+paneMode = null;
+acceptPaneMode(mode);
+assert.equal(paneMode, null);
+"""
+    )
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    binary_at = script.index("if (event.data instanceof ArrayBuffer)")
+    output_at = script.index("term.write(event.data", binary_at)
+    assert binary_at < output_at
+    assert "epoch !== connectionEpoch || nextSocket !== socket" in script
+    assert 'data-pane-mode-capable="' in (ROOT / "termroom/templates/terminal.html").read_text()
+
+
+def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None:
+    script = (VENDOR_DIR.parent / "terminal.js").read_text()
+    switch = script[script.index("  const resetTerminalActivityState ="):
+                    script.index("  terminalTabs.forEach((tab) => {")]
+    message = script[script.index('    nextSocket.addEventListener("message",'):
+                     script.index('    nextSocket.addEventListener("close",')]
+    probe = r"""
+const assert = require('node:assert/strict');
+const events = [], connections = [], queue = [];
+const host = {dataset:{terminalId:'A',workspaceId:'w',terminalRole:'shell'}};
+const tabs = ['A','B','C'].map(id => ({dataset:{terminalSwitch:id,terminalRole:'shell'},
+  classList:{toggle(){}},setAttribute(){},removeAttribute(){},getAttribute(){return '/'+id;}}));
+const terminalTabs = tabs;
+const window = {clearTimeout(){},dispatchEvent(e){events.push(e);}};
+const document = {body:{classList:{remove(){}}},querySelector(){return null;}};
+const CustomEvent = function(kind, options){this.type=kind;this.detail=options.detail;};
+const WebSocket = {OPEN:1,CLOSING:2};
+let connectionEpoch=0, pendingTerminalId='', socket={readyState:1,close(){this.readyState=3;}};
+let shellTerminal=true, reconnectTimer, otherInputTimer, reconnectAllowed=true, reconnectDelay=500;
+let presenceInitialized=true,lastInputRevision=1,activityAckTimer=0,pendingActivityAt=10,
+ acknowledgedActivityAt=0,renderedActivityAt=0,outputRenderSequence=0,acknowledgedRenderSequence=0;
+const terminalOutputLink=null,terminalManageForm=null,terminalNameInput=null,
+ terminalCommandClearTarget=null;
+const history={pushState(){}},location={href:'/A'},terminalHistoryState=id=>({id});
+const setComposerOpen=()=>{},closeMoreKeys=()=>{},closeTerminalPopovers=()=>{},
+ setStatus=()=>{},tr=x=>x;
+const term={buffer:[],write(data,callback){
+ queue.push(()=>{if(data)this.buffer.push(data);callback();});},
+ reset(){this.buffer=[];},clearSelection(){}};
+const connect=()=>{connections.push(host.dataset.terminalId);connectionEpoch++;
+  socket={readyState:1,close(){this.readyState=3;}};};
+const scheduleActivityAcknowledge=()=>events.push({type:'ack-scheduled',
+ terminalId:host.dataset.terminalId});
+const acceptPaneMode=()=>{};
+function attachMessage(nextSocket,epoch) {
+  let receive;
+  nextSocket.addEventListener=(_,listener)=>{receive=listener;};
+MESSAGE_HANDLER
+  return receive;
+}
+SWITCH_HANDLER
+const oldSocket=socket, oldReceive=attachMessage(oldSocket,connectionEpoch);
+oldReceive({data:'OLD-A'});
+assert.equal(switchShellTerminal(tabs[1]),true);
+assert.equal(host.dataset.terminalId,'A','identity must not change until native queue drains');
+assert.equal(connections.length,0);
+queue.shift()(); // old A parses while still A; stale callback is ignored
+assert.equal(outputRenderSequence,0);
+assert.equal(events.filter(e=>e.type==='termroom:terminal-output').length,0);
+queue.shift()(); // drain fence resets before assigning B and reconnecting
+assert.equal(host.dataset.terminalId,'B');
+assert.deepEqual(term.buffer,[]);
+assert.deepEqual(connections,['B']);
+const bReceive=attachMessage(socket,connectionEpoch);
+pendingActivityAt=20;
+bReceive({data:'CURRENT-B'});queue.shift()();
+assert.deepEqual(term.buffer,['CURRENT-B']);
+assert.equal(events.filter(e=>e.type==='termroom:terminal-output').at(-1).detail.terminal_id,'B');
+assert.equal(renderedActivityAt,20);
+// Multiple pending clicks: only the latest target fence may reset/connect.
+switchShellTerminal(tabs[2]);switchShellTerminal(tabs[1]);
+queue.shift()();assert.equal(host.dataset.terminalId,'B');
+queue.shift()();assert.deepEqual(connections,['B','B']);
+// Same terminal ID, new socket: stale reconnect callback must not render/ack.
+const staleReceive=attachMessage(socket,connectionEpoch);
+staleReceive({data:'OLD-CONNECTION'});socket={readyState:1};
+const count=outputRenderSequence;queue.shift()();assert.equal(outputRenderSequence,count);
+assert.equal(pendingTerminalId,'');
+""".replace("MESSAGE_HANDLER", message).replace("SWITCH_HANDLER", switch)
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_remote_run_form_reuses_one_submission_identity_until_intent_changes() -> None:
@@ -624,24 +760,44 @@ function harness(scenario) {
 """
     expected = {
         "create-loss": {
-            "createIds": ["run-1", "run-1"], "statusCalls": 1, "uploadCount": 1,
-            "uploadedA": True, "uploadedB": False, "assignments": ["/remote-runs/run-1"],
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 1,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": ["/remote-runs/run-1"],
         },
         "uploading": {
-            "createIds": ["run-1", "run-1"], "statusCalls": 2, "uploadCount": 1,
-            "uploadedA": True, "uploadedB": False, "assignments": [],
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 2,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": [],
         },
         "accepted": {
-            "createIds": ["run-1", "run-1"], "statusCalls": 2, "uploadCount": 1,
-            "uploadedA": True, "uploadedB": False, "assignments": ["/remote-runs/run-1"],
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 2,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": ["/remote-runs/run-1"],
         },
         "unknown": {
-            "createIds": ["run-1", "run-1"], "statusCalls": 2, "uploadCount": 1,
-            "uploadedA": True, "uploadedB": False, "assignments": [],
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 2,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": [],
         },
         "replacement": {
-            "createIds": ["run-1", "run-2"], "statusCalls": 1, "uploadCount": 1,
-            "uploadedA": False, "uploadedB": True, "assignments": ["/remote-runs/run-2"],
+            "createIds": ["run-1", "run-2"],
+            "statusCalls": 1,
+            "uploadCount": 1,
+            "uploadedA": False,
+            "uploadedB": True,
+            "assignments": ["/remote-runs/run-2"],
         },
     }
     for scenario, assertions in expected.items():
@@ -726,9 +882,7 @@ const send=async()=>{for(const f of form.l.submit||[])await f({preventDefault(){
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     files_template = (templates_dir / "files.html").read_text(encoding="utf-8")
-    results_template = (templates_dir / "_file_results.html").read_text(
-        encoding="utf-8"
-    )
+    results_template = (templates_dir / "_file_results.html").read_text(encoding="utf-8")
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     assert "data-file-visibility-form" in files_template
@@ -742,16 +896,20 @@ def test_recursive_file_search_keeps_live_controls_consistent() -> None:
 
 def test_mobile_editor_toolbar_uses_balanced_rows() -> None:
     stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
-    assert """@media (max-width: 520px) {
+    assert (
+        """@media (max-width: 520px) {
   .editor-toolbar {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-""" in stylesheet
+"""
+        in stylesheet
+    )
 
 
 def test_mobile_terminal_more_keys_panel_is_anchored_to_the_viewport() -> None:
     stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
-    assert """@media (max-width: 520px) {
+    assert (
+        """@media (max-width: 520px) {
   .quick-keys {
     position: relative;
   }
@@ -767,12 +925,15 @@ def test_mobile_terminal_more_keys_panel_is_anchored_to_the_viewport() -> None:
     min-width: 0;
   }
 }
-""" in stylesheet
+"""
+        in stylesheet
+    )
 
 
 def test_mobile_workspace_usage_popover_is_anchored_to_the_viewport() -> None:
     stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
-    assert """@media (max-width: 1023px) {
+    assert (
+        """@media (max-width: 1023px) {
   .workspace-mobile-actions .workspace-usage-popover {
     position: fixed;
     top: calc(var(--topbar-height) + env(safe-area-inset-top) + 8px);
@@ -783,7 +944,9 @@ def test_mobile_workspace_usage_popover_is_anchored_to_the_viewport() -> None:
     transform: translateX(-50%);
     overscroll-behavior: contain;
   }
-}""" in stylesheet
+}"""
+        in stylesheet
+    )
 
 
 def test_global_header_layers_settings_menu_above_transformed_page_actions() -> None:
@@ -798,12 +961,8 @@ def test_global_header_layers_settings_menu_above_transformed_page_actions() -> 
 def test_remote_run_result_zip_is_the_primary_completed_run_action() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     wait_template = (templates_dir / "remote_run_wait.html").read_text(encoding="utf-8")
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
-    collect_template = (templates_dir / "remote_run_collect.html").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
+    collect_template = (templates_dir / "remote_run_collect.html").read_text(encoding="utf-8")
 
     result_link = 'class="primary-button" href="/remote-runs/{{'
     assert result_link in wait_template
@@ -816,16 +975,10 @@ def test_remote_run_result_zip_is_the_primary_completed_run_action() -> None:
 
 def test_remote_workspace_connection_freshness_is_transition_deduped() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
-    remote_run_script = (VENDOR_DIR.parent / "remote_run.js").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
+    remote_run_script = (VENDOR_DIR.parent / "remote_run.js").read_text(encoding="utf-8")
 
-    status_wrapper = re.search(
-        r"<span[^>]*data-run-workspace-connection[^>]*>", workspace_template
-    )
+    status_wrapper = re.search(r"<span[^>]*data-run-workspace-connection[^>]*>", workspace_template)
     assert status_wrapper is not None
     assert 'role="status"' in status_wrapper.group(0)
     assert 'aria-live="polite"' in status_wrapper.group(0)
@@ -885,30 +1038,21 @@ def test_file_run_connection_freshness_is_transition_deduped() -> None:
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     for template in templates:
-        status_wrapper = re.search(
-            r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>", template
-        )
+        status_wrapper = re.search(r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>", template)
         assert status_wrapper is not None
         assert 'role="status"' in status_wrapper.group(0)
         assert 'aria-live="polite"' in status_wrapper.group(0)
         assert 'aria-atomic="true"' in status_wrapper.group(0)
         assert " hidden" not in status_wrapper.group(0)
 
-        visual_chip = re.search(
-            r"<small[^>]*data-file-run-connection-chip[^>]*>", template
-        )
+        visual_chip = re.search(r"<small[^>]*data-file-run-connection-chip[^>]*>", template)
         assert visual_chip is not None
         assert 'class="file-run-error"' in visual_chip.group(0)
         assert 'aria-hidden="true"' in visual_chip.group(0)
         assert " hidden" in visual_chip.group(0)
         assert "{{ t('file_run.connection_offline') }}" in template
-        assert (
-            '<span class="sr-only" data-file-run-connection-announcer></span>'
-            in template
-        )
-        assert template.index("data-file-run-state") < template.index(
-            "data-file-run-connection"
-        )
+        assert '<span class="sr-only" data-file-run-connection-announcer></span>' in template
+        assert template.index("data-file-run-state") < template.index("data-file-run-connection")
 
     file_run_start = app_script.index(
         '  document.querySelectorAll("[data-file-run]").forEach((panel) => {'
@@ -933,22 +1077,16 @@ def test_file_run_connection_freshness_is_transition_deduped() -> None:
     ):
         assert behavior in file_run_script
     assert file_run_script.count("setConnectionUnavailable(true);") == 2
-    connection_handler = file_run_script.index(
-        "const renderConnectionAwareResult = (result) =>"
-    )
+    connection_handler = file_run_script.index("const renderConnectionAwareResult = (result) =>")
     offline_check = file_run_script.index(
         'if (result.connection !== "online") {', connection_handler
     )
     render_call = file_run_script.index("render(result);", offline_check)
     assert offline_check < render_call
-    assert file_run_script.index("setConnectionUnavailable(false);", offline_check) < (
-        render_call
-    )
+    assert file_run_script.index("setConnectionUnavailable(false);", offline_check) < (render_call)
     poll_start = file_run_script.index("    const poll = async () => {")
     failure_reset = file_run_script.index("failures = 0;", poll_start)
-    connection_render = file_run_script.index(
-        "renderConnectionAwareResult(result);", failure_reset
-    )
+    connection_render = file_run_script.index("renderConnectionAwareResult(result);", failure_reset)
     assert failure_reset < connection_render
     catch_start = file_run_script.index("      } catch {")
     failure_increment = file_run_script.index("failures += 1;", catch_start)
@@ -966,12 +1104,11 @@ def test_mobile_file_run_terminal_freshness_preserves_action_geometry() -> None:
     mobile_900_start = stylesheet.index(
         "@media (max-width: 900px)", stylesheet.index(".file-run-terminal-bar")
     )
-    mobile_760_start = stylesheet.index(
-        "@media (max-width: 760px)", mobile_900_start
-    )
+    mobile_760_start = stylesheet.index("@media (max-width: 760px)", mobile_900_start)
     mobile_900_styles = stylesheet[mobile_900_start:mobile_760_start]
 
-    assert """  .file-run-terminal-bar .file-run-summary {
+    assert (
+        """  .file-run-terminal-bar .file-run-summary {
     position: relative;
   }
 
@@ -995,7 +1132,9 @@ def test_mobile_file_run_terminal_freshness_preserves_action_geometry() -> None:
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-""" in mobile_900_styles
+"""
+        in mobile_900_styles
+    )
 
 
 def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
@@ -1023,7 +1162,7 @@ def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
         'link.setAttribute("aria-busy", "true")',
         'link.setAttribute("aria-disabled", "true")',
         'if (link.dataset.workspaceOpening === "true")',
-        'delete link.dataset.workspaceOpening',
+        "delete link.dataset.workspaceOpening",
         'link.removeAttribute("aria-busy")',
         'link.removeAttribute("aria-disabled")',
         'window.addEventListener("pageshow"',
@@ -1046,9 +1185,7 @@ def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
 
 def test_workspace_command_pending_contract_is_wired() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     for marker in (
@@ -1085,9 +1222,7 @@ def test_workspace_command_pending_contract_is_wired() -> None:
 
 def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     assert (
@@ -1109,28 +1244,20 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     )
     assert "const createTerminalActivityChannel = () =>" in terminal_script
     assert "new window.BroadcastChannel(TERMINAL_ACTIVITY_CHANNEL_NAME)" in terminal_script
-    assert "const terminalActivityChannel = createTerminalActivityChannel();" in (
-        terminal_script
-    )
+    assert "const terminalActivityChannel = createTerminalActivityChannel();" in (terminal_script)
     assert "const terminalActivityWorkspaceNeedsRefresh = new Map(" in terminal_script
     assert "const terminalActivityUnreadByTerminal = new Map();" in terminal_script
     assert "const terminalActivityRevisionByTerminal = new Map();" in terminal_script
     assert "const terminalActivityRequestedWorkspaceIds = () =>" in terminal_script
     assert "if (!requestedWorkspaceIds.length) return null;" in terminal_script
-    assert "const hasUnread = items.some((item) => Boolean(item?.unread));" in (
-        terminal_script
-    )
+    assert "const hasUnread = items.some((item) => Boolean(item?.unread));" in (terminal_script)
     assert "items.length > 0 && !hasUnread" in terminal_script
     assert "const rememberedUnreadTerminalIds = (workspaceId) =>" in terminal_script
     assert "const renderRememberedTerminalActivity = (workspaceId) =>" in terminal_script
-    assert "terminalActivityWorkspaceNeedsRefresh.get(workspaceId) === false" in (
-        terminal_script
-    )
+    assert "terminalActivityWorkspaceNeedsRefresh.get(workspaceId) === false" in (terminal_script)
     assert "terminalActivityUnreadByTerminal.get(terminalId) === true" in terminal_script
     assert "|| !terminalActivityRequest()" in terminal_script
-    assert "const firstSignalInBurst = terminalActivitySignalTimer === 0;" in (
-        terminal_script
-    )
+    assert "const firstSignalInBurst = terminalActivitySignalTimer === 0;" in (terminal_script)
     assert "scheduleTerminalActivityRefresh();" in terminal_script
     assert "scheduleTerminalActivitySignalRefresh" in terminal_script
     assert 'window.addEventListener("termroom:terminal-output"' in terminal_script
@@ -1155,9 +1282,7 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert 'data-workspace-id="{{ workspace.id }}"' in workspace_template
 
     usage_start = app_script.index("  const workspaceUsageViews =")
-    usage_end = app_script.index(
-        '  document.querySelectorAll("[data-file-run]")', usage_start
-    )
+    usage_end = app_script.index('  document.querySelectorAll("[data-file-run]")', usage_start)
     usage_script = app_script[usage_start:usage_end]
     assert 'view.addEventListener("toggle"' in usage_script
     assert "workspaceUsageViews.some((view) => view.open" in usage_script

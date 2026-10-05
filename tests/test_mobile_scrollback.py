@@ -35,9 +35,7 @@ def test_history_live_boundary_behavior(history: str, live: list[str], overlap: 
 
     script = (ROOT / "termroom/static/mobile_scrollback.js").read_text()
     helper = script[
-        script.index("  const boundaryRowText =") : script.index(
-            "  const liveBoundarySnapshot ="
-        )
+        script.index("  const boundaryRowText =") : script.index("  const liveBoundarySnapshot =")
     ]
     probe = f"""
 const assert = require('node:assert/strict');
@@ -72,7 +70,8 @@ def test_history_boundary_styles_revisions_and_304(live_revisions: int) -> None:
     loader = script[
         script.index("  const loadHistory =") : script.index("  const scheduleHistoryRefresh =")
     ]
-    probe = r"""
+    probe = (
+        r"""
 const assert = require('node:assert/strict');
 class Node {
   constructor(type = 1, text = '') {
@@ -118,7 +117,12 @@ const afterLayout = () => {}, syncLiveHeight = () => {}, updateScrollState = () 
 const clearHistoryDirty = () => { historyDirty = false; };
 const scheduleHistoryRefresh = () => {};
 const historyOnlyUrl = () => '/history';
-""" + constants + parser + boundary + loader + r"""
+"""
+        + constants
+        + parser
+        + boundary
+        + loader
+        + r"""
 (async () => {
   const text = '\x1b[31malpha 한글界e\u0301\x1b[0m\nmarker';
   assert.equal(commitHistoryBoundary(text, liveBoundarySnapshot()), true);
@@ -174,6 +178,7 @@ const historyOnlyUrl = () => '/history';
   assert.equal(history.fragment.textContent.endsWith('boundary'), true);
 })().catch(error => {console.error(error); process.exitCode = 1;});
 """
+    )
     probe = probe.replace("LIVE_REVISIONS", str(live_revisions))
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -181,15 +186,13 @@ const historyOnlyUrl = () => '/history';
 
 def test_base_loads_mobile_scrollback_assets() -> None:
     template = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
-    terminal_template = (ROOT / "termroom/templates/terminal.html").read_text(
-        encoding="utf-8"
-    )
+    terminal_template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
 
     assert "mobile_scrollback.css') }}?v=15" in template
     assert "terminal_selection.js') }}?v=1\" defer" in template
-    assert "mobile_scrollback.js') }}?v=37\" defer" in template
+    assert "mobile_scrollback.js') }}?v=39\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
-    assert "terminal.js') }}?v=57" in terminal_template
+    assert "terminal.js') }}?v=59" in terminal_template
 
 
 @pytest.mark.asyncio
@@ -208,12 +211,12 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
         page = await client.get("/")
         stylesheet = await client.get("/static/mobile_scrollback.css?v=15")
         ownership = await client.get("/static/terminal_selection.js?v=1")
-        script = await client.get("/static/mobile_scrollback.js?v=37")
+        script = await client.get("/static/mobile_scrollback.js?v=39")
 
     assert page.status_code == 401
     assert "/static/mobile_scrollback.css?v=15" in page.text
     assert "/static/terminal_selection.js?v=1" in page.text
-    assert "/static/mobile_scrollback.js?v=37" in page.text
+    assert "/static/mobile_scrollback.js?v=39" in page.text
     assert ownership.status_code == 200
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text
@@ -226,10 +229,49 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
     assert "terminal-scroll-surface" in script.text
 
 
+def test_parsed_write_history_state_rejects_old_terminal_and_connection_epochs() -> None:
+    script = (ROOT / "termroom/static/mobile_scrollback.js").read_text()
+    binding = script[script.index("  const bindParsedTerminalOutputRefresh ="):
+                     script.index("  const mouseTrackingActive =")]
+    probe = r"""
+const assert=require('node:assert/strict');
+const queue=[];
+class Terminal {write(data,callback){queue.push(callback);}}
+const window={Terminal};
+const terminalHost={dataset:{terminalId:'A'},termroomConnectionEpoch:0,
+ contains:e=>e===term.element};
+const term=new Terminal();term.element={};
+let switchGeneration=0,terminalRevision=0,dirty=0,refresh=0,completed=0;
+const document={hidden:false},liveFollowing=true,mouseTrackingActive=()=>false;
+const isFullViewportRedraw=text=>text==='REDRAW',CURSOR_SHOW_SEQUENCE='SHOW';
+const markHistoryDirty=()=>dirty++,scheduleHistoryRefresh=()=>refresh++;
+BINDING
+bindParsedTerminalOutputRefresh();
+term.write('old-A',()=>completed++);
+terminalHost.termroomConnectionEpoch++;
+queue.shift()();
+assert.deepEqual([terminalRevision,dirty,refresh,completed],[0,0,0,1]);
+term.write('current-A',()=>completed++);queue.shift()();
+assert.deepEqual([terminalRevision,dirty,refresh,completed],[1,1,1,2]);
+term.write('REDRAW',()=>completed++);
+terminalHost.dataset.terminalId='B';terminalHost.termroomConnectionEpoch++;switchGeneration++;
+queue.shift()();
+assert.deepEqual([terminalRevision,dirty,refresh,completed],[1,1,1,3]);
+term.write('current-B',()=>completed++);queue.shift()();
+assert.deepEqual([terminalRevision,dirty,refresh,completed],[2,2,2,4],
+  'old full-viewport suppression must not carry into a new connection');
+term.write('',()=>completed++);queue.shift()();
+assert.deepEqual([terminalRevision,dirty,refresh,completed],[2,2,2,5],
+  'drain fences complete without dirtying history');
+""".replace("BINDING", binding)
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> None:
     script = (ROOT / "termroom/static/mobile_scrollback.js").read_text(encoding="utf-8")
 
-    assert 'document.querySelector(\'.terminal-output-action[href*="/scrollback"]\')' in script
+    assert "document.querySelector('.terminal-output-action[href*=\"/scrollback\"]')" in script
     assert 'url.searchParams.set("history_only", "1")' in script
     assert 'url.searchParams.set("ansi", "1")' in script
     assert "fetch(historyOnlyUrl()" in script
@@ -308,10 +350,7 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "HISTORY_ANSI_MAX_SEGMENTS = 20_000" in script
     assert "HISTORY_HANGUL_MAX_RUNS = 20_000" in script
     assert 'const TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width";' in script
-    assert (
-        'const HISTORY_HANGUL_SPACING_PROPERTY = "--termroom-history-hangul-spacing";'
-        in script
-    )
+    assert 'const HISTORY_HANGUL_SPACING_PROPERTY = "--termroom-history-hangul-spacing";' in script
     assert "HISTORY_CELL_WIDTH_CACHE_LIMIT = 4096" in script
     assert "HISTORY_HANGUL_CANDIDATE_PATTERN" in script
     for unicode_range in (
@@ -340,7 +379,7 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert 'window.addEventListener("termroom:terminal-metrics", syncHistoryMetrics);' in script
     assert 'history.dataset.rendering = rendered.styled ? "ansi" : "plain";' in script
     assert "history.replaceChildren(rendered.fragment);" in script
-    assert "document.createElement(\"span\")" in script
+    assert 'document.createElement("span")' in script
     assert "Object.assign(span.style, segment.style);" in script
     assert "innerHTML" not in script
     assert "const selectionBelongsToSurface = () =>" in script
@@ -376,11 +415,15 @@ def test_layout_scroll_does_not_turn_live_input_into_reading_mode() -> None:
     )
     composer_start = script.index('    "click",\n    (event) => {')
     composer_end = script.index("\n    { capture: true },", composer_start)
-    composer_click = script[composer_start:composer_end].replace(
-        '    "click",\n    (event) => {',
-        "globalThis.handleComposerClick = (event) => {",
-        1,
-    ).replace("\n    },", "\n};", 1)
+    composer_click = (
+        script[composer_start:composer_end]
+        .replace(
+            '    "click",\n    (event) => {',
+            "globalThis.handleComposerClick = (event) => {",
+            1,
+        )
+        .replace("\n    },", "\n};", 1)
+    )
     probe = f"""
 const assert = require("node:assert/strict");
 globalThis.Element = Object;
@@ -465,9 +508,89 @@ updateScrollState();
 assert.equal(returnedToLive, 4);
 assert.equal(liveFollowing, true);
 """
-    result = subprocess.run(
-        ["node", "-e", probe], check=False, capture_output=True, text=True
+    result = subprocess.run(["node", "-e", probe], check=False, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_wheel_ownership_uses_buffer_and_mouse_modes() -> None:
+    script = (ROOT / "termroom/static/mobile_scrollback.js").read_text()
+    helpers = script[
+        script.index("  const mouseTrackingActive =") : script.index(
+            "  const bindMouseTrackingOwnership ="
+        )
+    ]
+    host_start = script.index('  terminalHost.addEventListener(\n    "wheel",')
+    host_listener = script[host_start : script.index("\n\n", host_start)]
+    surface_start = script.index('  surface.addEventListener(\n    "wheel",')
+    surface_listener = script[surface_start : script.index("\n\n", surface_start)]
+    probe = (
+        r"""
+const assert = require('node:assert/strict');
+class Node {}
+let mouse = false;
+const callbacks = {};
+const terminalHost = {
+  dataset: {paneModeCapable:'true'},
+  termroomActiveBufferType: 'alternate', // tmux's outer screen is not pane authority
+  termroomPaneMode: {alternate:false,mouse_tracking:false},
+  querySelector: () => mouse ? {} : null,
+  contains: () => true,
+  addEventListener: (_, callback) => callbacks.host = callback,
+};
+const surface = {addEventListener: (_, callback) => callbacks.surface = callback};
+let historyIntents = 0;
+const applySelectionOwnership = () => {};
+const noteUserScrollIntent = () => historyIntents++;
+"""
+        + helpers
+        + host_listener
+        + surface_listener
+        + r"""
+for (const [buffer, tracking, nativeHistory] of [
+  ['normal', false, true], ['alternate', false, false],
+  ['alternate', true, false], ['normal', true, false],
+]) {
+  terminalHost.termroomPaneMode = {alternate:buffer==='alternate',mouse_tracking:tracking};
+  mouse = tracking;
+  historyIntents = 0;
+  let stopped = 0;
+  const event = {target:new Node(), deltaY:-180, stopPropagation:()=>stopped++};
+  callbacks.surface(event);
+  callbacks.host(event);
+  assert.equal(stopped, Number(nativeHistory), `${buffer}/mouse=${tracking}`);
+  assert.equal(historyIntents, Number(nativeHistory));
+}
+mouse = false;
+for (const buffer of ['normal', 'alternate']) {
+  terminalHost.termroomPaneMode = {alternate:buffer==='alternate',mouse_tracking:false};
+  for (const modifier of ['ctrlKey', 'metaKey', 'altKey', 'shiftKey']) {
+    let stopped = 0;
+    historyIntents = 0;
+    const event = {target:new Node(),deltaY:-180,[modifier]:true,stopPropagation:()=>stopped++};
+    callbacks.surface(event);
+    callbacks.host(event);
+    assert.equal(stopped, 0);
+    assert.equal(historyIntents, 0);
+  }
+}
+terminalHost.termroomPaneMode = null;
+let pendingStopped = 0, prevented = 0;
+callbacks.host({stopImmediatePropagation:()=>pendingStopped++,preventDefault:()=>prevented++});
+assert.equal(pendingStopped, 1);
+assert.equal(prevented, 1);
+callbacks.host({ctrlKey:true,stopImmediatePropagation:()=>pendingStopped++,preventDefault:()=>prevented++});
+assert.equal(pendingStopped, 1);
+assert.equal(prevented, 1);
+terminalHost.dataset.paneModeCapable = 'false';
+for (const tracking of [false,true]) {
+  mouse = tracking;
+  let stopped = 0;
+  callbacks.host({stopPropagation:()=>stopped++});
+  assert.equal(stopped, Number(!tracking));
+}
+"""
     )
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
@@ -534,9 +657,7 @@ assert.equal(mode, ownership.LIVE_XTERM);
 
 
 def test_mobile_scrollback_is_native_touch_scrollable() -> None:
-    stylesheet = (ROOT / "termroom/static/mobile_scrollback.css").read_text(
-        encoding="utf-8"
-    )
+    stylesheet = (ROOT / "termroom/static/mobile_scrollback.css").read_text(encoding="utf-8")
 
     assert ".terminal-scroll-surface {" in stylesheet
     assert "overflow-y: auto;" in stylesheet

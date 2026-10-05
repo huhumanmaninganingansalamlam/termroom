@@ -282,6 +282,29 @@ def test_local_browser_views_share_windows_without_sharing_current_selection(
         ).stdout.strip()
 
         assert canonical_window == first["tmux_window"]
+        original_mode = manager.current_pane_mode(workspace, first)
+        assert original_mode["session"] == workspace["tmux_session"]
+        assert original_mode["window"] == first["tmux_window"]
+        assert manager.current_pane_mode(workspace, second)["window"] == second["tmux_window"]
+        manager._run_tmux("kill-session", "-t", first_view)
+        assert not manager.session_exists(first_view)
+        replacement_view = tmux_browser_view_session(uuid.uuid4().hex)
+        try:
+            manager._prepare_browser_view(workspace, first, replacement_view)
+            assert replacement_view != first_view
+            assert manager.current_pane_mode(workspace, first) == original_mode
+            assert manager._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                replacement_view,
+                "#{window_id}|#{pane_id}|#{pane_pid}",
+            ).stdout.strip() == (
+                f"{original_mode['window']}|{original_mode['pane']}|{original_mode['pane_pid']}"
+            )
+        finally:
+            manager._run_tmux("kill-session", "-t", replacement_view, check=False)
+        manager._prepare_browser_view(workspace, first, first_view)
         assert first_window == first["tmux_window"]
         assert second_window == second["tmux_window"]
         assert {

@@ -4,12 +4,16 @@ import asyncio
 import contextlib
 import json
 import os
+import select
 import shlex
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -57,8 +61,22 @@ class _BridgeWebSocket:
     async def send_text(self, _value: str) -> None:
         return None
 
+    async def send_bytes(self, _value: bytes) -> None:
+        return None
+
     async def close(self, *, code: int, reason: str) -> None:
         raise AssertionError((code, reason))
+
+
+def _receive_terminal_text(websocket) -> str:  # type: ignore[no-untyped-def]
+    """Existing text contracts ignore the separately typed Local mode controls."""
+    while True:
+        message = websocket.receive()
+        if message["type"] in {"websocket.disconnect", "websocket.close"}:
+            raise WebSocketDisconnect(message.get("code", 1000))
+        if message.get("text") is not None:
+            return message["text"]
+        assert json.loads(message["bytes"])["kind"] == "pane_mode"
 
 
 async def _assert_bridge_barrier_keeps_loop_live(
@@ -73,8 +91,7 @@ async def _assert_bridge_barrier_keeps_loop_live(
     ready: set[str] = set()
     ready_event = asyncio.Event()
     progress = {
-        name: threading.Event()
-        for name in ("heartbeat", "health", "navigation", "second_terminal")
+        name: threading.Event() for name in ("heartbeat", "health", "navigation", "second_terminal")
     }
     trace: list[str] = []
     trace_lock = threading.Lock()
@@ -159,19 +176,317 @@ async def _assert_bridge_barrier_keeps_loop_live(
     assert trace.index("heartbeat_scheduled") < trace.index("health_scheduled")
     assert trace.index("health_scheduled") < trace.index("navigation_scheduled")
     assert trace.index("navigation_scheduled") < trace.index("second_terminal_progress_scheduled")
-    assert (
-        trace.index("second_terminal_progress_scheduled")
-        < trace.index("progress_before_release")
+    assert trace.index("second_terminal_progress_scheduled") < trace.index(
+        "progress_before_release"
     )
     assert trace.index("progress_before_release") < trace.index("watchdog_release")
-    assert max(
-        trace.index(f"probe_completed:{name}") for name in progress
-    ) < trace.index("bridge_complete")
+    assert max(trace.index(f"probe_completed:{name}") for name in progress) < trace.index(
+        "bridge_complete"
+    )
     return trace, before_release
 
 
 def _terminal_disconnect() -> dict[str, object]:
     return {"type": "websocket.disconnect", "code": 1000}
+
+
+@pytest.mark.asyncio
+async def test_two_idle_local_pty_readers_leave_shared_executor_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real private PTYs, not a replacement reader/output pipeline."""
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    fifo = tmp_path / "inert-output.fifo"
+    os.mkfifo(fifo)
+    producer = (
+        "import os,sys\n"
+        "f=os.open(sys.argv[1],os.O_RDWR)\n"
+        "with os.fdopen(f,'rb',buffering=0) as stream:\n"
+        " for line in iter(stream.readline,b''):\n"
+        "  os.write(1,line)\n"
+    )
+    manager._run_tmux(
+        "respawn-pane",
+        "-k",
+        "-t",
+        str(terminal["tmux_window"]),
+        shlex.join([sys.executable, "-u", "-c", producer, str(fifo)]),
+    )
+    manager._run_tmux("set-option", "-t", str(workspace["tmux_session"]), "status", "off")
+    output_fd = os.open(fifo, os.O_RDWR)
+    loop = asyncio.get_running_loop()
+    previous_executor = loop._default_executor
+    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="owned-idle-pty")
+    loop.set_default_executor(executor)
+    owned: dict[int, tuple[int, str]] = {}
+    idle = [asyncio.Event(), asyncio.Event()]
+    reader_threads: dict[int, int] = {}
+    registrations: set[int] = set()
+    queues: list[asyncio.Queue[bytes]] = []
+    original_read, original_spawn = os.read, manager._spawn_tmux_client
+    original_add, original_remove = loop.add_reader, loop.remove_reader
+    original_queue = asyncio.Queue
+
+    class Socket(_BridgeWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+            self.controls: list[dict[str, object]] = []
+            self.text: list[str] = []
+            self.delivered = asyncio.Event()
+
+        async def receive(self) -> dict[str, object]:
+            return await self.incoming.get()
+
+        async def send_bytes(self, value: bytes) -> None:
+            self.controls.append(json.loads(value))
+
+        async def send_text(self, value: str) -> None:
+            assert self.controls, "initial mode control precedes output"
+            self.text.append(value)
+            self.delivered.set()
+
+    sockets = [Socket(), Socket()]
+    bridges: list[asyncio.Task[None]] = []
+
+    def spawn(_workspace, view):  # type: ignore[no-untyped-def]
+        pid, fd = original_spawn(_workspace, view)
+        owned[fd] = (pid, view)
+        return pid, fd
+
+    def read(fd: int, length: int) -> bytes:
+        if fd in owned and not select.select([fd], [], [], 0)[0]:
+            reader_threads[fd] = threading.get_ident()
+            loop.call_soon_threadsafe(idle[list(owned).index(fd)].set)
+        return original_read(fd, length)
+
+    def add_reader(fd, callback, *args):  # type: ignore[no-untyped-def]
+        result = original_add(fd, callback, *args)
+        if fd in owned:
+            registrations.add(fd)
+            if not select.select([fd], [], [], 0)[0]:
+                idle[list(owned).index(fd)].set()
+        return result
+
+    def remove_reader(fd):  # type: ignore[no-untyped-def]
+        registrations.discard(fd)
+        return original_remove(fd)
+
+    def queue(*args, **kwargs):  # type: ignore[no-untyped-def]
+        value = original_queue(*args, **kwargs)
+        if value.maxsize == 16:
+            queues.append(value)
+        return value
+
+    monkeypatch.setattr(manager, "_spawn_tmux_client", spawn)
+    monkeypatch.setattr(os, "read", read)
+    monkeypatch.setattr(loop, "add_reader", add_reader)
+    monkeypatch.setattr(loop, "remove_reader", remove_reader)
+    monkeypatch.setattr(asyncio, "Queue", queue)
+    jobs: list[asyncio.Task[object]] = []
+    observed: dict[str, object] = {}
+    readers: set[asyncio.Task[object]] = set()
+    try:
+        for index, socket in enumerate(sockets):
+            bridges.append(asyncio.create_task(manager.bridge(socket, workspace, terminal)))
+            await asyncio.wait_for(idle[index].wait(), 3)
+        counts = [len(s.text) for s in sockets]
+        readers = {
+            task
+            for task in asyncio.all_tasks()
+            if task.get_coro().__qualname__.endswith("output_to_browser.<locals>.read_output")
+        }
+        assert len(readers) == 2
+        heartbeat = asyncio.Event()
+        loop.call_soon(heartbeat.set)
+        jobs = [
+            asyncio.create_task(asyncio.to_thread(lambda: "sentinel")),
+            asyncio.create_task(asyncio.to_thread(manager.current_pane_mode, workspace, terminal)),
+        ]
+        await asyncio.wait_for(heartbeat.wait(), 0.5)
+        started = time.monotonic()
+        _, pending = await asyncio.wait(jobs, timeout=0.3)
+        observed = {
+            "workers": 2,
+            "idle_bridges": 2,
+            "heartbeat": heartbeat.is_set(),
+            "sentinel": jobs[0].done(),
+            "pane_query": jobs[1].done(),
+            "no_new_output": counts == [len(s.text) for s in sockets],
+            "blocking_reader_threads": len(reader_threads),
+            "progress_elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+        print("IDLE_PTY_PROGRESS " + json.dumps(observed, sort_keys=True), flush=True)
+        if pending:
+            return  # cleanup first; the finally assertion retains the actual RED
+        assert observed["no_new_output"]
+        assert jobs[0].result() == "sentinel"
+        canonical = jobs[1].result()
+        first, second = "IDLE_PTY_MARKER_ONE", "IDLE_PTY_MARKER_TWO"
+
+        async def emit(marker: str, recipients: list[Socket]) -> None:
+            for socket in recipients:
+                socket.delivered.clear()
+            os.write(output_fd, (marker + "\r\n").encode())
+            for socket in recipients:
+                while marker not in "".join(socket.text):
+                    await asyncio.wait_for(socket.delivered.wait(), 2)
+                    socket.delivered.clear()
+                assert "".join(socket.text).count(marker) == 1
+            assert all(q.empty() for q in queues)
+
+        await emit(first, sockets)
+        assert len(registrations) == 2
+        await sockets[0].incoming.put(_terminal_disconnect())
+        await asyncio.wait_for(bridges[0], 3)
+        fd_a = next(iter(owned))
+        pid_a, view_a = owned[fd_a]
+        assert fd_a not in registrations
+        with pytest.raises(OSError):
+            os.fstat(fd_a)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid_a, 0)
+        assert not manager.session_exists(view_a)
+        assert not bridges[1].done()
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "after-A"), 0.5) == "after-A"
+        await emit(second, [sockets[1]])
+        assert "".join(sockets[1].text).index(first) < "".join(sockets[1].text).index(second)
+        assert second not in "".join(sockets[0].text)
+        assert manager.current_pane_mode(workspace, terminal) == canonical
+        observed.update(marker_one_each=1, marker_two_remaining=1, partial_disconnect=True)
+        print(
+            "IDLE_PTY_DELIVERY "
+            + json.dumps(
+                {
+                    "marker_one_counts": ["".join(s.text).count(first) for s in sockets],
+                    "marker_two_counts": ["".join(s.text).count(second) for s in sockets],
+                    "queue_sizes": [q.qsize() for q in queues],
+                    "canonical": canonical,
+                    "controls": [s.controls for s in sockets],
+                    "partial_disconnect": True,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    finally:
+        # RED must release actual blocked reads without needing executor capacity.
+        if not observed.get("sentinel"):
+            for pid, _view in owned.values():
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(pid, signal.SIGTERM)
+        for socket in sockets:
+            socket.incoming.put_nowait(_terminal_disconnect())
+        await asyncio.wait_for(asyncio.gather(*bridges, return_exceptions=True), 6)
+        await asyncio.wait_for(asyncio.gather(*jobs, return_exceptions=True), 2)
+        if previous_executor is None:
+            loop._default_executor = None
+        else:
+            loop.set_default_executor(previous_executor)
+        executor.shutdown(wait=True)
+        os.close(output_fd)
+        for fd, (pid, view) in owned.items():
+            assert fd not in registrations
+            with pytest.raises(KeyError):
+                loop._selector.get_key(fd)
+            with pytest.raises(OSError):
+                os.fstat(fd)
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+            assert not manager.session_exists(view)
+        assert manager.session_exists(str(workspace["tmux_session"]))
+        assert manager.control.client_count(terminal["id"]) == 0
+        assert all(task.done() for task in bridges)
+        assert all(task.done() for task in readers)
+        assert not any(thread.is_alive() for thread in executor._threads)
+        print(
+            "IDLE_PTY_CLEANUP "
+            + json.dumps(
+                {
+                    "owned": owned,
+                    "registrations": len(registrations),
+                    "bridges_done": True,
+                    "executor_threads_alive": 0,
+                    "canonical_preserved": True,
+                    "reader_tasks_done": len(readers),
+                    "queue_sizes": [q.qsize() for q in queues],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        _cleanup(app, workspace)
+        assert observed.get("sentinel") and observed.get("pane_query"), observed
+
+
+@pytest.mark.asyncio
+async def test_pane_controls_are_ordered_binary_and_do_not_count_as_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    read_fd, write_fd = os.pipe()
+    finished = asyncio.Event()
+    trace: list[tuple[str, object]] = []
+    touched: list[str] = []
+    alternate = True
+    main_thread = threading.get_ident()
+
+    def mode(_workspace, _terminal):  # type: ignore[no-untyped-def]
+        assert threading.get_ident() != main_thread
+        return {
+            "session": workspace["tmux_session"],
+            "window": "@0",
+            "pane": "%0",
+            "pane_pid": 123,
+            "alternate": alternate,
+            "mouse_tracking": False,
+        }
+
+    class Socket(_BridgeWebSocket):
+        async def receive(self) -> dict[str, object]:
+            await finished.wait()
+            return _terminal_disconnect()
+
+        async def send_bytes(self, value: bytes) -> None:
+            trace.append(("control", json.loads(value)))
+
+        async def send_text(self, value: str) -> None:
+            nonlocal alternate
+            trace.append(("output", value))
+            if value == "first":
+                alternate = False
+                os.write(write_fd, b"second")
+            elif value == "second":
+                finished.set()
+
+    monkeypatch.setattr(manager, "current_pane_mode", mode)
+    monkeypatch.setattr(manager, "_setup_browser_terminal", lambda *_args: (0, read_fd))
+    monkeypatch.setattr(manager, "_release_browser_terminal", lambda *_args: None)
+
+    # Existing release happens before collecting output tasks.
+    monkeypatch.setattr(manager, "_release_browser_terminal", lambda *_args: os.close(write_fd))
+    monkeypatch.setattr(manager, "_finish_browser_terminal", lambda *_args: os.close(read_fd))
+    monkeypatch.setattr(
+        "termroom.terminals.touch_terminal_output_if_present",
+        lambda _store, ident: touched.append(ident),
+    )
+    try:
+        os.write(write_fd, b"first")
+        await asyncio.wait_for(manager.bridge(Socket(), workspace, terminal), timeout=3)
+        assert [kind for kind, _value in trace] == ["control", "output", "control", "output"]
+        controls = [value for kind, value in trace if kind == "control"]
+        assert [value["alternate"] for value in controls] == [True, False]
+        assert [value["revision"] for value in controls] == [1, 2]
+        assert controls[0]["generation"] == controls[1]["generation"]
+        assert touched == [terminal["id"], terminal["id"]]
+        assert manager.control.client_count(terminal["id"]) == 0
+    finally:
+        for fd in (read_fd, write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        _cleanup(app, workspace)
 
 
 @pytest.mark.asyncio
@@ -202,9 +517,7 @@ async def test_terminal_setup_tmux_barrier_does_not_stall_shared_loop(
         original(*args, **kwargs)
 
     async def second_terminal_progress() -> None:
-        await manager.bridge(
-            _BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal
-        )
+        await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal)
 
     def record_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
         nonlocal owned_process
@@ -216,9 +529,7 @@ async def test_terminal_setup_tmux_barrier_does_not_stall_shared_loop(
     try:
         trace, before_release = await _assert_bridge_barrier_keeps_loop_live(
             app,
-            lambda: manager.bridge(
-                _BridgeWebSocket(_terminal_disconnect()), workspace, terminal
-            ),
+            lambda: manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, terminal),
             second_terminal_progress,
             entered,
             release,
@@ -236,9 +547,12 @@ async def test_terminal_setup_tmux_barrier_does_not_stall_shared_loop(
             os.kill(owned_process[0], 0)
         with pytest.raises(OSError):
             os.fstat(owned_process[1])
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         _cleanup(app, workspace)
 
@@ -285,9 +599,12 @@ async def test_terminal_setup_cancellation_cleans_owned_view_process_and_fd(
             os.kill(process[0], 0)
         with pytest.raises(OSError):
             os.fstat(process[1])
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         release.set()
         if not bridge_task.done():
@@ -320,9 +637,12 @@ async def test_terminal_pty_readiness_failure_removes_only_owned_view(
             await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, terminal)
         assert view_session
         assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         _cleanup(app, workspace)
 
@@ -350,9 +670,12 @@ async def test_terminal_tmux_setup_timeout_removes_partial_view_only(
             await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, terminal)
         assert timed_out_view
         assert manager._run_tmux("has-session", "-t", timed_out_view, check=False).returncode != 0
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         _cleanup(app, workspace)
 
@@ -389,14 +712,15 @@ async def test_terminal_cleanup_retries_timed_out_exact_view_removal(
 
     monkeypatch.setattr(manager, "_run_tmux", timeout_once)
     try:
-        await manager.bridge(
-            DisconnectWebSocket(_terminal_disconnect()), workspace, terminal
-        )
+        await manager.bridge(DisconnectWebSocket(_terminal_disconnect()), workspace, terminal)
         assert timed_out and view_session
         assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         _cleanup(app, workspace)
 
@@ -435,9 +759,7 @@ async def test_terminal_cleanup_tmux_barrier_does_not_stall_shared_loop(
             return await super().receive()
 
     async def second_terminal_progress() -> None:
-        await manager.bridge(
-            _BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal
-        )
+        await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal)
 
     monkeypatch.setattr(manager, "_run_tmux", blocked_tmux)
     try:
@@ -459,9 +781,12 @@ async def test_terminal_cleanup_tmux_barrier_does_not_stall_shared_loop(
         }, trace
         assert view_session
         assert manager._run_tmux("has-session", "-t", view_session, check=False).returncode != 0
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         release.set()
         _cleanup(app, workspace)
@@ -500,9 +825,7 @@ async def test_terminal_blocked_pty_write_does_not_stall_shared_loop_or_duplicat
         return process_pid, master_fd
 
     async def second_terminal_progress() -> None:
-        await manager.bridge(
-            _BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal
-        )
+        await manager.bridge(_BridgeWebSocket(_terminal_disconnect()), workspace, second_terminal)
 
     monkeypatch.setattr(manager, "_spawn_tmux_client", record_spawn)
     monkeypatch.setattr(os, "write", record_write)
@@ -549,9 +872,12 @@ async def test_terminal_blocked_pty_write_does_not_stall_shared_loop_or_duplicat
         scrollback = manager.capture_scrollback(workspace, terminal)
         assert scrollback.count(marker) == 1
         assert writes == [command.encode()]
-        assert manager._run_tmux(
-            "has-session", "-t", str(workspace["tmux_session"]), check=False
-        ).returncode == 0
+        assert (
+            manager._run_tmux(
+                "has-session", "-t", str(workspace["tmux_session"]), check=False
+            ).returncode
+            == 0
+        )
     finally:
         release.set()
         _cleanup(app, workspace)
@@ -568,7 +894,7 @@ def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Pa
                 ) as websocket,
                 pytest.raises(WebSocketDisconnect) as unauthenticated,
             ):
-                websocket.receive_text()
+                _receive_terminal_text(websocket)
             assert unauthenticated.value.code == 4401
 
             login = client.post("/login", data={"password": "correct-password"})
@@ -580,14 +906,14 @@ def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Pa
                 ) as websocket,
                 pytest.raises(WebSocketDisconnect) as wrong_origin,
             ):
-                websocket.receive_text()
+                _receive_terminal_text(websocket)
             assert wrong_origin.value.code == 4403
 
             with client.websocket_connect(
                 f"/ws/terminal/{terminal['id']}",
                 headers={"origin": "http://testserver"},
             ) as websocket:
-                assert isinstance(websocket.receive_text(), str)
+                assert isinstance(_receive_terminal_text(websocket), str)
                 websocket.send_json({"kind": "resize", "rows": 41, "cols": 123})
                 websocket.send_text("[]")
             with client.websocket_connect(
@@ -597,7 +923,7 @@ def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Pa
                     "origin": "https://termroom.example",
                 },
             ) as websocket:
-                assert isinstance(websocket.receive_text(), str)
+                assert isinstance(_receive_terminal_text(websocket), str)
                 websocket.send_json({"kind": "resize", "rows": 42, "cols": 124})
     finally:
         _cleanup(app, workspace)
@@ -614,7 +940,7 @@ def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(tmp_path
                 f"/ws/terminal/{terminal['id']}",
                 headers={"origin": "http://testserver"},
             ) as websocket:
-                assert isinstance(websocket.receive_text(), str)
+                assert isinstance(_receive_terminal_text(websocket), str)
                 websocket.send_json(
                     {
                         "kind": "input",
@@ -648,13 +974,13 @@ def test_terminal_presence_deduplicates_tabs_in_same_session(tmp_path: Path) -> 
             headers = {"origin": "http://testserver"}
 
             with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as first:
-                first.receive_text()
+                _receive_terminal_text(first)
                 assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
 
                 with client.websocket_connect(
                     f"/ws/terminal/{terminal_id}", headers=headers
                 ) as second:
-                    second.receive_text()
+                    _receive_terminal_text(second)
                     assert app.state.terminals.control.client_count(terminal_id) == 2
                     assert client.get(f"/api/terminals/{terminal_id}/presence").json()["count"] == 1
 
@@ -684,11 +1010,11 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
             client.post("/login", data={"password": "correct-password"})
             headers = {"origin": "http://testserver"}
             with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as first:
-                first.receive_text()
+                _receive_terminal_text(first)
                 with client.websocket_connect(
                     f"/ws/terminal/{terminal_id}", headers=headers
                 ) as second:
-                    second.receive_text()
+                    _receive_terminal_text(second)
                     assert len(registered) == 2
                     first_id, second_id = registered
 
@@ -759,11 +1085,11 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
             with client.websocket_connect(
                 f"/ws/terminal/{terminal['id']}", headers=headers
             ) as first:
-                first.receive_text()
+                _receive_terminal_text(first)
                 with client.websocket_connect(
                     f"/ws/terminal/{terminal['id']}", headers=headers
                 ) as second:
-                    second.receive_text()
+                    _receive_terminal_text(second)
                     second.send_json({"kind": "resize", "rows": 22, "cols": 66})
                     deadline = time.monotonic() + 2
                     while (22, 66) not in applied_sizes and time.monotonic() < deadline:
@@ -876,7 +1202,7 @@ def test_terminal_one_shot_bootstrap_passive_resize_input_and_reconnect(tmp_path
             client.post("/login", data={"password": "correct-password"})
             headers = {"origin": "http://testserver"}
             with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws:
-                ws.receive_text()
+                _receive_terminal_text(ws)
                 owner = manager.control._clients[terminal_id][0]
                 # tmux reserves one status row: viewport 124x23 -> pane 124x22.
                 ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
@@ -904,7 +1230,7 @@ def test_terminal_one_shot_bootstrap_passive_resize_input_and_reconnect(tmp_path
                 assert manager.control.presence(terminal_id)["input_revision"] == 1
                 assert manager.control.can_resize(terminal_id, owner)
             with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws:
-                ws.receive_text()
+                _receive_terminal_text(ws)
                 ws.send_json({"kind": "resize", "rows": 30, "cols": 90})
                 time.sleep(0.1)
                 assert grid() == "124x17"
@@ -923,9 +1249,7 @@ def test_terminal_bootstrap_role_failure_retry_or_fail_closed(
     original = manager._set_browser_view_grid_resize
     attempts: list[bool] = []
 
-    def role(
-        view: str, *, enabled: bool, tmux_timeout: float | None = None
-    ) -> bool:
+    def role(view: str, *, enabled: bool, tmux_timeout: float | None = None) -> bool:
         attempts.append(enabled)
         if failure == "enable" and len(attempts) == 1:
             return False
@@ -947,7 +1271,7 @@ def test_terminal_bootstrap_role_failure_retry_or_fail_closed(
                 expected_error,
                 client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws,
             ):
-                ws.receive_text()
+                _receive_terminal_text(ws)
                 ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
                 deadline = time.monotonic() + 3
                 while not attempts and time.monotonic() < deadline:
@@ -963,9 +1287,9 @@ def test_terminal_bootstrap_role_failure_retry_or_fail_closed(
                 assert False in attempts
                 if failure == "demote":
                     while True:
-                        ws.receive_text()
+                        _receive_terminal_text(ws)
             with client.websocket_connect(f"/ws/terminal/{terminal_id}", headers=headers) as ws:
-                ws.receive_text()
+                _receive_terminal_text(ws)
                 assert not manager.control.can_resize(
                     terminal_id, manager.control._clients[terminal_id][0]
                 )
@@ -1011,9 +1335,7 @@ def test_terminal_input_waits_for_grid_promotion_retry(
             "#{window_width}x#{window_height}",
         ).stdout.strip()
 
-    def role(
-        view: str, *, enabled: bool, tmux_timeout: float | None = None
-    ) -> bool:
+    def role(view: str, *, enabled: bool, tmux_timeout: float | None = None) -> bool:
         nonlocal failed
         if enabled and not failed and manager.control.presence(terminal_id)["input_revision"]:
             failed = True
@@ -1034,7 +1356,7 @@ def test_terminal_input_waits_for_grid_promotion_retry(
             with client.websocket_connect(
                 f"/ws/terminal/{terminal_id}", headers={"origin": "http://testserver"}
             ) as ws:
-                ws.receive_text()
+                _receive_terminal_text(ws)
                 ws.send_json({"kind": "resize", "rows": 23, "cols": 124})
                 deadline = time.monotonic() + 3
                 while (grid() != "124x22" or not ready.exists()) and time.monotonic() < deadline:
@@ -1093,7 +1415,7 @@ def test_terminal_websocket_closes_when_signed_session_expires(
                 closed = False
                 for _ in range(20):
                     try:
-                        websocket.receive_text()
+                        _receive_terminal_text(websocket)
                     except WebSocketDisconnect as exc:
                         assert exc.code == 4401
                         closed = True
