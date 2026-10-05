@@ -127,6 +127,7 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
 
     class ResizeWebSocket:
         def __init__(self) -> None:
+            self.controls: list[dict[str, object]] = []
             self.messages = [
                 {
                     "type": "websocket.receive",
@@ -148,6 +149,9 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
 
         async def send_text(self, _value: str) -> None:
             return None
+
+        async def send_bytes(self, value: bytes) -> None:
+            self.controls.append(json.loads(value))
 
         async def close(self, *, code: int, reason: str) -> None:
             raise AssertionError((code, reason))
@@ -177,14 +181,31 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
         )
 
     ticker_task = asyncio.create_task(ticker())
+    browser = ResizeWebSocket()
     try:
         await manager.bridge(
-            ResizeWebSocket(),  # type: ignore[arg-type]
+            browser,  # type: ignore[arg-type]
             workspace,
             terminal,
         )
         assert helper_done.is_set()
         assert await ticker_task < 0.1
+        assert browser.controls
+        generation = browser.controls[0]["generation"]
+        assert isinstance(generation, str) and generation
+        for revision, control in enumerate(browser.controls, start=1):
+            assert control["kind"] == "pane_mode"
+            assert control["terminal_id"] == terminal["id"]
+            assert control["generation"] == generation
+            assert control["revision"] == revision
+            assert control["session"] == workspace["tmux_session"]
+            assert control["window"] == terminal["tmux_window"]
+            assert str(control["pane"]).startswith("%")
+            assert isinstance(control["pane_pid"], int) and control["pane_pid"] > 0
+            assert isinstance(control["alternate"], bool)
+            assert isinstance(control["mouse_tracking"], bool)
+            assert len(control["mouse_flags"]) == 5
+            assert all(type(flag) is int and flag in (0, 1) for flag in control["mouse_flags"])
     finally:
         if not ticker_task.done():
             ticker_task.cancel()
