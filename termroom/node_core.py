@@ -164,7 +164,9 @@ class NodeStream:
         try:
             self._queue.put_nowait(dict(control))
         except asyncio.QueueFull as exc:
-            self.feed_error(NodeCoreError("Node stream exceeded its buffer", code="stream_overflow"))
+            self.feed_error(
+                NodeCoreError("Node stream exceeded its buffer", code="stream_overflow")
+            )
             raise NodeCoreError("Node stream exceeded its buffer", code="stream_overflow") from exc
 
     def feed_end(self, result: Mapping[str, Any] | None = None) -> None:
