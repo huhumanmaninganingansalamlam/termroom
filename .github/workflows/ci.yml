@@ -70,7 +70,25 @@ jobs:
       - name: Run WebSocket integration tests
         # These tests own real tmux PTYs and Starlette TestClient event-loop threads.
         # A separate process gives their teardown a clean lifecycle without retries.
-        run: env -u TMUX -u TMUX_PANE uv run --frozen pytest tests/test_websocket.py
+        run: |
+          set +e
+          pytest_log="${RUNNER_TEMP}/websocket-pytest.log"
+          env -u TMUX -u TMUX_PANE uv run --frozen pytest tests/test_websocket.py 2>&1 | tee "$pytest_log"
+          test_status=${PIPESTATUS[0]}
+          if (( test_status != 0 )); then
+            while IFS= read -r failure; do
+              failure=${failure//'%'/'%25'}
+              failure=${failure//$'\r'/'%0D'}
+              failure=${failure//$'\n'/'%0A'}
+              echo "::error title=WebSocket pytest failure::$failure"
+            done < <(grep -E '^FAILED ' "$pytest_log" || true)
+            failure_tail=$(tail -n 80 "$pytest_log")
+            failure_tail=${failure_tail//'%'/'%25'}
+            failure_tail=${failure_tail//$'\r'/'%0D'}
+            failure_tail=${failure_tail//$'\n'/'%0A'}
+            echo "::error title=WebSocket pytest failure tail::$failure_tail"
+          fi
+          exit "$test_status"
 
       - name: Check all browser JavaScript syntax
         shell: bash
