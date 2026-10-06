@@ -838,18 +838,38 @@ def _remove_directory_contents(directory_fd: int) -> None:
                 opened = os.fstat(child_fd)
                 if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
                     raise OSError("Remote Run child directory was replaced")
-                _remove_directory_contents(child_fd)
-                expected = os.fstat(child_fd)
-                try:
-                    current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
-                    raise OSError("Remote Run child directory was replaced")
-                try:
-                    os.rmdir(entry, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    continue
+                child_identity = (opened.st_dev, opened.st_ino)
+                for attempt in range(3):
+                    pinned = os.fstat(child_fd)
+                    try:
+                        current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        break
+                    if (pinned.st_dev, pinned.st_ino) != child_identity or (
+                        current.st_dev,
+                        current.st_ino,
+                    ) != child_identity:
+                        raise OSError("Remote Run child directory was replaced")
+                    _remove_directory_contents(child_fd)
+                    expected = os.fstat(child_fd)
+                    try:
+                        current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        break
+                    if (expected.st_dev, expected.st_ino) != child_identity or (
+                        current.st_dev,
+                        current.st_ino,
+                    ) != child_identity:
+                        raise OSError("Remote Run child directory was replaced")
+                    try:
+                        os.rmdir(entry, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST} or attempt == 2:
+                            raise
+                        continue
+                    break
             finally:
                 os.close(child_fd)
         else:

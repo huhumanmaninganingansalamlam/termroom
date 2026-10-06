@@ -218,6 +218,62 @@ def test_remote_run_delete_rescans_one_late_quarantine_entry(
     assert (runtime.run_root / sibling_id / ".termroom" / "marker").read_text() == f"{sibling_id}\n"
 
 
+def test_remote_run_delete_rescans_one_late_child_directory_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    child = quarantine / "late-child"
+    child.mkdir()
+    original_rmdir = os.rmdir
+    injected = False
+
+    def add_late_entry(name: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal injected
+        if name == "late-child" and dir_fd is not None and not injected:
+            injected = True
+            (child / "late-entry").write_bytes(b"late")
+        original_rmdir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(node_remote_runs.os, "rmdir", add_late_entry)
+    deleted = runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert deleted == {"deleted": True, "already_missing": False}
+    assert injected
+    assert not quarantine.exists()
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_remote_run_delete_bounds_persistent_late_child_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    child = quarantine / "late-child"
+    child.mkdir()
+    original_rmdir = os.rmdir
+    attempts = 0
+
+    def keep_child_nonempty(name: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal attempts
+        if name == "late-child" and dir_fd is not None:
+            attempts += 1
+            (child / f"late-entry-{attempts}").write_bytes(b"late")
+        original_rmdir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(node_remote_runs.os, "rmdir", keep_child_nonempty)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert invalid.value.code == "cleanup_invalid"
+    assert isinstance(invalid.value.__cause__, OSError)
+    assert invalid.value.__cause__.errno == errno.ENOTEMPTY
+    assert attempts == 3
+    assert quarantine.exists()
+    runtime._assert_marked_tree(runtime._root_path / quarantine.name, run_id)
+    assert sentinel.read_bytes() == b"keep"
+
+
 def test_remote_run_delete_after_external_tree_removal_forgets_handles(
     tmp_path: Path,
 ) -> None:
