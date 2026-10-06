@@ -180,6 +180,7 @@
     paneModeGeneration = value.generation;
     paneModeRevision = value.revision;
     paneMode = value.available === false ? null : Object.freeze(value);
+    host.dispatchEvent(new Event("termroom:pane-mode"));
   };
   term.options.screenReaderMode = false;
   screenReaderModeToggle?.addEventListener("change", () => {
@@ -588,6 +589,7 @@
     paneMode = null;
     paneModeGeneration = null;
     paneModeRevision = 0;
+    host.dispatchEvent(new Event("termroom:pane-mode"));
     socket = nextSocket;
     setStatus(tr("terminal.status.connecting"));
 

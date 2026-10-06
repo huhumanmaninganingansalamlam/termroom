@@ -2154,17 +2154,23 @@ class TerminalManager:
         )
         if created.returncode:
             raise TerminalError(created.stderr.strip() or "Browser Terminal view could not start")
-        selected = run_tmux(
-            "select-window",
-            "-t",
-            f"{view_session}:{terminal['tmux_window']}",
-            check=False,
-        )
-        if selected.returncode:
-            run_tmux("kill-session", "-t", view_session, check=False)
-            raise TerminalError(
-                selected.stderr.strip() or "Browser Terminal window could not be selected"
+        try:
+            # Mouse policy belongs to this disposable browser client, not the
+            # original Workspace session or the user's global tmux defaults.
+            run_tmux("set-option", "-t", view_session, "mouse", "on")
+            selected = run_tmux(
+                "select-window",
+                "-t",
+                f"{view_session}:{terminal['tmux_window']}",
+                check=False,
             )
+            if selected.returncode:
+                raise TerminalError(
+                    selected.stderr.strip() or "Browser Terminal window could not be selected"
+                )
+        except Exception:
+            run_tmux("kill-session", "-t", view_session, check=False)
+            raise
 
     def _spawn_tmux_client(
         self, workspace: dict[str, Any], view_session: str | None = None

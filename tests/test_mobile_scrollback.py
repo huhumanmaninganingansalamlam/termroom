@@ -590,10 +590,25 @@ for (const buffer of ['normal', 'alternate']) {
     assert.equal(historyIntents, 0);
   }
 }
+// The browser view reports mouse even when the underlying shell does not.
+mouse = true;
+terminalHost.termroomPaneMode = {alternate:false,mouse_tracking:false};
+assert.equal(mouseTrackingActive(), false);
+let shellStopped = 0;
+historyIntents = 0;
+callbacks.surface({target:new Node(),deltaY:-180});
+callbacks.host({stopPropagation:()=>shellStopped++});
+assert.equal(shellStopped, 1);
+assert.equal(historyIntents, 1);
+// Pane authority also wins while xterm is still parsing a mouse-mode change.
+mouse = false;
+terminalHost.termroomPaneMode = {alternate:true,mouse_tracking:true};
+assert.equal(mouseTrackingActive(), true);
 terminalHost.termroomPaneMode = null;
 let pendingStopped = 0, prevented = 0;
 let bubbled = 0;
 mouse = false;
+historyIntents = 0;
 callbacks.surface({target:new Node(),deltaY:-180,stopPropagation:()=>bubbled++});
 callbacks.host({stopImmediatePropagation:()=>pendingStopped++,stopPropagation:()=>bubbled++,preventDefault:()=>prevented++});
 assert.equal(historyIntents, 1);

@@ -5848,9 +5848,10 @@ class SSHBackend:
         cleanup = f"tmux kill-session -t {quoted_view} >/dev/null 2>&1 || true"
         remote_command = (
             f"{cleanup}; "
-            f"tmux new-session -d -s {quoted_view} -t {quoted_workspace_session} && "
-            f"tmux select-window -t {quoted_window} && "
             f"trap {shlex.quote(cleanup)} EXIT HUP INT TERM; "
+            f"tmux new-session -d -s {quoted_view} -t {quoted_workspace_session} && "
+            f"tmux set-option -t {quoted_view} mouse on && "
+            f"tmux select-window -t {quoted_window} && "
             f"tmux attach-session -f ignore-size -t {quoted_view}"
         )
         remote_path = self._remote_command_path_for_computer(computer)

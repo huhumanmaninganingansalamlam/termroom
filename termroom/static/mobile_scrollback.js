@@ -1057,8 +1057,12 @@
     };
   };
 
-  const mouseTrackingActive = () =>
-    Boolean(terminalHost.querySelector(".xterm.enable-mouse-events"));
+  const mouseTrackingActive = () => {
+    const mode = terminalHost.termroomPaneMode;
+    return mode
+      ? mode.mouse_tracking
+      : Boolean(terminalHost.querySelector(".xterm.enable-mouse-events"));
+  };
 
   const terminalOwnsWheel = () => {
     const mode = terminalHost.termroomPaneMode;
@@ -1085,6 +1089,7 @@
       attributes: true,
       attributeFilter: ["class"],
     });
+    terminalHost.addEventListener("termroom:pane-mode", sync);
     sync();
   };
 

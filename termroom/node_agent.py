@@ -2251,6 +2251,7 @@ class NodeRuntime:
         self._tmux("kill-session", "-t", view_session, check=False)
         self._tmux("new-session", "-d", "-s", view_session, "-t", session)
         try:
+            self._tmux("set-option", "-t", view_session, "mouse", "on")
             self._tmux("select-window", "-t", f"{view_session}:{window}")
         except Exception:
             self._tmux("kill-session", "-t", view_session, check=False)

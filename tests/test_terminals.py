@@ -452,8 +452,35 @@ def test_pty_success_transfers_open_master_fd_to_caller() -> None:
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_browser_mouse_policy_does_not_change_workspace_or_global_defaults(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "project").mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+    terminal = manager.ensure_workspace(workspace)[0]
+    view_session = "termroom-view-mouse-policy"
+    manager._run_tmux("set-option", "-g", "mouse", "off")
+    try:
+        manager._prepare_browser_view(workspace, terminal, view_session)
+        assert manager._run_tmux(
+            "display-message", "-p", "-t", view_session, "#{mouse}"
+        ).stdout.strip() == "1"
+        assert manager._run_tmux(
+            "display-message", "-p", "-t", str(workspace["tmux_session"]), "#{mouse}"
+        ).stdout.strip() == "0"
+        assert manager._run_tmux("show-options", "-gv", "mouse").stdout.strip() == "off"
+    finally:
+        manager._run_tmux("kill-session", "-t", view_session, check=False)
+        manager._run_tmux("kill-session", "-t", str(workspace["tmux_session"]), check=False)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.parametrize("failed_command", ["select-window", "set-option"])
 def test_browser_view_selection_failure_removes_only_its_view(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_command: str
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -466,7 +493,9 @@ def test_browser_view_selection_failure_removes_only_its_view(
     original = manager._run_tmux
 
     def fail_selection(*args: str, **kwargs) -> subprocess.CompletedProcess[str]:  # type: ignore[no-untyped-def]
-        if args[:1] == ("select-window",):
+        if args[:1] == (failed_command,):
+            if kwargs.get("check", True):
+                raise TerminalError("window missing")
             return subprocess.CompletedProcess(["tmux", *args], 1, "", "window missing")
         return original(*args, **kwargs)
 
