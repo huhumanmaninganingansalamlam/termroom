@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import ctypes
+import errno
 import fcntl
 import json
 import os
@@ -820,24 +821,73 @@ except Exception:
 
 def _remove_directory_contents(directory_fd: int) -> None:
     for entry in os.listdir(directory_fd):
-        info = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            info = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
         if stat.S_ISDIR(info.st_mode):
-            child_fd = os.open(
-                entry,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
-            )
             try:
+                child_fd = os.open(
+                    entry,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                opened = os.fstat(child_fd)
+                if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise OSError("Remote Run child directory was replaced")
                 _remove_directory_contents(child_fd)
                 expected = os.fstat(child_fd)
-                current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                try:
+                    current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
                 if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
                     raise OSError("Remote Run child directory was replaced")
-                os.rmdir(entry, dir_fd=directory_fd)
+                try:
+                    os.rmdir(entry, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    continue
             finally:
                 os.close(child_fd)
         else:
-            os.unlink(entry, dir_fd=directory_fd)
+            try:
+                current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (info.st_dev, info.st_ino, info.st_mode) != (
+                current.st_dev,
+                current.st_ino,
+                current.st_mode,
+            ):
+                raise OSError("Remote Run cleanup entry was replaced")
+            try:
+                os.unlink(entry, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+
+
+def _restore_cleanup_marker(root_fd: int, run_id: str) -> None:
+    metadata_fd = _open_directory_at(
+        root_fd, (".termroom",), create=True, mode=0o700
+    )
+    try:
+        if _private_leaf_state_at(metadata_fd, "marker", mode=0o600) is None:
+            _atomic_private_write_at(
+                metadata_fd,
+                "marker",
+                f"{run_id}\n".encode(),
+                mode=0o600,
+                expected_state=None,
+            )
+        elif _read_regular_at(metadata_fd, "marker", 128).decode().strip() != run_id:
+            raise NodeRemoteRunError(
+                "Remote Run marker does not match", code="marker_mismatch"
+            )
+    finally:
+        os.close(metadata_fd)
 
 
 def _copy_snapshot_tree(source_fd: int, destination_fd: int, parent: str = "") -> None:
@@ -1901,6 +1951,7 @@ class NodeRemoteRunRuntime:
                 )
             self._kill_session(run_id)
             if not root_exists and not quarantine_exists:
+                self._forget_layout_handles(run_id)
                 return {"deleted": True, "already_missing": True}
             source = paths["root"] if root_exists else quarantine
             self._assert_marked_tree(source, run_id)
@@ -2492,18 +2543,47 @@ class NodeRemoteRunRuntime:
 
     def _forget_layout_handles(self, run_id: str) -> None:
         metadata_fd = self._metadata_dir_fds.get(run_id)
+        identity = None
+        first_error: OSError | None = None
         if metadata_fd is not None:
-            info = os.fstat(metadata_fd)
-            self._work_identity_states.pop((info.st_dev, info.st_ino), None)
+            try:
+                info = os.fstat(metadata_fd)
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    self._metadata_dir_fds.pop(run_id, None)
+                else:
+                    first_error = exc
+            else:
+                identity = (info.st_dev, info.st_ino)
         for handles in (
             self._metadata_dir_fds,
             self._run_dir_fds,
             self._work_dir_fds,
             self._work_staging_dir_fds,
         ):
-            descriptor = handles.pop(run_id, None)
+            descriptor = handles.get(run_id)
             if descriptor is not None:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError as state_error:
+                        if state_error.errno == errno.EBADF:
+                            handles.pop(run_id, None)
+                            if exc.errno != errno.EBADF and first_error is None:
+                                first_error = exc
+                        elif first_error is None:
+                            first_error = state_error
+                    else:
+                        if first_error is None:
+                            first_error = exc
+                    continue
+                handles.pop(run_id, None)
+        if run_id not in self._metadata_dir_fds and identity is not None:
+            self._work_identity_states.pop(identity, None)
+        if first_error is not None:
+            raise first_error
 
     def _staging_target(self, run_id: str, relative: str) -> Path:
         paths = self._assert_layout(run_id)
@@ -3203,8 +3283,26 @@ class NodeRemoteRunRuntime:
             raise NodeRemoteRunError("Remote Run cleanup path is invalid", code="cleanup_invalid")
         parent_fd, name = self._open_parent(path)
         root_fd = -1
+        marker_validated = False
+        destructive_started = False
         try:
             root_fd = _open_directory_at(parent_fd, (name,), create=False, mode=None)
+            root_info = os.fstat(root_fd)
+            root_identity = (root_info.st_dev, root_info.st_ino, stat.S_IFMT(root_info.st_mode))
+            known_run_fd = self._run_dir_fds.get(run_id)
+            if known_run_fd is not None:
+                known_run = os.fstat(known_run_fd)
+                known_identity = (
+                    known_run.st_dev,
+                    known_run.st_ino,
+                    stat.S_IFMT(known_run.st_mode),
+                )
+                if known_identity != root_identity:
+                    raise NodeRemoteRunError(
+                        "Remote Run cleanup root was replaced", code="cleanup_invalid"
+                    )
+            parent_info = os.fstat(parent_fd)
+            parent_identity = (parent_info.st_dev, parent_info.st_ino)
             try:
                 metadata_fd = _open_directory_at(
                     root_fd, (".termroom",), create=False, mode=None
@@ -3219,18 +3317,66 @@ class NodeRemoteRunRuntime:
                         raise NodeRemoteRunError(
                             "Remote Run marker does not match", code="marker_mismatch"
                         )
+                    marker_validated = True
                 finally:
                     os.close(metadata_fd)
-            _remove_directory_contents(root_fd)
-            expected = os.fstat(root_fd)
-            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
-                raise NodeRemoteRunError(
-                    "Remote Run cleanup root was replaced", code="cleanup_invalid"
-                )
-            os.rmdir(name, dir_fd=parent_fd)
             self._forget_layout_handles(run_id)
+
+            transient = {errno.ENOTEMPTY, errno.EEXIST}
+            for attempt in range(3):
+                self._assert_root_path_matches()
+                current_parent = os.fstat(parent_fd)
+                current_root = os.fstat(root_fd)
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    (current_parent.st_dev, current_parent.st_ino) != parent_identity
+                    or (current_root.st_dev, current_root.st_ino, stat.S_IFMT(current_root.st_mode))
+                    != root_identity
+                    or (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode))
+                    != root_identity
+                ):
+                    raise NodeRemoteRunError(
+                        "Remote Run cleanup root was replaced", code="cleanup_invalid"
+                    )
+                destructive_started = True
+                _remove_directory_contents(root_fd)
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    stat.S_IFMT(current.st_mode),
+                ) != root_identity:
+                    raise NodeRemoteRunError(
+                        "Remote Run cleanup root was replaced", code="cleanup_invalid"
+                    )
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno not in transient or attempt == 2:
+                        raise
+                    continue
+                break
         except OSError as exc:
+            if destructive_started and marker_validated:
+                try:
+                    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    exc.add_note(
+                        "Cleanup marker restoration skipped; root identity was unavailable."
+                    )
+                else:
+                    if (
+                        current.st_dev,
+                        current.st_ino,
+                        stat.S_IFMT(current.st_mode),
+                    ) == root_identity:
+                        try:
+                            _restore_cleanup_marker(root_fd, run_id)
+                        except (OSError, NodeRemoteRunError) as restore_error:
+                            exc.add_note(
+                                "Cleanup marker restoration failed "
+                                f"({type(restore_error).__name__})."
+                            )
             raise NodeRemoteRunError(
                 "Remote Run cleanup root is invalid", code="cleanup_invalid"
             ) from exc

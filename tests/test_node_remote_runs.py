@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -92,6 +93,455 @@ async def _write_snapshot_file(
     await stream.feed(content[:2])
     await stream.feed(content[2:])
     assert await stream.close() == {"size": len(content)}
+
+
+def _quarantined_run(tmp_path: Path) -> tuple[NodeRemoteRunRuntime, str, Path, Path]:
+    root = tmp_path / "managed-runs"
+    runtime = NodeRemoteRunRuntime(root)
+    runtime._tmux = lambda *args, check=True: subprocess.CompletedProcess(  # type: ignore[method-assign]
+        args, 1 if args[0] == "has-session" else 0, "", ""
+    )
+    run_id = str(uuid.uuid4())
+    payload = _payload(root, run_id)
+    runtime.create({**payload, "command": "true", "cwd_rel": "."})
+    quarantine = root / f".termroom-deleting-{run_id}"
+    runtime._replace(
+        runtime._root_path / run_id,
+        runtime._root_path / quarantine.name,
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    return runtime, run_id, quarantine, sentinel
+
+
+def _run_layout_descriptors(runtime: NodeRemoteRunRuntime, run_id: str) -> tuple[int, ...]:
+    return tuple(
+        handles[run_id]
+        for handles in (
+            runtime._metadata_dir_fds,
+            runtime._run_dir_fds,
+            runtime._work_dir_fds,
+            runtime._work_staging_dir_fds,
+        )
+        if run_id in handles
+    )
+
+
+def _track_cleanup_descriptors(monkeypatch: pytest.MonkeyPatch) -> set[int]:
+    opened: set[int] = set()
+    original_open = os.open
+    original_close = os.close
+
+    def track_open(*args: Any, **kwargs: Any) -> int:
+        descriptor = original_open(*args, **kwargs)
+        opened.add(descriptor)
+        return descriptor
+
+    def track_close(descriptor: int) -> None:
+        original_close(descriptor)
+        if descriptor in opened:
+            with pytest.raises(OSError) as closed:
+                os.fstat(descriptor)
+            assert closed.value.errno == errno.EBADF
+            opened.remove(descriptor)
+
+    monkeypatch.setattr(node_remote_runs.os, "open", track_open)
+    monkeypatch.setattr(node_remote_runs.os, "close", track_close)
+    return opened
+
+
+def _assert_run_layout_descriptors_closed(
+    runtime: NodeRemoteRunRuntime, run_id: str, descriptors: tuple[int, ...]
+) -> None:
+    for handles in (
+        runtime._metadata_dir_fds,
+        runtime._run_dir_fds,
+        runtime._work_dir_fds,
+        runtime._work_staging_dir_fds,
+    ):
+        assert run_id not in handles
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptor)
+        assert closed.value.errno == errno.EBADF
+
+
+def test_remote_run_delete_rescans_one_late_quarantine_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    sibling_id = str(uuid.uuid4())
+    runtime.create(
+        {
+            **_payload(runtime.run_root, sibling_id),
+            "command": "true",
+            "cwd_rel": ".",
+        }
+    )
+    descriptors = _run_layout_descriptors(runtime, run_id)
+    original_forget = runtime._forget_layout_handles
+    checked_handles = False
+
+    def forget_and_check(candidate_id: str) -> None:
+        nonlocal checked_handles
+        original_forget(candidate_id)
+        if candidate_id == run_id and not checked_handles:
+            checked_handles = True
+            _assert_run_layout_descriptors_closed(runtime, run_id, descriptors)
+
+    monkeypatch.setattr(runtime, "_forget_layout_handles", forget_and_check)
+    cleanup_descriptors = _track_cleanup_descriptors(monkeypatch)
+    original_rmdir = os.rmdir
+    injected = False
+
+    def add_late_entry(name: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal injected
+        if name == quarantine.name and dir_fd is not None and not injected:
+            injected = True
+            (quarantine / "late-entry").write_bytes(b"late")
+        original_rmdir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(node_remote_runs.os, "rmdir", add_late_entry)
+    deleted = runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert deleted == {"deleted": True, "already_missing": False}
+    assert injected
+    assert not quarantine.exists()
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert checked_handles
+    assert not cleanup_descriptors
+    assert (runtime.run_root / sibling_id / ".termroom" / "marker").read_text() == f"{sibling_id}\n"
+
+
+def test_remote_run_delete_after_external_tree_removal_forgets_handles(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    descriptors = _run_layout_descriptors(runtime, run_id)
+    detached = tmp_path / "detached-quarantine"
+    quarantine.rename(detached)
+
+    assert runtime.delete(_payload(runtime.run_root, run_id)) == {
+        "deleted": True,
+        "already_missing": True,
+    }
+    _assert_run_layout_descriptors_closed(runtime, run_id, descriptors)
+    assert (detached / ".termroom" / "marker").read_text() == f"{run_id}\n"
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_remote_run_delete_treats_listed_entry_disappearance_as_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    (quarantine / "vanish").write_bytes(b"gone")
+    original_stat = os.stat
+    original_unlink = os.unlink
+    removed = False
+
+    def remove_after_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal removed
+        result = original_stat(path, *args, **kwargs)
+        if (
+            path == "vanish"
+            and kwargs.get("dir_fd") is not None
+            and not removed
+        ):
+            removed = True
+            original_unlink(path, dir_fd=kwargs["dir_fd"])
+        return result
+
+    monkeypatch.setattr(node_remote_runs.os, "stat", remove_after_stat)
+    deleted = runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert deleted == {"deleted": True, "already_missing": False}
+    assert removed
+    assert not quarantine.exists()
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_remote_run_delete_rejects_entry_replacement_before_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    victim = quarantine / "victim"
+    victim.write_bytes(b"owned")
+    original_stat = os.stat
+    original_rename = os.rename
+    swapped = False
+
+    def replace_after_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal swapped
+        result = original_stat(path, *args, **kwargs)
+        if (
+            path == "victim"
+            and kwargs.get("dir_fd") is not None
+            and not swapped
+        ):
+            swapped = True
+            parent_fd = kwargs["dir_fd"]
+            original_rename("victim", "saved-victim", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            replacement_fd = os.open(
+                "victim", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent_fd
+            )
+            try:
+                os.write(replacement_fd, b"replacement")
+            finally:
+                os.close(replacement_fd)
+        return result
+
+    monkeypatch.setattr(node_remote_runs.os, "stat", replace_after_stat)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert invalid.value.code == "cleanup_invalid"
+    assert swapped
+    assert (quarantine / "victim").read_bytes() == b"replacement"
+    assert (quarantine / "saved-victim").read_bytes() == b"owned"
+    assert sentinel.read_bytes() == b"keep"
+    assert quarantine.exists()
+
+
+def test_remote_run_delete_bounds_persistent_late_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    original_rmdir = os.rmdir
+    attempts = 0
+    descriptors = _run_layout_descriptors(runtime, run_id)
+    original_forget = runtime._forget_layout_handles
+    checked_handles = False
+
+    def forget_and_check(candidate_id: str) -> None:
+        nonlocal checked_handles
+        original_forget(candidate_id)
+        if candidate_id == run_id and not checked_handles:
+            checked_handles = True
+            _assert_run_layout_descriptors_closed(runtime, run_id, descriptors)
+
+    def keep_root_nonempty(name: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal attempts
+        if name == quarantine.name and dir_fd is not None:
+            attempts += 1
+            (quarantine / f"late-{attempts}").write_bytes(b"late")
+        original_rmdir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(runtime, "_forget_layout_handles", forget_and_check)
+    cleanup_descriptors = _track_cleanup_descriptors(monkeypatch)
+    monkeypatch.setattr(node_remote_runs.os, "rmdir", keep_root_nonempty)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert invalid.value.code == "cleanup_invalid"
+    assert isinstance(invalid.value.__cause__, OSError)
+    assert invalid.value.__cause__.errno == errno.ENOTEMPTY
+    assert attempts == 3
+    assert checked_handles
+    assert not cleanup_descriptors
+    assert quarantine.exists()
+    assert sentinel.read_bytes() == b"keep"
+    runtime._assert_marked_tree(runtime._root_path / quarantine.name, run_id)
+    monkeypatch.setattr(node_remote_runs.os, "rmdir", original_rmdir)
+    assert runtime.delete(_payload(runtime.run_root, run_id)) == {
+        "deleted": True,
+        "already_missing": False,
+    }
+    assert not quarantine.exists()
+    assert not cleanup_descriptors
+
+
+@pytest.mark.parametrize(
+    ("stage", "error_number"),
+    [
+        ("entry-stat", errno.EACCES),
+        ("entry-open", errno.EIO),
+        ("entry-unlink", errno.EACCES),
+        ("child-rmdir", errno.EACCES),
+        ("root-stat", errno.EIO),
+        ("root-rmdir", errno.EACCES),
+        ("layout-handle-close", errno.EIO),
+    ],
+)
+def test_remote_run_delete_preserves_quarantine_and_errno_by_failure_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error_number: int,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    if stage == "entry-open" or stage == "child-rmdir":
+        (quarantine / stage).mkdir()
+    elif stage.startswith("entry-"):
+        (quarantine / stage).write_bytes(b"entry")
+
+    operation = {
+        "entry-stat": "stat",
+        "entry-open": "open",
+        "entry-unlink": "unlink",
+        "child-rmdir": "rmdir",
+        "root-stat": "stat",
+        "root-rmdir": "rmdir",
+        "layout-handle-close": "close",
+    }[stage]
+    original = getattr(os, operation)
+    target_descriptor = runtime._metadata_dir_fds[run_id]
+    calls = 0
+    root_stat_calls = 0
+
+    def fail_at_stage(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls, root_stat_calls
+        target = args[0] if args else None
+        should_fail = False
+        if stage in {"entry-stat", "entry-open", "entry-unlink", "child-rmdir"}:
+            should_fail = target == stage and kwargs.get("dir_fd") is not None
+        elif stage == "root-stat":
+            should_fail = target == quarantine.name and kwargs.get("dir_fd") is not None
+            if should_fail:
+                root_stat_calls += 1
+                should_fail = root_stat_calls == 2
+        elif stage == "root-rmdir":
+            should_fail = target == quarantine.name and kwargs.get("dir_fd") is not None
+        else:
+            should_fail = target == target_descriptor
+        if should_fail:
+            calls += 1
+            raise OSError(error_number, "injected cleanup failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(node_remote_runs.os, operation, fail_at_stage)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert invalid.value.code == "cleanup_invalid"
+    assert isinstance(invalid.value.__cause__, OSError)
+    assert invalid.value.__cause__.errno == error_number
+    assert calls == 1
+    assert quarantine.exists()
+    assert sentinel.read_bytes() == b"keep"
+    runtime._assert_marked_tree(runtime._root_path / quarantine.name, run_id)
+    monkeypatch.setattr(node_remote_runs.os, operation, original)
+    assert runtime.delete(_payload(runtime.run_root, run_id)) == {
+        "deleted": True,
+        "already_missing": False,
+    }
+
+
+def test_remote_run_delete_rejects_invalid_and_ambiguous_cleanup_roots(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    outside = tmp_path / "outside-tree"
+    outside.mkdir()
+    marker = outside / "marker"
+    marker.write_bytes(b"preserve")
+
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime._remove_owned_tree(outside, run_id)
+    assert invalid.value.code == "cleanup_invalid"
+
+    (runtime.run_root / run_id).mkdir()
+    with pytest.raises(NodeRemoteRunError) as ambiguous:
+        runtime.delete(_payload(runtime.run_root, run_id))
+    assert ambiguous.value.code == "cleanup_ambiguous"
+    assert (runtime.run_root / run_id).is_dir()
+    assert quarantine.is_dir()
+    assert marker.read_bytes() == b"preserve"
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_remote_run_delete_rejects_marker_and_child_directory_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    metadata_marker = quarantine / ".termroom" / "marker"
+    metadata_marker.write_text("wrong-run\n")
+    with pytest.raises(NodeRemoteRunError) as mismatch:
+        runtime.delete(_payload(runtime.run_root, run_id))
+    assert mismatch.value.code == "marker_mismatch"
+    metadata_marker.write_text(f"{run_id}\n")
+
+    child = quarantine / "child"
+    child.mkdir()
+    (child / "original").write_bytes(b"original")
+    moved = quarantine / "child-original"
+    original_open = os.open
+    replaced = False
+
+    def replace_child_before_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        if path == "child" and kwargs.get("dir_fd") is not None and not replaced:
+            parent_fd = kwargs["dir_fd"]
+            os.rename("child", "child-original", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.mkdir("child", 0o700, dir_fd=parent_fd)
+            replacement_fd = original_open(
+                "child", os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd
+            )
+            try:
+                leaf_fd = os.open(
+                    "replacement",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=replacement_fd,
+                )
+                os.close(leaf_fd)
+            finally:
+                os.close(replacement_fd)
+            replaced = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(node_remote_runs.os, "open", replace_child_before_open)
+    with pytest.raises(NodeRemoteRunError) as replacement:
+        runtime.delete(_payload(runtime.run_root, run_id))
+    assert replacement.value.code == "cleanup_invalid"
+    assert replaced
+    assert (moved / "original").read_bytes() == b"original"
+    assert (child / "replacement").is_file()
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_remote_run_delete_rejects_replaced_quarantine_root_identity(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    detached = tmp_path / "detached-original-run"
+    quarantine.rename(detached)
+    (quarantine / ".termroom").mkdir(parents=True, mode=0o700)
+    marker = quarantine / ".termroom" / "marker"
+    marker.write_text(f"{run_id}\n")
+    marker.chmod(0o600)
+    with pytest.raises(NodeRemoteRunError) as invalid:
+        runtime._remove_owned_tree(runtime._root_path / quarantine.name, run_id)
+
+    assert invalid.value.code == "cleanup_invalid"
+    assert (detached / ".termroom" / "marker").read_text() == f"{run_id}\n"
+    assert (detached / "work").is_dir()
+    assert (quarantine / ".termroom" / "marker").read_text() == f"{run_id}\n"
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_remote_run_delete_unlinks_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, quarantine, sentinel = _quarantined_run(tmp_path)
+    link = quarantine / "outside-link"
+    link.symlink_to(sentinel)
+
+    deleted = runtime.delete(_payload(runtime.run_root, run_id))
+
+    assert deleted == {"deleted": True, "already_missing": False}
+    assert not link.exists()
+    assert not link.is_symlink()
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
 
 
 def test_node_remote_run_root_rejects_symlink_before_touching_target(tmp_path: Path) -> None:
@@ -1360,7 +1810,17 @@ async def test_node_remote_run_start_is_idempotent_and_interrupt_targets_owned_r
     observed = await _wait_for_terminal(runtime, payload)
     assert observed["state"] == "stopped"
     assert count.read_text(encoding="utf-8") == "once\n"
-    await _operation(runtime, "remote_run.delete", payload)
+    deleted = await _operation(runtime, "remote_run.delete", payload)
+    assert deleted == {"deleted": True, "already_missing": False}
+    assert not (run_root / run_id).exists()
+    assert not (run_root / f".termroom-deleting-{run_id}").exists()
+    assert runtime.remote_runs is not None
+    session = runtime.remote_runs._session_name(run_id)
+    assert runtime.remote_runs._tmux("has-session", "-t", session, check=False).returncode != 0
+    assert await _operation(runtime, "remote_run.delete", payload) == {
+        "deleted": True,
+        "already_missing": True,
+    }
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
