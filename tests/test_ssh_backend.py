@@ -73,6 +73,60 @@ def test_ssh_scrollback_ansi_capture_keeps_a_plain_fallback(
     assert "|| tmux capture-pane -p -J -S -321 -E -1 -t @7" in commands[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_fails", [False, True])
+async def test_ssh_bridge_sends_selected_pane_mode_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query_fails: bool
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    store = StateStore(state_dir / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, state_dir)
+    workspace = {
+        "id": "workspace",
+        "tmux_session": "session",
+        "computer": {"id": "computer"},
+    }
+    terminal = {"id": "terminal", "tmux_window": "@7"}
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    mode = "session|@7|%1|4321|1|0|0|0|0|0"
+    controls: list[dict[str, object]] = []
+    monkeypatch.setattr(backend, "ensure_workspace", lambda _workspace: [])
+    monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, read_fd))
+    def execute(_computer, _command):  # type: ignore[no-untyped-def]
+        if query_fails:
+            raise SSHBackendError("pane mode unavailable")
+        return mode
+
+    monkeypatch.setattr(backend, "_exec", execute)
+    monkeypatch.setattr(backend, "_wait_for_pid", lambda _pid, _timeout: True)
+    monkeypatch.setattr("termroom.ssh_backend.os.killpg", lambda *_args: None)
+
+    class Browser:
+        async def receive(self) -> dict[str, object]:
+            return {"type": "websocket.disconnect", "code": 1000}
+
+        async def send_bytes(self, data: bytes) -> None:
+            controls.append(json.loads(data))
+
+        async def send_text(self, _data: str) -> None:
+            return None
+
+    await backend.bridge(Browser(), workspace, terminal, device_id="device")  # type: ignore[arg-type]
+
+    assert len(controls) == 1
+    assert controls[0]["kind"] == "pane_mode"
+    assert controls[0]["terminal_id"] == "terminal"
+    assert controls[0]["available"] is (not query_fails)
+    if not query_fails:
+        assert controls[0]["window"] == "@7" and controls[0]["pane"] == "%1"
+        assert controls[0]["alternate"] is True and controls[0]["mouse_tracking"] is False
+    assert backend.control.client_count("terminal") == 0
+    assert "terminal" not in backend._browser_grid_owners
+
+
 @contextlib.contextmanager
 def _test_sshd(
     tmp_path: Path,
@@ -1154,6 +1208,7 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
         failed = False
         input_writes: list[bytes] = []
         input_applies: list[tuple[int, int]] = []
+        pane_modes: list[dict[str, object]] = []
 
         def role(workspace, view, *, enabled):  # type: ignore[no-untyped-def]
             nonlocal failed
@@ -1286,6 +1341,10 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
             async def send_text(self, _data: str) -> None:
                 return None
 
+            async def send_bytes(self, data: bytes) -> None:
+                pane_modes.append(json.loads(data))
+
+
         try:
             deadline = time.monotonic() + 3
             while not ready.exists() and time.monotonic() < deadline:
@@ -1297,6 +1356,16 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
             backend._exec(
                 computer, f"tmux kill-session -t {shlex.quote(workspace['tmux_session'])}"
             )
+        assert pane_modes
+        assert all(
+            mode["kind"] == "pane_mode"
+            and mode["terminal_id"] == terminal_id
+            and isinstance(mode["generation"], str)
+            and isinstance(mode["revision"], int)
+            and isinstance(mode["alternate"], bool)
+            and isinstance(mode["mouse_tracking"], bool)
+            for mode in pane_modes
+        )
 
 
 @pytest.mark.asyncio

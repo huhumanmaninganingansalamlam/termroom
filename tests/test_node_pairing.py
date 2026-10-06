@@ -8,6 +8,7 @@ import ssl
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -120,6 +121,55 @@ async def test_node_connection_ignores_late_frames_for_a_locally_closed_stream()
 
     with pytest.raises(NodeProtocolError, match="Unknown Node stream"):
         await connection.dispatch({"type": "stream.data", "stream_id": "b" * 32, "data": ""})
+
+
+@pytest.mark.asyncio
+async def test_node_terminal_mode_control_stays_ordered_with_its_stream() -> None:
+    sent: list[dict[str, Any]] = []
+
+    class FakeWebSocket:
+        async def send_text(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+    connection = NodeConnection(FakeWebSocket(), "a" * 32)  # type: ignore[arg-type]
+    opening = asyncio.create_task(connection.open_stream("terminal.attach", {}))
+    await asyncio.sleep(0)
+    request = sent[0]
+    request_id = str(request["id"])
+    stream_id = str(request["payload"]["stream_id"])
+    await connection.dispatch(
+        {
+            "type": "response",
+            "id": request_id,
+            "ok": True,
+            "result": {"stream_id": stream_id},
+        }
+    )
+    _, stream = await opening
+    await connection.dispatch(
+        {
+            "type": "stream.control",
+            "stream_id": stream.stream_id,
+            "kind": "pane_mode",
+            "revision": 1,
+            "available": True,
+            "mode": {"session": "s", "window": "@1", "alternate": False},
+        }
+    )
+    await connection.dispatch(
+        {
+            "type": "stream.data",
+            "stream_id": stream.stream_id,
+            "data": "eA==",
+        }
+    )
+    assert await stream.receive_event() == {
+        "kind": "pane_mode",
+        "revision": 1,
+        "available": True,
+        "mode": {"session": "s", "window": "@1", "alternate": False},
+    }
+    assert await stream.receive_event() == b"x"
 
 
 @pytest.mark.asyncio

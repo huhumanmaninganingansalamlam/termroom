@@ -173,7 +173,7 @@
      data-terminal-id="{{ terminal.id }}"
      data-workspace-id="{{ workspace.id }}"
      data-device-id="{{ current_device_id }}"
-     data-pane-mode-capable="{{ 'true' if workspace.backend_kind == 'local' else 'false' }}"
+     data-pane-mode-capable="true"
      data-terminal-role="{{ terminal.role | default('shell') }}"></div>
 
 <div class="terminal-composer">

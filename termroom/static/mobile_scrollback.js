@@ -1060,12 +1060,12 @@
   const mouseTrackingActive = () =>
     Boolean(terminalHost.querySelector(".xterm.enable-mouse-events"));
 
-  const terminalOwnsWheel = () =>
-    terminalHost.dataset.paneModeCapable === "true"
-      ? !terminalHost.termroomPaneMode
-        || terminalHost.termroomPaneMode.alternate
-        || terminalHost.termroomPaneMode.mouse_tracking
+  const terminalOwnsWheel = () => {
+    const mode = terminalHost.termroomPaneMode;
+    return mode
+      ? mode.alternate || mode.mouse_tracking
       : mouseTrackingActive();
+  };
 
   const bindMouseTrackingOwnership = () => {
     const xterm = terminalHost.querySelector(".xterm");
@@ -1256,13 +1256,6 @@
     "wheel",
     (event) => {
       if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-      if (terminalHost.dataset.paneModeCapable === "true" && !terminalHost.termroomPaneMode) {
-        // Local capability is known at page render; never guess before its
-        // first authoritative control, or during reconnect.
-        event.stopImmediatePropagation();
-        event.preventDefault();
-        return;
-      }
       if (
         terminalOwnsWheel()
         || event.ctrlKey

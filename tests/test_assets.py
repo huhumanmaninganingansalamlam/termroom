@@ -467,11 +467,13 @@ def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> Non
 const assert = require('node:assert/strict');
 const host = {dataset:{paneModeCapable:'true',terminalId:'t'}};
 let paneMode = null;
+let paneModeGeneration = null;
+let paneModeRevision = 0;
 """
         + handler
         + """
 const mode = {kind:'pane_mode',terminal_id:'t',generation:'a',revision:1,
- alternate:true,mouse_tracking:false};
+ available:true,alternate:true,mouse_tracking:false};
 acceptPaneMode(mode);
 assert.equal(paneMode.alternate, true);
 assert.ok(Object.isFrozen(paneMode));
@@ -481,12 +483,20 @@ acceptPaneMode(mode);
 acceptPaneMode({...mode,generation:'old',revision:99});
 acceptPaneMode({...mode,terminal_id:'other',revision:99});
 assert.equal(paneMode.revision, 2);
+acceptPaneMode({kind:'pane_mode',terminal_id:'t',generation:'a',revision:3,available:false});
+assert.equal(paneMode, null);
+acceptPaneMode(mode);
+assert.equal(paneMode, null);
 paneMode = null; // each new socket resets state, socket/epoch guards reject old events
+paneModeGeneration = null;
+paneModeRevision = 0;
 acceptPaneMode({...mode,generation:'b'});
 assert.equal(paneMode.generation, 'b');
 host.dataset.paneModeCapable = 'false';
 paneMode = null;
-acceptPaneMode(mode);
+paneModeGeneration = null;
+paneModeRevision = 0;
+acceptPaneMode({...mode,generation:'c'});
 assert.equal(paneMode, null);
 """
     )

@@ -62,6 +62,7 @@ from termroom.terminal_control import TerminalControl
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
     MAX_TERMINAL_MESSAGE_BYTES,
+    PANE_MODE_REFRESH_INTERVAL_SECONDS,
     TERMINAL_EDITOR_WRAPPER,
     TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
@@ -4066,6 +4067,41 @@ class SSHBackend:
             command = capture
         return self._exec(self._computer(workspace), command)
 
+    def current_pane_mode(
+        self, workspace: dict[str, Any], terminal: dict[str, Any]
+    ) -> dict[str, Any]:
+        session = str(workspace.get("tmux_session") or "")
+        window = str(terminal.get("tmux_window") or "")
+        target = shlex.quote(f"{session}:{window}")
+        format_string = (
+            "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
+            "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
+            "#{mouse_all_flag}|#{mouse_sgr_flag}"
+        )
+        output = self._exec(
+            self._computer(workspace),
+            f"tmux display-message -p -t {target} {shlex.quote(format_string)}",
+        )
+        fields = output.strip().split("|")
+        if (
+            len(fields) != 10
+            or fields[0] != session
+            or fields[1] != window
+            or not fields[2].startswith("%")
+            or not fields[3].isdigit()
+            or any(flag not in {"0", "1"} for flag in fields[4:])
+        ):
+            raise SSHBackendError("Current Terminal pane mode is unavailable")
+        return {
+            "session": fields[0],
+            "window": fields[1],
+            "pane": fields[2],
+            "pane_pid": int(fields[3]),
+            "alternate": fields[4] == "1",
+            "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
+            "mouse_flags": [int(flag) for flag in fields[5:]],
+        }
+
     async def bridge(
         self,
         websocket: WebSocket,
@@ -4087,34 +4123,91 @@ class SSHBackend:
             self._forget_ssh_browser_grid_owner(terminal_id, client_id)
             raise
         last_viewport: tuple[int, int] | None = None
+        mode_revision = 0
+        previous_mode: dict[str, Any] | None = None
+        mode_available: bool | None = None
+
+        async def send_pane_mode() -> None:
+            nonlocal mode_revision, previous_mode, mode_available
+            try:
+                mode = await asyncio.to_thread(self.current_pane_mode, workspace, terminal)
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                SSHBackendError,
+                paramiko.SSHException,
+                ValueError,
+            ):
+                if mode_available is False:
+                    return
+                mode_available = False
+                previous_mode = None
+                mode_revision += 1
+                control = {
+                    "kind": "pane_mode",
+                    "terminal_id": terminal_id,
+                    "generation": client_id,
+                    "revision": mode_revision,
+                    "available": False,
+                }
+                await websocket.send_bytes(json.dumps(control).encode("utf-8"))
+                return
+            if mode_available is True and mode == previous_mode:
+                return
+            mode_available = True
+            previous_mode = mode
+            mode_revision += 1
+            await websocket.send_bytes(
+                json.dumps(
+                    {
+                        "kind": "pane_mode",
+                        "terminal_id": terminal_id,
+                        "generation": client_id,
+                        "revision": mode_revision,
+                        "available": True,
+                        **mode,
+                    }
+                ).encode("utf-8")
+            )
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
-            while True:
-                try:
-                    chunk = await asyncio.to_thread(os.read, master_fd, 65536)
-                except OSError:
-                    tail = decoder.feed(b"", final=True)
-                    if tail:
+            chunks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
+
+            async def read_pty() -> None:
+                while True:
+                    try:
+                        chunk = await asyncio.to_thread(os.read, master_fd, 65536)
+                    except OSError:
+                        chunk = b""
+                    await chunks.put(chunk)
+                    if not chunk:
+                        return
+
+            reader = asyncio.create_task(read_pty())
+            last_mode_refresh = asyncio.get_running_loop().time()
+            try:
+                while True:
+                    batch = [await chunks.get()]
+                    loop = asyncio.get_running_loop()
+                    delay = last_mode_refresh + PANE_MODE_REFRESH_INTERVAL_SECONDS - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    while not chunks.empty() and len(batch) < 16 and batch[-1]:
+                        batch.append(chunks.get_nowait())
+                    await send_pane_mode()
+                    last_mode_refresh = loop.time()
+                    decoded = decoder.feed(b"".join(batch), final=not batch[-1])
+                    if decoded:
                         await asyncio.to_thread(
                             touch_terminal_output_if_present, self.store, terminal_id
                         )
-                        await websocket.send_text(tail)
-                    return
-                if not chunk:
-                    tail = decoder.feed(b"", final=True)
-                    if tail:
-                        await asyncio.to_thread(
-                            touch_terminal_output_if_present, self.store, terminal_id
-                        )
-                        await websocket.send_text(tail)
-                    return
-                decoded = decoder.feed(chunk)
-                if decoded:
-                    await asyncio.to_thread(
-                        touch_terminal_output_if_present, self.store, terminal_id
-                    )
-                    await websocket.send_text(decoded)
+                        await websocket.send_text(decoded)
+                    if not batch[-1]:
+                        return
+            finally:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
 
         async def apply_browser_resize(payload: dict[str, Any]) -> bool:
             nonlocal last_viewport
@@ -4258,9 +4351,12 @@ class SSHBackend:
                         continue
                     os.write(master_fd, str(payload.get("data", "")).encode())
 
-        output_task = asyncio.create_task(output_to_browser())
-        input_task = asyncio.create_task(browser_to_input())
+        output_task: asyncio.Task[None] | None = None
+        input_task: asyncio.Task[None] | None = None
         try:
+            await send_pane_mode()
+            output_task = asyncio.create_task(output_to_browser())
+            input_task = asyncio.create_task(browser_to_input())
             done, pending = await asyncio.wait(
                 {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -4277,7 +4373,7 @@ class SSHBackend:
                 terminal_id, client_id, workspace=workspace, window=str(terminal["tmux_window"])
             )
             for task in (output_task, input_task):
-                if not task.done():
+                if task is not None and not task.done():
                     task.cancel()
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process_pid, signal.SIGTERM)
@@ -4286,6 +4382,11 @@ class SSHBackend:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process_pid, signal.SIGKILL)
                 await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
+            if output_task is not None or input_task is not None:
+                await asyncio.gather(
+                    *(task for task in (output_task, input_task) if task is not None),
+                    return_exceptions=True,
+                )
             with contextlib.suppress(OSError):
                 os.close(master_fd)
 

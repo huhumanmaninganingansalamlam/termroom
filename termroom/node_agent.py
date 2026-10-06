@@ -99,6 +99,7 @@ from termroom.security import (
 )
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
+    PANE_MODE_REFRESH_INTERVAL_SECONDS,
     TERMINAL_EDITOR_WRAPPER,
     TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
@@ -2309,6 +2310,8 @@ class NodeRuntime:
             ),
             cleanup=cleanup_view,
             freeze_grid=freeze_view_grid,
+            current_pane_mode=lambda: self._current_pane_mode(session, window),
+            pane_mode_control=payload.get("pane_mode_control") is True,
             wait_grid_resize=lambda rows, cols: wait_tmux_browser_grid_size(
                 lambda: (
                     self._tmux(
@@ -2332,6 +2335,36 @@ class NodeRuntime:
                 view_session,
                 enabled=enabled,
             )
+
+    def _current_pane_mode(self, session: str, window: str) -> dict[str, Any]:
+        format_string = (
+            "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
+            "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
+            "#{mouse_all_flag}|#{mouse_sgr_flag}"
+        )
+        result = self._tmux(
+            "display-message", "-p", "-t", f"{session}:{window}", format_string
+        )
+        fields = result.stdout.strip().split("|")
+        if (
+            result.returncode
+            or len(fields) != 10
+            or fields[0] != session
+            or fields[1] != window
+            or not fields[2].startswith("%")
+            or not fields[3].isdigit()
+            or any(flag not in {"0", "1"} for flag in fields[4:])
+        ):
+            raise NodeAgentError("Current Terminal pane mode is unavailable")
+        return {
+            "session": fields[0],
+            "window": fields[1],
+            "pane": fields[2],
+            "pane_pid": int(fields[3]),
+            "alternate": fields[4] == "1",
+            "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
+            "mouse_flags": [int(flag) for flag in fields[5:]],
+        }
 
     async def _read_text_open(
         self,
@@ -3844,6 +3877,8 @@ class TerminalAgentStream:
         cleanup: Callable[[], object] | None = None,
         wait_grid_resize: Callable[[int, int], bool] | None = None,
         freeze_grid: Callable[[], bool] | None = None,
+        current_pane_mode: Callable[[], dict[str, Any]] | None = None,
+        pane_mode_control: bool = False,
     ) -> None:
         self.stream_id = stream_id
         self.process_pid = process_pid
@@ -3855,6 +3890,11 @@ class TerminalAgentStream:
         self.cleanup = cleanup
         self.wait_grid_resize = wait_grid_resize
         self.freeze_grid = freeze_grid
+        self.current_pane_mode = current_pane_mode
+        self.pane_mode_control = pane_mode_control
+        self.previous_pane_mode: dict[str, Any] | None = None
+        self.pane_mode_available: bool | None = None
+        self.pane_mode_revision = 0
         self.grid_active = False
         self.last_viewport: tuple[int, int] | None = None
         self.closed = False
@@ -3979,21 +4019,88 @@ class TerminalAgentStream:
 
     async def start(self) -> None:
         try:
-            while True:
-                try:
-                    chunk = await asyncio.to_thread(
-                        os.read, self.master_fd, MAX_NODE_STREAM_CHUNK_BYTES
-                    )
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                await _send_stream_data(self.send, self.stream_id, chunk)
+            await self._send_pane_mode()
+            chunks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
+
+            async def read_output() -> None:
+                while True:
+                    try:
+                        chunk = await asyncio.to_thread(
+                            os.read, self.master_fd, MAX_NODE_STREAM_CHUNK_BYTES
+                        )
+                    except OSError:
+                        chunk = b""
+                    await chunks.put(chunk)
+                    if not chunk:
+                        return
+
+            reader = asyncio.create_task(read_output())
+            last_mode_refresh = asyncio.get_running_loop().time()
+            try:
+                while True:
+                    batch = [await chunks.get()]
+                    if batch[0]:
+                        loop = asyncio.get_running_loop()
+                        delay = (
+                            last_mode_refresh
+                            + PANE_MODE_REFRESH_INTERVAL_SECONDS
+                            - loop.time()
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        while not chunks.empty() and len(batch) < 16 and batch[-1]:
+                            batch.append(chunks.get_nowait())
+                        await self._send_pane_mode()
+                        last_mode_refresh = asyncio.get_running_loop().time()
+                        for chunk in batch:
+                            if chunk:
+                                await _send_stream_data(self.send, self.stream_id, chunk)
+                    if not batch[-1]:
+                        break
+            finally:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
         finally:
             if not self.closed:
                 with contextlib.suppress(Exception):
                     await self.send({"type": "stream.close", "stream_id": self.stream_id})
             await self.close()
+
+    async def _send_pane_mode(self) -> None:
+        if not self.pane_mode_control or self.current_pane_mode is None:
+            return
+        try:
+            mode = await asyncio.to_thread(self.current_pane_mode)
+        except (OSError, NodeAgentError, subprocess.SubprocessError, ValueError):
+            if self.pane_mode_available is not False:
+                self.pane_mode_available = False
+                self.previous_pane_mode = None
+                self.pane_mode_revision += 1
+                await self.send(
+                    {
+                        "type": "stream.control",
+                        "stream_id": self.stream_id,
+                        "kind": "pane_mode",
+                        "revision": self.pane_mode_revision,
+                        "available": False,
+                    }
+                )
+            return
+        if self.pane_mode_available is True and mode == self.previous_pane_mode:
+            return
+        self.previous_pane_mode = mode
+        self.pane_mode_available = True
+        self.pane_mode_revision += 1
+        await self.send(
+            {
+                "type": "stream.control",
+                "stream_id": self.stream_id,
+                "kind": "pane_mode",
+                "revision": self.pane_mode_revision,
+                "available": True,
+                "mode": mode,
+            }
+        )
 
     async def feed(self, chunk: bytes) -> None:
         if not self.closed and chunk:

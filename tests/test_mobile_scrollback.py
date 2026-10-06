@@ -592,12 +592,20 @@ for (const buffer of ['normal', 'alternate']) {
 }
 terminalHost.termroomPaneMode = null;
 let pendingStopped = 0, prevented = 0;
-callbacks.host({stopImmediatePropagation:()=>pendingStopped++,preventDefault:()=>prevented++});
-assert.equal(pendingStopped, 1);
-assert.equal(prevented, 1);
-callbacks.host({ctrlKey:true,stopImmediatePropagation:()=>pendingStopped++,preventDefault:()=>prevented++});
-assert.equal(pendingStopped, 1);
-assert.equal(prevented, 1);
+let bubbled = 0;
+mouse = false;
+callbacks.surface({target:new Node(),deltaY:-180,stopPropagation:()=>bubbled++});
+callbacks.host({stopImmediatePropagation:()=>pendingStopped++,stopPropagation:()=>bubbled++,preventDefault:()=>prevented++});
+assert.equal(historyIntents, 1);
+assert.equal(pendingStopped, 0);
+assert.equal(prevented, 0);
+mouse = true;
+callbacks.host({stopImmediatePropagation:()=>pendingStopped++,stopPropagation:()=>bubbled++,preventDefault:()=>prevented++});
+assert.equal(pendingStopped, 0);
+assert.equal(prevented, 0);
+callbacks.host({ctrlKey:true,stopImmediatePropagation:()=>pendingStopped++,stopPropagation:()=>bubbled++,preventDefault:()=>prevented++});
+assert.equal(pendingStopped, 0);
+assert.equal(prevented, 0);
 terminalHost.dataset.paneModeCapable = 'false';
 for (const tracking of [false,true]) {
   mouse = tracking;

@@ -76,6 +76,57 @@ def _terminal_resize_ack(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pane_mode_control", [False, True])
+async def test_node_terminal_mode_control_is_opt_in_and_precedes_first_pty_output(
+    monkeypatch: pytest.MonkeyPatch, pane_mode_control: bool
+) -> None:
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"first output")
+    os.close(write_fd)
+    modes = iter(
+        [
+            {"session": "s", "window": "@1", "pane": "%1", "pane_pid": 1,
+             "alternate": False, "mouse_tracking": False, "mouse_flags": [0] * 5},
+            {"session": "s", "window": "@1", "pane": "%1", "pane_pid": 1,
+             "alternate": True, "mouse_tracking": True, "mouse_flags": [1] * 5},
+        ]
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: Any) -> None:
+        sent.append(dict(message))
+
+    monkeypatch.setattr(node_agent.os, "killpg", lambda *_args: None)
+    monkeypatch.setattr(node_agent, "_wait_for_pid", lambda *_args: True)
+    stream = TerminalAgentStream(
+        "d" * 32,
+        -1,
+        read_fd,
+        send,
+        {},
+        current_pane_mode=lambda: next(modes),
+        pane_mode_control=pane_mode_control,
+    )
+
+    await stream.start()
+
+    if pane_mode_control:
+        assert [message["type"] for message in sent] == [
+            "stream.control",
+            "stream.control",
+            "stream.data",
+            "stream.close",
+        ]
+        assert sent[0]["mode"]["alternate"] is False
+        assert sent[1]["mode"]["alternate"] is True
+        assert sent[1]["revision"] == 2
+        assert base64.b64decode(sent[2]["data"]) == b"first output"
+    else:
+        assert [message["type"] for message in sent] == ["stream.data", "stream.close"]
+        assert base64.b64decode(sent[0]["data"]) == b"first output"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["none", "enable", "apply", "demote", "cleanup"])
 async def test_node_terminal_resize_bootstrap_ack_failure_retry_and_idempotency(
     monkeypatch: pytest.MonkeyPatch, failure: str
@@ -2175,6 +2226,7 @@ async def test_node_terminal_bridge_retrieves_the_canceled_direction() -> None:
 @pytest.mark.asyncio
 async def test_node_terminal_binary_and_structured_input_take_over_before_send() -> None:
     events: list[tuple[Any, ...]] = []
+    attach_payload: dict[str, Any] = {}
 
     class FakeStore:
         def touch_terminal(self, _terminal_id: str) -> None:
@@ -2194,6 +2246,11 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
             await asyncio.Event().wait()
             raise StopAsyncIteration
 
+        async def receive_event(self) -> bytes | dict[str, Any] | None:
+            if not hasattr(self, "events"):
+                await asyncio.Event().wait()
+            return self.events.pop(0)
+
         async def control(self, action: str, **values: Any) -> None:
             events.append(("control", action, values))
 
@@ -2204,11 +2261,32 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
             return None
 
     stream = FakeStream()
+    stream.events = [
+        {
+            "kind": "pane_mode",
+            "revision": 1,
+            "available": True,
+            "mode": {
+                "session": "termroom-project",
+                "window": "@1",
+                "pane": "%1",
+                "pane_pid": 4321,
+                "alternate": True,
+                "mouse_tracking": False,
+                "mouse_flags": [0, 0, 0, 0, 0],
+            },
+        },
+        b"remote output",
+        None,
+    ]
+
+    browser_frames: list[tuple[str, Any]] = []
 
     class FakeConnection:
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            attach_payload.update(_payload)
             stream.stream_id = "a" * 32
             return {}, stream
 
@@ -2273,8 +2351,11 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         async def receive(self) -> dict[str, Any]:
             return messages.pop(0)
 
-        async def send_text(self, _value: str) -> None:
-            return None
+        async def send_bytes(self, value: bytes) -> None:
+            browser_frames.append(("control", json.loads(value)))
+
+        async def send_text(self, value: str) -> None:
+            browser_frames.append(("text", value))
 
         async def close(self, *, code: int, reason: str) -> None:
             raise AssertionError((code, reason))
@@ -2308,6 +2389,7 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         device_id="device",
     )
 
+    assert attach_payload["pane_mode_control"] is True
     assert events == [
         (
             "control",
@@ -2336,6 +2418,30 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         ("command", "pwd"),
         ("send", b"pwd\r"),
         ("send", b"legacy"),
+    ]
+    assert browser_frames == [
+        (
+            "control",
+            {
+                "kind": "pane_mode",
+                "terminal_id": "terminal",
+                "generation": next(
+                    message["generation"]
+                    for kind, message in browser_frames
+                    if kind == "control"
+                ),
+                "revision": 1,
+                "available": True,
+                "session": "termroom-project",
+                "window": "@1",
+                "pane": "%1",
+                "pane_pid": 4321,
+                "alternate": True,
+                "mouse_tracking": False,
+                "mouse_flags": [0, 0, 0, 0, 0],
+            },
+        ),
+        ("text", "remote output"),
     ]
 
 

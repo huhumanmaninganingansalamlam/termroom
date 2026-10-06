@@ -156,6 +156,8 @@
     get: () => term.buffer.active.type,
   });
   let paneMode = null;
+  let paneModeGeneration = null;
+  let paneModeRevision = 0;
   Object.defineProperty(host, "termroomPaneMode", {
     configurable: true,
     get: () => paneMode,
@@ -168,12 +170,16 @@
       || typeof value.generation !== "string"
       || !Number.isSafeInteger(value.revision)
       || value.revision < 1
-      || typeof value.alternate !== "boolean"
-      || typeof value.mouse_tracking !== "boolean"
-      || (paneMode && (value.generation !== paneMode.generation
-        || value.revision <= paneMode.revision))
+      || (value.available !== undefined && typeof value.available !== "boolean")
+      || (value.available !== false
+        && (typeof value.alternate !== "boolean"
+          || typeof value.mouse_tracking !== "boolean"))
+      || (paneModeGeneration !== null && value.generation !== paneModeGeneration)
+      || (value.generation === paneModeGeneration && value.revision <= paneModeRevision)
     ) return;
-    paneMode = Object.freeze(value);
+    paneModeGeneration = value.generation;
+    paneModeRevision = value.revision;
+    paneMode = value.available === false ? null : Object.freeze(value);
   };
   term.options.screenReaderMode = false;
   screenReaderModeToggle?.addEventListener("change", () => {
@@ -580,6 +586,8 @@
     );
     nextSocket.binaryType = "arraybuffer";
     paneMode = null;
+    paneModeGeneration = null;
+    paneModeRevision = 0;
     socket = nextSocket;
     setStatus(tr("terminal.status.connecting"));
 

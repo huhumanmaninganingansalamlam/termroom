@@ -61,7 +61,7 @@ class NodeStream:
     def __init__(self, connection: NodeConnection, stream_id: str) -> None:
         self.connection = connection
         self.stream_id = validate_request_id(stream_id)
-        self._queue: asyncio.Queue[bytes | BaseException | object] = asyncio.Queue(
+        self._queue: asyncio.Queue[bytes | dict[str, Any] | BaseException | object] = asyncio.Queue(
             maxsize=NODE_STREAM_QUEUE_DEPTH
         )
         self._closed = False
@@ -83,12 +83,18 @@ class NodeStream:
             )
 
     async def receive(self) -> bytes | None:
+        while True:
+            item = await self.receive_event()
+            if item is None or isinstance(item, bytes):
+                return item
+
+    async def receive_event(self) -> bytes | dict[str, Any] | None:
         item = await self._queue.get()
         if item is _STREAM_END:
             return None
         if isinstance(item, BaseException):
             raise item
-        return bytes(item)
+        return bytes(item) if isinstance(item, bytes) else dict(item)
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         while True:
@@ -150,6 +156,15 @@ class NodeStream:
             self.feed_error(
                 NodeCoreError("Node stream exceeded its buffer", code="stream_overflow")
             )
+            raise NodeCoreError("Node stream exceeded its buffer", code="stream_overflow") from exc
+
+    def feed_control(self, control: Mapping[str, Any]) -> None:
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(dict(control))
+        except asyncio.QueueFull as exc:
+            self.feed_error(NodeCoreError("Node stream exceeded its buffer", code="stream_overflow"))
             raise NodeCoreError("Node stream exceeded its buffer", code="stream_overflow") from exc
 
     def feed_end(self, result: Mapping[str, Any] | None = None) -> None:
@@ -258,6 +273,9 @@ class NodeConnection:
         if kind == "stream.data":
             self._dispatch_stream_data(message)
             return
+        if kind == "stream.control":
+            self._dispatch_stream_control(message)
+            return
         if kind == "stream.close":
             stream = self._stream(message)
             if stream is None:
@@ -316,6 +334,31 @@ class NodeConnection:
         if len(chunk) > MAX_NODE_STREAM_CHUNK_BYTES:
             raise NodeProtocolError("Node stream chunk is too large", code="stream_too_large")
         stream.feed_data(chunk)
+
+    def _dispatch_stream_control(self, message: Mapping[str, Any]) -> None:
+        stream = self._stream(message)
+        if stream is None:
+            return
+        revision = message.get("revision")
+        available = message.get("available")
+        mode = message.get("mode")
+        if (
+            message.get("kind") != "pane_mode"
+            or type(revision) is not int
+            or revision < 1
+            or type(available) is not bool
+            or (available and not isinstance(mode, dict))
+            or (not available and mode is not None)
+        ):
+            raise NodeProtocolError("Node stream control is invalid", code="stream_invalid")
+        control: dict[str, Any] = {
+            "kind": "pane_mode",
+            "revision": revision,
+            "available": available,
+        }
+        if available:
+            control["mode"] = dict(mode)
+        stream.feed_control(control)
 
     def _stream(self, message: Mapping[str, Any]) -> NodeStream | None:
         stream_id = validate_request_id(str(message.get("stream_id") or ""))
