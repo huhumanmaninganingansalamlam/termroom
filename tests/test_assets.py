@@ -403,7 +403,8 @@ assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
     assert "if (epoch !== connectionEpoch || nextSocket !== socket) return;" in terminal_script
     assert re.search(
         r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
-        r'if \(document\.visibilityState !== "visible"\) return;\s*'
+        r'if \(document\.visibilityState !== "visible"\) \{\s*'
+        r"cancelPresenceRequest\(\);\s*return;\s*\}\s*"
         r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{",
         terminal_script,
     )
@@ -481,6 +482,8 @@ assert.equal(paneMode, null);
 
 def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None:
     script = (VENDOR_DIR.parent / "terminal.js").read_text()
+    cancel = script[script.index("  const cancelPresenceRequest = () => {"):
+                    script.index("  const updatePresence = async () => {")]
     switch = script[script.index("  const resetTerminalActivityState ="):
                     script.index("  terminalTabs.forEach((tab) => {")]
     message = script[script.index('    nextSocket.addEventListener("message",'):
@@ -497,6 +500,8 @@ const document = {body:{classList:{remove(){}}},querySelector(){return null;}};
 const CustomEvent = function(kind, options){this.type=kind;this.detail=options.detail;};
 const WebSocket = {OPEN:1,CLOSING:2};
 let connectionEpoch=0, pendingTerminalId='', socket={readyState:1,close(){this.readyState=3;}};
+let presenceAborted=false;
+let presenceRequest={controller:{abort(){presenceAborted=true;}}};
 let shellTerminal=true, reconnectTimer, otherInputTimer, reconnectAllowed=true, reconnectDelay=500;
 let presenceInitialized=true,lastInputRevision=1,activityAckTimer=0,pendingActivityAt=10,
  acknowledgedActivityAt=0,renderedActivityAt=0,outputRenderSequence=0,acknowledgedRenderSequence=0;
@@ -513,6 +518,7 @@ const connect=()=>{connections.push(host.dataset.terminalId);connectionEpoch++;
 const scheduleActivityAcknowledge=()=>events.push({type:'ack-scheduled',
  terminalId:host.dataset.terminalId});
 const acceptPaneMode=()=>{};
+CANCEL_HANDLER
 function attachMessage(nextSocket,epoch) {
   let receive;
   nextSocket.addEventListener=(_,listener)=>{receive=listener;};
@@ -523,6 +529,7 @@ SWITCH_HANDLER
 const oldSocket=socket, oldReceive=attachMessage(oldSocket,connectionEpoch);
 oldReceive({data:'OLD-A'});
 assert.equal(switchShellTerminal(tabs[1]),true);
+assert.equal(presenceAborted,true,'switching must cancel the in-flight presence request');
 assert.equal(host.dataset.terminalId,'A','identity must not change until native queue drains');
 assert.equal(connections.length,0);
 queue.shift()(); // old A parses while still A; stale callback is ignored
@@ -547,7 +554,9 @@ const staleReceive=attachMessage(socket,connectionEpoch);
 staleReceive({data:'OLD-CONNECTION'});socket={readyState:1};
 const count=outputRenderSequence;queue.shift()();assert.equal(outputRenderSequence,count);
 assert.equal(pendingTerminalId,'');
-""".replace("MESSAGE_HANDLER", message).replace("SWITCH_HANDLER", switch)
+""".replace("CANCEL_HANDLER", cancel).replace("MESSAGE_HANDLER", message).replace(
+    "SWITCH_HANDLER", switch
+)
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
