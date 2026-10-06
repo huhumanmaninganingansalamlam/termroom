@@ -571,7 +571,10 @@ let presenceRequest=null,connectionEpoch=1,launched=0,outstanding=0,maximum=0;
 let failNext=false;
 const urls=[],jsonBodies=[],statusUpdates=[],cleared=[],scheduled=[];
 const host={dataset:{terminalId:'same-terminal',deviceId:'fixture-device'}};
-const window={clearTimeout(value){cleared.push(value);},setTimeout(_callback,delay){scheduled.push(delay);return scheduled.length;}};
+const window={
+  clearTimeout(value){cleared.push(value);},
+  setTimeout(_callback,delay){scheduled.push(delay);return scheduled.length;}
+};
 const document={visibilityState:'visible'};
 const tr=value=>value;
 const setStatusMessage=value=>statusUpdates.push(value);
@@ -579,8 +582,13 @@ global.fetch=(_url,options)=>{
   launched++;outstanding++;maximum=Math.max(maximum,outstanding);
   urls.push(_url);
   let active=true;
-  options.signal.addEventListener('abort',()=>{if(active){active=false;outstanding--;}}, {once:true});
-  if(failNext){failNext=false;active=false;outstanding--;return Promise.reject(new Error('fixture failure'));}
+  options.signal.addEventListener(
+    'abort',()=>{if(active){active=false;outstanding--;}}, {once:true}
+  );
+  if(failNext){
+    failNext=false;active=false;outstanding--;
+    return Promise.reject(new Error('fixture failure'));
+  }
   return Promise.resolve({ok:true,json:()=>new Promise(resolve=>{
     jsonBodies.push(value=>{if(active){active=false;outstanding--;}resolve(value);});
   })});
@@ -603,7 +611,9 @@ __PRESENCE_UPDATE__
   assert.equal(launched,2,'same-terminal reopen must start its own request');
   jsonBodies[0]({count:2,input_revision:9,last_input_device_id:'other-device'});
   await Promise.all([old,overlapping]);
-  assert.deepEqual(state(),before,'a successful response queued before cancellation must not update reopened state');
+  assert.deepEqual(
+    state(),before,'a successful response queued before cancellation must not update reopened state'
+  );
   const duplicateAfterOld=updatePresence();
   await duplicateAfterOld;
   assert.equal(launched,2,'the old finally must not clear the reopened request guard');
@@ -612,7 +622,9 @@ __PRESENCE_UPDATE__
   assert.equal(jsonBodies.length,2);
   jsonBodies[1]({count:1,input_revision:4});
   await reopened;
-  assert.equal(statusUpdates.at(-1),'terminal.status.connected','the current response must still update status');
+  assert.equal(
+    statusUpdates.at(-1),'terminal.status.connected','the current response must still update status'
+  );
   assert.equal(outstanding,0);
   assert.equal(maximum,1);
 
