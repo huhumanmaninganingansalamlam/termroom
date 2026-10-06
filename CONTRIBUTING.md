@@ -25,6 +25,10 @@ node --check termroom/static/remote_run.js
 node --check termroom/static/terminal.js
 ```
 
+## Tests
+
+Test observable behavior and outcomes so tests remain valid across internal refactors. Keep each test isolated and deterministic; use bounded fault injection only to reproduce a diagnosed race, and avoid timing sleeps, redundant assertions, and test-only frameworks.
+
 ## Product rules
 
 Prefer changes that improve at least one of these:

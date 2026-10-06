@@ -1866,24 +1866,7 @@ async def test_node_remote_run_start_is_idempotent_and_interrupt_targets_owned_r
     observed = await _wait_for_terminal(runtime, payload)
     assert observed["state"] == "stopped"
     assert count.read_text(encoding="utf-8") == "once\n"
-    try:
-        deleted = await _operation(runtime, "remote_run.delete", payload)
-    except NodeRemoteRunError as exc:
-        cause = exc.__cause__
-        if isinstance(cause, OSError):
-            frame = cause.__traceback__
-            deepest = None
-            while frame is not None:
-                if frame.tb_frame.f_globals.get("__name__") == node_remote_runs.__name__:
-                    deepest = frame
-                frame = frame.tb_next
-            location = (
-                f"{deepest.tb_frame.f_code.co_name}:{deepest.tb_lineno}"
-                if deepest is not None
-                else "unavailable"
-            )
-            exc.add_note(f"cleanup diagnostic errno={cause.errno!r} deepest={location}")
-        raise
+    deleted = await _operation(runtime, "remote_run.delete", payload)
     assert deleted == {"deleted": True, "already_missing": False}
     assert not (run_root / run_id).exists()
     assert not (run_root / f".termroom-deleting-{run_id}").exists()
