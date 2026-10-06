@@ -192,7 +192,7 @@ def test_base_loads_mobile_scrollback_assets() -> None:
     assert "terminal_selection.js') }}?v=1\" defer" in template
     assert "mobile_scrollback.js') }}?v=39\" defer" in template
     assert "__termroomTerminalOutputHookInstalled" not in template
-    assert "terminal.js') }}?v=59" in terminal_template
+    assert "terminal.js') }}?v=61" in terminal_template
 
 
 @pytest.mark.asyncio

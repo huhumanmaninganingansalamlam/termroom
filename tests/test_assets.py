@@ -430,7 +430,7 @@ def test_template_static_asset_versions_are_consistent() -> None:
     assert versions["remote_run.js"] == {"14"}
     assert versions["terminal-font.css"] == {"3"}
     assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"59"}
+    assert versions["terminal.js"] == {"61"}
     assert versions["mobile_scrollback.js"] == {"39"}
 
 
@@ -550,6 +550,122 @@ assert.equal(pendingTerminalId,'');
 """.replace("MESSAGE_HANDLER", message).replace("SWITCH_HANDLER", switch)
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_terminal_presence_poll_does_not_overlap_slow_requests() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise terminal presence polling")
+    source = (VENDOR_DIR.parent / "terminal.js").read_text()
+    cancel_start = source.index("  const cancelPresenceRequest = () => {")
+    start = source.index("  const updatePresence = async () => {", cancel_start)
+    end = source.index("\n\n  const send =", start)
+    presence = source[start:end].replace("  const updatePresence =", "const updatePresence =")
+    cancel = source[cancel_start:start].replace(
+        "  const cancelPresenceRequest =", "const cancelPresenceRequest ="
+    )
+    probe = r"""
+const assert=require('node:assert/strict');
+let isConnected=true,presenceInitialized=true,lastInputRevision=4,otherInputTimer=77;
+let presenceRequest=null,connectionEpoch=1,launched=0,outstanding=0,maximum=0;
+let failNext=false;
+const urls=[],jsonBodies=[],statusUpdates=[],cleared=[],scheduled=[];
+const host={dataset:{terminalId:'same-terminal',deviceId:'fixture-device'}};
+const window={clearTimeout(value){cleared.push(value);},setTimeout(_callback,delay){scheduled.push(delay);return scheduled.length;}};
+const document={visibilityState:'visible'};
+const tr=value=>value;
+const setStatusMessage=value=>statusUpdates.push(value);
+global.fetch=(_url,options)=>{
+  launched++;outstanding++;maximum=Math.max(maximum,outstanding);
+  urls.push(_url);
+  let active=true;
+  options.signal.addEventListener('abort',()=>{if(active){active=false;outstanding--;}}, {once:true});
+  if(failNext){failNext=false;active=false;outstanding--;return Promise.reject(new Error('fixture failure'));}
+  return Promise.resolve({ok:true,json:()=>new Promise(resolve=>{
+    jsonBodies.push(value=>{if(active){active=false;outstanding--;}resolve(value);});
+  })});
+};
+__PRESENCE_CANCEL__
+__PRESENCE_UPDATE__
+(async()=>{
+  const state=()=>({presenceInitialized,lastInputRevision,otherInputTimer,
+    statusUpdates:[...statusUpdates],cleared:[...cleared],scheduled:[...scheduled]});
+  const old=updatePresence();
+  const overlapping=updatePresence();
+  assert.equal(launched,1,'slow polls must be single-flight');
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,1,'the first response body must be pending');
+  const before=state();
+  document.visibilityState='hidden';
+  cancelPresenceRequest();
+  document.visibilityState='visible';
+  const reopened=updatePresence();
+  assert.equal(launched,2,'same-terminal reopen must start its own request');
+  jsonBodies[0]({count:2,input_revision:9,last_input_device_id:'other-device'});
+  await Promise.all([old,overlapping]);
+  assert.deepEqual(state(),before,'a successful response queued before cancellation must not update reopened state');
+  const duplicateAfterOld=updatePresence();
+  await duplicateAfterOld;
+  assert.equal(launched,2,'the old finally must not clear the reopened request guard');
+  assert.equal(outstanding,1);
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,2);
+  jsonBodies[1]({count:1,input_revision:4});
+  await reopened;
+  assert.equal(statusUpdates.at(-1),'terminal.status.connected','the current response must still update status');
+  assert.equal(outstanding,0);
+  assert.equal(maximum,1);
+
+  failNext=true;
+  const beforeFailure=launched;
+  await updatePresence();
+  assert.equal(launched,beforeFailure+1);
+  assert.equal(presenceRequest,null,'failed requests must release the single-flight guard');
+  const recovered=updatePresence();
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,3);
+  jsonBodies[2]({count:1,input_revision:4});
+  await recovered;
+  assert.equal(launched,beforeFailure+2,'a poll after failure must recover');
+
+  document.visibilityState='hidden';
+  const beforeHidden=launched;
+  await updatePresence();
+  assert.equal(launched,beforeHidden,'hidden pages must not fetch presence');
+  document.visibilityState='visible';
+  const visible=updatePresence();
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,4);
+  jsonBodies[3]({count:1,input_revision:4});
+  await visible;
+  assert.equal(launched,beforeHidden+1,'visible pages must resume polling');
+
+  const oldTerminal=updatePresence();
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,5);
+  const beforeSwitch=state();
+  host.dataset.terminalId='other-terminal';
+  connectionEpoch++;
+  cancelPresenceRequest();
+  const switched=updatePresence();
+  assert.equal(urls.at(-1),'/api/terminals/other-terminal/presence');
+  jsonBodies[4]({count:2,input_revision:12,last_input_device_id:'other-device'});
+  await oldTerminal;
+  assert.deepEqual(state(),beforeSwitch,'old terminal/epoch success must not update current state');
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,6);
+  jsonBodies[5]({count:1,input_revision:4});
+  await switched;
+  assert.equal(outstanding,0);
+  assert.equal(maximum,1);
+  process.stdout.write('PRESENCE_ASSERTIONS_COMPLETE\n');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""".replace("__PRESENCE_CANCEL__", cancel).replace("__PRESENCE_UPDATE__", presence)
+    result = subprocess.run(
+        [node, "-e", probe], capture_output=True, text=True, timeout=3
+    )
+    assert result.returncode == 0, result.stderr
+    assert "PRESENCE_ASSERTIONS_COMPLETE" in result.stdout, result.stdout
 
 
 def test_remote_run_form_reuses_one_submission_identity_until_intent_changes() -> None:

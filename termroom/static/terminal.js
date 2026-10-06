@@ -280,6 +280,7 @@
   let isConnected = false;
   let lastInputRevision = 0;
   let presenceInitialized = false;
+  let presenceRequest = null;
   let otherInputTimer = null;
   let shellTerminal = (host.dataset.terminalRole || "shell") === "shell";
   let activityAckTimer = 0;
@@ -310,17 +311,35 @@
     status.classList.toggle("connected", connected);
   };
 
+  const cancelPresenceRequest = () => {
+    presenceRequest?.controller.abort();
+    presenceRequest = null;
+  };
+
   const updatePresence = async () => {
-    if (!isConnected) return;
+    if (
+      !isConnected ||
+      document.visibilityState === "hidden" ||
+      presenceRequest
+    ) return;
+    const request = { controller: new AbortController() };
+    presenceRequest = request;
     const terminalId = host.dataset.terminalId;
+    const epoch = connectionEpoch;
     try {
       const response = await fetch(`/api/terminals/${terminalId}/presence`, {
         credentials: "same-origin",
         cache: "no-store",
+        signal: request.controller.signal,
       });
       if (!response.ok) return;
       const presence = await response.json();
-      if (terminalId !== host.dataset.terminalId) return;
+      if (
+        presenceRequest !== request ||
+        request.controller.signal.aborted ||
+        epoch !== connectionEpoch ||
+        terminalId !== host.dataset.terminalId
+      ) return;
       const count = Number(presence.count || 0);
       const revision = Number(presence.input_revision || 0);
       if (!presenceInitialized) {
@@ -355,6 +374,8 @@
       );
     } catch {
       // The WebSocket status remains the source of truth when polling fails.
+    } finally {
+      if (presenceRequest === request) presenceRequest = null;
     }
   };
 
@@ -603,6 +624,7 @@
     });
     nextSocket.addEventListener("close", (event) => {
       if (epoch !== connectionEpoch || nextSocket !== socket) return;
+      cancelPresenceRequest();
       const terminalCloseMessages = {
         4401: tr("terminal.status.auth_required"),
         4403: tr("terminal.status.rejected"),
@@ -656,11 +678,15 @@
   terminalTextarea?.addEventListener("focus", updateMobileKeyboardState);
   terminalTextarea?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== "visible") {
+      cancelPresenceRequest();
+      return;
+    }
     if (reconnectAllowed && socket?.readyState === WebSocket.CLOSED) {
       connect();
       return;
     }
+    updatePresence();
     scheduleActivityAcknowledge();
   });
   window.addEventListener("focus", () => {
@@ -880,6 +906,7 @@
     connectionEpoch += 1;
     const epoch = connectionEpoch;
     pendingTerminalId = targetId;
+    cancelPresenceRequest();
     window.clearTimeout(reconnectTimer);
     window.clearTimeout(otherInputTimer);
     const previousSocket = socket;
