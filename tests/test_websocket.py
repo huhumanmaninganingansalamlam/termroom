@@ -805,7 +805,7 @@ async def test_terminal_blocked_pty_write_does_not_stall_shared_loop_or_duplicat
     target_fd: int | None = None
     writes: list[bytes] = []
     marker = "TERMROOM_BLOCKED_WRITE_ONCE"
-    command = f"printf '%s\\n' '{marker}'\r"
+    command = "echo TERMROOM_BLOCKED_''WRITE_ONCE\r"
 
     def record_write(fd: int, data: bytes) -> int:
         if fd == target_fd:
