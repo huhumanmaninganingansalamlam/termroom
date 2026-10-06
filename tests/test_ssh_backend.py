@@ -1848,6 +1848,9 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 async def send_text(self, _value: str) -> None:
                     return None
 
+                async def send_bytes(self, _value: bytes) -> None:
+                    return None
+
                 async def close(self, *, code: int, reason: str) -> None:
                     raise AssertionError((code, reason))
 

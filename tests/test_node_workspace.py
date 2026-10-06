@@ -2457,12 +2457,8 @@ async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
             return None
 
     class FakeStream:
-        def __aiter__(self) -> FakeStream:
-            return self
-
-        async def __anext__(self) -> bytes:
+        async def receive_event(self) -> bytes | dict[str, Any] | None:
             await asyncio.Event().wait()
-            raise StopAsyncIteration
 
         async def control(self, action: str, **values: Any) -> None:
             events.append((action, values))
@@ -2555,12 +2551,8 @@ async def test_node_terminal_bridge_demotes_owner_that_changes_during_control() 
             return None
 
     class FakeStream:
-        def __aiter__(self) -> FakeStream:
-            return self
-
-        async def __anext__(self) -> bytes:
+        async def receive_event(self) -> bytes | dict[str, Any] | None:
             await asyncio.Event().wait()
-            raise StopAsyncIteration
 
         async def control(self, action: str, **values: Any) -> None:
             events.append((action, values))
