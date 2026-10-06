@@ -1419,8 +1419,15 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
         assert "escape" not in {item["name"] for item in project_picker["entries"]}
         canonical = backend.validate_workspace_path(computer, str(project))
         manager = WorkspaceManager(RootManager(local_root), store)
-        workspace = manager.open_remote(computer["id"], canonical, "remote-qa")
-        terminal = backend.ensure_workspace(workspace)[0]
+        bootstrap_session = "termroom-test-shell"
+        backend._exec(computer, f"tmux new-session -d -s {bootstrap_session} /bin/sh")
+        try:
+            backend._exec(computer, "tmux set-option -g default-shell /bin/sh")
+            workspace = manager.open_remote(computer["id"], canonical, "remote-qa")
+            terminal = backend.ensure_workspace(workspace)[0]
+        finally:
+            with contextlib.suppress(Exception):
+                backend._exec(computer, f"tmux kill-session -t {bootstrap_session}")
         stale_view = tmux_browser_view_session(uuid.uuid4().hex)
         backend._exec(
             computer,
