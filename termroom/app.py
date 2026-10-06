@@ -1336,11 +1336,22 @@ def create_app(settings: Settings) -> FastAPI:
         requested = {
             str(workspace["id"]): workspace for workspace in scoped_workspaces
         }
+
+        def clear(
+            completed: asyncio.Task[None],
+            *,
+            key: tuple[str, str] = provider_key,
+        ) -> None:
+            current = terminal_activity_refreshes.get(key)
+            if current is not None and current[1] is completed:
+                terminal_activity_refreshes.pop(key, None)
+
         while requested:
             in_flight = terminal_activity_refreshes.get(provider_key)
             if in_flight is not None:
                 covered, task = in_flight
                 await asyncio.shield(task)
+                clear(task)
                 requested = {
                     workspace_id: workspace
                     for workspace_id, workspace in requested.items()
@@ -1355,18 +1366,9 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             )
             terminal_activity_refreshes[provider_key] = (covered, task)
-
-            def clear(
-                completed: asyncio.Task[None],
-                *,
-                key: tuple[str, str] = provider_key,
-            ) -> None:
-                current = terminal_activity_refreshes.get(key)
-                if current is not None and current[1] is completed:
-                    terminal_activity_refreshes.pop(key, None)
-
             task.add_done_callback(clear)
             await asyncio.shield(task)
+            clear(task)
             return
 
     async def refresh_terminal_activity_scope(

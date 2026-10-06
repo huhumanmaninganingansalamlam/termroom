@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import gzip
 import hashlib
+import inspect
 import io
+import multiprocessing
 import re
 import shutil
 import subprocess
@@ -35,6 +37,422 @@ def _terminal_activity_seconds(offset: int) -> int:
 
 def _static_asset_hash(filename: str) -> str:
     return hashlib.sha256((PACKAGE_ROOT / "static" / filename).read_bytes()).hexdigest()
+
+
+def _terminal_activity_provider_helpers(app):
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None)
+        == "/api/workspaces/{workspace_id}/terminal-activity"
+    )
+    scope = inspect.getclosurevars(endpoint).nonlocals[
+        "refresh_terminal_activity_scope"
+    ]
+    refresh = inspect.getclosurevars(scope).nonlocals[
+        "refresh_terminal_activity_provider"
+    ]
+    helpers = inspect.getclosurevars(refresh).nonlocals
+    return refresh, helpers["terminal_activity_refreshes"]
+
+
+def _probe_terminal_activity_cleanup_race(report, work_dir: str) -> None:
+    async def run() -> None:
+        root = Path(work_dir) / "root"
+        root.mkdir()
+        app = create_app(
+            Settings.create(root, state_dir=Path(work_dir) / "state", access_token="test")
+        )
+        refresh, registry = _terminal_activity_provider_helpers(app)
+        key = ("remote", "cleanup-probe")
+        calls: list[list[str]] = []
+        held: list[tuple[asyncio.Task[None], object]] = []
+
+        async def provider(workspaces: list[dict[str, str]]) -> None:
+            calls.append([workspace["id"] for workspace in workspaces])
+
+        app.state.remote.refresh_terminal_activity = provider
+        loop = asyncio.get_running_loop()
+
+        class DelayedCleanupTask(asyncio.Task[None]):
+            def add_done_callback(self, callback, *, context=None) -> None:
+                if getattr(callback, "__name__", "") == "clear":
+                    held.append((self, callback))
+                else:
+                    super().add_done_callback(callback, context=context)
+
+        loop.set_task_factory(
+            lambda loop, coroutine, context=None: DelayedCleanupTask(
+                coroutine, loop=loop, context=context
+            )
+        )
+        try:
+            await refresh(key, [{"id": "A"}])
+            assert key not in registry and len(held) == 1
+            report.send({"stage": "A complete; cleanup held", "calls": calls.copy()})
+
+            progress = asyncio.Event()
+
+            async def request_b() -> None:
+                report.send({"stage": "B helper entered", "calls": calls.copy()})
+                await refresh(key, [{"id": "B"}])
+
+            second = asyncio.create_task(request_b())
+            loop.call_soon(
+                lambda: (progress.set(), report.send({"stage": "same-loop sentinel"}))
+            )
+            await second
+            assert progress.is_set()
+            report.send({"stage": "B complete", "calls": calls, "progress": True})
+        finally:
+            loop.set_task_factory(None)
+
+    asyncio.run(run())
+
+
+def test_terminal_activity_provider_retires_completed_entry(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_probe_terminal_activity_cleanup_race,
+        args=(sender, str(tmp_path)),
+    )
+    process.start()
+    sender.close()
+    process.join(timeout=2)
+    timed_out = process.is_alive()
+    if timed_out:
+        process.terminate()
+        process.join(timeout=1)
+    reports = []
+    while receiver.poll():
+        try:
+            reports.append(receiver.recv())
+        except EOFError:
+            break
+    receiver.close()
+    process.close()
+
+    assert not timed_out, f"bounded child timed out: {reports!r}"
+    assert reports[-1] == {
+        "stage": "B complete",
+        "calls": [["A"], ["B"]],
+        "progress": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_provider_coalesces_and_refreshes_only_uncovered(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test")
+    )
+    refresh, _ = _terminal_activity_provider_helpers(app)
+    key = ("remote", "coalescing-probe")
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    first_workspace = app.state.workspaces.open("a")
+    second_workspace = app.state.workspaces.open("b")
+    first_id = str(first_workspace["id"])
+    second_id = str(second_workspace["id"])
+    app.state.store.create_terminal(first_id, "first", "@1")
+    app.state.store.create_terminal(second_id, "second", "@2")
+    calls: list[list[str]] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    uncovered_started = asyncio.Event()
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [workspace["id"] for workspace in workspaces]
+        calls.append(workspace_ids)
+        if workspace_ids == [first_id]:
+            first_started.set()
+            await release_first.wait()
+        elif workspace_ids == [second_id]:
+            uncovered_started.set()
+        for workspace_id in workspace_ids:
+            app.state.store.observe_terminal_activity(
+                workspace_id,
+                [
+                    {
+                        "tmux_window": "@1" if workspace_id == first_id else "@2",
+                        "activity_at": _terminal_activity_seconds(50),
+                    }
+                ],
+            )
+
+    app.state.remote.refresh_terminal_activity = provider
+
+    async def request(
+        workspace_ids: list[str], entered: asyncio.Event
+    ) -> dict[str, object]:
+        entered.set()
+        await refresh(key, [{"id": workspace_id} for workspace_id in workspace_ids])
+        return app.state.store.terminal_activity_summary(workspace_ids=workspace_ids)
+
+    owner = asyncio.create_task(request([first_id], asyncio.Event()))
+    await first_started.wait()
+    covered_entered = asyncio.Event()
+    overlap_entered = asyncio.Event()
+    covered = asyncio.create_task(request([first_id], covered_entered))
+    overlap = asyncio.create_task(request([first_id, second_id], overlap_entered))
+    await covered_entered.wait()
+    await overlap_entered.wait()
+
+    release_first.set()
+    owner_result, covered_result, overlap_result = await asyncio.wait_for(
+        asyncio.gather(owner, covered, overlap), timeout=2
+    )
+
+    assert uncovered_started.is_set()
+    assert calls == [[first_id], [second_id]]
+    assert owner_result == covered_result
+    assert {
+        workspace["workspace_id"] for workspace in overlap_result["workspaces"]
+    } == {first_id, second_id}
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_provider_preserves_newer_entry_on_both_cleanups(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test")
+    )
+    refresh, registry = _terminal_activity_provider_helpers(app)
+    key = ("remote", "identity-probe")
+    calls: list[list[str]] = []
+    first_started = asyncio.Event()
+    newer_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_newer = asyncio.Event()
+    held: list[tuple[asyncio.Task[None], object]] = []
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [workspace["id"] for workspace in workspaces]
+        calls.append(workspace_ids)
+        if workspace_ids == ["A"]:
+            first_started.set()
+            await release_first.wait()
+        elif workspace_ids == ["C"]:
+            newer_started.set()
+            await release_newer.wait()
+
+    app.state.remote.refresh_terminal_activity = provider
+    loop = asyncio.get_running_loop()
+
+    class DelayedCleanupTask(asyncio.Task[None]):
+        def add_done_callback(self, callback, *, context=None) -> None:
+            if getattr(callback, "__name__", "") == "clear":
+                held.append((self, callback))
+            else:
+                super().add_done_callback(callback, context=context)
+
+    loop.set_task_factory(
+        lambda loop, coroutine, context=None: DelayedCleanupTask(
+            coroutine, loop=loop, context=context
+        )
+    )
+    try:
+        first_caller = asyncio.create_task(refresh(key, [{"id": "A"}]))
+        await first_started.wait()
+        first_task = registry[key][1]
+        first_clear = next(callback for task, callback in held if task is first_task)
+
+        registry.pop(key)
+        newer_caller = asyncio.create_task(refresh(key, [{"id": "C"}]))
+        await newer_started.wait()
+        newer_task = registry[key][1]
+        newer_clear = next(callback for task, callback in held if task is newer_task)
+
+        release_first.set()
+        await first_caller
+        assert registry[key][1] is newer_task
+        first_clear(first_task)
+        assert registry[key][1] is newer_task
+
+        release_newer.set()
+        await newer_caller
+        assert key not in registry
+        newer_clear(newer_task)
+        assert key not in registry
+        assert calls == [["A"], ["C"]]
+    finally:
+        release_first.set()
+        release_newer.set()
+        loop.set_task_factory(None)
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_provider_shield_and_failure_fallback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test")
+    )
+    refresh, registry = _terminal_activity_provider_helpers(app)
+    key = ("remote", "cancellation-probe")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    newer_started = asyncio.Event()
+    release_newer = asyncio.Event()
+    calls: list[list[str]] = []
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [workspace["id"] for workspace in workspaces]
+        calls.append(workspace_ids)
+        if workspace_ids == ["A"]:
+            started.set()
+            await release.wait()
+        elif workspace_ids == ["C"]:
+            newer_started.set()
+            await release_newer.wait()
+        else:
+            raise RuntimeError("provider unavailable")
+
+    app.state.remote.refresh_terminal_activity = provider
+    owner = asyncio.create_task(refresh(key, [{"id": "A"}]))
+    await started.wait()
+    first_task = registry[key][1]
+    waiter_entered = asyncio.Event()
+
+    async def wait_for_a() -> None:
+        waiter_entered.set()
+        await refresh(key, [{"id": "A"}])
+
+    waiter = asyncio.create_task(wait_for_a())
+    await waiter_entered.wait()
+    registry.pop(key)
+    newer = asyncio.create_task(refresh(key, [{"id": "C"}]))
+    await newer_started.wait()
+    newer_task = registry[key][1]
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert registry[key][1] is newer_task
+    assert not first_task.cancelled() and not first_task.done()
+
+    release.set()
+    await owner
+    assert registry[key][1] is newer_task
+    release_newer.set()
+    await newer
+    await refresh(key, [{"id": "failed"}])
+
+    assert key not in registry
+    assert calls == [["A"], ["C"], ["failed"]]
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_summary_refreshes_two_remote_workspaces(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root, state_dir=tmp_path / "state", access_token="test-token"
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="Activity QA",
+        ssh_alias="",
+        host="activity.example.test",
+        port=22,
+        username="qa",
+        identity_file="",
+        auth_kind="existing_key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    first = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/first", "first"
+    )
+    second = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/second", "second"
+    )
+    first_terminal = app.state.store.create_terminal(str(first["id"]), "first", "@1")
+    second_terminal = app.state.store.create_terminal(
+        str(second["id"]), "second", "@2"
+    )
+    calls: list[list[str]] = []
+    fail = False
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [str(workspace["id"]) for workspace in workspaces]
+        calls.append(workspace_ids)
+        if fail:
+            raise RuntimeError("provider unavailable")
+        for workspace in workspaces:
+            window = "@1" if workspace["id"] == first["id"] else "@2"
+            app.state.store.observe_terminal_activity(
+                str(workspace["id"]),
+                [{"tmux_window": window, "activity_at": _terminal_activity_seconds(50)}],
+            )
+
+    app.state.remote.refresh_terminal_activity = provider
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    params = [
+        ("workspace_id", str(first["id"])),
+        ("workspace_id", str(second["id"])),
+    ]
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        response = await asyncio.wait_for(
+            client.get("/api/terminal-activity/summary", params=params), timeout=2
+        )
+        fail = True
+        fallback = await client.get("/api/terminal-activity/summary", params=params)
+
+    assert response.status_code == 200
+    assert fallback.status_code == 200
+    assert fallback.json() == response.json()
+    assert calls == [
+        [str(first["id"]), str(second["id"])],
+        [str(first["id"]), str(second["id"])],
+    ]
+    payload = response.json()
+    assert set(payload) == {
+        "ok",
+        "terminals",
+        "workspaces",
+        "unread_count",
+        "latest_unread_terminal_id",
+    }
+    assert payload["ok"] is True
+    assert payload["unread_count"] == 0
+    assert payload["latest_unread_terminal_id"] is None
+    assert {
+        terminal["workspace_id"] for terminal in payload["terminals"]
+    } == {str(first["id"]), str(second["id"])}
+    assert {
+        terminal["terminal_id"] for terminal in payload["terminals"]
+    } == {str(first_terminal["id"]), str(second_terminal["id"])}
+    assert all(
+        terminal["activity_at"] == _terminal_activity_seconds(50)
+        and terminal["acknowledged_activity_at"] == _terminal_activity_seconds(50)
+        and terminal["unread"] is False
+        for terminal in payload["terminals"]
+    )
+    assert {
+        workspace["workspace_id"] for workspace in payload["workspaces"]
+    } == {str(first["id"]), str(second["id"])}
+    assert all(
+        workspace["terminal_count"] == 1
+        and workspace["unread_terminal_count"] == 0
+        and workspace["unread_count"] == 0
+        and workspace["latest_unread_terminal_id"] is None
+        for workspace in payload["workspaces"]
+    )
 
 
 async def _login(client: httpx.AsyncClient, password: str = "test-token") -> None:
@@ -3867,6 +4285,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         access_token="test-token",
     )
     transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
         korean_page = await client.get("/")
