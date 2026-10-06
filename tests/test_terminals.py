@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+from termroom import pty_process
 from termroom.db import StateStore
 from termroom.terminals import (
     TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
     TMUX_TERMINAL_RECORD_FORMAT,
+    TerminalError,
     TerminalManager,
     TerminalOutputDecoder,
     normalize_terminal_editor_path,
@@ -123,6 +127,7 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
 
     class ResizeWebSocket:
         def __init__(self) -> None:
+            self.controls: list[dict[str, object]] = []
             self.messages = [
                 {
                     "type": "websocket.receive",
@@ -145,13 +150,19 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
         async def send_text(self, _value: str) -> None:
             return None
 
+        async def send_bytes(self, value: bytes) -> None:
+            self.controls.append(json.loads(value))
+
         async def close(self, *, code: int, reason: str) -> None:
             raise AssertionError((code, reason))
 
     helper_done = threading.Event()
 
-    def slow_missing_client(_view_session: str, *, enabled: bool) -> bool:
+    def slow_missing_client(
+        _view_session: str, *, enabled: bool, tmux_timeout: float | None = None
+    ) -> bool:
         assert enabled
+        assert tmux_timeout is not None
         time.sleep(0.2)
         helper_done.set()
         return False
@@ -170,14 +181,31 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
         )
 
     ticker_task = asyncio.create_task(ticker())
+    browser = ResizeWebSocket()
     try:
         await manager.bridge(
-            ResizeWebSocket(),  # type: ignore[arg-type]
+            browser,  # type: ignore[arg-type]
             workspace,
             terminal,
         )
         assert helper_done.is_set()
         assert await ticker_task < 0.1
+        assert browser.controls
+        generation = browser.controls[0]["generation"]
+        assert isinstance(generation, str) and generation
+        for revision, control in enumerate(browser.controls, start=1):
+            assert control["kind"] == "pane_mode"
+            assert control["terminal_id"] == terminal["id"]
+            assert control["generation"] == generation
+            assert control["revision"] == revision
+            assert control["session"] == workspace["tmux_session"]
+            assert control["window"] == terminal["tmux_window"]
+            assert str(control["pane"]).startswith("%")
+            assert isinstance(control["pane_pid"], int) and control["pane_pid"] > 0
+            assert isinstance(control["alternate"], bool)
+            assert isinstance(control["mouse_tracking"], bool)
+            assert len(control["mouse_flags"]) == 5
+            assert all(type(flag) is int and flag in (0, 1) for flag in control["mouse_flags"])
     finally:
         if not ticker_task.done():
             ticker_task.cancel()
@@ -327,6 +355,129 @@ def test_tmux_commands_do_not_inherit_termroom_or_legacy_password(
     environment = captured["env"]
     assert isinstance(environment, dict)
     assert "TERMROOM_PASSWORD" not in environment
+
+
+def test_tmux_timeout_kills_and_reaps_the_owned_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_tmux = tmp_path / "tmux"
+    pid_file = tmp_path / "tmux.pid"
+    fake_tmux.write_text(
+        "#!/bin/sh\n"
+        'printf "%s" "$$" > "$TERMROOM_TEST_PID_FILE"\n'
+        "exec sleep 30\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    monkeypatch.setenv("PYTEST_REAL_TMUX", str(fake_tmux))
+    monkeypatch.setenv("PYTEST_TMUX_WRAPPER_DIR", "")
+    monkeypatch.setenv("TERMROOM_TEST_PID_FILE", str(pid_file))
+
+    with pytest.raises(TerminalError, match="tmux command timed out"):
+        TerminalManager._run_tmux("blocked", timeout=0.05)
+
+    process_pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_pid, 0)
+
+
+def test_pty_readiness_timeout_reaps_child_and_closes_master_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawned_pids: list[int] = []
+    master_fds: list[int] = []
+    original_spawn = pty_process.os.posix_spawn
+    original_openpty = pty_process.pty.openpty
+
+    def capture_spawn(*args, **kwargs) -> int:  # type: ignore[no-untyped-def]
+        pid = original_spawn(*args, **kwargs)
+        spawned_pids.append(pid)
+        return pid
+
+    def capture_openpty() -> tuple[int, int]:
+        master_fd, slave_fd = original_openpty()
+        master_fds.append(master_fd)
+        return master_fd, slave_fd
+
+    monkeypatch.setattr(pty_process.os, "posix_spawn", capture_spawn)
+    monkeypatch.setattr(pty_process.pty, "openpty", capture_openpty)
+    monkeypatch.setattr(
+        pty_process.select, "select", lambda *_args, **_kwargs: ([], [], [])
+    )
+    try:
+        with pytest.raises(RuntimeError, match=r"^PTY child did not become ready$"):
+            pty_process.spawn_pty_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"]
+            )
+
+        assert len(spawned_pids) == len(master_fds) == 1
+        child_pid, master_fd = spawned_pids[0], master_fds[0]
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        try:
+            os.fstat(master_fd)
+        except OSError as exc:
+            assert exc.errno == errno.EBADF
+        else:
+            pytest.fail(
+                f"master FD {master_fd} remained open after child PID {child_pid} was reaped"
+            )
+    finally:
+        for child_pid in spawned_pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child_pid, 0)
+        for master_fd in master_fds:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+
+def test_pty_success_transfers_open_master_fd_to_caller() -> None:
+    child_pid, master_fd = pty_process.spawn_pty_process(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    try:
+        os.fstat(master_fd)
+        os.kill(child_pid, 0)
+    finally:
+        os.close(master_fd)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child_pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(child_pid, 0)
+    with pytest.raises(OSError) as closed_fd:
+        os.fstat(master_fd)
+    assert closed_fd.value.errno == errno.EBADF
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_browser_view_selection_failure_removes_only_its_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    workspace = WorkspaceManager(RootManager(tmp_path), store).open("project")
+    manager = TerminalManager(store)
+    terminal = manager.ensure_workspace(workspace)[0]
+    view_session = "termroom-view-wp06b-selection-failure"
+    original = manager._run_tmux
+
+    def fail_selection(*args: str, **kwargs) -> subprocess.CompletedProcess[str]:  # type: ignore[no-untyped-def]
+        if args[:1] == ("select-window",):
+            return subprocess.CompletedProcess(["tmux", *args], 1, "", "window missing")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_run_tmux", fail_selection)
+    try:
+        with pytest.raises(TerminalError, match="window missing"):
+            manager._prepare_browser_view(workspace, terminal, view_session)
+        assert manager.session_exists(str(workspace["tmux_session"]))
+        assert not manager.session_exists(view_session)
+    finally:
+        original("kill-session", "-t", str(workspace["tmux_session"]), check=False)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")

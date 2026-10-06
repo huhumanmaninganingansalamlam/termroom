@@ -12,6 +12,8 @@
   const HISTORY_REFRESH_DEBOUNCE_MS = 1200;
   const HISTORY_REFRESH_MAX_WAIT_MS = 3000;
   const HISTORY_BOUNDARY_ROW_COUNT = 6;
+  const HISTORY_BOUNDARY_MAX_CHARS = 8192;
+  const HISTORY_BOUNDARY_MAX_ROW_CHARS = 2048;
   const NATIVE_COPY_SELECTION_CLASS = "terminal-scroll-native-selection";
   const HISTORY_ANSI_MAX_CHARS = 2_000_000;
   const HISTORY_ANSI_MAX_SEGMENTS = 20_000;
@@ -69,6 +71,7 @@
   let lastLiveHeight = 0;
   let touchGesture = null;
   let renderedHistoryText = "";
+  let renderedHistoryPlainText = "";
   let historyEtag = "";
   let historyChangeRevision = 0;
   let historyDirty = true;
@@ -76,7 +79,10 @@
   let lastHistoryChangeAt = historyDirtySince;
   let historyRenderRevision = 0;
   let terminalRevision = 0;
+  let switchGeneration = 0;
+  let renderedHistoryOverlap = -1;
   let userScrollRevision = 0;
+  let userScrollIntentPending = false;
   let liveFollowing = true;
   let selectionOwnershipMode = selectionOwnership.LIVE_XTERM;
   let nativeCopySelectionActive = false;
@@ -596,9 +602,113 @@
     );
     const parts = [String(children.length)];
     for (let index = 0; index < count; index += 1) {
-      parts.push(children[index].textContent || "");
+      parts.push((children[index].textContent || "").slice(0, HISTORY_BOUNDARY_MAX_ROW_CHARS));
     }
     return parts.join("\u0000");
+  };
+
+  const boundaryRowText = (value) => normalizeText(value).replace(/ +$/, "");
+
+  const historyBoundaryOverlap = (text, liveRows) => {
+    if (!liveRows.length || liveRows.length > HISTORY_BOUNDARY_ROW_COUNT) return 0;
+    let chars = 0;
+    for (const row of liveRows) {
+      chars += row.length;
+      if (row.length > HISTORY_BOUNDARY_MAX_ROW_CHARS || chars > HISTORY_BOUNDARY_MAX_CHARS) return 0;
+    }
+    const suffix = [];
+    let end = text.length;
+    for (let index = 0; index < liveRows.length; index += 1) {
+      const start = Math.max(0, end - HISTORY_BOUNDARY_MAX_ROW_CHARS - 1);
+      const localNewline = text.slice(start, end).lastIndexOf("\n");
+      if (localNewline < 0 && start > 0) break;
+      const newline = localNewline < 0 ? -1 : start + localNewline;
+      const row = text.slice(newline + 1, end);
+      chars += row.length;
+      if (row.length > HISTORY_BOUNDARY_MAX_ROW_CHARS || chars > HISTORY_BOUNDARY_MAX_CHARS) break;
+      suffix.unshift(boundaryRowText(row));
+      if (newline < 0) break;
+      end = newline;
+    }
+    for (let count = suffix.length; count > 0; count -= 1) {
+      const candidate = suffix.slice(-count);
+      // Blank-only boundaries are ambiguous, not evidence of shared rows.
+      if (!candidate.some((row) => row.length)) continue;
+      if (candidate.every((row, index) => row === boundaryRowText(liveRows[index]))) return count;
+    }
+    return 0;
+  };
+
+  const liveBoundarySnapshot = () => {
+    const rows = terminalHost.querySelector(".xterm-rows");
+    const text = [];
+    let chars = 0;
+    for (let index = 0; rows && index < Math.min(rows.children.length, HISTORY_BOUNDARY_ROW_COUNT); index += 1) {
+      const value = rows.children[index].textContent || "";
+      chars += value.length;
+      if (value.length > HISTORY_BOUNDARY_MAX_ROW_CHARS || chars > HISTORY_BOUNDARY_MAX_CHARS) break;
+      text.push(value);
+    }
+    return { text, terminalId: terminalHost.dataset.terminalId, revision: terminalRevision, generation: switchGeneration };
+  };
+
+  const boundarySnapshotCurrent = (snapshot) =>
+    snapshot.terminalId === terminalHost.dataset.terminalId
+    && snapshot.revision === terminalRevision
+    && snapshot.generation === switchGeneration;
+
+  const trimHistoryBoundary = (rendered, overlap) => {
+    if (!overlap) return rendered;
+    let end = rendered.text.length;
+    for (let row = 0; row < overlap; row += 1) {
+      end = Math.max(0, rendered.text.lastIndexOf("\n", end - 1));
+    }
+    let remaining = rendered.text.length - end;
+    const trim = (parent) => {
+      while (remaining && parent.lastChild) {
+        const node = parent.lastChild;
+        if (node.nodeType === 3) {
+          const count = Math.min(remaining, node.textContent.length);
+          node.textContent = node.textContent.slice(0, -count);
+          remaining -= count;
+        } else trim(node);
+        if (!node.textContent) node.remove();
+      }
+    };
+    trim(rendered.fragment);
+    rendered.text = rendered.text.slice(0, end);
+    return rendered;
+  };
+
+  const commitHistoryBoundary = (historicalText, snapshot) => {
+    if (!boundarySnapshotCurrent(snapshot)) {
+      refreshQueued = true;
+      urgentRefreshQueued = true;
+      return false;
+    }
+    const sourceChanged = historicalText !== renderedHistoryText;
+    let rendered = sourceChanged ? parseAnsiHistory(historicalText) : null;
+    const plainText = rendered ? rendered.text : renderedHistoryPlainText;
+    const overlap = historyBoundaryOverlap(plainText, snapshot.text);
+    const historyChanged = sourceChanged || overlap !== renderedHistoryOverlap;
+    if (!historyChanged) return false;
+    rendered ||= parseAnsiHistory(historicalText);
+    trimHistoryBoundary(rendered, overlap);
+    if (!boundarySnapshotCurrent(snapshot)) {
+      refreshQueued = true;
+      urgentRefreshQueued = true;
+      return false;
+    }
+    if (historyChanged) {
+      renderedHistoryText = historicalText;
+      renderedHistoryPlainText = plainText;
+      renderedHistoryOverlap = overlap;
+      history.replaceChildren(rendered.fragment);
+      history.hidden = !rendered.text;
+      history.dataset.rendering = rendered.styled ? "ansi" : "plain";
+      syncHistoryMetrics();
+    }
+    return historyChanged;
   };
 
   const isFullViewportRedraw = (value) =>
@@ -694,6 +804,13 @@
   const updateScrollState = () => {
     const wasFollowing = liveFollowing;
     const away = !atLiveBottom();
+    // Keyboard viewport changes and history reflow can move the surface
+    // without the user choosing to read. Keep live input focused in that case.
+    if (away && liveFollowing && !userScrollIntentPending) {
+      scrollToLive();
+      return;
+    }
+    if (!away) userScrollIntentPending = false;
     liveFollowing = !away;
     liveButton.hidden = !away;
     document.body.classList.toggle("terminal-scroll-away", away);
@@ -747,6 +864,8 @@
     }
     loading = true;
     const requestedTerminalRevision = terminalRevision;
+    const requestedTerminalId = terminalHost.dataset.terminalId;
+    const requestedSwitchGeneration = switchGeneration;
     const requestedChangeRevision = historyChangeRevision;
     surface.dataset.historyLoading = "true";
     try {
@@ -757,25 +876,22 @@
         cache: "no-store",
         headers,
       });
-      if (requestedTerminalRevision !== terminalRevision) {
+      if (requestedTerminalRevision !== terminalRevision
+        || requestedTerminalId !== terminalHost.dataset.terminalId
+        || requestedSwitchGeneration !== switchGeneration) {
         refreshQueued = true;
         urgentRefreshQueued = true;
         forceNextHistoryRefresh = true;
         return;
       }
-      if (response.status === 304) {
-        if (historyChangeRevision === requestedChangeRevision) {
-          clearHistoryDirty();
-        } else {
-          refreshQueued = true;
-          forceNextHistoryRefresh = true;
-        }
-        return;
-      }
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (response.status !== 304 && !response.ok) throw new Error(`HTTP ${response.status}`);
       const responseEtag = response.headers.get("etag") || historyEtag;
-      const historicalText = normalizeText(await response.text());
-      if (requestedTerminalRevision !== terminalRevision) {
+      const historicalText = response.status === 304
+        ? renderedHistoryText
+        : normalizeText(await response.text());
+      if (requestedTerminalRevision !== terminalRevision
+        || requestedTerminalId !== terminalHost.dataset.terminalId
+        || requestedSwitchGeneration !== switchGeneration) {
         refreshQueued = true;
         urgentRefreshQueued = true;
         forceNextHistoryRefresh = true;
@@ -820,16 +936,7 @@
       const keepBottom = stickToBottom || liveFollowing || atLiveBottom();
       const previousTop = surface.scrollTop;
       const interactionRevision = userScrollRevision;
-      const historyChanged = historicalText !== renderedHistoryText;
-
-      if (historyChanged) {
-        const rendered = parseAnsiHistory(historicalText);
-        renderedHistoryText = historicalText;
-        history.replaceChildren(rendered.fragment);
-        history.hidden = !rendered.text;
-        history.dataset.rendering = rendered.styled ? "ansi" : "plain";
-        syncHistoryMetrics();
-      }
+      const historyChanged = commitHistoryBoundary(historicalText, liveBoundarySnapshot());
 
       const renderRevision = ++historyRenderRevision;
       if (historyChanged || keepBottom) {
@@ -897,7 +1004,11 @@
       const nextSignature = historyBoundarySignature(rows);
       if (nextSignature === boundarySignature) return;
       boundarySignature = nextSignature;
+      terminalRevision += 1;
       markHistoryDirty();
+      if (!nativeCopySelectionActive && liveFollowing) {
+        commitHistoryBoundary(renderedHistoryText, liveBoundarySnapshot());
+      }
       if (document.hidden || mouseTrackingActive() || !liveFollowing) return;
       scheduleHistoryRefresh();
     }).observe(rows, {
@@ -915,7 +1026,12 @@
     const redrawState = new WeakMap();
     terminalPrototype.write = function termroomScrollbackWrite(value, callback) {
       const text = typeof value === "string" ? value : "";
-      const state = redrawState.get(this) || { fullViewport: false };
+      const terminalId = terminalHost.dataset.terminalId;
+      const epoch = terminalHost.termroomConnectionEpoch;
+      const generation = switchGeneration;
+      const previousState = redrawState.get(this);
+      const state = previousState && previousState.epoch === epoch
+        ? previousState : { epoch, fullViewport: false };
       if (isFullViewportRedraw(text)) state.fullViewport = true;
       const suppressHistoryRefresh = state.fullViewport;
       if (state.fullViewport && text.includes(CURSOR_SHOW_SEQUENCE)) {
@@ -923,11 +1039,14 @@
       }
       redrawState.set(this, state);
       return nativeWrite.call(this, value, () => {
-        if (
-          this.element
-          && terminalHost.contains(this.element)
-          && !suppressHistoryRefresh
-        ) {
+        const current = text.length > 0
+          && terminalId === terminalHost.dataset.terminalId
+          && epoch === terminalHost.termroomConnectionEpoch
+          && generation === switchGeneration
+          && this.element
+          && terminalHost.contains(this.element);
+        if (current) terminalRevision += 1;
+        if (current && !suppressHistoryRefresh) {
           markHistoryDirty();
           if (!document.hidden && liveFollowing && !mouseTrackingActive()) {
             scheduleHistoryRefresh();
@@ -940,6 +1059,13 @@
 
   const mouseTrackingActive = () =>
     Boolean(terminalHost.querySelector(".xterm.enable-mouse-events"));
+
+  const terminalOwnsWheel = () =>
+    terminalHost.dataset.paneModeCapable === "true"
+      ? !terminalHost.termroomPaneMode
+        || terminalHost.termroomPaneMode.alternate
+        || terminalHost.termroomPaneMode.mouse_tracking
+      : mouseTrackingActive();
 
   const bindMouseTrackingOwnership = () => {
     const xterm = terminalHost.querySelector(".xterm");
@@ -964,6 +1090,7 @@
 
   const noteUserScrollIntent = ({ revealHistory = false } = {}) => {
     userScrollRevision += 1;
+    if (revealHistory) userScrollIntentPending = true;
     if (revealHistory && historyDirty && liveFollowing) {
       scheduleHistoryRefresh({ urgent: true });
     }
@@ -983,7 +1110,7 @@
     (event) => {
       if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
       const target = event.target instanceof Node ? event.target : null;
-      if (target && terminalHost.contains(target) && mouseTrackingActive()) return;
+      if (target && terminalHost.contains(target) && terminalOwnsWheel()) return;
       applySelectionOwnership({ type: "wheel" });
       noteUserScrollIntent({ revealHistory: event.deltaY < 0 });
     },
@@ -1069,6 +1196,7 @@
       return;
     }
     const returnToLive = () => {
+      userScrollIntentPending = false;
       applySelectionOwnership({
         type: "terminal-input",
         mouseTracking: mouseTrackingActive(),
@@ -1101,12 +1229,15 @@
     "click",
     (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (
-        target?.closest(
-          '[data-terminal-key], [data-terminal-action], #paste-terminal, #focus-terminal',
-        )
-        && !atLiveBottom()
-      ) {
+      const terminalInputTarget = target?.closest(
+        '[data-terminal-key], [data-terminal-action], #paste-terminal, #focus-terminal',
+      );
+      if (!terminalInputTarget) return;
+      // Helper keys and paste enter xterm through their direct handlers, so
+      // they may not produce a textarea keydown. Clear an older history
+      // gesture before a later layout callback can interpret it as reading.
+      userScrollIntentPending = false;
+      if (!atLiveBottom()) {
         applySelectionOwnership({
           type: "terminal-input",
           mouseTracking: mouseTrackingActive(),
@@ -1120,12 +1251,20 @@
   // xterm consumes wheel events even when the attached tmux view has no xterm
   // scrollback. In the normal shell case, stop the event before xterm handles
   // it and let the browser's default action scroll the outer native surface.
-  // Mouse-reporting TUIs keep ownership of the wheel unchanged.
+  // Alternate-screen and mouse-reporting TUIs keep xterm's wheel handling.
   terminalHost.addEventListener(
     "wheel",
     (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      if (terminalHost.dataset.paneModeCapable === "true" && !terminalHost.termroomPaneMode) {
+        // Local capability is known at page render; never guess before its
+        // first authoritative control, or during reconnect.
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        return;
+      }
       if (
-        mouseTrackingActive()
+        terminalOwnsWheel()
         || event.ctrlKey
         || event.metaKey
         || event.altKey
@@ -1133,7 +1272,7 @@
       ) return;
       event.stopPropagation();
     },
-    { capture: true, passive: true },
+    { capture: true, passive: false },
   );
 
   // On touch devices, preserve long-press selection and horizontal gestures.
@@ -1222,6 +1361,7 @@
   window.addEventListener("termroom:terminal-switched", () => {
     applySelectionOwnership({ type: "reset" }, { refreshHistory: false });
     terminalRevision += 1;
+    switchGeneration += 1;
     historyRenderRevision += 1;
     userScrollRevision += 1;
     window.clearTimeout(refreshTimer);
@@ -1230,6 +1370,8 @@
     urgentRefreshQueued = loading;
     forceNextHistoryRefresh = true;
     renderedHistoryText = "";
+    renderedHistoryPlainText = "";
+    renderedHistoryOverlap = -1;
     historyEtag = "";
     historyHangulMetricKey = "";
     history.textContent = "";

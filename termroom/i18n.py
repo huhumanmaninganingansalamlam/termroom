@@ -8,6 +8,8 @@ from typing import Any
 
 from fastapi import Request
 
+from termroom.assets import static_asset_version
+
 LOCALES_DIR = Path(__file__).resolve().parent / "locales"
 SUPPORTED_LOCALES = ("en", "ko")
 DEFAULT_LOCALE = "en"
@@ -147,6 +149,9 @@ def template_context(request: Request) -> dict[str, Any]:
     def t(key: str, **values: Any) -> str:
         return translate(locale, key, **values)
 
+    def asset_version(path: str) -> str:
+        return static_asset_version(Path(__file__).resolve().parent / "static" / path)
+
     return {
         "locale": locale,
         "authenticated": bool(getattr(request.state, "session", None)),
@@ -156,4 +161,5 @@ def template_context(request: Request) -> dict[str, Any]:
         },
         "t": t,
         "i18n_messages": messages(locale),
+        "static_asset_version": asset_version,
     }

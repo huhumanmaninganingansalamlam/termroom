@@ -75,7 +75,7 @@ def file_digest(content: bytes) -> str:
 
 
 def secure_compare(left: str | None, right: str) -> bool:
-    return bool(left) and hmac.compare_digest(left, right)
+    return bool(left) and hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 def ensure_private_directory(path: Path) -> None:

@@ -79,7 +79,7 @@
     {% else %}
     <span><small>{{ t('ssh.detail.host_key') }}</small><code>{{ computer.host_fingerprint }}</code></span>
     <span><small>{{ t('ssh.detail.auth') }}</small><strong>{% if computer.auth_kind == 'password' %}{{ t('ssh.detail.auth_password') }}{% elif computer.identity_file == managed_key_path %}{{ t('ssh.detail.auth_public_key') }}{% elif computer.identity_file %}{{ t('ssh.detail.auth_existing') }}{% else %}{{ t('ssh.detail.auth_config') }}{% endif %}</strong></span>
-    <span><small>{{ t('ssh.detail.requirements') }}</small><strong>SSH + tmux</strong></span>
+    <span><small>{{ t('ssh.detail.requirements') }}</small><strong>SSH + /bin/bash + tmux</strong></span>
     {% endif %}
   </section>
 

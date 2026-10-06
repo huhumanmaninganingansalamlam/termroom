@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import array
 import asyncio
 import base64
 import contextlib
+import ctypes
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -15,7 +18,7 @@ import ssl
 import stat as stat_module
 import struct
 import subprocess
-import tempfile
+import sys
 import termios
 import threading
 import time
@@ -23,7 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -90,13 +93,14 @@ from termroom.run_sources import (
 )
 from termroom.security import (
     PathBoundaryError,
-    ensure_private_directory,
     is_within,
+    resolve_inside,
     resolve_no_symlink_inside,
 )
 from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
     TERMINAL_EDITOR_WRAPPER,
+    TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
     TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
@@ -106,12 +110,12 @@ from termroom.terminals import (
     TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
-    WORKSPACE_COMMAND_WRAPPER,
+    WORKSPACE_COMMAND_WRAPPER_ARGV,
     clear_tmux_workspace_command_identity,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
-    file_run_dispatch_timestamp,
+    freeze_tmux_window_size,
     normalize_terminal_editor_path,
     normalize_terminal_name,
     normalize_workspace_command,
@@ -123,6 +127,7 @@ from termroom.terminals import (
     tmux_browser_view_session,
     validate_workspace_command_launch,
     validate_workspace_command_slot,
+    wait_tmux_browser_grid_size,
     workspace_command_digest,
     workspace_command_history_name,
     workspace_command_record_is_ready,
@@ -158,6 +163,54 @@ NODE_LEGACY_SESSION_PATTERN = re.compile(r"^termroom-[A-Za-z0-9_-]{1,112}$")
 NODE_WINDOW_PATTERN = re.compile(r"^@[0-9]+$")
 NODE_WORKSPACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 FILE_RUN_DIGEST_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+_TMUX_DESCRIPTOR_LAUNCHER = r"""import array, json, os, socket, sys
+endpoint, config_json = sys.argv[1:]
+channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    channel.connect("\0" + endpoint)
+    config = json.loads(config_json)
+    count = len(config["expected"])
+    payload, ancillary, flags, _ = channel.recvmsg(
+        1, socket.CMSG_SPACE(count * array.array("i").itemsize),
+        getattr(socket, "MSG_CMSG_CLOEXEC", 0),
+    )
+    received = array.array("i")
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            received.frombytes(data[: len(data) - len(data) % received.itemsize])
+    if payload != b"F" or flags & getattr(socket, "MSG_CTRUNC", 0) or len(received) != count:
+        raise RuntimeError("invalid descriptor handoff")
+    for descriptor, expected in zip(received, config["expected"], strict=True):
+        info = os.fstat(descriptor)
+        observed = [info.st_dev, info.st_ino, info.st_mode & 0o170000, info.st_uid]
+        if info.st_mode & 0o170000 == 0o100000:
+            observed.append(info.st_nlink)
+        if observed != expected:
+            raise RuntimeError("descriptor identity changed")
+    os.fchdir(received[config["cwd"]])
+    inherited = set(config["inherit"])
+    for index, descriptor in enumerate(received):
+        os.set_inheritable(descriptor, index in inherited)
+    def resolve(value):
+        for index, descriptor in enumerate(received):
+            value = value.replace("{fd:" + str(index) + "}", "/proc/self/fd/" + str(descriptor))
+        return value
+    command = [resolve(value) for value in config["command"]]
+    environment = os.environ.copy()
+    environment.update({key: resolve(value) for key, value in config["environment"].items()})
+    channel.sendall(b"R")
+    channel.close()
+    if command:
+        os.execvpe(command[0], command, environment)
+    shell = environment.get("SHELL") or "/bin/sh"
+    os.execlp(shell, shell)
+except BaseException:
+    try:
+        channel.sendall(b"E")
+    except OSError:
+        pass
+    raise
+"""
 
 
 def node_session_is_valid(session: str) -> bool:
@@ -192,6 +245,49 @@ class NodePermanentError(NodeAgentError):
     """A local identity or protocol failure that reconnecting cannot repair."""
 
 
+def _make_sealed_memfd(content: bytes, name: str, *, mode: int = 0o400) -> int:
+    flags = getattr(os, "MFD_CLOEXEC", 1) | getattr(os, "MFD_ALLOW_SEALING", 2)
+    create_memfd = getattr(os, "memfd_create", None)
+    if create_memfd is None:
+        try:
+            create_memfd = ctypes.CDLL(None, use_errno=True).memfd_create
+        except (AttributeError, OSError) as exc:
+            raise NodeAgentError(
+                "Immutable File Run execution descriptors are unavailable",
+                code="capability_unsupported",
+            ) from exc
+        create_memfd.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+        create_memfd.restype = ctypes.c_int
+        descriptor = create_memfd(name.encode(), flags)
+        if descriptor < 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    else:
+        descriptor = create_memfd(name, flags)
+    try:
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("short write to immutable execution descriptor")
+            remaining = remaining[written:]
+        os.fchmod(descriptor, mode)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        fcntl.fcntl(descriptor, getattr(fcntl, "F_ADD_SEALS", 1033), seals)
+        if fcntl.fcntl(descriptor, getattr(fcntl, "F_GET_SEALS", 1034)) & seals != seals:
+            raise OSError("execution descriptor could not be sealed")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 @dataclass(frozen=True, slots=True)
 class NodeConfig:
     core_url: str
@@ -201,12 +297,16 @@ class NodeConfig:
     state_dir: Path | None = None
     run_root: Path | None = None
     ca_file: Path | None = None
+    state_dir_identity: tuple[int, int] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(slots=True)
 class OperationResult:
     value: dict[str, Any]
     start: Callable[[], Awaitable[None]] | None = None
+
+
+_PRIVATE_STATE_UNSPECIFIED = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,95 +326,412 @@ class AgentStream(Protocol):
     async def close(self) -> dict[str, Any] | None: ...
 
 
-def ensure_node_identity(state_dir: Path):  # type: ignore[no-untyped-def]
-    ensure_private_directory(state_dir)
-    key_path = state_dir / NODE_PRIVATE_KEY_FILE
-    if key_path.exists():
-        if key_path.is_symlink() or not key_path.is_file():
-            raise NodeAgentError(
-                "Node identity path is not a regular file", code="identity_invalid"
+def _open_directory_components(
+    path: Path,
+    *,
+    create: bool,
+    mode: int | None,
+) -> tuple[int, Path]:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("no-follow directory handles are unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    parts = path.parts
+    if len(parts) < 2:
+        raise OSError("private directory cannot be the filesystem root")
+    descriptor = os.open(path.anchor, flags & ~os.O_NOFOLLOW)
+    try:
+        for index, component in enumerate(parts[1:], start=1):
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if index == len(parts) - 1:
+                if os.fstat(descriptor).st_uid != os.geteuid():
+                    raise OSError("private directory is not owned by the Node user")
+                if mode is not None:
+                    os.fchmod(descriptor, mode)
+        return descriptor, path
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_private_directory(path: Path, *, create: bool) -> tuple[int, Path]:
+    return _open_directory_components(path, create=create, mode=0o700)
+
+
+def _open_directory_at(
+    directory_fd: int,
+    components: Sequence[str],
+    *,
+    create: bool,
+    mode: int | None,
+    require_owner: bool = False,
+) -> int:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("no-follow directory handles are unavailable")
+    descriptor = os.dup(directory_fd)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        for index, component in enumerate(components):
+            if not component or component in {".", ".."} or "/" in component:
+                raise OSError("invalid private directory component")
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if require_owner and os.fstat(descriptor).st_uid != os.geteuid():
+                raise OSError("private directory is not owned by the Node user")
+            if index == len(components) - 1 and mode is not None:
+                os.fchmod(descriptor, mode)
+        if not components:
+            if require_owner and os.fstat(descriptor).st_uid != os.geteuid():
+                raise OSError("private directory is not owned by the Node user")
+            if mode is not None:
+                os.fchmod(descriptor, mode)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_directory_path_matches(path: Path, descriptor: int) -> None:
+    current, _ = _open_directory_components(path, create=False, mode=None)
+    try:
+        expected = os.fstat(descriptor)
+        observed = os.fstat(current)
+        if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError("private directory was replaced")
+    finally:
+        os.close(current)
+
+
+def _open_private_state_file(directory_fd: int, name: str, flags: int) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("no-follow file handles are unavailable")
+    return os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory_fd)
+
+
+def _private_state_leaf_state(
+    directory_fd: int,
+    name: str,
+    *,
+    code: str,
+    label: str,
+    mode: int,
+) -> tuple[int, ...] | None:
+    try:
+        descriptor = _open_private_state_file(directory_fd, name, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise NodeAgentError(label, code=code) from exc
+    try:
+        info = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+
+        def signature(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_uid,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
             )
-        private_key = load_private_key(key_path.read_bytes())
-        with contextlib.suppress(PermissionError):
-            key_path.chmod(0o600)
+
+        if (
+            not stat_module.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat_module.S_IMODE(info.st_mode) != mode
+            or signature(info) != signature(current)
+        ):
+            raise NodeAgentError(label, code=code)
+        return signature(info)
+    except OSError as exc:
+        raise NodeAgentError(label, code=code) from exc
+    finally:
+        os.close(descriptor)
+
+
+def _validate_private_state_leaf(
+    directory_fd: int, name: str, *, code: str, label: str
+) -> tuple[int, ...] | None:
+    return _private_state_leaf_state(directory_fd, name, code=code, label=label, mode=0o600)
+
+
+def _read_private_state_file(
+    directory_fd: int,
+    name: str,
+    *,
+    code: str,
+    label: str,
+    limit: int = 1024 * 1024,
+) -> bytes:
+    try:
+        descriptor = _open_private_state_file(directory_fd, name, os.O_RDONLY)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise NodeAgentError(label, code=code) from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat_module.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise NodeAgentError(label, code=code)
+        content = bytearray()
+        while len(content) <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > limit:
+            raise NodeAgentError(label, code=code)
+        final = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+
+        def signature(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_uid,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if (
+            signature(info) != signature(final)
+            or signature(final) != signature(current)
+            or not stat_module.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+            or stat_module.S_IMODE(current.st_mode) != 0o600
+        ):
+            raise NodeAgentError(label, code=code)
+        return bytes(content)
+    except OSError as exc:
+        raise NodeAgentError(label, code=code) from exc
+    finally:
+        os.close(descriptor)
+
+
+def ensure_node_identity(state_dir: Path):  # type: ignore[no-untyped-def]
+    try:
+        directory_fd, _resolved = _open_private_directory(state_dir, create=True)
+    except OSError as exc:
+        raise NodeAgentError(
+            "Node identity state path is invalid", code="identity_invalid"
+        ) from exc
+    try:
+        private_key = _ensure_node_identity_at(directory_fd)
+        try:
+            _assert_directory_path_matches(state_dir, directory_fd)
+        except (OSError, RuntimeError) as exc:
+            raise NodeAgentError(
+                "Node identity state path changed during access", code="identity_invalid"
+            ) from exc
         return private_key
-    private_key = generate_private_key()
-    _atomic_private_write(key_path, private_key_pem(private_key), mode=0o600)
-    return private_key
+    finally:
+        os.close(directory_fd)
+
+
+def _ensure_node_identity_at(directory_fd: int):  # type: ignore[no-untyped-def]
+    try:
+        content = _read_private_state_file(
+            directory_fd,
+            NODE_PRIVATE_KEY_FILE,
+            code="identity_invalid",
+            label="Node identity file is invalid",
+        )
+    except FileNotFoundError:
+        private_key = generate_private_key()
+        try:
+            _atomic_private_write(
+                Path(NODE_PRIVATE_KEY_FILE),
+                private_key_pem(private_key),
+                mode=0o600,
+                directory_fd=directory_fd,
+                expected_state=None,
+                error_code="identity_invalid",
+            )
+        except OSError as exc:
+            raise NodeAgentError(
+                "Node identity could not be saved", code="identity_invalid"
+            ) from exc
+        return private_key
+    return load_private_key(content)
 
 
 def load_node_identity(state_dir: Path):  # type: ignore[no-untyped-def]
-    key_path = state_dir / NODE_PRIVATE_KEY_FILE
     try:
-        info = key_path.lstat()
-        if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
-            raise NodeAgentError(
-                "Node identity path is not a regular file", code="identity_invalid"
-            )
-        private_key = load_private_key(key_path.read_bytes())
+        directory_fd, _resolved = _open_private_directory(state_dir, create=False)
     except FileNotFoundError as exc:
         raise NodeAgentError(
             "Node identity is missing. Pair this Node again after revoking the old identity.",
             code="identity_missing",
         ) from exc
-    except OSError as exc:
-        raise NodeAgentError("Node identity is unavailable", code="identity_invalid") from exc
-    with contextlib.suppress(PermissionError):
-        key_path.chmod(0o600)
-    return private_key
+    except (OSError, RuntimeError) as exc:
+        raise NodeAgentError(
+            "Node identity state path is invalid", code="identity_invalid"
+        ) from exc
+    try:
+        try:
+            content = _read_private_state_file(
+                directory_fd,
+                NODE_PRIVATE_KEY_FILE,
+                code="identity_invalid",
+                label="Node identity file is invalid",
+            )
+        except FileNotFoundError as exc:
+            raise NodeAgentError(
+                "Node identity is missing. Pair this Node again after revoking the old identity.",
+                code="identity_missing",
+            ) from exc
+        private_key = load_private_key(content)
+        try:
+            _assert_directory_path_matches(state_dir, directory_fd)
+        except (OSError, RuntimeError) as exc:
+            raise NodeAgentError(
+                "Node identity state path changed during load", code="identity_invalid"
+            ) from exc
+        return private_key
+    finally:
+        os.close(directory_fd)
 
 
 def load_node_config(state_dir: Path) -> NodeConfig:
-    path = state_dir / NODE_CONFIG_FILE
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        directory_fd, resolved_state_dir = _open_private_directory(state_dir, create=False)
+    except FileNotFoundError as exc:
         raise NodeAgentError(
             "Node is not paired. Run `termroom node pair` first.", code="not_paired"
         ) from exc
+    except (OSError, RuntimeError) as exc:
+        raise NodeAgentError(
+            "Node configuration state path is invalid", code="config_invalid"
+        ) from exc
+    try:
+        state_info = os.fstat(directory_fd)
+        state_dir_identity = (state_info.st_dev, state_info.st_ino)
+        try:
+            content = _read_private_state_file(
+                directory_fd,
+                NODE_CONFIG_FILE,
+                code="config_invalid",
+                label="Node configuration is invalid",
+            )
+        except FileNotFoundError as exc:
+            raise NodeAgentError(
+                "Node is not paired. Run `termroom node pair` first.",
+                code="not_paired",
+            ) from exc
+        try:
+            value = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise NodeAgentError("Node configuration is invalid", code="config_invalid") from exc
+        try:
+            _assert_directory_path_matches(state_dir, directory_fd)
+        except (OSError, RuntimeError) as exc:
+            raise NodeAgentError(
+                "Node configuration state path changed during load", code="config_invalid"
+            ) from exc
+    finally:
+        os.close(directory_fd)
+
     if not isinstance(value, dict):
         raise NodeAgentError("Node configuration is invalid", code="config_invalid")
     roots = normalize_allowed_roots(value.get("allowed_roots", []))
-    run_root = normalize_run_root(value.get("run_root"), state_dir=state_dir)
+    run_root = normalize_run_root(value.get("run_root"), state_dir=resolved_state_dir)
     core_url = normalize_core_url(str(value.get("core_url") or ""))
     return NodeConfig(
         core_url=core_url,
         node_id=validate_node_id(str(value.get("node_id") or "")),
         name=str(value.get("name") or socket.gethostname())[:120],
         allowed_roots=roots,
-        state_dir=state_dir.resolve(),
+        state_dir=resolved_state_dir,
         run_root=run_root,
         ca_file=normalize_ca_file(value.get("ca_file"), core_url=core_url),
+        state_dir_identity=state_dir_identity,
     )
 
 
-def save_node_config(state_dir: Path, config: NodeConfig) -> None:
-    ensure_private_directory(state_dir)
-    core_url = normalize_core_url(config.core_url)
-    payload = json.dumps(
-        {
-            "core_url": core_url,
-            "node_id": validate_node_id(config.node_id),
-            "name": config.name,
-            "allowed_roots": [str(path) for path in config.allowed_roots],
-            "run_root": str(
-                normalize_run_root(
-                    config.run_root,
-                    state_dir=config.state_dir or state_dir,
-                )
-            ),
-            "ca_file": (
-                str(normalize_ca_file(config.ca_file, core_url=core_url))
-                if config.ca_file
-                else None
-            ),
-            "protocol_version": NODE_PROTOCOL_VERSION,
-        },
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    ).encode("utf-8")
-    _atomic_private_write(state_dir / NODE_CONFIG_FILE, payload, mode=0o600)
+def save_node_config(
+    state_dir: Path,
+    config: NodeConfig,
+    *,
+    directory_fd: int | None = None,
+) -> None:
+    owns_directory_fd = directory_fd is None
+    if directory_fd is None:
+        try:
+            directory_fd, _resolved_state_dir = _open_private_directory(state_dir, create=True)
+        except (OSError, RuntimeError) as exc:
+            raise NodeAgentError(
+                "Node configuration state path is invalid", code="config_invalid"
+            ) from exc
+    try:
+        core_url = normalize_core_url(config.core_url)
+        payload = json.dumps(
+            {
+                "core_url": core_url,
+                "node_id": validate_node_id(config.node_id),
+                "name": config.name,
+                "allowed_roots": [str(path) for path in config.allowed_roots],
+                "run_root": str(
+                    normalize_run_root(
+                        config.run_root,
+                        state_dir=config.state_dir or state_dir,
+                    )
+                ),
+                "ca_file": (
+                    str(normalize_ca_file(config.ca_file, core_url=core_url))
+                    if config.ca_file
+                    else None
+                ),
+                "protocol_version": NODE_PROTOCOL_VERSION,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        try:
+            expected_state = _validate_private_state_leaf(
+                directory_fd,
+                NODE_CONFIG_FILE,
+                code="config_invalid",
+                label="Node configuration path is not a private regular file",
+            )
+            _atomic_private_write(
+                Path(NODE_CONFIG_FILE),
+                payload,
+                mode=0o600,
+                directory_fd=directory_fd,
+                expected_state=expected_state,
+                error_code="config_invalid",
+            )
+            _assert_directory_path_matches(state_dir, directory_fd)
+        except OSError as exc:
+            raise NodeAgentError(
+                "Node configuration could not be saved", code="config_invalid"
+            ) from exc
+    finally:
+        if owns_directory_fd:
+            os.close(directory_fd)
 
 
 def normalize_allowed_roots(values: object) -> tuple[Path, ...]:
@@ -341,11 +758,11 @@ def normalize_allowed_roots(values: object) -> tuple[Path, ...]:
 
 def normalize_run_root(value: object, *, state_dir: Path) -> Path:
     if value is None or str(value) == "":
-        return state_dir.resolve() / "runs"
+        return Path(os.path.abspath(os.fspath(state_dir.expanduser()))) / "runs"
     raw = Path(str(value)).expanduser()
     if not raw.is_absolute():
         raise NodeAgentError("Node Remote Run root must be absolute", code="config_invalid")
-    return raw.resolve(strict=False)
+    return Path(os.path.abspath(os.fspath(raw)))
 
 
 def normalize_ca_file(value: object, *, core_url: str) -> Path | None:
@@ -391,50 +808,76 @@ def pair_node(
     roots = normalize_allowed_roots(list(allowed_roots))
     trusted_ca = normalize_ca_file(ca_file, core_url=normalized_core)
     ssl_context = _node_ssl_context(trusted_ca)
-    private_key = ensure_node_identity(state_dir)
-    public_key = public_key_text(private_key.public_key())
-    polling_secret = secrets.token_urlsafe(32)
-    enrollment = _json_post(
-        normalized_core,
-        "/api/node/enroll",
-        {
-            "code": code,
-            "name": (name or socket.gethostname())[:120],
-            "public_key": public_key,
-            "fingerprint": public_key_fingerprint(public_key),
-            "protocol_version": NODE_PROTOCOL_VERSION,
-            "polling_secret": polling_secret,
-        },
-        ssl_context=ssl_context,
-    )
-    enrollment_id = str(enrollment.get("enrollment_id") or "")
-    if not enrollment_id:
-        raise NodeAgentError("Core returned an invalid enrollment", code="enrollment_invalid")
-    deadline = time.monotonic() + max(1.0, timeout_seconds)
-    while time.monotonic() < deadline:
-        status = _json_post(
+    try:
+        directory_fd, resolved_state_dir = _open_private_directory(state_dir, create=True)
+    except (OSError, RuntimeError) as exc:
+        raise NodeAgentError(
+            "Node identity state path is invalid", code="identity_invalid"
+        ) from exc
+    try:
+        private_key = _ensure_node_identity_at(directory_fd)
+        public_key = public_key_text(private_key.public_key())
+        state_info = os.fstat(directory_fd)
+        state_identity = (state_info.st_dev, state_info.st_ino)
+        polling_secret = secrets.token_urlsafe(32)
+        enrollment = _json_post(
             normalized_core,
-            "/api/node/enroll/status",
-            {"enrollment_id": enrollment_id, "polling_secret": polling_secret},
+            "/api/node/enroll",
+            {
+                "code": code,
+                "name": (name or socket.gethostname())[:120],
+                "public_key": public_key,
+                "fingerprint": public_key_fingerprint(public_key),
+                "protocol_version": NODE_PROTOCOL_VERSION,
+                "polling_secret": polling_secret,
+            },
             ssl_context=ssl_context,
         )
-        decision = str(status.get("status") or "")
-        if decision == "approved":
-            config = NodeConfig(
-                core_url=normalized_core,
-                node_id=validate_node_id(str(status.get("node_id") or "")),
-                name=(name or socket.gethostname())[:120],
-                allowed_roots=roots,
-                state_dir=state_dir.resolve(),
-                run_root=normalize_run_root(run_root, state_dir=state_dir),
-                ca_file=trusted_ca,
+        enrollment_id = str(enrollment.get("enrollment_id") or "")
+        if not enrollment_id:
+            raise NodeAgentError("Core returned an invalid enrollment", code="enrollment_invalid")
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while time.monotonic() < deadline:
+            status = _json_post(
+                normalized_core,
+                "/api/node/enroll/status",
+                {"enrollment_id": enrollment_id, "polling_secret": polling_secret},
+                ssl_context=ssl_context,
             )
-            save_node_config(state_dir, config)
-            return config
-        if decision == "rejected":
-            raise NodeAgentError("Node pairing was rejected", code="pairing_rejected")
-        time.sleep(1.0)
-    raise NodeAgentError("Node pairing approval timed out", code="pairing_timeout")
+            decision = str(status.get("status") or "")
+            if decision == "approved":
+                try:
+                    _assert_directory_path_matches(resolved_state_dir, directory_fd)
+                except (OSError, RuntimeError) as exc:
+                    raise NodeAgentError(
+                        "Node identity state path changed during pairing",
+                        code="config_invalid",
+                    ) from exc
+                config = NodeConfig(
+                    core_url=normalized_core,
+                    node_id=validate_node_id(str(status.get("node_id") or "")),
+                    name=(name or socket.gethostname())[:120],
+                    allowed_roots=roots,
+                    state_dir=resolved_state_dir,
+                    run_root=normalize_run_root(run_root, state_dir=resolved_state_dir),
+                    ca_file=trusted_ca,
+                    state_dir_identity=state_identity,
+                )
+                save_node_config(resolved_state_dir, config, directory_fd=directory_fd)
+                try:
+                    _assert_directory_path_matches(resolved_state_dir, directory_fd)
+                except (OSError, RuntimeError) as exc:
+                    raise NodeAgentError(
+                        "Node identity state path changed during config save",
+                        code="config_invalid",
+                    ) from exc
+                return config
+            if decision == "rejected":
+                raise NodeAgentError("Node pairing was rejected", code="pairing_rejected")
+            time.sleep(1.0)
+        raise NodeAgentError("Node pairing approval timed out", code="pairing_timeout")
+    finally:
+        os.close(directory_fd)
 
 
 class NodeRuntime:
@@ -446,24 +889,61 @@ class NodeRuntime:
         file_run_root: Path | None = None,
         remote_run_root: Path | None = None,
         private_state_root: Path | None = None,
+        private_state_identity: tuple[int, int] | None = None,
     ) -> None:
         self.allowed_roots = normalize_allowed_roots(list(allowed_roots))
+        self._allowed_root_ids: dict[Path, tuple[int, int]] = {}
+        for root in self.allowed_roots:
+            descriptor, _ = _open_directory_components(root, create=False, mode=None)
+            try:
+                info = os.fstat(descriptor)
+                self._allowed_root_ids[root] = (info.st_dev, info.st_ino)
+            finally:
+                os.close(descriptor)
+        self._workspace_dir_ids: dict[Path, tuple[int, int]] = {}
+        self._workspace_dir_fds: dict[Path, int] = {}
+        self._workspace_dir_ids_lock = threading.Lock()
         self.files = FileService(max_edit_bytes=max_edit_bytes)
         self.streams: dict[str, AgentStream] = {}
-        self.file_run_root = self._prepare_file_run_root(file_run_root)
+        private_state = self._prepare_source_private_root(
+            private_state_root, expected_identity=private_state_identity
+        )
+        self.private_state_fd = private_state[0] if private_state else None
+        self.private_state_root = private_state[1] if private_state else None
+        self.source_private_boundaries = (
+            (self.private_state_root,) if self.private_state_root is not None else ()
+        )
+        self.files_private_boundaries = self.source_private_boundaries
+        self.file_run_root_fd, self.file_run_root = self._open_file_run_root(
+            file_run_root,
+            private_state_fd=self.private_state_fd,
+            private_state_root=self.private_state_root,
+        )
+        self._file_run_workspace_ids: dict[str, tuple[int, int]] = {}
+        self._file_run_metadata_ids: dict[tuple[str, str], tuple[int, int]] = {}
+        self._file_run_execution_fds: dict[tuple[str, str], tuple[int, int]] = {}
         self.remote_runs = (
-            NodeRemoteRunRuntime(remote_run_root) if remote_run_root is not None else None
+            NodeRemoteRunRuntime(
+                remote_run_root,
+                parent_fd=self.private_state_fd,
+                parent_path=self.private_state_root,
+                descriptor_handoff=self._tmux_with_descriptors,
+            )
+            if remote_run_root is not None
+            else None
         )
         private_boundaries = [
             boundary
             for boundary in (
-                self._prepare_source_private_root(private_state_root),
                 self.file_run_root,
                 self.remote_runs.run_root if self.remote_runs is not None else None,
             )
             if boundary is not None
         ]
-        self.source_private_boundaries = tuple(dict.fromkeys(private_boundaries))
+        self.source_private_boundaries = tuple(
+            dict.fromkeys((*self.source_private_boundaries, *private_boundaries))
+        )
+        self.files_private_boundaries = self.source_private_boundaries
         self._file_run_locks: dict[str, threading.RLock] = {}
         self._file_run_locks_guard = threading.Lock()
         self._workspace_command_locks: dict[str, threading.RLock] = {}
@@ -471,6 +951,7 @@ class NodeRuntime:
         self._browser_grid_resize_lock = threading.RLock()
         self._fresh_grid_windows: set[str] = set()
         self._fresh_grid_windows_lock = threading.Lock()
+        self._closed_terminal_streams: dict[str, TerminalAgentStream] = {}
 
     async def handle(
         self,
@@ -481,6 +962,17 @@ class NodeRuntime:
         operation = validate_request_operation(operation)
         if operation == "terminal.attach":
             return await self._terminal_attach(payload, send)
+        if operation == "terminal.resize":
+            stream_id = validate_request_id(str(payload.get("stream_id") or ""))
+            stream = self.streams.get(stream_id) or self._closed_terminal_streams.get(stream_id)
+            if not isinstance(stream, TerminalAgentStream):
+                raise NodeAgentError("Terminal stream is unavailable", code="terminal_stream_stale")
+            result = await stream.resize(payload)
+            if stream.closed:
+                self._closed_terminal_streams[stream_id] = stream
+                if len(self._closed_terminal_streams) > 64:
+                    self._closed_terminal_streams.pop(next(iter(self._closed_terminal_streams)))
+            return OperationResult(result)
         if operation == "files.read_text.open":
             return await self._read_text_open(payload, send)
         if operation == "files.write_text.open":
@@ -539,7 +1031,9 @@ class NodeRuntime:
         if operation == "terminal.scrollback":
             return {"output": self._capture_scrollback(payload)}
         if operation == "files.list":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or ".")
+            self._require_files_path(root, relative_path)
             raw_max_entries = payload.get("max_entries")
             if raw_max_entries is None:
                 max_entries = NODE_FILE_LIST_MAX_ENTRIES
@@ -560,16 +1054,19 @@ class NodeRuntime:
                 max_metadata_bytes = raw_metadata_bytes
             directory, entries = self.files.list_dir(
                 root,
-                str(payload.get("path") or "."),
+                relative_path,
                 max_entries=max_entries,
                 max_metadata_bytes=max_metadata_bytes,
+                excluded_paths=self._private_paths_relative_to(root),
             )
             return {
                 "directory": self._relative(root, directory),
                 "entries": [asdict(entry) for entry in entries],
             }
         if operation == "files.search":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or ".")
+            self._require_files_path(root, relative_path)
             raw_query = payload.get("query")
             if not isinstance(raw_query, str) or not raw_query.strip() or len(raw_query) > 256:
                 raise NodeAgentError("File search query is invalid", code="request_invalid")
@@ -578,12 +1075,13 @@ class NodeRuntime:
                 raise NodeAgentError("File search visibility is invalid", code="request_invalid")
             search = self.files.search_files(
                 root,
-                str(payload.get("path") or "."),
+                relative_path,
                 raw_query,
                 include_noise=raw_include_noise,
                 max_matches=DEFAULT_FILE_SEARCH_MAX_MATCHES,
                 max_entries=DEFAULT_FILE_SEARCH_MAX_ENTRIES,
                 max_seconds=DEFAULT_FILE_SEARCH_MAX_SECONDS,
+                excluded_paths=self._private_paths_relative_to(root),
             )
             return {
                 "entries": [asdict(entry) for entry in search.entries],
@@ -592,46 +1090,66 @@ class NodeRuntime:
                 "truncated": search.truncated,
             }
         if operation == "files.recent":
-            root = self._workspace_path(payload)
-            recent = self.files.recent_files(root, limit=int(payload.get("limit") or 50))
+            root = self._files_workspace_path(payload)
+            recent = self.files.recent_files(
+                root,
+                limit=int(payload.get("limit") or 50),
+                excluded_paths=self._private_paths_relative_to(root),
+            )
             return {
                 "entries": [asdict(entry) for entry in recent.entries],
                 "scanned_files": recent.scanned_files,
                 "truncated": recent.truncated,
             }
         if operation == "files.stat":
-            root = self._workspace_path(payload)
-            return {"entry": asdict(self.files.stat(root, str(payload.get("path") or "")))}
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            self._require_files_path(root, relative_path)
+            return {"entry": asdict(self.files.stat(root, relative_path))}
         if operation == "files.read_preview":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            self._require_files_path(root, relative_path)
             preview = self.files.read_text_preview(
                 root,
-                str(payload.get("path") or ""),
+                relative_path,
                 mode=str(payload.get("mode") or "head"),
                 offset=int(payload.get("offset") or 0),
                 max_bytes=int(payload.get("max_bytes") or 256 * 1024),
             )
             return {"preview": asdict(preview)}
         if operation == "files.create":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            parent = str(payload.get("parent") or ".")
+            name = str(payload.get("name") or "")
+            self._require_files_path(
+                root, Path(parent) / name, destructive=True, allow_missing=True
+            )
             self.files.create(
                 root,
-                str(payload.get("parent") or "."),
-                str(payload.get("name") or ""),
+                parent,
+                name,
                 directory=payload.get("directory") is True,
             )
             return {}
         if operation == "files.rename":
-            root = self._workspace_path(payload)
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            source = self._require_files_path(root, relative_path, destructive=True)
+            new_name = str(payload.get("new_name") or "")
+            destination = source.relative_to(root).parent / new_name
+            self._require_files_path(root, destination, destructive=True, allow_missing=True)
             self.files.rename(
                 root,
-                str(payload.get("path") or ""),
-                str(payload.get("new_name") or ""),
+                relative_path,
+                new_name,
             )
             return {}
         if operation == "files.delete":
-            root = self._workspace_path(payload)
-            self.files.delete(root, str(payload.get("path") or ""))
+            root = self._files_workspace_path(payload)
+            relative_path = str(payload.get("path") or "")
+            self._require_files_path(root, relative_path, destructive=True)
+            self.files.delete(root, relative_path)
             return {}
         if operation == "file_run.inspect":
             return self._inspect_runnable(payload)
@@ -698,25 +1216,205 @@ class NodeRuntime:
             raise PathBoundaryError("Workspace path must be a real directory")
         if not any(is_within(resolved, root) for root in self.allowed_roots):
             raise PathBoundaryError("Workspace path is outside the Node allowed roots")
+        try:
+            descriptor = self._open_workspace_directory(resolved)
+        except OSError as exc:
+            raise PathBoundaryError("Workspace or allowed root changed") from exc
+        try:
+            info = os.fstat(descriptor)
+            identity = (info.st_dev, info.st_ino)
+            with self._workspace_dir_ids_lock:
+                previous = self._workspace_dir_ids.get(resolved)
+                if previous is not None and previous != identity:
+                    raise PathBoundaryError("Workspace directory was replaced")
+                if previous is None:
+                    self._workspace_dir_ids[resolved] = identity
+                    self._workspace_dir_fds[resolved] = descriptor
+                    descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        self._require_persistent_workspace_path(resolved)
         return resolved
 
+    def _open_workspace_directory(self, path: Path) -> int:
+        for root in self.allowed_roots:
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            root_fd, _ = _open_directory_components(root, create=False, mode=None)
+            try:
+                root_info = os.fstat(root_fd)
+                if (root_info.st_dev, root_info.st_ino) != self._allowed_root_ids[root]:
+                    raise OSError("Node allowed root was replaced")
+                descriptor = _open_directory_at(root_fd, relative.parts, create=False, mode=None)
+            finally:
+                os.close(root_fd)
+            try:
+                _assert_directory_path_matches(path, descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            return descriptor
+        raise OSError("Workspace is outside Node allowed roots")
+
+    @contextlib.contextmanager
+    def _workspace_tmux_cwd(self, path: Path, *, remote_run_id: object = None) -> Iterator[int]:
+        if remote_run_id is not None:
+            descriptor = os.dup(self._remote_run_runtime().workspace_fd(str(remote_run_id), path))
+            try:
+                yield descriptor
+            finally:
+                os.close(descriptor)
+            return
+        try:
+            descriptor = self._open_workspace_directory(path)
+        except OSError as exc:
+            raise PathBoundaryError("Workspace directory changed before tmux launch") from exc
+        launch_descriptor = -1
+        try:
+            info = os.fstat(descriptor)
+            identity = (info.st_dev, info.st_ino)
+            with self._workspace_dir_ids_lock:
+                if self._workspace_dir_ids.get(path) != identity:
+                    raise PathBoundaryError("Workspace directory was replaced")
+                pinned_descriptor = self._workspace_dir_fds[path]
+                pinned = os.fstat(pinned_descriptor)
+                if (pinned.st_dev, pinned.st_ino) != identity:
+                    raise PathBoundaryError("Workspace directory was replaced")
+                launch_descriptor = os.dup(pinned_descriptor)
+            yield launch_descriptor
+        finally:
+            os.close(descriptor)
+            if launch_descriptor >= 0:
+                os.close(launch_descriptor)
+
+    def __del__(self) -> None:
+        for descriptor in getattr(self, "_workspace_dir_fds", {}).values():
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        for descriptors in getattr(self, "_file_run_execution_fds", {}).values():
+            for descriptor in descriptors:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+    def _files_workspace_path(self, payload: Mapping[str, Any]) -> Path:
+        return self._workspace_path(payload)
+
+    def _require_persistent_workspace_path(self, path: Path) -> None:
+        if any(is_within(path, boundary) for boundary in self.source_private_boundaries):
+            raise PathBoundaryError("Workspace path overlaps Node private state")
+
+    def _private_paths_relative_to(self, root: Path) -> frozenset[str]:
+        return frozenset(
+            boundary.relative_to(root).as_posix()
+            for boundary in self.files_private_boundaries
+            if is_within(boundary, root)
+        )
+
+    def _require_files_path(
+        self,
+        root: Path,
+        relative_path: str | Path,
+        *,
+        destructive: bool = False,
+        allow_missing: bool = False,
+        allow_missing_parents: bool = False,
+    ) -> Path:
+        try:
+            target = resolve_inside(root, relative_path, must_exist=not allow_missing)
+        except FileNotFoundError:
+            if not allow_missing_parents:
+                raise
+            raw = Path(relative_path)
+            if raw.is_absolute():
+                raise PathBoundaryError("Absolute paths are not allowed") from None
+            target = (root / raw).resolve(strict=False)
+            if not is_within(target, root):
+                raise PathBoundaryError("Path escapes the allowed boundary") from None
+        if allow_missing:
+            target = target.resolve(strict=False)
+        protected_descendants = tuple(
+            boundary for boundary in self.files_private_boundaries if is_within(boundary, root)
+        )
+        if any(
+            is_within(target, boundary) or (destructive and is_within(boundary, target))
+            for boundary in protected_descendants
+        ):
+            raise PathBoundaryError("Path overlaps Node private state")
+        return target
+
     @staticmethod
-    def _prepare_source_private_root(value: Path | None) -> Path | None:
+    def _prepare_source_private_root(
+        value: Path | None,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> tuple[int, Path] | None:
         if value is None:
             return None
-        candidate = value.expanduser()
         try:
-            info = candidate.lstat()
-            resolved = candidate.resolve(strict=True)
-        except OSError as exc:
+            descriptor, candidate = _open_directory_components(
+                value,
+                create=expected_identity is None,
+                mode=None,
+            )
+            info = os.fstat(descriptor)
+            if (
+                expected_identity is not None
+                and (
+                    info.st_dev,
+                    info.st_ino,
+                )
+                != expected_identity
+            ):
+                raise OSError("Node private state directory was replaced")
+            _assert_directory_path_matches(candidate, descriptor)
+            os.fchmod(descriptor, 0o700)
+            _assert_directory_path_matches(candidate, descriptor)
+            return descriptor, candidate
+        except (OSError, RuntimeError) as exc:
+            if "descriptor" in locals():
+                os.close(descriptor)
             raise NodeAgentError(
                 "Node private state is unavailable", code="node_state_invalid"
             ) from exc
-        if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISDIR(info.st_mode):
+
+    @staticmethod
+    def _open_file_run_root(
+        value: Path | None,
+        *,
+        private_state_fd: int | None,
+        private_state_root: Path | None,
+    ) -> tuple[int | None, Path | None]:
+        if value is None:
+            return None, None
+        candidate = Path(os.path.abspath(os.fspath(value.expanduser())))
+        try:
+            relative = candidate.relative_to(private_state_root) if private_state_root else None
+        except ValueError:
+            relative = None
+        descriptor = -1
+        try:
+            if relative is not None and private_state_fd is not None:
+                descriptor = _open_directory_at(
+                    private_state_fd,
+                    relative.parts,
+                    create=True,
+                    mode=0o700,
+                    require_owner=True,
+                )
+            else:
+                descriptor, candidate = _open_private_directory(candidate, create=True)
+            _assert_directory_path_matches(candidate, descriptor)
+            return descriptor, candidate
+        except (OSError, RuntimeError) as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
             raise NodeAgentError(
-                "Node private state must be a real directory", code="node_state_invalid"
-            )
-        return resolved
+                "Node File Run state path is not a stable real directory",
+                code="file_run_state_invalid",
+            ) from exc
 
     @staticmethod
     def _require_remote_run_source_version(payload: Mapping[str, Any]) -> None:
@@ -979,6 +1677,7 @@ class NodeRuntime:
         parent = self._workspace_path({"path": payload.get("parent")})
         safe_name = validate_project_name(str(payload.get("name") or ""))
         target = parent / safe_name
+        self._require_persistent_workspace_path(target)
         try:
             info = target.lstat()
         except FileNotFoundError:
@@ -991,16 +1690,20 @@ class NodeRuntime:
     def _ensure_workspace(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         root = self._workspace_path(payload)
         session = self._session(payload)
-        session_missing = bool(
-            self._tmux("has-session", "-t", session, check=False).returncode
-        )
+        session_missing = bool(self._tmux("has-session", "-t", session, check=False).returncode)
         created_session = False
         if session_missing and not self._recover_workspace_from_browser_view(session):
-            self._tmux(
-                "new-session", "-d", "-s", session, "-c", str(root), "-n", "shell"
-            )
+            with self._workspace_tmux_cwd(
+                root, remote_run_id=payload.get("remote_run_id")
+            ) as cwd_fd:
+                self._tmux_with_descriptors(
+                    ("new-session", "-d", "-s", session, "-c", "/", "-n", "shell"),
+                    (cwd_fd,),
+                    rollback=lambda _result: self._tmux("kill-session", "-t", session, check=False),
+                )
             created_session = True
-        self._tmux("set-window-option", "-t", session, "window-size", "latest", check=False)
+        if created_session:
+            self._tmux("set-window-option", "-t", session, "window-size", "latest", check=False)
         terminals = self._list_terminals(session)
         if created_session:
             self._mark_fresh_grid_windows(terminals)
@@ -1051,9 +1754,7 @@ class NodeRuntime:
 
     def _mark_fresh_grid_windows(self, terminals: Iterable[Mapping[str, Any]]) -> None:
         with self._fresh_grid_windows_lock:
-            self._fresh_grid_windows.update(
-                str(terminal["tmux_window"]) for terminal in terminals
-            )
+            self._fresh_grid_windows.update(str(terminal["tmux_window"]) for terminal in terminals)
 
     def _fresh_grid_window(self, window: str) -> bool:
         with self._fresh_grid_windows_lock:
@@ -1135,9 +1836,7 @@ class NodeRuntime:
                         "rename-window",
                         "-t",
                         str(existing["tmux_window"]),
-                        workspace_command_history_name(
-                            safe_slot, str(existing["launch_id"])
-                        ),
+                        workspace_command_history_name(safe_slot, str(existing["launch_id"])),
                         check=False,
                     )
                 existing = None
@@ -1147,54 +1846,71 @@ class NodeRuntime:
                 self._tmux("kill-window", "-t", str(existing["tmux_window"]))
             else:
                 window = str(existing["tmux_window"])
-                respawned = self._tmux(
-                    "respawn-pane",
-                    "-k",
-                    "-c",
-                    str(root),
-                    "-e",
-                    f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
-                    "-e",
-                    f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
-                    "-e",
-                    f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
-                    "-e",
-                    f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
-                    "-t",
-                    window,
-                    WORKSPACE_COMMAND_WRAPPER,
-                    check=False,
-                )
+                with self._workspace_tmux_cwd(
+                    root, remote_run_id=payload.get("remote_run_id")
+                ) as cwd_fd:
+                    respawned = self._tmux_with_descriptors(
+                        (
+                            "respawn-pane",
+                            "-k",
+                            "-c",
+                            "/",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                            "-e",
+                            f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                            "-t",
+                            window,
+                        ),
+                        (cwd_fd,),
+                        WORKSPACE_COMMAND_WRAPPER_ARGV,
+                        rollback=lambda _result: self._tmux(
+                            "kill-window", "-t", window, check=False
+                        ),
+                        check=False,
+                    )
                 if respawned.returncode:
                     raise NodeAgentError(
-                        respawned.stderr.strip()
-                        or "Workspace command Terminal could not restart",
+                        respawned.stderr.strip() or "Workspace command Terminal could not restart",
                         code="workspace_command_invalid",
                     )
 
         if not window:
-            created = self._tmux(
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-e",
-                f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
-                "-e",
-                f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
-                "-e",
-                f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
-                "-e",
-                f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
-                "-t",
-                session,
-                "-n",
-                f"run-{safe_slot + 1}",
-                "-c",
-                str(root),
-                WORKSPACE_COMMAND_WRAPPER,
-            )
+            with self._workspace_tmux_cwd(
+                root, remote_run_id=payload.get("remote_run_id")
+            ) as cwd_fd:
+                created = self._tmux_with_descriptors(
+                    (
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND={safe_command}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND_SLOT={safe_slot}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND_LAUNCH={safe_launch}",
+                        "-e",
+                        f"TERMROOM_WORKSPACE_COMMAND_DIGEST={digest}",
+                        "-t",
+                        session,
+                        "-n",
+                        f"run-{safe_slot + 1}",
+                        "-c",
+                        "/",
+                    ),
+                    (cwd_fd,),
+                    WORKSPACE_COMMAND_WRAPPER_ARGV,
+                    rollback=lambda result: self._tmux(
+                        "kill-window", "-t", result.stdout.strip(), check=False
+                    ),
+                )
             window = created.stdout.strip()
             created_window = True
         try:
@@ -1277,19 +1993,26 @@ class NodeRuntime:
         session = self._session(payload)
         self._ensure_workspace(payload)
         safe_name = normalize_terminal_name(str(payload.get("name") or "shell"))
-        result = self._tmux(
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-t",
-            session,
-            "-n",
-            safe_name,
-            "-c",
-            str(root),
-        )
+        with self._workspace_tmux_cwd(root, remote_run_id=payload.get("remote_run_id")) as cwd_fd:
+            result = self._tmux_with_descriptors(
+                (
+                    "new-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                    "-t",
+                    session,
+                    "-n",
+                    safe_name,
+                    "-c",
+                    "/",
+                ),
+                (cwd_fd,),
+                rollback=lambda created: self._tmux(
+                    "kill-window", "-t", created.stdout.strip(), check=False
+                ),
+            )
         window = result.stdout.strip()
         terminal = next(
             item for item in self._list_terminals(session) if item["tmux_window"] == window
@@ -1298,13 +2021,14 @@ class NodeRuntime:
         return terminal
 
     def _open_terminal_editor(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         session = self._session(payload)
         try:
             normalized = normalize_terminal_editor_path(payload.get("path"))
         except ValueError as exc:
             raise NodeAgentError(str(exc), code="terminal_editor_invalid") from exc
         target = (root / normalized).resolve(strict=True)
+        self._require_files_path(root, normalized)
         if not is_within(target, root) or not target.is_file():
             raise NodeAgentError(
                 "Terminal editor target is not a Workspace file",
@@ -1329,45 +2053,46 @@ class NodeRuntime:
             try:
                 records = parse_tmux_terminal_editor_records(listed.stdout)
             except ValueError as exc:
-                raise NodeAgentError(
-                    str(exc), code="terminal_editor_invalid"
-                ) from exc
+                raise NodeAgentError(str(exc), code="terminal_editor_invalid") from exc
             existing = next((item for item in records if item["digest"] == digest), None)
             if existing is not None and not existing["dead"]:
                 terminal = next(
-                    (
-                        item
-                        for item in terminals
-                        if item["tmux_window"] == existing["tmux_window"]
-                    ),
+                    (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
                     None,
                 )
                 if terminal is None:
-                    raise NodeAgentError(
-                        "Vim Terminal is missing", code="terminal_editor_invalid"
-                    )
+                    raise NodeAgentError("Vim Terminal is missing", code="terminal_editor_invalid")
                 return {"terminal": terminal, "terminals": terminals}
             if existing is not None:
                 self._tmux("kill-window", "-t", str(existing["tmux_window"]))
 
-            created = self._tmux(
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-e",
-                f"TERMROOM_TERMINAL_EDITOR_FILE={target}",
-                "-e",
-                f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}",
-                "-t",
-                session,
-                "-n",
-                normalize_terminal_name(f"vim-{Path(normalized).name}"),
-                "-c",
-                str(root),
-                TERMINAL_EDITOR_WRAPPER,
-            )
+            with self._workspace_tmux_cwd(
+                root, remote_run_id=payload.get("remote_run_id")
+            ) as cwd_fd:
+                created = self._tmux_with_descriptors(
+                    (
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-e",
+                        f"TERMROOM_TERMINAL_EDITOR_FILE={normalized}",
+                        "-e",
+                        f"TERMROOM_TERMINAL_EDITOR_DIGEST={digest}",
+                        "-t",
+                        session,
+                        "-n",
+                        normalize_terminal_name(f"vim-{Path(normalized).name}"),
+                        "-c",
+                        "/",
+                    ),
+                    (cwd_fd,),
+                    ("/bin/sh", "-c", TERMINAL_EDITOR_WRAPPER),
+                    rollback=lambda result: self._tmux(
+                        "kill-window", "-t", result.stdout.strip(), check=False
+                    ),
+                )
             window = created.stdout.strip()
             try:
                 deadline = time.monotonic() + WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
@@ -1392,9 +2117,7 @@ class NodeRuntime:
                 self._tmux("kill-window", "-t", window, check=False)
                 raise
             terminals = self._ensure_workspace(payload)
-            terminal = next(
-                (item for item in terminals if item["tmux_window"] == window), None
-            )
+            terminal = next((item for item in terminals if item["tmux_window"] == window), None)
             if terminal is None:
                 raise NodeAgentError(
                     "Vim Terminal disappeared while starting",
@@ -1559,6 +2282,19 @@ class NodeRuntime:
         except Exception:
             self._tmux("kill-session", "-t", view_session, check=False)
             raise
+
+        def cleanup_view() -> bool:
+            self._tmux("kill-session", "-t", view_session, check=False)
+            return self._tmux("has-session", "-t", view_session, check=False).returncode != 0
+
+        def freeze_view_grid() -> bool:
+            flags = self._tmux(
+                "list-clients", "-t", view_session, "-F", "#{client_flags}", check=False
+            ).stdout
+            if "ignore-size" in flags.strip().split(","):
+                return True
+            return freeze_tmux_window_size(self._tmux, window)
+
         stream = TerminalAgentStream(
             stream_id,
             process_pid,
@@ -1569,11 +2305,19 @@ class NodeRuntime:
                 view_session, enabled=enabled
             ),
             grid_resize_applied=(
-                lambda: self._complete_fresh_grid_window(window)
-                if bootstrap_grid
-                else None
+                (lambda: self._complete_fresh_grid_window(window)) if bootstrap_grid else None
             ),
-            cleanup=lambda: self._tmux("kill-session", "-t", view_session, check=False),
+            cleanup=cleanup_view,
+            freeze_grid=freeze_view_grid,
+            wait_grid_resize=lambda rows, cols: wait_tmux_browser_grid_size(
+                lambda: (
+                    self._tmux(
+                        "list-clients", "-t", view_session, "-F", TMUX_BROWSER_SIZE_FORMAT
+                    ).stdout
+                ),
+                rows=rows,
+                cols=cols,
+            ),
         )
         self.streams[stream_id] = stream
         return OperationResult(
@@ -1594,8 +2338,9 @@ class NodeRuntime:
         payload: Mapping[str, Any],
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
     ) -> OperationResult:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path)
         max_bytes = min(
             self.files.max_edit_bytes,
             max(1, int(payload.get("max_bytes") or 1)),
@@ -1617,8 +2362,9 @@ class NodeRuntime:
         )
 
     async def _write_text_open(self, payload: Mapping[str, Any]) -> OperationResult:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path, destructive=True)
         expected_digest = str(payload.get("expected_digest") or "")
         expected_mtime_ns = int(payload.get("expected_mtime_ns") or 0)
         max_bytes = min(
@@ -1647,32 +2393,75 @@ class NodeRuntime:
         payload: Mapping[str, Any],
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
     ) -> OperationResult:
-        root = self._workspace_path(payload)
-        target = self.files.resolve_regular_file(root, str(payload.get("path") or ""))
-        info = target.stat()
-        offset = max(0, min(int(payload.get("offset") or 0), info.st_size))
-        length_value = payload.get("length")
-        length = None if length_value is None else max(0, int(length_value))
-        stream_id = validate_request_id(str(payload.get("stream_id") or ""))
-        stream = DownloadAgentStream(stream_id, target, offset, length, send, self.streams)
-        self.streams[stream_id] = stream
-        return OperationResult({"stream_id": stream_id, "size": info.st_size}, start=stream.start)
+        root = self._files_workspace_path(payload)
+        relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path)
+        target = self.files.resolve_regular_file(root, relative_path)
+        parent_fd, _ = _open_directory_components(target.parent, create=False, mode=None)
+        file_fd = -1
+        try:
+            file_fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            info = os.fstat(file_fd)
+            current = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat_module.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (
+                current.st_dev,
+                current.st_ino,
+            ):
+                raise NodeAgentError("Download path changed", code="path_changed")
+            offset = max(0, min(int(payload.get("offset") or 0), info.st_size))
+            length_value = payload.get("length")
+            length = None if length_value is None else max(0, int(length_value))
+            stream_id = validate_request_id(str(payload.get("stream_id") or ""))
+            stream = DownloadAgentStream(
+                stream_id, file_fd, parent_fd, target.name, offset, length, send, self.streams
+            )
+            file_fd = parent_fd = -1
+            self.streams[stream_id] = stream
+            return OperationResult(
+                {"stream_id": stream_id, "size": info.st_size}, start=stream.start
+            )
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+            if parent_fd >= 0:
+                os.close(parent_fd)
 
     async def _upload_open(self, payload: Mapping[str, Any]) -> OperationResult:
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
         parent = str(payload.get("parent") or ".")
         filename = str(payload.get("filename") or "")
         overwrite = payload.get("overwrite") is True
         max_bytes = max(1, int(payload.get("max_bytes") or 1))
-        target = self.files.upload_target(root, parent, filename)
-        if target.exists() and not overwrite:
-            raise FileExistsError(filename)
-        stream_id = validate_request_id(str(payload.get("stream_id") or ""))
-        stream = UploadAgentStream(
-            stream_id, target, overwrite=overwrite, max_bytes=max_bytes, registry=self.streams
+        self._require_files_path(
+            root, Path(parent) / filename, destructive=True, allow_missing=True
         )
-        self.streams[stream_id] = stream
-        return OperationResult({"stream_id": stream_id})
+        target = self.files.upload_target(root, parent, filename)
+        parent_fd, _ = _open_directory_components(target.parent, create=False, mode=None)
+        try:
+            try:
+                existing = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and not stat_module.S_ISREG(existing.st_mode):
+                raise UnsupportedFileError("Upload target is not a regular file")
+            if existing is not None and not overwrite:
+                raise FileExistsError(filename)
+            stream_id = validate_request_id(str(payload.get("stream_id") or ""))
+            stream = UploadAgentStream(
+                stream_id,
+                parent_fd,
+                target.name,
+                existing=existing,
+                overwrite=overwrite,
+                max_bytes=max_bytes,
+                registry=self.streams,
+            )
+            parent_fd = -1
+            self.streams[stream_id] = stream
+            return OperationResult({"stream_id": stream_id})
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
 
     @staticmethod
     def _prepare_file_run_root(value: Path | None) -> Path | None:
@@ -1682,17 +2471,13 @@ class NodeRuntime:
         if not candidate.is_absolute():
             candidate = candidate.absolute()
         try:
-            info = candidate.lstat()
-        except FileNotFoundError:
-            ensure_private_directory(candidate)
-            info = candidate.lstat()
-        if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISDIR(info.st_mode):
+            descriptor, resolved = _open_private_directory(candidate, create=True)
+        except (OSError, RuntimeError) as exc:
             raise NodeAgentError(
-                "Node File Run state path is not a real directory",
+                "Node File Run state path is not a stable real directory",
                 code="file_run_state_invalid",
-            )
-        resolved = candidate.resolve(strict=True)
-        ensure_private_directory(resolved)
+            ) from exc
+        os.close(descriptor)
         return resolved
 
     @staticmethod
@@ -1746,6 +2531,169 @@ class NodeRuntime:
         with self._file_run_locks_guard:
             return self._file_run_locks.setdefault(workspace_id, threading.RLock())
 
+    def _assert_file_run_root(self) -> None:
+        root = self.file_run_root
+        root_fd = self.file_run_root_fd
+        if root is None or root_fd is None:
+            raise NodeAgentError(
+                "Node File Run state is unavailable", code="capability_unsupported"
+            )
+        current = -1
+        try:
+            current, _ = _open_directory_components(root, create=False, mode=None)
+            expected = os.fstat(root_fd)
+            actual = os.fstat(current)
+            if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+                raise OSError("Node File Run state directory was replaced")
+        except (OSError, RuntimeError) as exc:
+            raise NodeAgentError(
+                "Node File Run state path is invalid", code="file_run_state_invalid"
+            ) from exc
+        finally:
+            if current >= 0:
+                os.close(current)
+
+    def _file_run_metadata_fd(self, workspace_id: str, run_id: str, *, create: bool) -> int | None:
+        self._assert_file_run_root()
+        root_fd = self.file_run_root_fd
+        assert root_fd is not None
+        workspace_id = self._file_run_workspace_id(workspace_id)
+        run_id = self._file_run_id(run_id)
+        workspace_fd = -1
+        metadata_fd = -1
+        try:
+            workspace_fd = _open_directory_at(
+                root_fd, (workspace_id,), create=create, mode=None, require_owner=True
+            )
+        except FileNotFoundError as exc:
+            if workspace_id in self._file_run_workspace_ids:
+                raise NodeAgentError(
+                    "Node File Run workspace directory was replaced",
+                    code="file_run_state_invalid",
+                ) from exc
+            return None
+        except OSError as exc:
+            raise NodeAgentError(
+                "Node File Run workspace path is invalid", code="file_run_state_invalid"
+            ) from exc
+        try:
+            workspace_info = os.fstat(workspace_fd)
+            workspace_identity = (workspace_info.st_dev, workspace_info.st_ino)
+            expected_workspace = self._file_run_workspace_ids.get(workspace_id)
+            if expected_workspace is not None and expected_workspace != workspace_identity:
+                raise NodeAgentError(
+                    "Node File Run workspace directory was replaced",
+                    code="file_run_state_invalid",
+                )
+            self._file_run_workspace_ids.setdefault(workspace_id, workspace_identity)
+            if create:
+                os.fchmod(workspace_fd, 0o700)
+
+            key = (workspace_id, run_id)
+            try:
+                metadata_fd = _open_directory_at(
+                    workspace_fd, (run_id,), create=create, mode=None, require_owner=True
+                )
+            except FileNotFoundError as exc:
+                if key in self._file_run_metadata_ids:
+                    raise NodeAgentError(
+                        "Node File Run metadata directory was replaced",
+                        code="file_run_state_invalid",
+                    ) from exc
+                return None
+            except OSError as exc:
+                raise NodeAgentError(
+                    "Node File Run metadata path is invalid", code="file_run_state_invalid"
+                ) from exc
+
+            metadata_info = os.fstat(metadata_fd)
+            metadata_identity = (metadata_info.st_dev, metadata_info.st_ino)
+            expected_metadata = self._file_run_metadata_ids.get(key)
+            if expected_metadata is not None and expected_metadata != metadata_identity:
+                raise NodeAgentError(
+                    "Node File Run metadata directory was replaced",
+                    code="file_run_state_invalid",
+                )
+            self._file_run_metadata_ids.setdefault(key, metadata_identity)
+            if create:
+                os.fchmod(metadata_fd, 0o700)
+            result = metadata_fd
+            metadata_fd = -1
+            return result
+        finally:
+            os.close(workspace_fd)
+            if metadata_fd >= 0:
+                os.close(metadata_fd)
+
+    def _read_file_run_leaf(
+        self, directory_fd: int, name: str, *, limit: int = 16 * 1024
+    ) -> tuple[bytes, float]:
+        try:
+            descriptor = _open_private_state_file(directory_fd, name, os.O_RDONLY)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise NodeAgentError(
+                "Node File Run metadata file is invalid", code="file_run_state_invalid"
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat_module.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+                or info.st_size > limit
+            ):
+                raise NodeAgentError(
+                    "Node File Run metadata file is invalid", code="file_run_state_invalid"
+                )
+            content = bytearray()
+            while len(content) <= limit:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(content)))
+                if not chunk:
+                    break
+                content.extend(chunk)
+            final = os.fstat(descriptor)
+            if (
+                len(content) > limit
+                or final.st_nlink != 1
+                or (final.st_dev, final.st_ino) != (info.st_dev, info.st_ino)
+            ):
+                raise NodeAgentError(
+                    "Node File Run metadata file changed while reading",
+                    code="file_run_state_invalid",
+                )
+            return bytes(content), info.st_mtime
+        finally:
+            os.close(descriptor)
+
+    def _file_run_leaf_exists(self, directory_fd: int, name: str) -> bool:
+        try:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (
+            not stat_module.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+        ):
+            raise NodeAgentError(
+                "Node File Run metadata file is invalid", code="file_run_state_invalid"
+            )
+        return True
+
+    def _file_run_dispatch_time(self, metadata_dir: Path, run_id: str) -> float | None:
+        directory_fd = self._file_run_metadata_fd(metadata_dir.parent.name, run_id, create=False)
+        if directory_fd is None:
+            return None
+        try:
+            _content, modified_at = self._read_file_run_leaf(directory_fd, "request-id", limit=4096)
+            return modified_at
+        except (FileNotFoundError, OSError, NodeAgentError):
+            return None
+        finally:
+            os.close(directory_fd)
+
     def _file_run_metadata_dir(
         self,
         workspace_id: str,
@@ -1760,72 +2708,205 @@ class NodeRuntime:
             )
         workspace_dir = root / self._file_run_workspace_id(workspace_id)
         metadata_dir = workspace_dir / self._file_run_id(run_id)
-        metadata_dir.relative_to(root)
-        for directory in (workspace_dir, metadata_dir):
-            try:
-                info = directory.lstat()
-            except FileNotFoundError:
-                if not create:
-                    break
-                directory.mkdir(mode=0o700)
-                info = directory.lstat()
-            if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISDIR(info.st_mode):
-                raise NodeAgentError(
-                    "Node File Run metadata path is invalid",
-                    code="file_run_state_invalid",
-                )
-            if directory.resolve(strict=True) != directory:
-                raise NodeAgentError(
-                    "Node File Run metadata path is not canonical",
-                    code="file_run_state_invalid",
-                )
-            with contextlib.suppress(PermissionError):
-                directory.chmod(0o700)
+        descriptor = self._file_run_metadata_fd(workspace_id, run_id, create=create)
+        if descriptor is not None:
+            os.close(descriptor)
         return metadata_dir
+
+    def _snapshot_file_run_source(
+        self,
+        root: Path,
+        relative_path: str,
+        expected_digest: str,
+        *,
+        remote_run_id: object = None,
+    ) -> tuple[RunnableFile, int]:
+        components = relative_path.split("/")
+        if (
+            not relative_path
+            or relative_path.startswith("/")
+            or any(part in {"", ".", ".."} for part in components)
+        ):
+            raise UnsupportedFileError("File Run path must be Workspace-relative")
+        with self._workspace_tmux_cwd(root, remote_run_id=remote_run_id) as workspace_fd:
+            parent_fd = (
+                _open_directory_at(workspace_fd, components[:-1], create=False, mode=None)
+                if len(components) > 1
+                else os.dup(workspace_fd)
+            )
+            source_fd = -1
+            try:
+                source_fd = os.open(
+                    components[-1],
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                before = os.fstat(source_fd)
+                if not stat_module.S_ISREG(before.st_mode):
+                    raise UnsupportedFileError("Only regular files can be executed")
+                if before.st_size > self.files.max_edit_bytes:
+                    raise UnsupportedFileError("File exceeds the editable size limit")
+                content = bytearray()
+                while len(content) <= self.files.max_edit_bytes:
+                    chunk = os.read(
+                        source_fd,
+                        min(64 * 1024, self.files.max_edit_bytes + 1 - len(content)),
+                    )
+                    if not chunk:
+                        break
+                    content.extend(chunk)
+                if len(content) > self.files.max_edit_bytes or b"\x00" in content:
+                    raise UnsupportedFileError("File cannot be executed")
+                try:
+                    bytes(content).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise UnsupportedFileError("Only UTF-8 text files can be executed") from exc
+                after = os.fstat(source_fd)
+                current = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
+
+                def signature(info: os.stat_result) -> tuple[int, ...]:
+                    return (
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_mode,
+                        info.st_nlink,
+                        info.st_uid,
+                        info.st_size,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
+                    )
+
+                if signature(before) != signature(after) or signature(after) != signature(current):
+                    raise FileConflictError("The file changed before execution")
+                digest = hashlib.sha256(content).hexdigest()
+                if digest != expected_digest:
+                    raise FileConflictError("The file changed before execution")
+                runnable = RunnableFile(
+                    relative_path=relative_path,
+                    digest=digest,
+                    executable=bool(before.st_mode & 0o111),
+                    has_shebang=content.startswith(b"#!"),
+                )
+                try:
+                    snapshot_fd = _make_sealed_memfd(
+                        bytes(content), "termroom-file-run-source", mode=0o400
+                    )
+                except OSError as exc:
+                    raise NodeAgentError(
+                        "Immutable File Run source descriptors are unavailable",
+                        code="capability_unsupported",
+                    ) from exc
+                return runnable, snapshot_fd
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
+                os.close(parent_fd)
 
     def _write_file_run_metadata(
         self,
         metadata_dir: Path,
         run_id: str,
         request_record: Mapping[str, Any],
-    ) -> Path:
-        metadata_dir = self._file_run_metadata_dir(metadata_dir.parent.name, run_id, create=True)
-        request_id = metadata_dir / "request-id"
-        if request_id.exists():
-            if request_id.is_symlink() or not request_id.is_file():
-                raise NodeAgentError(
-                    "Node File Run metadata identity is invalid",
-                    code="file_run_state_invalid",
-                )
-            existing = request_id.read_text(encoding="utf-8").strip()
-            if existing != run_id:
+    ) -> tuple[Path, int, int]:
+        workspace_id = metadata_dir.parent.name
+        metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=True)
+        directory_fd = self._file_run_metadata_fd(workspace_id, run_id, create=True)
+        assert directory_fd is not None
+        runner_fd = -1
+        try:
+            try:
+                content, _ = self._read_file_run_leaf(directory_fd, "request-id", limit=4096)
+            except FileNotFoundError:
+                content = None
+            if content is not None and content.decode("utf-8").strip() != run_id:
                 raise NodeAgentError(
                     "Node File Run metadata identity does not match",
                     code="file_run_state_invalid",
                 )
-        _atomic_private_write(request_id, (run_id + "\n").encode("utf-8"), mode=0o600)
-        _atomic_private_write(
-            metadata_dir / "request.json",
-            json.dumps(dict(request_record), ensure_ascii=False, separators=(",", ":")).encode(
-                "utf-8"
-            ),
-            mode=0o600,
-        )
-        wrapper = metadata_dir / "runner.sh"
-        _atomic_private_write(wrapper, FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"), mode=0o700)
-        return wrapper
+            _atomic_private_write(
+                Path("request-id"),
+                (run_id + "\n").encode("utf-8"),
+                mode=0o600,
+                directory_fd=directory_fd,
+            )
+            _atomic_private_write(
+                Path("request.json"),
+                json.dumps(dict(request_record), ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                ),
+                mode=0o600,
+                directory_fd=directory_fd,
+            )
+            _atomic_private_write(
+                Path("runner.sh"),
+                FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"),
+                mode=0o700,
+                directory_fd=directory_fd,
+            )
+            runner_fd = _open_private_state_file(directory_fd, "runner.sh", os.O_RDONLY)
+            info = os.fstat(runner_fd)
+            if (
+                not stat_module.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+                or stat_module.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise NodeAgentError(
+                    "Node File Run runner is invalid", code="file_run_state_invalid"
+                )
+            return metadata_dir, directory_fd, runner_fd
+        except BaseException:
+            if runner_fd >= 0:
+                os.close(runner_fd)
+            os.close(directory_fd)
+            raise
 
     @staticmethod
-    def _read_file_run_record(path: Path, run_id: str) -> dict[str, Any] | None:
+    def _assert_file_run_execution_handles(
+        metadata_dir: Path, metadata_fd: int, runner_fd: int
+    ) -> None:
         try:
-            info = path.lstat()
-            if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+            _assert_directory_path_matches(metadata_dir, metadata_fd)
+            current = os.stat("runner.sh", dir_fd=metadata_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise NodeAgentError(
+                "Node File Run metadata path changed", code="file_run_state_invalid"
+            ) from exc
+        opened = os.fstat(runner_fd)
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise NodeAgentError(
+                "Node File Run runner changed before execution",
+                code="file_run_state_invalid",
+            )
+
+    def _release_file_run_execution(self, workspace_id: str, run_id: str) -> None:
+        descriptors = self._file_run_execution_fds.pop((workspace_id, run_id), None)
+        if descriptors is not None:
+            for descriptor in descriptors:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+    def _read_file_run_record(self, path: Path, run_id: str) -> dict[str, Any] | None:
+        directory_fd = -1
+        try:
+            relative = path.parent.relative_to(self.file_run_root) if self.file_run_root else None
+            if relative is None or len(relative.parts) != 2:
                 return None
-            if info.st_size > 16 * 1024:
+            directory_fd = self._file_run_metadata_fd(relative.parts[0], run_id, create=False)
+            if directory_fd is None:
                 return None
-            value = json.loads(path.read_text(encoding="utf-8"))
+            content, _ = self._read_file_run_leaf(directory_fd, path.name)
+            value = json.loads(content.decode("utf-8"))
         except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
+        finally:
+            if directory_fd is not None and directory_fd >= 0:
+                os.close(directory_fd)
         if not isinstance(value, dict) or value.get("run_id") != run_id:
             return None
         return value
@@ -1841,12 +2922,14 @@ class NodeRuntime:
 
     def _inspect_runnable(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         version = self._runner_registry_version(payload)
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
+        relative_path = str(payload.get("path") or "")
+        self._require_files_path(root, relative_path)
         expected_value = payload.get("expected_digest")
         expected_digest = None if expected_value is None else self._file_run_digest(expected_value)
         runnable = self.files.inspect_runnable(
             root,
-            str(payload.get("path") or ""),
+            relative_path,
             expected_digest=expected_digest,
         )
         runner = resolve_runner(runnable)
@@ -1858,14 +2941,20 @@ class NodeRuntime:
 
     def _start_file_run(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._runner_registry_version(payload)
-        root = self._workspace_path(payload)
+        root = self._files_workspace_path(payload)
+        relative_path = str(payload.get("path") or "")
+        self._require_files_path(
+            root,
+            relative_path,
+            allow_missing=True,
+            allow_missing_parents=True,
+        )
         session = self._session(payload)
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))
         expected_digest = self._file_run_digest(payload.get("expected_digest"))
         expected_runner_id = str(payload.get("runner_id") or "")
         expected_runner_version = payload.get("runner_version")
-        relative_path = str(payload.get("path") or "")
         if isinstance(expected_runner_version, bool):
             raise NodeAgentError("File Run Runner version is invalid", code="runner_mismatch")
         try:
@@ -1885,7 +2974,9 @@ class NodeRuntime:
 
         with self._file_run_lock(workspace_id):
             metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
-            if metadata_dir.exists():
+            existing_metadata_fd = self._file_run_metadata_fd(workspace_id, run_id, create=False)
+            if existing_metadata_fd is not None:
+                os.close(existing_metadata_fd)
                 stored_request = self._read_file_run_record(metadata_dir / "request.json", run_id)
                 if stored_request is None:
                     raise NodeAgentError(
@@ -1918,8 +3009,11 @@ class NodeRuntime:
                     "replayed": True,
                 }
 
-            runnable = self.files.inspect_runnable(
-                root, relative_path, expected_digest=expected_digest
+            runnable, source_fd = self._snapshot_file_run_source(
+                root,
+                relative_path,
+                expected_digest,
+                remote_run_id=payload.get("remote_run_id"),
             )
             runner = resolve_runner(runnable)
             if (
@@ -1927,47 +3021,62 @@ class NodeRuntime:
                 or runner.id != expected_runner_id
                 or runner.version != runner_version
             ):
+                os.close(source_fd)
                 raise NodeAgentError(
                     "File Run Runner changed before execution",
                     code="runner_mismatch",
                 )
 
             metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=True)
-            wrapper = self._write_file_run_metadata(metadata_dir, run_id, request_record)
-            self._ensure_workspace(payload)
-            windows = self._list_terminals(session)
-            terminal = next((item for item in windows if item.get("role") == "file_run"), None)
-            created = terminal is None
-            if terminal is None:
-                result = self._tmux(
-                    "new-window",
-                    "-d",
-                    "-P",
-                    "-F",
-                    "#{window_id}",
-                    "-t",
-                    session,
-                    "-n",
-                    "Run",
-                    "-c",
-                    str(root),
+            try:
+                metadata_dir, metadata_fd, runner_fd = self._write_file_run_metadata(
+                    metadata_dir, run_id, request_record
                 )
-                terminal = {
-                    "tmux_window": result.stdout.strip(),
-                    "role": "shell",
-                    "managed_run_id": None,
-                }
-            else:
-                pane = self._file_run_pane(str(terminal["tmux_window"]))
-                if pane is not None and not pane["dead"]:
-                    raise NodeAgentError(
-                        "The managed File Run Terminal is still active",
-                        code="file_run_slot_occupied",
+            except BaseException:
+                os.close(source_fd)
+                raise
+            try:
+                self._ensure_workspace(payload)
+                self._assert_file_run_execution_handles(metadata_dir, metadata_fd, runner_fd)
+                windows = self._list_terminals(session)
+                terminal = next((item for item in windows if item.get("role") == "file_run"), None)
+                created = terminal is None
+                if terminal is None:
+                    result = self._tmux(
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-t",
+                        session,
+                        "-n",
+                        "Run",
+                        "-c",
+                        "/",
                     )
+                    terminal = {
+                        "tmux_window": result.stdout.strip(),
+                        "role": "shell",
+                        "managed_run_id": None,
+                    }
+                else:
+                    pane = self._file_run_pane(str(terminal["tmux_window"]))
+                    if pane is not None and not pane["dead"]:
+                        raise NodeAgentError(
+                            "The managed File Run Terminal is still active",
+                            code="file_run_slot_occupied",
+                        )
+            except BaseException:
+                os.close(source_fd)
+                os.close(runner_fd)
+                os.close(metadata_fd)
+                raise
 
             tmux_window = str(terminal["tmux_window"])
             previous_role = str(terminal.get("role") or "shell")
             previous_run_id = str(terminal.get("managed_run_id") or "") or None
+            runner_exec_fd = -1
             try:
                 self._tmux("set-window-option", "-t", tmux_window, "remain-on-exit", "on")
                 self._tmux(
@@ -1984,28 +3093,48 @@ class NodeRuntime:
                     TMUX_MANAGED_RUN_OPTION,
                     run_id,
                 )
-                result = self._tmux(
-                    "respawn-pane",
-                    "-k",
-                    "-c",
-                    str(root),
-                    "-t",
-                    tmux_window,
-                    "/bin/sh",
-                    str(wrapper),
-                    str(metadata_dir),
-                    run_id,
-                    runner.id,
-                    runner.runtime_error_code,
-                    *runner.argv,
-                    check=False,
-                )
+                with self._workspace_tmux_cwd(
+                    root, remote_run_id=payload.get("remote_run_id")
+                ) as cwd_fd:
+                    self._assert_file_run_execution_handles(metadata_dir, metadata_fd, runner_fd)
+                    runner_exec_fd = _make_sealed_memfd(
+                        FILE_RUN_WRAPPER_SCRIPT.encode("utf-8"),
+                        "termroom-file-runner",
+                    )
+                    try:
+                        result = self._tmux_with_descriptors(
+                            ("respawn-pane", "-k", "-c", "/", "-t", tmux_window),
+                            (cwd_fd, metadata_fd, runner_exec_fd, source_fd),
+                            (
+                                "/bin/sh",
+                                "{fd:2}",
+                                "{fd:1}",
+                                run_id,
+                                runner.id,
+                                runner.runtime_error_code,
+                                *runner.argv[:-1],
+                                "{fd:3}",
+                            ),
+                            inherit=(1, 2, 3),
+                            check=False,
+                        )
+                    finally:
+                        os.close(runner_exec_fd)
+                        runner_exec_fd = -1
+                os.close(source_fd)
                 if result.returncode:
                     raise NodeAgentError(
                         result.stderr.strip() or "File Run could not start",
                         code="tmux_failed",
                     )
             except (NodeAgentError, OSError, subprocess.SubprocessError):
+                if runner_exec_fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(runner_exec_fd)
+                with contextlib.suppress(OSError):
+                    os.close(source_fd)
+                os.close(runner_fd)
+                os.close(metadata_fd)
                 self._rollback_file_run_slot(
                     session,
                     tmux_window,
@@ -2015,6 +3144,10 @@ class NodeRuntime:
                     previous_run_id=previous_run_id,
                 )
                 raise
+            self._file_run_execution_fds[(workspace_id, run_id)] = (
+                metadata_fd,
+                runner_fd,
+            )
 
             windows = self._list_terminals(session)
             terminal = next(
@@ -2026,10 +3159,13 @@ class NodeRuntime:
                 None,
             )
             if terminal is None:
+                self._release_file_run_execution(workspace_id, run_id)
                 raise NodeAgentError(
                     "Managed File Run Terminal is missing", code="managed_terminal_missing"
                 )
             observation, _ = self._file_run_observation(session, metadata_dir, run_id)
+            if observation["state"] in {"finished", "failed", "stopped", "lost"}:
+                self._release_file_run_execution(workspace_id, run_id)
             return {
                 "terminal": terminal,
                 "terminals": windows,
@@ -2046,6 +3182,8 @@ class NodeRuntime:
         with self._file_run_lock(workspace_id):
             metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
             observation, windows = self._file_run_observation(session, metadata_dir, run_id)
+            if observation["state"] in {"finished", "failed", "stopped", "lost"}:
+                self._release_file_run_execution(workspace_id, run_id)
             result: dict[str, Any] = {"observation": observation}
             if windows is not None:
                 result["terminals"] = windows
@@ -2103,8 +3241,14 @@ class NodeRuntime:
                 },
                 windows,
             )
-        force_marker = metadata_dir / "force-stopped"
-        if force_marker.is_file() and not force_marker.is_symlink():
+        metadata_fd = self._file_run_metadata_fd(metadata_dir.parent.name, run_id, create=False)
+        force_stopped = False
+        if metadata_fd is not None:
+            try:
+                force_stopped = self._file_run_leaf_exists(metadata_fd, "force-stopped")
+            finally:
+                os.close(metadata_fd)
+        if force_stopped:
             return (
                 {
                     "state": "stopped",
@@ -2114,7 +3258,7 @@ class NodeRuntime:
                 },
                 windows,
             )
-        dispatch_at = file_run_dispatch_timestamp(metadata_dir / "request-id")
+        dispatch_at = self._file_run_dispatch_time(metadata_dir, run_id)
         if file_run_completion_grace_active(pane, dispatch_at=dispatch_at):
             return (
                 {
@@ -2142,59 +3286,67 @@ class NodeRuntime:
         workspace_id = self._file_run_workspace_id(payload.get("workspace_id"))
         run_id = self._file_run_id(payload.get("run_id"))
         with self._file_run_lock(workspace_id):
-            metadata_dir = self._file_run_metadata_dir(workspace_id, run_id, create=False)
-            request_id = metadata_dir / "request-id"
-            try:
-                stored_id = request_id.read_text(encoding="utf-8").strip()
-            except (FileNotFoundError, OSError, UnicodeDecodeError):
+            metadata_fd = self._file_run_metadata_fd(workspace_id, run_id, create=False)
+            if metadata_fd is None:
                 return False
-            if request_id.is_symlink() or stored_id != run_id:
-                return False
-            if not self._session_exists(session):
-                return False
-            terminal = next(
-                (
-                    item
-                    for item in self._list_terminals(session)
-                    if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
-                ),
-                None,
-            )
-            if terminal is None:
-                return False
-            pane = self._file_run_pane(str(terminal["tmux_window"]))
-            if pane is None or pane["dead"]:
-                return False
-            _atomic_private_write(
-                metadata_dir / "stop-requested-at",
-                (str(time.time()) + "\n").encode("utf-8"),
-                mode=0o600,
-            )
-            if not force:
-                result = self._tmux(
-                    "send-keys",
-                    "-t",
-                    str(terminal["tmux_window"]),
-                    "C-c",
-                    check=False,
+            with contextlib.ExitStack() as cleanup:
+                cleanup.callback(os.close, metadata_fd)
+                try:
+                    stored_bytes, _ = self._read_file_run_leaf(
+                        metadata_fd, "request-id", limit=4096
+                    )
+                    stored_id = stored_bytes.decode("utf-8").strip()
+                except (FileNotFoundError, OSError, UnicodeDecodeError, NodeAgentError):
+                    return False
+                if stored_id != run_id:
+                    return False
+                if not self._session_exists(session):
+                    return False
+                terminal = next(
+                    (
+                        item
+                        for item in self._list_terminals(session)
+                        if item.get("role") == "file_run" and item.get("managed_run_id") == run_id
+                    ),
+                    None,
                 )
-                return result.returncode == 0
-            pane_pid = pane.get("pane_pid")
-            if not isinstance(pane_pid, int):
-                raise NodeAgentError(
-                    "Managed File Run process identity is unavailable",
-                    code="managed_terminal_missing",
+                if terminal is None:
+                    return False
+                pane = self._file_run_pane(str(terminal["tmux_window"]))
+                if pane is None or pane["dead"]:
+                    return False
+                _atomic_private_write(
+                    Path("stop-requested-at"),
+                    (str(time.time()) + "\n").encode("utf-8"),
+                    mode=0o600,
+                    directory_fd=metadata_fd,
                 )
-            try:
-                os.killpg(pane_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                return False
-            _atomic_private_write(
-                metadata_dir / "force-stopped",
-                (str(time.time()) + "\n").encode("utf-8"),
-                mode=0o600,
-            )
-            return True
+                if not force:
+                    result = self._tmux(
+                        "send-keys",
+                        "-t",
+                        str(terminal["tmux_window"]),
+                        "C-c",
+                        check=False,
+                    )
+                    return result.returncode == 0
+                pane_pid = pane.get("pane_pid")
+                if not isinstance(pane_pid, int):
+                    raise NodeAgentError(
+                        "Managed File Run process identity is unavailable",
+                        code="managed_terminal_missing",
+                    )
+                try:
+                    os.killpg(pane_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return False
+                _atomic_private_write(
+                    Path("force-stopped"),
+                    (str(time.time()) + "\n").encode("utf-8"),
+                    mode=0o600,
+                    directory_fd=metadata_fd,
+                )
+                return True
 
     def _rollback_file_run_slot(
         self,
@@ -2316,6 +3468,103 @@ class NodeRuntime:
     def _list_terminals(self, session: str) -> list[dict[str, Any]]:
         result = self._tmux("list-windows", "-t", session, "-F", TMUX_TERMINAL_RECORD_FORMAT)
         return [dict(item) for item in parse_tmux_terminal_records(result.stdout)]
+
+    def _tmux_with_descriptors(
+        self,
+        tmux_args: Sequence[str],
+        descriptors: Sequence[int],
+        command: Sequence[str] = (),
+        *,
+        cwd_index: int = 0,
+        inherit: Sequence[int] = (),
+        environment: Mapping[str, str] | None = None,
+        rollback: Callable[[subprocess.CompletedProcess[str]], None] | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        if (
+            not descriptors
+            or not 0 <= cwd_index < len(descriptors)
+            or any(not 0 <= index < len(descriptors) for index in inherit)
+            or not hasattr(socket, "SCM_RIGHTS")
+            or not hasattr(socket, "SO_PEERCRED")
+        ):
+            raise NodeAgentError(
+                "tmux descriptor handoff is unavailable", code="capability_unsupported"
+            )
+        expected: list[list[int]] = []
+        for descriptor in descriptors:
+            info = os.fstat(descriptor)
+            value = [info.st_dev, info.st_ino, stat_module.S_IFMT(info.st_mode), info.st_uid]
+            if stat_module.S_ISREG(info.st_mode):
+                value.append(info.st_nlink)
+            expected.append(value)
+        endpoint = "termroom-" + uuid.uuid4().hex
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection: socket.socket | None = None
+        listener.settimeout(10.0)
+        try:
+            listener.bind("\0" + endpoint)
+            listener.listen(1)
+            config = json.dumps(
+                {
+                    "expected": expected,
+                    "cwd": cwd_index,
+                    "inherit": list(inherit),
+                    "command": list(command),
+                    "environment": dict(environment or {}),
+                },
+                separators=(",", ":"),
+            )
+            result = self._tmux(
+                *tmux_args,
+                sys.executable,
+                "-c",
+                _TMUX_DESCRIPTOR_LAUNCHER,
+                endpoint,
+                config,
+                check=False,
+            )
+            if result.returncode:
+                if check:
+                    raise NodeAgentError(
+                        result.stderr.strip() or "tmux operation failed", code="tmux_failed"
+                    )
+                return result
+            try:
+                connection, _ = listener.accept()
+                connection.settimeout(5.0)
+                credentials = connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                )
+                _pid, uid, _gid = struct.unpack("3i", credentials)
+                if uid != os.geteuid():
+                    raise OSError("tmux pane launcher has an unexpected owner")
+                descriptor_array = array.array("i", descriptors)
+                sent = connection.sendmsg(
+                    [b"F"],
+                    [
+                        (
+                            socket.SOL_SOCKET,
+                            socket.SCM_RIGHTS,
+                            descriptor_array.tobytes(),
+                        )
+                    ],
+                )
+                if sent != 1 or connection.recv(1) != b"R":
+                    raise OSError("tmux pane launcher rejected descriptor handoff")
+            except (OSError, TimeoutError) as exc:
+                if rollback is not None:
+                    with contextlib.suppress(Exception):
+                        rollback(result)
+                raise NodeAgentError(
+                    "tmux pane did not acquire its verified descriptors",
+                    code="tmux_handoff_failed",
+                ) from exc
+            return result
+        finally:
+            if connection is not None:
+                connection.close()
+            listener.close()
 
     @staticmethod
     def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -2593,6 +3842,8 @@ class TerminalAgentStream:
         set_grid_resize: Callable[[bool], bool] | None = None,
         grid_resize_applied: Callable[[], object] | None = None,
         cleanup: Callable[[], object] | None = None,
+        wait_grid_resize: Callable[[int, int], bool] | None = None,
+        freeze_grid: Callable[[], bool] | None = None,
     ) -> None:
         self.stream_id = stream_id
         self.process_pid = process_pid
@@ -2602,9 +3853,129 @@ class TerminalAgentStream:
         self.set_grid_resize = set_grid_resize
         self.grid_resize_applied = grid_resize_applied
         self.cleanup = cleanup
+        self.wait_grid_resize = wait_grid_resize
+        self.freeze_grid = freeze_grid
         self.grid_active = False
         self.last_viewport: tuple[int, int] | None = None
         self.closed = False
+        self.resize_lock = asyncio.Lock()
+        self.resize_revision = 0
+        self.resize_payload: dict[str, Any] | None = None
+        self.resize_result: dict[str, Any] | None = None
+        self.cleanup_confirmed = False
+
+    async def resize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        values = {
+            key: payload.get(key)
+            for key in ("stream_id", "revision", "rows", "cols", "affects_grid", "bootstrap")
+        }
+        revision, rows, cols = values["revision"], values["rows"], values["cols"]
+        if (
+            values["stream_id"] != self.stream_id
+            or type(revision) is not int
+            or not 1 <= revision <= 2**31 - 1
+            or type(rows) is not int
+            or not 4 <= rows <= 500
+            or type(cols) is not int
+            or not 20 <= cols <= 1000
+            or type(values["affects_grid"]) is not bool
+            or type(values["bootstrap"]) is not bool
+            or (values["bootstrap"] and not values["affects_grid"])
+        ):
+            raise NodeAgentError("Terminal resize is invalid", code="terminal_resize_invalid")
+        async with self.resize_lock:
+            if revision == self.resize_revision and values == self.resize_payload:
+                assert self.resize_result is not None
+                return dict(self.resize_result)
+            if revision <= self.resize_revision or self.closed:
+                raise NodeAgentError("Terminal resize is stale", code="terminal_resize_stale")
+            if values["bootstrap"] and self.grid_resize_applied is None:
+                raise NodeAgentError("Terminal bootstrap is stale", code="terminal_resize_stale")
+            self.resize_revision = revision
+            self.resize_payload = values
+            outcome = {
+                **values,
+                "ok": False,
+                "shared_applied": False,
+                "viewport_applied": False,
+                "passive_restored": False,
+                "bootstrap_consumed": False,
+                "grid_active": self.grid_active,
+                "retryable": True,
+                "cleanup_confirmed": False,
+            }
+            self.resize_result = outcome
+            affects_grid = values["affects_grid"]
+            try:
+                if affects_grid != self.grid_active or affects_grid:
+                    if self.set_grid_resize is not None and not await asyncio.to_thread(
+                        self.set_grid_resize, affects_grid
+                    ):
+                        if self.grid_active and not affects_grid:
+                            await self.close()
+                            outcome.update(
+                                retryable=False,
+                                cleanup_confirmed=self.cleanup_confirmed,
+                                grid_active=self.grid_active and not self.cleanup_confirmed,
+                            )
+                        return dict(outcome)
+                    self.grid_active = affects_grid
+                viewport = (rows, cols)
+                if viewport != self.last_viewport:
+                    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                    await asyncio.to_thread(
+                        fcntl.ioctl, self.master_fd, termios.TIOCSWINSZ, winsize
+                    )
+                    os.killpg(self.process_pid, signal.SIGWINCH)
+                    self.last_viewport = viewport
+                outcome["viewport_applied"] = True
+                if (
+                    affects_grid
+                    and self.wait_grid_resize is not None
+                    and not await asyncio.to_thread(self.wait_grid_resize, rows, cols)
+                ):
+                    raise NodeAgentError(
+                        "Terminal grid resize was not applied", code="terminal_resize_failed"
+                    )
+                outcome["shared_applied"] = affects_grid
+                if affects_grid and self.grid_resize_applied is not None:
+                    await asyncio.to_thread(self.grid_resize_applied)
+                    self.grid_resize_applied = None
+                    outcome["bootstrap_consumed"] = True
+                if values["bootstrap"]:
+                    if self.freeze_grid is not None and not await asyncio.to_thread(
+                        self.freeze_grid
+                    ):
+                        raise NodeAgentError(
+                            "Terminal grid freeze failed", code="terminal_resize_failed"
+                        )
+                    if self.set_grid_resize is not None and not await asyncio.to_thread(
+                        self.set_grid_resize, False
+                    ):
+                        await self.close()
+                        outcome.update(
+                            retryable=False,
+                            cleanup_confirmed=self.cleanup_confirmed,
+                            grid_active=self.grid_active and not self.cleanup_confirmed,
+                        )
+                        return dict(outcome)
+                    self.grid_active = False
+                outcome.update(ok=True, passive_restored=not self.grid_active, retryable=False)
+            except (OSError, NodeAgentError):
+                if outcome["shared_applied"]:
+                    await self.close()
+                    outcome.update(retryable=False, cleanup_confirmed=self.cleanup_confirmed)
+                elif self.grid_active:
+                    if self.set_grid_resize is not None and await asyncio.to_thread(
+                        self.set_grid_resize, False
+                    ):
+                        self.grid_active = False
+                    else:
+                        await self.close()
+                        outcome.update(retryable=False, cleanup_confirmed=self.cleanup_confirmed)
+            finally:
+                outcome["grid_active"] = self.grid_active and not self.cleanup_confirmed
+            return dict(outcome)
 
     async def start(self) -> None:
         try:
@@ -2629,49 +4000,34 @@ class TerminalAgentStream:
             await asyncio.to_thread(os.write, self.master_fd, chunk)
 
     async def control(self, kind: str, values: Mapping[str, Any]) -> None:
-        if self.closed or kind != "resize":
-            return
-        affects_grid = values.get("affects_grid", False)
-        if type(affects_grid) is not bool:
+        if kind == "resize":
             raise NodeAgentError(
-                "Terminal resize control is invalid", code="stream_control_invalid"
+                "Terminal resize requires an acknowledged request",
+                code="terminal_resize_unacknowledged",
             )
-        role_changed = affects_grid != self.grid_active
-        sync_grid_role = role_changed or affects_grid
-        if sync_grid_role:
-            if self.set_grid_resize is not None and not await asyncio.to_thread(
-                self.set_grid_resize, affects_grid
-            ):
-                return
-            self.grid_active = affects_grid
-        rows = max(4, min(int(values.get("rows") or 24), 500))
-        cols = max(20, min(int(values.get("cols") or 80), 1000))
-        viewport = (rows, cols)
-        if viewport == self.last_viewport and not (sync_grid_role and affects_grid):
-            return
-        winsize = struct.pack("HHHH", rows, cols, 0, 0)
-        await asyncio.to_thread(fcntl.ioctl, self.master_fd, termios.TIOCSWINSZ, winsize)
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(self.process_pid, signal.SIGWINCH)
-        self.last_viewport = viewport
-        if affects_grid and self.grid_resize_applied is not None:
-            callback = self.grid_resize_applied
-            self.grid_resize_applied = None
-            await asyncio.to_thread(callback)
 
     async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
         self.registry.pop(self.stream_id, None)
+        if self.grid_active and self.freeze_grid is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.freeze_grid)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(self.process_pid, signal.SIGTERM)
-        await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0)
+        if not await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process_pid, signal.SIGKILL)
+            await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0)
         with contextlib.suppress(OSError):
             os.close(self.master_fd)
         if self.cleanup is not None:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(self.cleanup)
+            try:
+                result = await asyncio.to_thread(self.cleanup)
+                self.cleanup_confirmed = result is True
+            except Exception:
+                self.cleanup_confirmed = False
 
 
 class TextDownloadAgentStream:
@@ -2730,14 +4086,18 @@ class DownloadAgentStream:
     def __init__(
         self,
         stream_id: str,
-        path: Path,
+        file_fd: int,
+        parent_fd: int,
+        name: str,
         offset: int,
         length: int | None,
         send: Callable[[Mapping[str, Any]], Awaitable[None]],
         registry: dict[str, AgentStream],
     ) -> None:
         self.stream_id = stream_id
-        self.path = path
+        self.file_fd = file_fd
+        self.parent_fd = parent_fd
+        self.name = name
         self.offset = offset
         self.length = length
         self.send = send
@@ -2746,7 +4106,16 @@ class DownloadAgentStream:
 
     async def start(self) -> None:
         try:
-            with self.path.open("rb") as handle:
+            opened = os.fstat(self.file_fd)
+            current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            if not stat_module.S_ISREG(current.st_mode) or (opened.st_dev, opened.st_ino) != (
+                current.st_dev,
+                current.st_ino,
+            ):
+                raise NodeAgentError("Download path changed", code="path_changed")
+            descriptor = self.file_fd
+            self.file_fd = -1
+            with os.fdopen(descriptor, "rb") as handle:
                 handle.seek(self.offset)
                 remaining = self.length
                 while not self.closed:
@@ -2772,7 +4141,9 @@ class DownloadAgentStream:
                         {
                             "type": "stream.error",
                             "stream_id": self.stream_id,
-                            "code": "download_failed",
+                            "code": exc.code
+                            if isinstance(exc, NodeAgentError)
+                            else "download_failed",
                             "error": str(exc)[:500],
                         }
                     )
@@ -2788,30 +4159,47 @@ class DownloadAgentStream:
     async def close(self) -> None:
         self.closed = True
         self.registry.pop(self.stream_id, None)
+        for name in ("file_fd", "parent_fd"):
+            descriptor = getattr(self, name)
+            if descriptor >= 0:
+                os.close(descriptor)
+                setattr(self, name, -1)
 
 
 class UploadAgentStream:
     def __init__(
         self,
         stream_id: str,
-        target: Path,
+        parent_fd: int,
+        target_name: str,
         *,
+        existing: os.stat_result | None,
         overwrite: bool,
         max_bytes: int,
         registry: dict[str, AgentStream],
     ) -> None:
         self.stream_id = stream_id
-        self.target = target
+        self.parent_fd = parent_fd
+        self.target_name = target_name
+        self.existing_identity = (
+            (existing.st_dev, existing.st_ino) if existing is not None else None
+        )
+        self.existing_mode = (
+            stat_module.S_IMODE(existing.st_mode) if existing is not None else 0o644
+        )
         self.overwrite = overwrite
         self.max_bytes = max_bytes
         self.registry = registry
         self.total = 0
         self.closed = False
-        temporary_fd, temporary_name = tempfile.mkstemp(
-            dir=target.parent, prefix=f".{target.name}.termroom-"
+        self.temporary_name = f".{target_name}.termroom-{uuid.uuid4().hex}"
+        temporary_fd = os.open(
+            self.temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
         )
         self._temporary = os.fdopen(temporary_fd, "wb")
-        self.temp_path = Path(temporary_name)
 
     async def feed(self, chunk: bytes) -> None:
         if self.closed:
@@ -2832,26 +4220,54 @@ class UploadAgentStream:
             return
         self.closed = True
         self.registry.pop(self.stream_id, None)
-        await asyncio.to_thread(self._temporary.flush)
-        await asyncio.to_thread(os.fsync, self._temporary.fileno())
-        await asyncio.to_thread(self._temporary.close)
-        if not self.overwrite:
-            os.chmod(self.temp_path, 0o644)
-            try:
-                os.link(self.temp_path, self.target, follow_symlinks=False)
-            except FileExistsError:
-                self.temp_path.unlink(missing_ok=True)
-                raise FileExistsError(self.target.name) from None
-            self.temp_path.unlink(missing_ok=True)
-        else:
-            mode = self.target.stat().st_mode & 0o777 if self.target.exists() else 0o644
-            os.chmod(self.temp_path, mode)
-            os.replace(self.temp_path, self.target)
-        directory_fd = os.open(self.target.parent, os.O_RDONLY)
         try:
-            os.fsync(directory_fd)
+            await asyncio.to_thread(self._temporary.flush)
+            await asyncio.to_thread(os.fsync, self._temporary.fileno())
+            await asyncio.to_thread(self._temporary.close)
+            try:
+                current = os.stat(
+                    self.target_name,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                current = None
+            identity = (current.st_dev, current.st_ino) if current is not None else None
+            if identity != self.existing_identity:
+                if not self.overwrite and current is not None:
+                    raise FileExistsError(self.target_name)
+                raise NodeAgentError("Upload path changed", code="path_changed")
+            temporary_fd = os.open(
+                self.temporary_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self.parent_fd,
+            )
+            try:
+                os.fchmod(temporary_fd, self.existing_mode)
+            finally:
+                os.close(temporary_fd)
+            if self.overwrite:
+                os.replace(
+                    self.temporary_name,
+                    self.target_name,
+                    src_dir_fd=self.parent_fd,
+                    dst_dir_fd=self.parent_fd,
+                )
+            else:
+                os.link(
+                    self.temporary_name,
+                    self.target_name,
+                    src_dir_fd=self.parent_fd,
+                    dst_dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(self.temporary_name, dir_fd=self.parent_fd)
+            os.fsync(self.parent_fd)
         finally:
-            os.close(directory_fd)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.temporary_name, dir_fd=self.parent_fd)
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
     async def abort(self) -> None:
         if self.closed:
@@ -2859,7 +4275,12 @@ class UploadAgentStream:
         self.closed = True
         self.registry.pop(self.stream_id, None)
         await asyncio.to_thread(self._temporary.close)
-        self.temp_path.unlink(missing_ok=True)
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.temporary_name, dir_fd=self.parent_fd)
+        finally:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
 
 class TextUploadAgentStream:
@@ -2944,6 +4365,7 @@ class NodeAgent:
             file_run_root=state_dir / "file-runs",
             remote_run_root=config.run_root or (state_dir / "runs"),
             private_state_root=state_dir,
+            private_state_identity=config.state_dir_identity,
         )
         self._send_lock = asyncio.Lock()
         self._socket: ClientConnection | None = None
@@ -3207,6 +4629,15 @@ class NodeAgent:
                         "result": result.value,
                     }
                 )
+                if (
+                    operation == "terminal.resize"
+                    and result.value.get("ok") is False
+                    and result.value.get("retryable") is False
+                    and result.value.get("grid_active") is True
+                    and result.value.get("cleanup_confirmed") is False
+                    and self._socket is not None
+                ):
+                    await self._socket.close(code=1011, reason="Terminal view cleanup failed")
                 if result.start is not None:
                     self._start_request_task(result.start())
             finally:
@@ -3351,19 +4782,88 @@ def _json_post(
     return value
 
 
-def _atomic_private_write(path: Path, content: bytes, *, mode: int) -> None:
-    ensure_private_directory(path.parent)
-    temporary = path.parent / f".{path.name}.{secrets.token_hex(6)}.tmp"
+def _atomic_private_write(
+    path: Path,
+    content: bytes,
+    *,
+    mode: int,
+    directory_fd: int | None = None,
+    expected_state: object = _PRIVATE_STATE_UNSPECIFIED,
+    error_code: str = "file_run_state_invalid",
+) -> None:
+    owns_directory_fd = directory_fd is None
+    if directory_fd is None:
+        directory_fd, _resolved_parent = _open_private_directory(path.parent, create=True)
+    temporary = f".{path.name}.{secrets.token_hex(6)}.tmp"
+    fd = -1
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        with os.fdopen(fd, "wb") as handle:
+        if expected_state is _PRIVATE_STATE_UNSPECIFIED:
+            expected_state = _private_state_leaf_state(
+                directory_fd,
+                path.name,
+                code=error_code,
+                label="Private state file changed during write",
+                mode=mode,
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temporary, flags, mode, dir_fd=directory_fd)
+        with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, mode)
+            os.fchmod(handle.fileno(), mode)
+        current_state = _private_state_leaf_state(
+            directory_fd,
+            path.name,
+            code=error_code,
+            label="Private state file changed during write",
+            mode=mode,
+        )
+        if current_state != expected_state:
+            raise NodeAgentError("Private state file changed during write", code=error_code)
+        if expected_state is None:
+            try:
+                os.link(
+                    temporary,
+                    path.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise NodeAgentError(
+                    "Private state file appeared during write", code=error_code
+                ) from exc
+            os.unlink(temporary, dir_fd=directory_fd)
+        else:
+            os.replace(
+                temporary,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        published_state = _private_state_leaf_state(
+            directory_fd,
+            path.name,
+            code=error_code,
+            label="Private state file changed during write",
+            mode=mode,
+        )
+        written_info = os.fstat(fd)
+        if published_state is None or published_state[:2] != (
+            written_info.st_dev,
+            written_info.st_ino,
+        ):
+            raise NodeAgentError("Private state file changed during publication", code=error_code)
+        os.fsync(directory_fd)
     finally:
-        temporary.unlink(missing_ok=True)
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
+        if owns_directory_fd:
+            os.close(directory_fd)
 
 
 def _wait_for_pid(process_pid: int, timeout: float) -> bool:

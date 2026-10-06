@@ -25,6 +25,7 @@ NOTIFICATION_DEVICE_RETENTION = timedelta(days=90)
 HISTORY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 MAX_WORKSPACE_COMMANDS = 3
 MAX_WORKSPACE_COMMAND_BYTES = 4096
+MAX_REMOTE_RUN_COLLECTION_REPORT_BYTES = 2 * 1024 * 1024
 WORKSPACE_TMUX_SESSION_PREFIX = "tr"
 WORKSPACE_TMUX_SESSION_ID_CHARS = 4
 WORKSPACE_TMUX_SESSION_SLUG_CHARS = 16
@@ -262,6 +263,15 @@ class StateStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS workspace_command_claims (
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                    launch_id TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    command_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(workspace_id, launch_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS file_runs (
                     id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL
@@ -290,6 +300,14 @@ class StateStore:
                 );
 
                 {_remote_runs_table_sql(if_not_exists=True)}
+
+                CREATE TABLE IF NOT EXISTS remote_run_collection_reports (
+                    run_id TEXT PRIMARY KEY,
+                    report_id TEXT NOT NULL UNIQUE,
+                    plan_revision TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    report_json TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1855,6 +1873,36 @@ class StateStore:
         with self.connect() as db:
             db.execute("DELETE FROM command_history WHERE workspace_id = ?", (workspace_id,))
 
+    def claim_workspace_command(
+        self, workspace_id: str, launch_id: str, slot: int, command_digest: str
+    ) -> str:
+        """Consume a Workspace command launch identity before dispatch."""
+        if not launch_id:
+            raise ValueError("Workspace command launch identity is required")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT slot, command_digest FROM workspace_command_claims "
+                "WHERE workspace_id = ? AND launch_id = ?",
+                (workspace_id, launch_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    int(existing["slot"]) != slot
+                    or str(existing["command_digest"]) != command_digest
+                ):
+                    raise ValueError(
+                        "Workspace command launch identity was reused with a different command"
+                    )
+                return "replayed"
+            db.execute(
+                "INSERT INTO workspace_command_claims("
+                "workspace_id, launch_id, slot, command_digest, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (workspace_id, launch_id, slot, command_digest, utc_now()),
+            )
+            return "created"
+
     def claim_file_run(
         self, payload: Mapping[str, Any]
     ) -> tuple[str, dict[str, Any]]:
@@ -2206,6 +2254,54 @@ class StateStore:
                 "SELECT * FROM remote_runs WHERE id = ?", (run_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def save_remote_run_collection_report(
+        self, run_id: str, report: Mapping[str, Any]
+    ) -> str:
+        payload = json.dumps(report, separators=(",", ":"), ensure_ascii=False)
+        if len(payload.encode("utf-8")) > MAX_REMOTE_RUN_COLLECTION_REPORT_BYTES:
+            raise ValueError("Remote Run collection report exceeds storage limit")
+        report_id = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO remote_run_collection_reports(
+                    run_id, report_id, plan_revision, created_at, report_json
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    report_id = excluded.report_id,
+                    plan_revision = excluded.plan_revision,
+                    created_at = excluded.created_at,
+                    report_json = excluded.report_json
+                """,
+                (
+                    run_id,
+                    report_id,
+                    str(report["plan_revision"]),
+                    utc_now(),
+                    payload,
+                ),
+            )
+        return report_id
+
+    def get_remote_run_collection_report(
+        self, run_id: str, report_id: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT report_json FROM remote_run_collection_reports
+                WHERE run_id = ? AND report_id = ?
+                """,
+                (run_id, report_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            report = json.loads(str(row["report_json"]))
+        except json.JSONDecodeError:
+            return None
+        return report if isinstance(report, dict) else None
 
     def get_remote_run_for_workspace(self, workspace_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -2904,6 +3000,10 @@ class StateStore:
             ).fetchone()
             if row is not None and row["workspace_id"] is not None:
                 raise RuntimeError("Delete the Remote Run Workspace before its record")
+            db.execute(
+                "DELETE FROM remote_run_collection_reports WHERE run_id = ?",
+                (run_id,),
+            )
             db.execute("DELETE FROM remote_runs WHERE id = ?", (run_id,))
 
     def update_computer_run_base(self, computer_id: str, run_base_dir: str | None) -> None:

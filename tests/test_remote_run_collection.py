@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 
 from termroom.app import create_app
 from termroom.config import Settings
+from termroom.db import StateStore
 from termroom.files import FileService
 from termroom.remote_runs import RemoteRunManager
 from termroom.run_results import (
@@ -971,6 +973,15 @@ async def test_result_routes_download_review_recheck_and_apply(
         (
             CollectionReportItem("main.py", "modified", "applied", "applied"),
             CollectionReportItem(
+                "conflict.py",
+                "modified",
+                "conflict",
+                "source_changed_during_apply",
+            ),
+            CollectionReportItem(
+                "failed.py", "modified", "failed", "apply_failed"
+            ),
+            CollectionReportItem(
                 "model.bin", "added", "skipped", "binary_result"
             ),
         ),
@@ -983,8 +994,12 @@ async def test_result_routes_download_review_recheck_and_apply(
         assert run_id == RUN_ID
         return archive_path
 
+    review_available = True
+
     async def review(run_id: str) -> CollectionPlan:
         assert run_id == RUN_ID
+        if not review_available:
+            raise OSError("result is unavailable")
         return plan
 
     async def apply(run_id: str, revision: str) -> CollectionReport:
@@ -1029,6 +1044,11 @@ async def test_result_routes_download_review_recheck_and_apply(
         assert "main.py" in reviewed.text
         assert "model.bin" in reviewed.text
         assert "Recover this file from the result ZIP." in reviewed.text
+        legacy = await client.get(
+            f"/remote-runs/{RUN_ID}/collect?collected=1&applied=999"
+        )
+        assert legacy.status_code == 200
+        assert "Finished:" not in legacy.text
 
         too_many = await client.post(
             f"/remote-runs/{RUN_ID}/collect",
@@ -1051,21 +1071,153 @@ async def test_result_routes_download_review_recheck_and_apply(
             follow_redirects=False,
         )
         assert applied.status_code == 303
-        assert applied.headers["location"] == (
-            f"/remote-runs/{RUN_ID}/collect?collected=1&applied=1&conflict=0"
-            "&already_result=0&skipped=1&failed=0"
+        assert applied.headers["location"].startswith(
+            f"/remote-runs/{RUN_ID}/collect?report="
         )
 
+        review_available = False
+
         completed = await client.get(applied.headers["location"])
-        assert completed.status_code == 200
-        assert "Finished: 1 applied, 0 conflicts, 0 already present, 1 ZIP only" in (
+        assert completed.status_code == 200, completed.text
+        assert "Collection result" in completed.text
+        assert "main.py" in completed.text
+        assert "conflict.py" in completed.text
+        assert "failed.py" in completed.text
+        assert "model.bin" in completed.text
+        assert "Applied after the final conflict check." in completed.text
+        assert "The original changed while changes were being applied." in (
             completed.text
         )
-        assert "Bring changes to original" in completed.text
-        assert "main.py" in completed.text
+        assert "This file could not be applied." in completed.text
+        assert "Recover this file from the result ZIP." in completed.text
 
         refreshed = await client.get(applied.headers["location"])
         assert refreshed.status_code == 200
-        assert "Finished: 1 applied" in refreshed.text
+        assert "This file could not be applied." in refreshed.text
+        missing = await client.get(f"/remote-runs/{RUN_ID}/collect?report=missing")
+        assert missing.status_code == 409
+        assert "This apply result is no longer available." in missing.text
 
     assert applied_revisions == ["too-many", "stale", plan.revision]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report_save_fails", [False, True])
+async def test_result_route_keeps_actual_mixed_apply_report_when_remote_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report_save_fails: bool
+) -> None:
+    source = tmp_path / "source"
+    result = tmp_path / "result"
+    source.mkdir()
+    result.mkdir()
+    originals = {
+        "applied.txt": b"before\n",
+        "conflict.txt": b"before\n",
+        "failed.txt": b"before\n",
+    }
+    for path, content in originals.items():
+        (source / path).write_bytes(content)
+        (result / path).write_text("remote\n", encoding="utf-8")
+    (source / "conflict.txt").write_text("local\n", encoding="utf-8")
+    (result / "zip-only.bin").write_bytes(b"\0result")
+    files = FileService()
+    access = LocalTreeAccess(files)
+    original_write = access.write_text
+
+    async def fail_one_write(*args: Any, **kwargs: Any) -> Any:
+        if args[1] == "failed.txt":
+            raise OSError("injected write failure")
+        return await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(access, "write_text", fail_one_write)
+    collector, _ = _collector(
+        tmp_path,
+        source=source,
+        result=result,
+        baseline=_baseline(originals),
+        access=access,
+        source_backend="remote",
+    )
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root, state_dir=tmp_path / "core", access_token="test-token"
+    )
+    app = create_app(settings)
+    run = dict(collector.remote_runs.run)  # type: ignore[attr-defined]
+    run["source_label"] = "project"
+    monkeypatch.setattr(app.state.remote_runs, "get", lambda _run_id: dict(run))
+    monkeypatch.setattr(app.state.run_results, "review", collector.review)
+    monkeypatch.setattr(app.state.run_results, "apply", collector.apply)
+    if report_save_fails:
+        def fail_save(*_args: Any, **_kwargs: Any) -> str:
+            raise sqlite3.OperationalError("injected database failure")
+
+        monkeypatch.setattr(
+            app.state.store, "save_remote_run_collection_report", fail_save
+        )
+    plan = await collector.review(RUN_ID)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+        ) as client:
+        login = await client.post("/login", data={"password": "test-token"})
+        assert login.status_code == 303
+        applied = await client.post(
+            f"/remote-runs/{RUN_ID}/collect",
+            data={"_csrf": settings.csrf_token, "revision": plan.revision},
+            follow_redirects=False,
+        )
+        if report_save_fails:
+            assert applied.status_code == 500
+            assert "Some files were applied, but the apply result could not be saved." in (
+                applied.text
+            )
+        else:
+            assert applied.status_code == 303
+            report_url = applied.headers["location"]
+
+            async def unavailable(_run_id: str) -> CollectionPlan:
+                raise OSError("remote result removed")
+
+            monkeypatch.setattr(collector, "review", unavailable)
+            completed = await client.get(report_url)
+            assert completed.status_code == 200
+            assert all(path in completed.text for path in (*originals, "zip-only.bin"))
+            assert "This file could not be applied." in completed.text
+            assert (await client.get(report_url)).status_code == 200
+
+    assert (source / "applied.txt").read_bytes() == b"remote\n"
+    assert (source / "conflict.txt").read_bytes() == b"local\n"
+    assert (source / "failed.txt").read_bytes() == b"before\n"
+    assert not (source / "zip-only.bin").exists()
+
+
+def test_collection_report_storage_replaces_old_ids_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
+    store.initialize()
+    with store.connect() as db:
+        db.execute("DROP TABLE remote_run_collection_reports")
+    store.initialize()
+    report = CollectionReport(
+        RUN_ID,
+        "revision",
+        (CollectionReportItem("main.py", "modified", "applied", "applied"),),
+    ).as_dict()
+
+    first_id = store.save_remote_run_collection_report(RUN_ID, report)
+    restarted = StateStore(database)
+    restarted.initialize()
+    assert restarted.get_remote_run_collection_report(RUN_ID, first_id) == report
+
+    second_id = restarted.save_remote_run_collection_report(RUN_ID, report)
+    assert second_id != first_id
+    assert restarted.get_remote_run_collection_report(RUN_ID, first_id) is None
+    assert restarted.get_remote_run_collection_report(SECOND_RUN_ID, second_id) is None
+    assert restarted.get_remote_run_collection_report(RUN_ID, second_id) == report
+
+    restarted.delete_remote_run(RUN_ID)
+    assert restarted.get_remote_run_collection_report(RUN_ID, second_id) is None

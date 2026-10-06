@@ -3,10 +3,31 @@ from __future__ import annotations
 import hashlib
 import shutil
 import urllib.request
+from functools import cache
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_DIR = PACKAGE_ROOT / "static" / "vendor"
+
+
+@cache
+def static_asset_version(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+for _asset_name in (
+    "app.css",
+    "app.js",
+    "mobile_scrollback.css",
+    "mobile_scrollback.js",
+    "remote_run.js",
+    "terminal-font.css",
+    "terminal.js",
+    "terminal_selection.js",
+):
+    static_asset_version(PACKAGE_ROOT / "static" / _asset_name)
+
+
 XTERM_VERSION = "6.0.0"
 XTERM_UNICODE11_VERSION = "0.8.0"
 XTERM_VERSION_FILE = VENDOR_DIR / "xterm.version"

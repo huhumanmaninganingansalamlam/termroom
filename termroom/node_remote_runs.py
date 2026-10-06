@@ -3,14 +3,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes
+import errno
+import fcntl
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +42,7 @@ from termroom.run_sources import (
     validate_cwd_rel,
     validate_public_https_git_url,
 )
-from termroom.security import ensure_private_directory, is_within
+from termroom.security import is_within
 from termroom.ssh_backend import (
     REMOTE_GIT_BOOTSTRAP_SCRIPT,
     REMOTE_RUN_INITIAL_TAIL,
@@ -63,6 +69,306 @@ class NodeRemoteRunError(SSHBackendError):
         self.code = code
 
 
+def _make_sealed_memfd(content: bytes, name: str, *, mode: int = 0o400) -> int:
+    flags = getattr(os, "MFD_CLOEXEC", 1) | getattr(os, "MFD_ALLOW_SEALING", 2)
+    create_memfd = getattr(os, "memfd_create", None)
+    if create_memfd is None:
+        try:
+            create_memfd = ctypes.CDLL(None, use_errno=True).memfd_create
+        except (AttributeError, OSError) as exc:
+            raise NodeRemoteRunError(
+                "Immutable Remote Run execution descriptors are unavailable",
+                code="capability_unsupported",
+            ) from exc
+        create_memfd.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+        create_memfd.restype = ctypes.c_int
+        descriptor = create_memfd(name.encode(), flags)
+        if descriptor < 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    else:
+        descriptor = create_memfd(name, flags)
+    try:
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("short write to immutable execution descriptor")
+            remaining = remaining[written:]
+        os.fchmod(descriptor, mode)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        fcntl.fcntl(descriptor, getattr(fcntl, "F_ADD_SEALS", 1033), seals)
+        if fcntl.fcntl(descriptor, getattr(fcntl, "F_GET_SEALS", 1034)) & seals != seals:
+            raise OSError("execution descriptor could not be sealed")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _replace_script_once(script: str, source: str, replacement: str) -> str:
+    if script.count(source) != 1:
+        raise NodeRemoteRunError(
+            "Node Remote Run launcher script is incompatible", code="runner_invalid"
+        )
+    return script.replace(source, replacement, 1)
+
+
+def _node_remote_run_script() -> str:
+    script = _replace_script_once(
+        REMOTE_RUNNER_SCRIPT,
+        'script_path=${BASH_SOURCE[0]}\n'
+        'meta_dir=${script_path%/*}\n'
+        'meta_dir=$(CDPATH= cd -- "$meta_dir" && pwd -P) || exit 120\n'
+        'run_root=$(CDPATH= cd -- "$meta_dir/.." && pwd -P) || exit 120',
+        'meta_dir=${TERMROOM_REMOTE_RUN_META_DIR:?}\n'
+        'run_root=${TERMROOM_REMOTE_RUN_ROOT_DIR:?}\n'
+        'command_path=${TERMROOM_REMOTE_RUN_COMMAND:?}\n'
+        'work_root=${TERMROOM_REMOTE_RUN_WORK_DIR:?}\n'
+        'work_dir=${TERMROOM_REMOTE_RUN_CWD_DIR:?}\n'
+        'output_path=${TERMROOM_REMOTE_RUN_OUTPUT_FILE:?}',
+    )
+    script = _replace_script_once(
+        script,
+        'IFS= read -r cwd_rel < "$meta_dir/cwd" || prepare_failed cwd_invalid',
+        'cwd_rel=${TERMROOM_REMOTE_RUN_CWD_REL:?}',
+    )
+    script = _replace_script_once(
+        script,
+        'work_root=$(CDPATH= cd -- "$run_root/work" && pwd -P) || prepare_failed work_missing\n'
+        'work_dir=$(CDPATH= cd -- "$work_root/$cwd_rel" && pwd -P) || prepare_failed cwd_missing\n'
+        'case "$work_dir/" in\n'
+        '    "$work_root/"*) ;;\n'
+        '    *) prepare_failed cwd_outside ;;\n'
+        'esac',
+        'test -d "$work_dir" || prepare_failed cwd_missing',
+    )
+    script = _replace_script_once(
+        script,
+        'test -f "$meta_dir/command.sh" || prepare_failed command_missing',
+        'test -f "$command_path" || prepare_failed command_missing',
+    )
+    script = script.replace('"$meta_dir/command.sh"', '"$command_path"')
+    script = _replace_script_once(
+        script,
+        ': > "$meta_dir/output.log" || exit 120\n'
+        'chmod 0600 "$meta_dir/output.log" || exit 120',
+        ':',
+    )
+    script = script.replace('"$meta_dir/output.log"', '"$output_path"')
+    script = _replace_script_once(
+        script,
+        r'''started_at=$(utc_now)
+printf '{"phase":"running","started_at":"%s"}\n' "$started_at" \
+    | atomic_record "$meta_dir/state.json" || exit 120''',
+        r'''cd -- "$work_dir" || prepare_failed cwd_missing
+if test "${TERMROOM_REMOTE_RUN_PIPE:-}" != true || \
+    test -z "${TMUX_PANE:-}" || ! command -v tmux >/dev/null 2>&1; then
+    prepare_failed output_pipe_unavailable
+fi
+case "$meta_dir" in
+    /proc/self/fd/*) metadata_fd=${meta_dir##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$output_path" in
+    /proc/self/fd/*) output_fd=${output_path##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$metadata_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+case "$output_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+pipe_pid=$BASHPID
+metadata_path="/proc/$pipe_pid/fd/$metadata_fd"
+output_file="/proc/$pipe_pid/fd/$output_fd"
+channel_path=${TERMROOM_REMOTE_RUN_LOG_CHANNEL:?}
+channel_write=${TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE:?}
+case "$channel_path" in
+    /proc/self/fd/*) channel_read_fd=${channel_path##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$channel_read_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+case "$channel_write" in
+    /proc/self/fd/*) channel_fd=${channel_write##*/} ;;
+    *) prepare_failed output_pipe_invalid ;;
+esac
+case "$channel_fd" in
+    ''|*[!0-9]*) prepare_failed output_pipe_invalid ;;
+esac
+printf -v pipe_command \
+    '%q -I -c %q %q %q %q' \
+    "$TERMROOM_NODE_PYTHON" "$TERMROOM_REMOTE_RUN_LOG_HELPER_CODE" \
+    "$metadata_path" "$output_file" "/proc/$pipe_pid/fd/$channel_fd"
+if ! tmux pipe-pane -o -t "$TMUX_PANE" "$pipe_command"; then
+    prepare_failed output_pipe_unavailable
+fi
+if ! IFS= read -r -t 5 pipe_ready < "$channel_path" || test "$pipe_ready" != ready; then
+    tmux pipe-pane -t "$TMUX_PANE" || true
+    prepare_failed output_pipe_unavailable
+fi
+started_at=$(utc_now)
+printf '{"phase":"running","started_at":"%s"}\n' "$started_at" \
+    | atomic_record "$meta_dir/state.json" || exit 120''',
+    )
+    script = _replace_script_once(
+        script,
+        r'''cd -- "$work_dir" || prepare_failed cwd_missing
+
+status=0
+pipe_active=false
+if test -n "${TMUX_PANE:-}" && command -v tmux >/dev/null 2>&1; then
+    printf -v pipe_command '/bin/bash --noprofile --norc %q' "$meta_dir/log-pipe.sh"
+    if tmux pipe-pane -o -t "$TMUX_PANE" "$pipe_command"; then
+        pipe_active=true
+    fi
+fi''',
+        'status=0',
+    )
+    script = _replace_script_once(script, 'rm -f -- "$meta_dir/output-seal.json"', ':')
+    drain_start = script.index('if test "$pipe_active" = true; then')
+    drain_end = script.index('\nstop_requested=false', drain_start)
+    script = script[:drain_start] + r'''(
+    exec {channel_fd}>&- {channel_read_fd}<&-
+    unset TERMROOM_REMOTE_RUN_LOG_CHANNEL TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE
+    exec /bin/bash --noprofile --norc -- "$command_path"
+) </dev/null 2>&1 || status=$?
+tmux pipe-pane -t "$TMUX_PANE" || true
+log_incomplete=true
+log_size=$(wc -c < "$output_path")
+log_size=${log_size//[[:space:]]/}
+if IFS= read -r -t 2 pipe_receipt < "$channel_path"; then
+    if admitted_size=$("$TERMROOM_NODE_PYTHON" -I -c \
+        "$TERMROOM_REMOTE_RUN_LOG_VERIFY_CODE" "$meta_dir" "$output_path" "$pipe_receipt"); then
+        log_size=$admitted_size
+        log_incomplete=false
+    fi
+fi
+''' + script[drain_end:]
+    return script
+
+
+def _node_git_bootstrap_script() -> str:
+    script = _replace_script_once(
+        REMOTE_GIT_BOOTSTRAP_SCRIPT,
+        'script_path=${BASH_SOURCE[0]}\n'
+        'meta_dir=${script_path%/*}\n'
+        'meta_dir=$(CDPATH= cd -- "$meta_dir" && pwd -P) || exit 120\n'
+        'run_root=$(CDPATH= cd -- "$meta_dir/.." && pwd -P) || exit 120',
+        'meta_dir=${TERMROOM_REMOTE_RUN_META_DIR:?}\n'
+        'run_root=${TERMROOM_REMOTE_RUN_ROOT_DIR:?}\n'
+        'staging_dir=${TERMROOM_REMOTE_RUN_STAGING_DIR:?}\n'
+        'git_argv_path=${TERMROOM_REMOTE_RUN_GIT_ARGV:?}\n'
+        'git_path_file=${TERMROOM_REMOTE_RUN_GIT_PATH_FILE:?}\n'
+        'askpass_path=${TERMROOM_REMOTE_RUN_ASKPASS:?}\n'
+        'git_home=${TERMROOM_REMOTE_RUN_GIT_HOME:?}\n'
+        'prepare_log=${TERMROOM_REMOTE_RUN_PREPARE_LOG:?}',
+    )
+    script = _replace_script_once(
+        script,
+        ': > "$meta_dir/prepare.log" || exit 120\n'
+        'chmod 0600 "$meta_dir/prepare.log" || exit 120\n'
+        'exec >>"$meta_dir/prepare.log" 2>&1',
+        'exec >>"$prepare_log" 2>&1',
+    )
+    script = _replace_script_once(
+        script,
+        'done < "$meta_dir/git-argv"',
+        'done < "$git_argv_path"',
+    )
+    script = _replace_script_once(
+        script,
+        '    clone_argv+=("$value")',
+        '    case "$value" in\n'
+        '        /__termroom_node_remote_run_work_staging_fd__) value=$staging_dir ;;\n'
+        '        /__termroom_node_remote_run_askpass_fd__) value=$askpass_path ;;\n'
+        '        /__termroom_node_remote_run_git_home_fd__) value=$git_home ;;\n'
+        '    esac\n'
+        '    clone_argv+=("$value")',
+    )
+    script = _replace_script_once(script, 'rm -rf -- "$run_root/work.tmp"', ':')
+    script = _replace_script_once(
+        script,
+        'IFS= read -r git_path < "$meta_dir/git-path" || {',
+        'IFS= read -r git_path < "$git_path_file" || {',
+    )
+    script = _replace_script_once(
+        script,
+        'revision=$("$git_path" -C "$run_root/work.tmp" rev-parse --verify HEAD 2>/dev/null) || {',
+        'revision=$("$git_path" -C "$staging_dir" rev-parse --verify HEAD 2>/dev/null) || {',
+    )
+    script = _replace_script_once(
+        script,
+        'rmdir -- "$run_root/work" || { prepare_result failed work_already_committed; exit 120; }\n'
+        'mv -- "$run_root/work.tmp" "$run_root/work" || {\n'
+        '    mkdir -m 0700 -- "$run_root/work" 2>/dev/null || true\n'
+        '    prepare_result failed work_commit_failed\n'
+        '    exit 120\n'
+        '}',
+        ':',
+    )
+    script = _replace_script_once(
+        script,
+        'exec /bin/bash --noprofile --norc "$meta_dir/runner.sh"',
+        'exec "$TERMROOM_NODE_PYTHON" -c "$TERMROOM_REMOTE_RUN_GIT_FINISH_CODE" '
+        '"$run_root" "$staging_dir" "$TERMROOM_REMOTE_RUN_WORK_DIR"',
+    )
+    return script
+
+
+_NODE_REMOTE_RUN_GIT_FINISH_CODE = r'''import os, sys
+run_path, staging_path, work_path = sys.argv[1:4]
+run_fd, staging_fd, work_fd = (
+    int(value.rsplit("/", 1)[1]) for value in (run_path, staging_path, work_path)
+)
+def identity(info):
+    return info.st_dev, info.st_ino
+if identity(os.stat("work.tmp", dir_fd=run_fd, follow_symlinks=False)) != identity(
+    os.fstat(staging_fd)
+):
+    raise RuntimeError("Remote Run staging directory was replaced")
+if identity(os.stat("work", dir_fd=run_fd, follow_symlinks=False)) != identity(os.fstat(work_fd)):
+    raise RuntimeError("Remote Run work directory was replaced")
+relative = os.environ["TERMROOM_REMOTE_RUN_CWD_REL"]
+parts = () if relative == "." else tuple(relative.split("/"))
+cwd_fd = os.dup(staging_fd)
+try:
+    for part in parts:
+        if not part or part in {".", ".."} or "/" in part:
+            raise RuntimeError("Remote Run working directory is invalid")
+        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cwd_fd)
+        os.close(cwd_fd)
+        cwd_fd = next_fd
+    os.rename("work.tmp", "work", src_dir_fd=run_fd, dst_dir_fd=run_fd)
+    if identity(os.stat("work", dir_fd=run_fd, follow_symlinks=False)) != identity(
+        os.fstat(staging_fd)
+    ):
+        raise RuntimeError("Remote Run work promotion failed")
+    os.fchdir(cwd_fd)
+    os.set_inheritable(cwd_fd, True)
+    environment = os.environ.copy()
+    environment["TERMROOM_REMOTE_RUN_WORK_DIR"] = staging_path
+    environment["TERMROOM_REMOTE_RUN_CWD_DIR"] = "/proc/self/fd/" + str(cwd_fd)
+    script = environment["TERMROOM_REMOTE_RUN_RUNNER_SCRIPT"]
+    os.execvpe(
+        "/bin/bash",
+        ["/bin/bash", "--noprofile", "--norc", "-c", script, "termroom-node-remote-run"],
+        environment,
+    )
+finally:
+    os.close(cwd_fd)
+'''
+
+
 def _validate_run_id(value: object) -> str:
     return SSHBackend.validate_remote_run_id(str(value or ""))
 
@@ -79,41 +385,696 @@ def _normalize_command(value: object) -> str:
     return body
 
 
-def _atomic_private_write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
-    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, mode)
+def _open_directory_at(
+    directory_fd: int,
+    components: Iterable[str],
+    *,
+    create: bool,
+    mode: int | None,
+    require_owner: bool = True,
+) -> int:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("no-follow directory handles are unavailable")
+    descriptor = os.dup(directory_fd)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    values = tuple(components)
     try:
+        for index, component in enumerate(values):
+            if not component or component in {".", ".."} or "/" in component:
+                raise OSError("invalid Remote Run directory component")
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if require_owner and os.fstat(descriptor).st_uid != os.geteuid():
+                raise OSError("Remote Run directory is not owned by the Node user")
+            if index == len(values) - 1 and mode is not None:
+                os.fchmod(descriptor, mode)
+        if not values:
+            if require_owner and os.fstat(descriptor).st_uid != os.geteuid():
+                raise OSError("Remote Run directory is not owned by the Node user")
+            if mode is not None:
+                os.fchmod(descriptor, mode)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _create_directory_handle_at(
+    parent_fd: int, name: str, *, mode: int = 0o700
+) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise OSError("invalid Remote Run directory name")
+    os.mkdir(name, mode, dir_fd=parent_fd)
+    created: os.stat_result | None = None
+    descriptor = -1
+    try:
+        created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(created.st_mode):
+            raise OSError("new Remote Run entry is not a directory")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            (created.st_dev, created.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_uid != os.geteuid()
+        ):
+            raise OSError("new Remote Run directory was replaced before opening")
+        os.fchmod(descriptor, mode)
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != mode:
+            raise OSError("new Remote Run directory is invalid")
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError("new Remote Run directory was replaced")
+        return descriptor
+    except BaseException:
+        if created is not None:
+            with contextlib.suppress(OSError):
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (created.st_dev, created.st_ino) == (
+                    current.st_dev,
+                    current.st_ino,
+                ):
+                    os.rmdir(name, dir_fd=parent_fd)
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _open_directory_components(
+    value: Path,
+    *,
+    create: bool,
+    parent_fd: int | None = None,
+    parent_path: Path | None = None,
+    mode: int | None = 0o700,
+) -> tuple[int, Path]:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("no-follow directory handles are unavailable")
+    path = Path(os.path.abspath(os.fspath(value.expanduser())))
+    if not path.is_absolute() or len(path.parts) < 2:
+        raise OSError("Remote Run root must be a non-root absolute directory")
+    if parent_fd is not None and parent_path is not None:
+        try:
+            relative = path.relative_to(parent_path)
+        except ValueError:
+            pass
+        else:
+            return (
+                _open_directory_at(
+                    parent_fd,
+                    relative.parts,
+                    create=create,
+                    mode=mode,
+                    require_owner=True,
+                ),
+                path,
+            )
+
+    descriptor = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        for index, component in enumerate(path.parts[1:]):
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if index == len(path.parts) - 2:
+                if os.fstat(descriptor).st_uid != os.geteuid():
+                    raise OSError("Remote Run root is not owned by the Node user")
+                if mode is not None:
+                    os.fchmod(descriptor, mode)
+        return descriptor, path
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+_PRIVATE_WRITE_UNSPECIFIED = object()
+
+
+def _private_leaf_state_at(
+    directory_fd: int, name: str, *, mode: int
+) -> tuple[int, ...] | None:
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != mode
+    ):
+        raise NodeRemoteRunError(
+            "Remote Run metadata is invalid", code="metadata_invalid"
+        )
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _atomic_private_write_at(
+    directory_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int = 0o600,
+    expected_state: object = _PRIVATE_WRITE_UNSPECIFIED,
+) -> tuple[int, ...]:
+    temporary = f".{name}.tmp-{uuid.uuid4().hex}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        if expected_state is _PRIVATE_WRITE_UNSPECIFIED:
+            expected_state = _private_leaf_state_at(directory_fd, name, mode=mode)
+        descriptor = os.open(temporary, flags, mode, dir_fd=directory_fd)
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, mode, follow_symlinks=False)
-        os.replace(temporary, path)
+        os.fchmod(descriptor, mode)
+        current_state = _private_leaf_state_at(directory_fd, name, mode=mode)
+        if current_state != expected_state:
+            raise NodeRemoteRunError(
+                "Remote Run metadata changed during write", code="metadata_invalid"
+            )
+        if expected_state is None:
+            try:
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise NodeRemoteRunError(
+                    "Remote Run metadata appeared during write",
+                    code="metadata_invalid",
+                ) from exc
+            os.unlink(temporary, dir_fd=directory_fd)
+        else:
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        published_state = _private_leaf_state_at(directory_fd, name, mode=mode)
+        written_info = os.fstat(descriptor)
+        if published_state is None or published_state[:2] != (
+            written_info.st_dev,
+            written_info.st_ino,
+        ):
+            raise NodeRemoteRunError(
+                "Remote Run metadata changed during publication",
+                code="metadata_invalid",
+            )
+        os.fsync(directory_fd)
+        return published_state
     finally:
-        with contextlib.suppress(OSError):
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
+
+
+def _read_regular_at(directory_fd: int, name: str, limit: int) -> bytes:
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+        ):
+            raise NodeRemoteRunError("Remote Run metadata is invalid", code="metadata_invalid")
+        if info.st_size > limit:
+            raise NodeRemoteRunError(
+                "Remote Run metadata is too large", code="metadata_invalid"
+            )
+        chunks = bytearray()
+        while len(chunks) <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > limit:
+            raise NodeRemoteRunError(
+                "Remote Run metadata is too large", code="metadata_invalid"
+            )
+        final = os.fstat(descriptor)
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise NodeRemoteRunError(
+                "Remote Run metadata changed while reading", code="metadata_invalid"
+            ) from exc
+
+        def signature(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_uid,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if (
+            signature(info) != signature(final)
+            or signature(final) != signature(current)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+        ):
+            raise NodeRemoteRunError(
+                "Remote Run metadata changed while reading", code="metadata_invalid"
+            )
+        return bytes(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _sealed_regular_at(
+    directory_fd: int,
+    name: str,
+    limit: int,
+    *,
+    mode: int = 0o400,
+) -> int:
+    content = _read_regular_at(directory_fd, name, limit)
+    try:
+        return _make_sealed_memfd(content, f"termroom-{name}", mode=mode)
+    except OSError as exc:
+        raise NodeRemoteRunError(
+            "Immutable Remote Run execution descriptors are unavailable",
+            code="capability_unsupported",
+        ) from exc
+
+
+def _open_owned_regular_at(
+    directory_fd: int, name: str, *, flags: int = os.O_RDONLY
+) -> int:
+    descriptor = os.open(
+        name, flags | os.O_NOFOLLOW, dir_fd=directory_fd
+    )
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+    ):
+        os.close(descriptor)
+        raise NodeRemoteRunError("Remote Run metadata is invalid", code="metadata_invalid")
+    return descriptor
+
+
+def _node_remote_run_output_state(metadata_fd: int, output_fd: int) -> tuple[int, ...]:
+    state = _private_leaf_state_at(metadata_fd, "output.log", mode=0o600)
+    info = os.fstat(output_fd)
+    if state is None or state != (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    ):
+        raise NodeRemoteRunError("Remote Run output changed", code="metadata_invalid")
+    return state
+
+
+def _node_remote_run_log_helper(metadata_path: str, output_path: str, channel_path: str) -> int:
+    descriptors: list[int] = []
+    channel_fd = -1
+    try:
+        channel_fd = os.open(channel_path, os.O_WRONLY | os.O_NONBLOCK)
+        descriptors.append(channel_fd)
+        metadata_fd = os.open(metadata_path, os.O_RDONLY | os.O_DIRECTORY)
+        descriptors.append(metadata_fd)
+        info = os.fstat(metadata_fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise NodeRemoteRunError("Remote Run metadata is invalid", code="metadata_invalid")
+        output_fd = os.open(output_path, os.O_WRONLY | os.O_APPEND)
+        descriptors.append(output_fd)
+        _node_remote_run_output_state(metadata_fd, output_fd)
+        if _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) is not None:
+            raise NodeRemoteRunError("Remote Run seal already exists", code="metadata_invalid")
+        os.write(channel_fd, b"ready\n")
+        while chunk := os.read(0, 64 * 1024):
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(output_fd, remaining)
+                if written <= 0:
+                    raise OSError("short write to Remote Run output")
+                remaining = remaining[written:]
+        os.fsync(output_fd)
+        output_state = _node_remote_run_output_state(metadata_fd, output_fd)
+        content = json.dumps({
+            "size": output_state[5],
+            "sealed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }).encode() + b"\n"
+        seal_state = _atomic_private_write_at(
+            metadata_fd, "output-seal.json", content, expected_state=None,
+        )
+        os.write(channel_fd, b"sealed " + json.dumps(seal_state).encode() + b"\n")
+        return 0
+    except (OSError, NodeRemoteRunError):
+        if channel_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.write(channel_fd, b"failed\n")
+        return 120
+    finally:
+        for descriptor in descriptors:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+
+
+def _node_remote_run_log_size(metadata_path: str, output_path: str, receipt: str) -> int:
+    if not receipt.startswith("sealed "):
+        raise NodeRemoteRunError("Remote Run output did not drain", code="metadata_invalid")
+    expected = tuple(json.loads(receipt.removeprefix("sealed ")))
+    metadata_fd = os.open(metadata_path, os.O_RDONLY | os.O_DIRECTORY)
+    seal_fd = output_fd = -1
+    try:
+        # NONBLOCK prevents a raced FIFO from hanging admission; never read a
+        # leaf until its no-follow descriptor matches the helper's receipt.
+        seal_fd = os.open(
+            "output-seal.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=metadata_fd,
+        )
+        info = os.fstat(seal_fd)
+        if (
+            _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) != expected
+            or expected[:2] != (info.st_dev, info.st_ino)
+            or not stat.S_ISREG(info.st_mode)
+            or not 0 < info.st_size <= 4096
+        ):
+            raise NodeRemoteRunError("Remote Run seal changed", code="metadata_invalid")
+        seal = json.loads(os.read(seal_fd, 4097))
+        output_fd = os.open(output_path, os.O_WRONLY | os.O_APPEND)
+        output_state = _node_remote_run_output_state(metadata_fd, output_fd)
+        if (
+            set(seal) != {"size", "sealed_at"}
+            or type(seal["size"]) is not int
+            or seal["size"] != output_state[5]
+            or not isinstance(seal["sealed_at"], str)
+            or not seal["sealed_at"]
+            or _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) != expected
+        ):
+            raise NodeRemoteRunError("Remote Run seal is incomplete", code="metadata_invalid")
+        return seal["size"]
+    finally:
+        for descriptor in (seal_fd, output_fd, metadata_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+_NODE_REMOTE_RUN_LOG_HELPER_CODE = (
+    "import sys; from termroom.node_remote_runs import _node_remote_run_log_helper; "
+    "sys.exit(_node_remote_run_log_helper(*sys.argv[1:]))"
+)
+_NODE_REMOTE_RUN_LOG_VERIFY_CODE = '''import sys
+from termroom.node_remote_runs import _node_remote_run_log_size
+try:
+    print(_node_remote_run_log_size(*sys.argv[1:]))
+except Exception:
+    sys.exit(120)
+'''
+
+
+def _remove_directory_contents(directory_fd: int) -> None:
+    for entry in os.listdir(directory_fd):
+        try:
+            info = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child_fd = os.open(
+                    entry,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                opened = os.fstat(child_fd)
+                if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise OSError("Remote Run child directory was replaced")
+                child_identity = (opened.st_dev, opened.st_ino)
+                for attempt in range(3):
+                    pinned = os.fstat(child_fd)
+                    try:
+                        current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        break
+                    if (pinned.st_dev, pinned.st_ino) != child_identity or (
+                        current.st_dev,
+                        current.st_ino,
+                    ) != child_identity:
+                        raise OSError("Remote Run child directory was replaced")
+                    _remove_directory_contents(child_fd)
+                    expected = os.fstat(child_fd)
+                    try:
+                        current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        break
+                    if (expected.st_dev, expected.st_ino) != child_identity or (
+                        current.st_dev,
+                        current.st_ino,
+                    ) != child_identity:
+                        raise OSError("Remote Run child directory was replaced")
+                    try:
+                        os.rmdir(entry, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST} or attempt == 2:
+                            raise
+                        continue
+                    break
+            finally:
+                os.close(child_fd)
+        else:
+            try:
+                current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (info.st_dev, info.st_ino, info.st_mode) != (
+                current.st_dev,
+                current.st_ino,
+                current.st_mode,
+            ):
+                raise OSError("Remote Run cleanup entry was replaced")
+            try:
+                os.unlink(entry, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+
+
+def _restore_cleanup_marker(root_fd: int, run_id: str) -> None:
+    metadata_fd = _open_directory_at(
+        root_fd, (".termroom",), create=True, mode=0o700
+    )
+    try:
+        if _private_leaf_state_at(metadata_fd, "marker", mode=0o600) is None:
+            _atomic_private_write_at(
+                metadata_fd,
+                "marker",
+                f"{run_id}\n".encode(),
+                mode=0o600,
+                expected_state=None,
+            )
+        elif _read_regular_at(metadata_fd, "marker", 128).decode().strip() != run_id:
+            raise NodeRemoteRunError(
+                "Remote Run marker does not match", code="marker_mismatch"
+            )
+    finally:
+        os.close(metadata_fd)
+
+
+def _copy_snapshot_tree(source_fd: int, destination_fd: int, parent: str = "") -> None:
+    def signature(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_uid,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    for name in os.listdir(source_fd):
+        entry = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        relative = f"{parent}/{name}" if parent else name
+        normalize_source_relative_path(relative)
+        if stat.S_ISDIR(entry.st_mode):
+            source_child = _open_directory_at(
+                source_fd, (name,), create=False, mode=None, require_owner=False
+            )
+            try:
+                opened = os.fstat(source_child)
+                if (
+                    signature(entry) != signature(opened)
+                    or opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened.st_mode) != 0o700
+                ):
+                    raise NodeRemoteRunError(
+                        "Remote Run snapshot directory changed", code="layout_invalid"
+                    )
+                os.mkdir(name, 0o700, dir_fd=destination_fd)
+                destination_child = _open_directory_at(
+                    destination_fd, (name,), create=False, mode=None
+                )
+                try:
+                    _copy_snapshot_tree(source_child, destination_child, relative)
+                finally:
+                    os.close(destination_child)
+                current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                if signature(opened) != signature(current):
+                    raise NodeRemoteRunError(
+                        "Remote Run snapshot directory changed", code="layout_invalid"
+                    )
+            finally:
+                os.close(source_child)
+        elif stat.S_ISREG(entry.st_mode):
+            source_file = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_fd
+            )
+            destination_file = -1
+            try:
+                before = os.fstat(source_file)
+                mode = 0o700 if before.st_mode & 0o111 else 0o600
+                if (
+                    signature(entry) != signature(before)
+                    or before.st_uid != os.geteuid()
+                    or before.st_nlink != 1
+                    or stat.S_IMODE(before.st_mode) != mode
+                ):
+                    raise NodeRemoteRunError(
+                        "Remote Run snapshot file changed", code="layout_invalid"
+                    )
+                destination_file = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    mode,
+                    dir_fd=destination_fd,
+                )
+                while True:
+                    chunk = os.read(source_file, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_file, view)
+                        if written <= 0:
+                            raise OSError("short write while copying Remote Run snapshot")
+                        view = view[written:]
+                after = os.fstat(source_file)
+                current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                if signature(before) != signature(after) or signature(after) != signature(current):
+                    raise NodeRemoteRunError(
+                        "Remote Run snapshot file changed", code="layout_invalid"
+                    )
+                os.fchmod(destination_file, mode)
+            finally:
+                os.close(source_file)
+                if destination_file >= 0:
+                    os.close(destination_file)
+        elif stat.S_ISLNK(entry.st_mode):
+            target = os.readlink(name, dir_fd=source_fd)
+            current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            if signature(entry) != signature(current):
+                raise NodeRemoteRunError(
+                    "Remote Run snapshot symlink changed", code="layout_invalid"
+                )
+            try:
+                validate_contained_symlink_target(relative, target)
+            except SourceValidationError as exc:
+                raise NodeRemoteRunError(
+                    "Remote Run snapshot symlink is invalid", code="layout_invalid"
+                ) from exc
+            os.symlink(target, name, dir_fd=destination_fd)
+        else:
+            raise NodeRemoteRunError(
+                "Remote Run snapshot contains an unsupported file", code="layout_invalid"
+            )
+
+
+def _remove_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    directory_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(directory_fd)
+        if expected_identity is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != expected_identity:
+            raise OSError("Remote Run cleanup directory was replaced")
+        _remove_directory_contents(directory_fd)
+        expected = os.fstat(directory_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError("Remote Run cleanup directory was replaced")
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
 class NodeRemoteRunUploadStream:
     def __init__(
         self,
         stream_id: str,
-        target: Path,
+        parent_fd: int,
+        target_name: str,
         *,
         expected_size: int,
         executable: bool,
         registry: dict[str, Any],
     ) -> None:
         self.stream_id = stream_id
-        self.target = target
+        self.parent_fd = os.dup(parent_fd)
+        self.target_name = target_name
         self.expected_size = expected_size
         self.executable = executable
         self.registry = registry
-        self.temporary = target.with_name(f".{target.name}.upload-{stream_id}")
+        self.temporary_name = f".{target_name}.upload-{stream_id}"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        self.descriptor = os.open(self.temporary, flags, 0o600)
+        try:
+            self.descriptor = os.open(
+                self.temporary_name, flags, 0o600, dir_fd=self.parent_fd
+            )
+        except BaseException:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
+            raise
         self.total = 0
         self.closed = False
 
@@ -146,24 +1107,38 @@ class NodeRemoteRunUploadStream:
                     "Remote Run Source file size changed during transfer",
                     code="source_file_changed",
                 )
+            os.fchmod(self.descriptor, 0o700 if self.executable else 0o600)
             os.fsync(self.descriptor)
             os.close(self.descriptor)
             self.descriptor = -1
-            os.chmod(self.temporary, 0o700 if self.executable else 0o600)
-            if self.target.exists() or self.target.is_symlink():
+            try:
+                os.stat(self.target_name, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
                 raise NodeRemoteRunError(
                     "Remote Run Source path already exists",
                     code="source_path_conflict",
                 )
-            os.replace(self.temporary, self.target)
+            os.replace(
+                self.temporary_name,
+                self.target_name,
+                src_dir_fd=self.parent_fd,
+                dst_dir_fd=self.parent_fd,
+            )
             return {"size": self.total}
         except BaseException:
             if self.descriptor >= 0:
                 with contextlib.suppress(OSError):
                     os.close(self.descriptor)
                 self.descriptor = -1
-            self.temporary.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.temporary_name, dir_fd=self.parent_fd)
             raise
+        finally:
+            if self.closed and self.parent_fd >= 0:
+                os.close(self.parent_fd)
+                self.parent_fd = -1
 
     async def abort(self) -> None:
         if self.closed:
@@ -174,27 +1149,40 @@ class NodeRemoteRunUploadStream:
             with contextlib.suppress(OSError):
                 os.close(self.descriptor)
             self.descriptor = -1
-        self.temporary.unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.temporary_name, dir_fd=self.parent_fd)
+        if self.parent_fd >= 0:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
 
 class NodeRemoteRunMetadataStream:
     def __init__(
         self,
         stream_id: str,
-        target: Path,
+        parent_fd: int,
+        target_name: str,
         *,
         expected_size: int,
         commit: Callable[[bytes], None],
         registry: dict[str, Any],
     ) -> None:
         self.stream_id = stream_id
-        self.target = target
+        self.parent_fd = os.dup(parent_fd)
+        self.target_name = target_name
         self.expected_size = expected_size
         self.commit = commit
         self.registry = registry
-        self.temporary = target.with_name(f".{target.name}.upload-{stream_id}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        self.descriptor = os.open(self.temporary, flags, 0o600)
+        self.temporary_name = f".{target_name}.upload-{stream_id}"
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self.descriptor = os.open(
+                self.temporary_name, flags, 0o600, dir_fd=self.parent_fd
+            )
+        except BaseException:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
+            raise
         self.total = 0
         self.closed = False
 
@@ -226,20 +1214,50 @@ class NodeRemoteRunMetadataStream:
                     "Remote Run metadata size changed during transfer",
                     code="metadata_invalid",
                 )
+            info = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+                or info.st_size != self.expected_size
+            ):
+                raise NodeRemoteRunError(
+                    "Remote Run metadata file is invalid", code="metadata_invalid"
+                )
             os.fsync(self.descriptor)
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            content = bytearray()
+            while len(content) <= self.expected_size:
+                chunk = os.read(
+                    self.descriptor,
+                    min(64 * 1024, self.expected_size + 1 - len(content)),
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if len(content) != self.expected_size:
+                raise NodeRemoteRunError(
+                    "Remote Run metadata size changed during transfer",
+                    code="metadata_invalid",
+                )
+            self.commit(bytes(content))
             os.close(self.descriptor)
             self.descriptor = -1
-            content = self.temporary.read_bytes()
-            self.commit(content)
-            self.temporary.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.temporary_name, dir_fd=self.parent_fd)
             return {"size": self.total}
         except BaseException:
             if self.descriptor >= 0:
                 with contextlib.suppress(OSError):
                     os.close(self.descriptor)
                 self.descriptor = -1
-            self.temporary.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.temporary_name, dir_fd=self.parent_fd)
             raise
+        finally:
+            if self.parent_fd >= 0:
+                os.close(self.parent_fd)
+                self.parent_fd = -1
 
     async def abort(self) -> None:
         if self.closed:
@@ -250,42 +1268,106 @@ class NodeRemoteRunMetadataStream:
             with contextlib.suppress(OSError):
                 os.close(self.descriptor)
             self.descriptor = -1
-        self.temporary.unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.temporary_name, dir_fd=self.parent_fd)
+        if self.parent_fd >= 0:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
 
 class NodeRemoteRunRuntime:
     """Node-local implementation of the fixed Remote Run operations."""
 
-    def __init__(self, run_root: Path) -> None:
-        self.run_root = self._prepare_run_root(run_root)
+    def __init__(
+        self,
+        run_root: Path,
+        *,
+        parent_fd: int | None = None,
+        parent_path: Path | None = None,
+        descriptor_handoff: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        try:
+            proc_fd = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as exc:
+            raise NodeRemoteRunError(
+                "Node Remote Run directory handles are unavailable", code="run_root_invalid"
+            ) from exc
+        else:
+            os.close(proc_fd)
+        self._root_fd, self.run_root = self._prepare_run_root(
+            run_root, parent_fd=parent_fd, parent_path=parent_path
+        )
+        self._root_path = Path(f"/proc/self/fd/{self._root_fd}")
+        if not self._root_path.is_dir():
+            os.close(self._root_fd)
+            raise NodeRemoteRunError(
+                "Node Remote Run directory handles are unavailable", code="run_root_invalid"
+            )
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
+        self._run_dir_fds: dict[str, int] = {}
+        self._metadata_dir_fds: dict[str, int] = {}
+        self._work_dir_fds: dict[str, int] = {}
+        self._work_staging_dir_fds: dict[str, int] = {}
+        self._work_identity_states: dict[tuple[int, int], tuple[int, ...] | None] = {}
+        self._invalid_run_ids: set[str] = set()
+        self._descriptor_handoff = descriptor_handoff
 
     @staticmethod
-    def _prepare_run_root(value: Path) -> Path:
+    def _prepare_run_root(
+        value: Path,
+        *,
+        parent_fd: int | None = None,
+        parent_path: Path | None = None,
+    ) -> tuple[int, Path]:
         candidate = value.expanduser()
         if not candidate.is_absolute():
             raise NodeRemoteRunError(
                 "Node Remote Run root must be absolute", code="run_root_invalid"
             )
-        ensure_private_directory(candidate)
+        descriptor = -1
         try:
-            info = candidate.lstat()
-            resolved = candidate.resolve(strict=True)
+            descriptor, candidate = _open_directory_components(
+                candidate,
+                create=True,
+                parent_fd=parent_fd,
+                parent_path=parent_path,
+            )
+            current, _ = _open_directory_components(candidate, create=False, mode=None)
+            try:
+                expected = os.fstat(descriptor)
+                actual = os.fstat(current)
+                if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+                    raise OSError("Remote Run root was replaced during initialization")
+            finally:
+                os.close(current)
+        except (OSError, RuntimeError) as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise NodeRemoteRunError(
+                "Node Remote Run root is unavailable", code="run_root_invalid"
+            ) from exc
+        return descriptor, candidate
+
+    def _assert_root_path_matches(self) -> None:
+        current = -1
+        try:
+            current, _ = _open_directory_components(
+                self.run_root, create=False, mode=None
+            )
+            expected = os.fstat(self._root_fd)
+            actual = os.fstat(current)
+            if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+                raise NodeRemoteRunError(
+                    "Node Remote Run root was replaced", code="run_root_invalid"
+                )
         except OSError as exc:
             raise NodeRemoteRunError(
                 "Node Remote Run root is unavailable", code="run_root_invalid"
             ) from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise NodeRemoteRunError(
-                "Node Remote Run root must be a real directory", code="run_root_invalid"
-            )
-        if info.st_mode & 0o022:
-            raise NodeRemoteRunError(
-                "Node Remote Run root must not be writable by other users",
-                code="run_root_invalid",
-            )
-        return resolved
+        finally:
+            if current >= 0:
+                os.close(current)
 
     def lock_for(self, run_id: str) -> threading.RLock:
         with self._locks_guard:
@@ -293,6 +1375,7 @@ class NodeRemoteRunRuntime:
 
     def preflight(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._require_version(payload)
+        self._assert_root_path_matches()
         bash = Path("/bin/bash")
         tmux = shutil.which("tmux")
         git = shutil.which("git") if payload.get("require_git") is True else None
@@ -302,21 +1385,29 @@ class NodeRemoteRunRuntime:
             raise NodeRemoteRunError("Node does not provide tmux", code="tmux_missing")
         if payload.get("require_git") is True and not git:
             raise NodeRemoteRunError("Node does not provide Git", code="git_missing")
-        probe = self.run_root / f".termroom-probe-{uuid.uuid4()}"
-        renamed = probe.with_name(probe.name + ".renamed")
+        probe = f".termroom-probe-{uuid.uuid4()}"
+        renamed = probe + ".renamed"
+        probe_created = False
+        renamed_created = False
         try:
-            probe.mkdir(mode=0o700)
-            probe.rename(renamed)
-            renamed.rmdir()
+            os.mkdir(probe, 0o700, dir_fd=self._root_fd)
+            probe_created = True
+            os.rename(probe, renamed, src_dir_fd=self._root_fd, dst_dir_fd=self._root_fd)
+            probe_created = False
+            renamed_created = True
+            os.rmdir(renamed, dir_fd=self._root_fd)
+            renamed_created = False
         except OSError as exc:
-            with contextlib.suppress(OSError):
-                probe.rmdir()
-            with contextlib.suppress(OSError):
-                renamed.rmdir()
+            if probe_created:
+                with contextlib.suppress(OSError):
+                    os.rmdir(probe, dir_fd=self._root_fd)
+            if renamed_created:
+                with contextlib.suppress(OSError):
+                    os.rmdir(renamed, dir_fd=self._root_fd)
             raise NodeRemoteRunError(
                 "Node Remote Run root is not writable", code="run_root_unwritable"
             ) from exc
-        usage = shutil.disk_usage(self.run_root)
+        usage = shutil.disk_usage(self._root_path)
         tools = {"bash": str(bash), "tmux": str(Path(tmux).resolve())}
         if git:
             tools["git"] = str(Path(git).resolve())
@@ -333,9 +1424,13 @@ class NodeRemoteRunRuntime:
         command = _normalize_command(payload.get("command"))
         cwd_rel = validate_cwd_rel(str(payload.get("cwd_rel") or "."))
         with self.lock_for(run_id):
+            if run_id in self._invalid_run_ids:
+                raise NodeRemoteRunError(
+                    "Remote Run directory was replaced", code="layout_invalid"
+                )
             self._finish_interrupted_delete(run_id)
             paths = self._paths(run_id)
-            if paths["root"].exists() or paths["root"].is_symlink():
+            if self._path_exists(paths["root"]):
                 self._assert_layout(run_id)
                 if self._read_regular(paths["command"], 256 * 1024) != command.encode():
                     raise NodeRemoteRunError(
@@ -350,29 +1445,98 @@ class NodeRemoteRunRuntime:
                 return self._layout_payload(run_id)
 
             creating = self._paths(run_id, leaf=f".termroom-creating-{run_id}")
-            if creating["root"].exists() or creating["root"].is_symlink():
+            if self._path_exists(creating["root"]):
                 self._remove_owned_tree(creating["root"], run_id, allow_missing_marker=True)
+            creating_run_fd = metadata_fd = work_fd = -1
+            publication_started = False
             try:
-                creating["root"].mkdir(mode=0o700)
-                creating["metadata"].mkdir(mode=0o700)
-                _atomic_private_write(creating["marker"], (run_id + "\n").encode())
-                creating["work"].mkdir(mode=0o700)
-                _atomic_private_write(creating["cwd"], (cwd_rel + "\n").encode())
-                _atomic_private_write(
-                    creating["runner"], REMOTE_RUNNER_SCRIPT.encode(), mode=0o700
+                creating_run_fd = _create_directory_handle_at(
+                    self._root_fd, creating["root"].name
                 )
-                _atomic_private_write(
-                    creating["log_pipe"], REMOTE_RUN_LOG_PIPE_SCRIPT.encode(), mode=0o700
+                metadata_fd = _create_directory_handle_at(
+                    creating_run_fd, ".termroom"
                 )
-                _atomic_private_write(creating["command"], command.encode())
-                os.replace(creating["root"], paths["root"])
-            except BaseException:
-                if creating["root"].exists() and not creating["root"].is_symlink():
+                _atomic_private_write_at(
+                    metadata_fd, "marker", (run_id + "\n").encode(), mode=0o600,
+                    expected_state=None,
+                )
+                work_fd = _create_directory_handle_at(
+                    creating_run_fd, "work"
+                )
+                _atomic_private_write_at(
+                    metadata_fd, "cwd", (cwd_rel + "\n").encode(), mode=0o600,
+                    expected_state=None,
+                )
+                _atomic_private_write_at(
+                    metadata_fd, "runner.sh", REMOTE_RUNNER_SCRIPT.encode(), mode=0o700,
+                    expected_state=None,
+                )
+                _atomic_private_write_at(
+                    metadata_fd,
+                    "log-pipe.sh",
+                    REMOTE_RUN_LOG_PIPE_SCRIPT.encode(),
+                    mode=0o700,
+                    expected_state=None,
+                )
+                _atomic_private_write_at(
+                    metadata_fd, "command.sh", command.encode(), mode=0o600,
+                    expected_state=None,
+                )
+                self._write_work_identity(
+                    metadata_fd, work_fd, "stable", expected_state=None
+                )
+                publication_started = True
+                self._replace(creating["root"], paths["root"])
+                published_fd = -1
+                try:
+                    published_fd = _open_directory_at(
+                        self._root_fd, (run_id,), create=False, mode=None
+                    )
+                    expected = os.fstat(creating_run_fd)
+                    observed = os.fstat(published_fd)
+                except OSError as exc:
+                    self._invalid_run_ids.add(run_id)
+                    raise NodeRemoteRunError(
+                        "Remote Run directory changed during publication",
+                        code="layout_invalid",
+                    ) from exc
+                finally:
+                    if published_fd >= 0:
+                        os.close(published_fd)
+                if (expected.st_dev, expected.st_ino) != (
+                    observed.st_dev,
+                    observed.st_ino,
+                ):
+                    self._invalid_run_ids.add(run_id)
+                    raise NodeRemoteRunError(
+                        "Remote Run directory changed during publication",
+                        code="layout_invalid",
+                    )
+                self._run_dir_fds[run_id] = creating_run_fd
+                creating_run_fd = -1
+                self._metadata_dir_fds[run_id] = metadata_fd
+                metadata_fd = -1
+                self._work_dir_fds[run_id] = work_fd
+                work_fd = -1
+                self._assert_layout(run_id)
+            except BaseException as exc:
+                if publication_started or isinstance(exc, OSError):
+                    self._invalid_run_ids.add(run_id)
+                self._forget_layout_handles(run_id)
+                if self._path_exists(creating["root"]):
                     self._remove_owned_tree(
                         creating["root"], run_id, allow_missing_marker=True
                     )
+                if isinstance(exc, OSError):
+                    raise NodeRemoteRunError(
+                        "Remote Run directory initialization failed",
+                        code="layout_invalid",
+                    ) from exc
                 raise
-            self._assert_layout(run_id)
+            finally:
+                for descriptor in (creating_run_fd, metadata_fd, work_fd):
+                    if descriptor >= 0:
+                        os.close(descriptor)
             return self._layout_payload(run_id)
 
     def snapshot_begin(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -381,9 +1545,26 @@ class NodeRemoteRunRuntime:
             paths = self._assert_layout(run_id)
             self._assert_not_started(run_id, paths)
             staging = paths["work_staging"]
-            if staging.exists() or staging.is_symlink():
+            if self._path_exists(staging):
                 self._remove_staging(staging, run_id)
-            staging.mkdir(mode=0o700)
+            try:
+                staging_fd = _create_directory_handle_at(
+                    self._run_dir_fds[run_id], "work.tmp"
+                )
+            except OSError as exc:
+                self._invalid_run_ids.add(run_id)
+                raise NodeRemoteRunError(
+                    "Remote Run staging directory was replaced",
+                    code="layout_invalid",
+                ) from exc
+            self._work_staging_dir_fds[run_id] = staging_fd
+            try:
+                self._assert_layout(run_id)
+            except BaseException:
+                self._invalid_run_ids.add(run_id)
+                self._work_staging_dir_fds.pop(run_id, None)
+                os.close(staging_fd)
+                raise
             return {"ready": True}
 
     def snapshot_directory(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -392,7 +1573,7 @@ class NodeRemoteRunRuntime:
         with self.lock_for(run_id):
             self._assert_not_started(run_id, self._assert_layout(run_id))
             target = self._staging_target(run_id, relative)
-            target.mkdir(mode=0o700)
+            self._create_directory(target)
             return {"path": relative}
 
     def snapshot_symlink(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -404,7 +1585,11 @@ class NodeRemoteRunRuntime:
         with self.lock_for(run_id):
             self._assert_not_started(run_id, self._assert_layout(run_id))
             target = self._staging_target(run_id, relative)
-            os.symlink(link_target, target)
+            parent_fd, name = self._open_parent(target)
+            try:
+                os.symlink(link_target, name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
             return {"path": relative}
 
     def snapshot_file_open(
@@ -428,34 +1613,70 @@ class NodeRemoteRunRuntime:
         with self.lock_for(run_id):
             self._assert_not_started(run_id, self._assert_layout(run_id))
             target = self._staging_target(run_id, relative)
-            return NodeRemoteRunUploadStream(
-                stream_id,
-                target,
-                expected_size=expected_size,
-                executable=payload.get("executable") is True,
-                registry=registry,
-            )
+            parent_fd, name = self._open_parent(target)
+            try:
+                return NodeRemoteRunUploadStream(
+                    stream_id,
+                    parent_fd,
+                    name,
+                    expected_size=expected_size,
+                    executable=payload.get("executable") is True,
+                    registry=registry,
+                )
+            finally:
+                os.close(parent_fd)
 
     def snapshot_commit(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         run_id = self._identity(payload)
         with self.lock_for(run_id):
             paths = self._assert_layout(run_id)
             self._assert_not_started(run_id, paths)
-            staging = self._real_directory(paths["work_staging"], "Source staging")
-            work = self._real_directory(paths["work"], "Remote Run work")
-            if any(work.iterdir()):
+            run_fd, metadata_fd = self._layout_handles(run_id)
+            staging_fd = self._work_staging_dir_fds.get(run_id)
+            if staging_fd is None:
+                staging_fd = self._open_directory(paths["work_staging"])
+                self._work_staging_dir_fds[run_id] = staging_fd
+                self._assert_layout(run_id)
+            work_fd = self._work_dir_fds[run_id]
+            has_entries = bool(os.listdir(work_fd))
+            if has_entries:
                 raise NodeRemoteRunError(
                     "Remote Run work directory is already committed",
                     code="work_already_committed",
                 )
-            work.rmdir()
+            staging_info = os.fstat(staging_fd)
+            staging_entry = os.stat(
+                "work.tmp", dir_fd=run_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(staging_entry.st_mode)
+                or (staging_info.st_dev, staging_info.st_ino)
+                != (staging_entry.st_dev, staging_entry.st_ino)
+            ):
+                raise NodeRemoteRunError(
+                    "Remote Run staging directory was replaced", code="layout_invalid"
+                )
             try:
-                os.replace(staging, work)
+                self._write_work_identity(
+                    metadata_fd,
+                    self._work_dir_fds[run_id],
+                    "snapshot-pending",
+                    staging_fd=staging_fd,
+                )
+                _copy_snapshot_tree(staging_fd, self._work_dir_fds[run_id])
+                self._assert_layout(run_id)
+                self._remove_staging(paths["work_staging"], run_id)
+                self._write_work_identity(
+                    metadata_fd, self._work_dir_fds[run_id], "stable"
+                )
             except BaseException:
                 with contextlib.suppress(OSError):
-                    work.mkdir(mode=0o700)
+                    _remove_directory_contents(self._work_dir_fds[run_id])
+                    self._write_work_identity(
+                        metadata_fd, self._work_dir_fds[run_id], "stable"
+                    )
                 raise
-            return {"work_path": str(work)}
+            return {"work_path": str(self._display_path(paths["work"]))}
 
     def write_metadata(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         run_id = self._identity(payload)
@@ -488,13 +1709,18 @@ class NodeRemoteRunRuntime:
             paths = self._assert_layout(run_id)
             self._assert_not_started(run_id, paths)
             target = paths["metadata"] / name
-            return NodeRemoteRunMetadataStream(
-                stream_id,
-                target,
-                expected_size=expected_size,
-                commit=lambda content: self._commit_metadata(run_id, name, content),
-                registry=registry,
-            )
+            parent_fd, target_name = self._open_parent(target)
+            try:
+                return NodeRemoteRunMetadataStream(
+                    stream_id,
+                    parent_fd,
+                    target_name,
+                    expected_size=expected_size,
+                    commit=lambda content: self._commit_metadata(run_id, name, content),
+                    registry=registry,
+                )
+            finally:
+                os.close(parent_fd)
 
     def start(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         run_id = self._identity(payload)
@@ -503,11 +1729,11 @@ class NodeRemoteRunRuntime:
             existing = self._existing_start(run_id, paths)
             if existing is not None:
                 return existing
-            self._start_tmux(run_id, paths["work"], paths["runner"])
+            self._start_tmux(run_id, mode="run")
             return {
                 "state": "preparing",
                 "session_name": self._session_name(run_id),
-                "run_root": str(paths["root"]),
+                "run_root": str(self._display_path(paths["root"])),
             }
 
     def start_git(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -530,26 +1756,44 @@ class NodeRemoteRunRuntime:
             invocation = build_public_git_clone_invocation(
                 url,
                 git_path=str(Path(git).resolve()),
-                askpass_path=str(paths["git_askpass"]),
-                empty_home=str(paths["git_home"]),
-                destination=str(paths["work_staging"]),
+                askpass_path="/__termroom_node_remote_run_askpass_fd__",
+                empty_home="/__termroom_node_remote_run_git_home_fd__",
+                destination="/__termroom_node_remote_run_work_staging_fd__",
             )
             argv = invocation.as_env_i_argv()
             encoded_argv = b"\x00".join(item.encode() for item in argv) + b"\x00"
-            paths["git_home"].mkdir(mode=0o700)
-            _atomic_private_write(paths["git_askpass"], b"#!/bin/sh\nexit 1\n", mode=0o700)
-            _atomic_private_write(paths["git_argv"], encoded_argv)
-            _atomic_private_write(paths["git_url"], (url + "\n").encode())
-            _atomic_private_write(paths["git_path"], (str(Path(git).resolve()) + "\n").encode())
-            _atomic_private_write(
-                paths["git_bootstrap"], REMOTE_GIT_BOOTSTRAP_SCRIPT.encode(), mode=0o700
+            self._create_directory(paths["git_home"])
+            self._write_private(
+                paths["git_askpass"], b"#!/bin/sh\nexit 1\n", mode=0o700,
+                expected_state=None,
             )
-            self._start_tmux(run_id, paths["root"], paths["git_bootstrap"])
+            self._write_private(paths["git_argv"], encoded_argv, expected_state=None)
+            self._write_private(
+                paths["git_url"], (url + "\n").encode(), expected_state=None
+            )
+            self._write_private(
+                paths["git_path"], (str(Path(git).resolve()) + "\n").encode(),
+                expected_state=None,
+            )
+            self._write_private(
+                paths["git_bootstrap"], REMOTE_GIT_BOOTSTRAP_SCRIPT.encode(),
+                mode=0o700, expected_state=None,
+            )
+            staging_fd = self._create_git_work_staging(run_id)
+            self._work_staging_dir_fds[run_id] = staging_fd
+            try:
+                self._set_work_identity_state(
+                    run_id, "git-pending", staging_fd=staging_fd
+                )
+                self._start_tmux(run_id, mode="git")
+            except BaseException:
+                self._discard_git_work_staging(run_id)
+                raise
             return {
                 "state": "preparing",
                 "phase": "cloning",
                 "session_name": self._session_name(run_id),
-                "run_root": str(paths["root"]),
+                "run_root": str(self._display_path(paths["root"])),
                 "source_url": url,
             }
 
@@ -655,7 +1899,17 @@ class NodeRemoteRunRuntime:
                         "terminal state is required to recreate it",
                         code="session_missing",
                     )
-                self._tmux("new-session", "-d", "-s", session, "-c", str(work), "-n", "shell")
+                work_fd = os.dup(self._work_dir_fds[run_id])
+                try:
+                    self._handoff_tmux(
+                        ("new-session", "-d", "-s", session, "-c", "/", "-n", "shell"),
+                        (work_fd,),
+                        rollback=lambda _result: self._tmux(
+                            "kill-session", "-t", session, check=False
+                        ),
+                    )
+                finally:
+                    os.close(work_fd)
                 self._tmux(
                     "set-option", "-t", session, "@termroom_remote_run_id", run_id
                 )
@@ -678,16 +1932,26 @@ class NodeRemoteRunRuntime:
             records = self._terminal_records(session)
             shell = next((item for item in records if item.get("role") == "shell"), None)
             if shell is None:
-                result = self._tmux(
-                    "new-window", "-d", "-P", "-F", "#{window_id}", "-t", session,
-                    "-c", str(work), "-n", "shell"
-                )
+                work_fd = os.dup(self._work_dir_fds[run_id])
+                try:
+                    result = self._handoff_tmux(
+                        (
+                            "new-window", "-d", "-P", "-F", "#{window_id}",
+                            "-t", session, "-c", "/", "-n", "shell",
+                        ),
+                        (work_fd,),
+                        rollback=lambda created: self._tmux(
+                            "kill-window", "-t", created.stdout.strip(), check=False
+                        ),
+                    )
+                finally:
+                    os.close(work_fd)
                 window = result.stdout.strip()
                 records = self._terminal_records(session)
                 shell = next(item for item in records if item["tmux_window"] == window)
             return {
                 "session_name": session,
-                "work_path": str(work),
+                "work_path": str(self._display_path(work)),
                 "shell_window": shell,
                 "terminals": records,
                 "created_session": created_session,
@@ -697,9 +1961,9 @@ class NodeRemoteRunRuntime:
         run_id = self._identity(payload)
         with self.lock_for(run_id):
             paths = self._paths(run_id)
-            quarantine = self.run_root / f".termroom-deleting-{run_id}"
-            root_exists = paths["root"].exists() or paths["root"].is_symlink()
-            quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+            quarantine = self._root_path / f".termroom-deleting-{run_id}"
+            root_exists = self._path_exists(paths["root"])
+            quarantine_exists = self._path_exists(quarantine)
             if root_exists and quarantine_exists:
                 raise NodeRemoteRunError(
                     "Multiple Remote Run roots exist; refusing automatic deletion",
@@ -707,11 +1971,12 @@ class NodeRemoteRunRuntime:
                 )
             self._kill_session(run_id)
             if not root_exists and not quarantine_exists:
+                self._forget_layout_handles(run_id)
                 return {"deleted": True, "already_missing": True}
             source = paths["root"] if root_exists else quarantine
             self._assert_marked_tree(source, run_id)
             if root_exists:
-                os.replace(source, quarantine)
+                self._replace(source, quarantine)
                 source = quarantine
                 self._assert_marked_tree(source, run_id)
             self._remove_owned_tree(source, run_id)
@@ -723,12 +1988,24 @@ class NodeRemoteRunRuntime:
         with self.lock_for(run_id):
             paths = self._assert_layout(run_id)
             work = self._real_directory(paths["work"], "Remote Run work")
-            if supplied != str(work):
+            display_work = self._display_path(work)
+            if supplied != str(display_work):
                 raise NodeRemoteRunError(
                     "Remote Run Workspace path does not match its managed Run",
                     code="path_outside",
                 )
-            return work
+            return display_work
+
+    def workspace_fd(self, run_id: str, workspace_path: Path) -> int:
+        with self.lock_for(run_id):
+            paths = self._assert_layout(run_id)
+            expected = self._display_path(paths["work"])
+            if workspace_path != expected:
+                raise NodeRemoteRunError(
+                    "Remote Run Workspace path does not match its managed Run",
+                    code="path_outside",
+                )
+            return self._work_dir_fds[run_id]
 
     @staticmethod
     def _require_version(payload: Mapping[str, Any]) -> None:
@@ -747,6 +2024,7 @@ class NodeRemoteRunRuntime:
                 "Remote Run root does not match Node local policy",
                 code="run_root_mismatch",
             )
+        self._assert_root_path_matches()
         return run_id
 
     def _paths(self, run_id: str, *, leaf: str | None = None) -> dict[str, Path]:
@@ -758,7 +2036,7 @@ class NodeRemoteRunRuntime:
             f".termroom-deleting-{run_id}",
         }:
             raise NodeRemoteRunError("Remote Run internal path is invalid", code="path_invalid")
-        root = self.run_root / safe_leaf
+        root = self._root_path / safe_leaf
         metadata = root / ".termroom"
         return {
             "root": root,
@@ -786,45 +2064,546 @@ class NodeRemoteRunRuntime:
         }
 
     def _assert_layout(self, run_id: str) -> dict[str, Path]:
+        if run_id in self._invalid_run_ids:
+            raise NodeRemoteRunError(
+                "Remote Run directory was replaced", code="layout_invalid"
+            )
+        self._assert_root_path_matches()
         paths = self._paths(run_id)
-        if not paths["root"].exists() and not paths["root"].is_symlink():
-            raise FileNotFoundError(str(paths["root"]))
-        self._assert_marked_tree(paths["root"], run_id)
+        self._layout_handles(run_id)
+        staging_fd = self._work_staging_dir_fds.get(run_id)
+        if staging_fd is not None:
+            try:
+                current = _open_directory_at(
+                    self._run_dir_fds[run_id], ("work.tmp",), create=False, mode=None
+                )
+            except OSError as exc:
+                raise NodeRemoteRunError(
+                    "Remote Run staging directory is unavailable", code="layout_invalid"
+                ) from exc
+            try:
+                expected = os.fstat(staging_fd)
+                actual = os.fstat(current)
+                if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+                    raise NodeRemoteRunError(
+                        "Remote Run staging directory was replaced", code="layout_invalid"
+                    )
+            finally:
+                os.close(current)
         return paths
 
     def _assert_marked_tree(self, root: Path, run_id: str) -> None:
         try:
-            root_info = root.lstat()
-            metadata = root / ".termroom"
-            metadata_info = metadata.lstat()
-            marker = metadata / "marker"
-            marker_info = marker.lstat()
+            relative = root.relative_to(self._root_path)
+            if len(relative.parts) != 1:
+                raise OSError("Remote Run root is not a direct child")
+            root_fd = _open_directory_at(
+                self._root_fd, relative.parts, create=False, mode=None
+            )
+        except (OSError, ValueError) as exc:
+            raise NodeRemoteRunError(
+                "Remote Run layout is incomplete", code="layout_incomplete"
+            ) from exc
+        metadata_fd = -1
+        try:
+            metadata_fd = _open_directory_at(
+                root_fd, (".termroom",), create=False, mode=None
+            )
+            if _read_regular_at(metadata_fd, "marker", 128).decode().strip() != run_id:
+                raise NodeRemoteRunError(
+                    "Remote Run marker does not match", code="marker_mismatch"
+                )
         except OSError as exc:
             raise NodeRemoteRunError(
                 "Remote Run layout is incomplete", code="layout_incomplete"
             ) from exc
-        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-            raise NodeRemoteRunError("Remote Run root is invalid", code="root_invalid")
-        if root.resolve(strict=True) != root or root.parent != self.run_root:
-            raise NodeRemoteRunError("Remote Run root is not canonical", code="root_invalid")
-        if stat.S_ISLNK(metadata_info.st_mode) or not stat.S_ISDIR(metadata_info.st_mode):
-            raise NodeRemoteRunError(
-                "Remote Run metadata directory is invalid", code="metadata_invalid"
-            )
-        if stat.S_ISLNK(marker_info.st_mode) or not stat.S_ISREG(marker_info.st_mode):
-            raise NodeRemoteRunError("Remote Run marker is invalid", code="marker_invalid")
-        if self._read_regular(marker, 128).decode().strip() != run_id:
-            raise NodeRemoteRunError(
-                "Remote Run marker does not match", code="marker_mismatch"
-            )
+        finally:
+            if metadata_fd >= 0:
+                os.close(metadata_fd)
+            os.close(root_fd)
 
     def _layout_payload(self, run_id: str) -> dict[str, Any]:
         paths = self._paths(run_id)
         return {
-            **{key: str(value) for key, value in paths.items()},
+            **{key: str(self._display_path(value)) for key, value in paths.items()},
             "run_base": str(self.run_root),
             "session_name": self._session_name(run_id),
         }
+
+    def _display_path(self, path: Path) -> Path:
+        return self.run_root / path.relative_to(self._root_path)
+
+    def _open_parent(self, path: Path) -> tuple[int, str]:
+        relative = path.relative_to(self._root_path)
+        parts = relative.parts
+        if not parts:
+            raise NodeRemoteRunError("Remote Run path is invalid", code="path_invalid")
+        run_id = parts[0]
+        run_fd = self._run_dir_fds.get(run_id)
+        metadata_fd = self._metadata_dir_fds.get(run_id)
+        if metadata_fd is not None and len(parts) >= 3 and parts[1] == ".termroom":
+            base_fd = os.dup(metadata_fd)
+            components = parts[2:-1]
+        elif run_fd is not None and len(parts) >= 2:
+            base_fd = os.dup(run_fd)
+            components = parts[1:-1]
+        else:
+            base_fd = os.dup(self._root_fd)
+            components = parts[:-1]
+        try:
+            if components:
+                nested = _open_directory_at(
+                    base_fd, components, create=False, mode=None
+                )
+                os.close(base_fd)
+                base_fd = nested
+            return base_fd, parts[-1]
+        except BaseException:
+            os.close(base_fd)
+            raise
+
+    def _create_directory(self, path: Path, *, mode: int = 0o700) -> None:
+        parent_fd, name = self._open_parent(path)
+        try:
+            directory_fd = _open_directory_at(
+                parent_fd, (name,), create=True, mode=mode
+            )
+            os.close(directory_fd)
+        finally:
+            os.close(parent_fd)
+
+    def _private_state_for_path(self, path: Path, *, mode: int) -> tuple[int, ...] | None:
+        parent_fd, name = self._open_parent(path)
+        try:
+            return _private_leaf_state_at(parent_fd, name, mode=mode)
+        finally:
+            os.close(parent_fd)
+
+    def _write_private(
+        self,
+        path: Path,
+        content: bytes,
+        *,
+        expected_state: object,
+        mode: int = 0o600,
+    ) -> None:
+        parent_fd, name = self._open_parent(path)
+        try:
+            _atomic_private_write_at(
+                parent_fd, name, content, mode=mode, expected_state=expected_state
+            )
+        finally:
+            os.close(parent_fd)
+
+    def _layout_handles(self, run_id: str) -> tuple[int, int]:
+        run_fd = self._run_dir_fds.get(run_id)
+        try:
+            current_run_fd = _open_directory_at(
+                self._root_fd, (run_id,), create=False, mode=None
+            )
+        except FileNotFoundError as exc:
+            if run_fd is not None:
+                raise NodeRemoteRunError(
+                    "Remote Run directory was replaced", code="layout_invalid"
+                ) from exc
+            raise
+        except OSError as exc:
+            raise NodeRemoteRunError(
+                "Remote Run directory is invalid", code="layout_invalid"
+            ) from exc
+        if run_fd is None:
+            run_fd = current_run_fd
+            self._run_dir_fds[run_id] = run_fd
+        else:
+            expected = os.fstat(run_fd)
+            current = os.fstat(current_run_fd)
+            os.close(current_run_fd)
+            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+                raise NodeRemoteRunError(
+                    "Remote Run directory was replaced", code="layout_invalid"
+                )
+        metadata_fd = self._metadata_dir_fds.get(run_id)
+        try:
+            current_metadata_fd = _open_directory_at(
+                run_fd, (".termroom",), create=False, mode=None
+            )
+        except OSError as exc:
+            raise NodeRemoteRunError(
+                "Remote Run metadata directory is invalid", code="layout_invalid"
+            ) from exc
+        if metadata_fd is None:
+            metadata_fd = current_metadata_fd
+            self._metadata_dir_fds[run_id] = metadata_fd
+        else:
+            expected = os.fstat(metadata_fd)
+            current = os.fstat(current_metadata_fd)
+            os.close(current_metadata_fd)
+            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+                raise NodeRemoteRunError(
+                    "Remote Run metadata directory was replaced", code="layout_invalid"
+                )
+        if _read_regular_at(metadata_fd, "marker", 128).decode().strip() != run_id:
+            raise NodeRemoteRunError(
+                "Remote Run marker does not match", code="marker_mismatch"
+            )
+        try:
+            current_work_fd = _open_directory_at(
+                run_fd, ("work",), create=False, mode=None
+            )
+        except OSError as exc:
+            raise NodeRemoteRunError(
+                "Remote Run work directory is invalid", code="layout_invalid"
+            ) from exc
+        work_fd = self._work_dir_fds.get(run_id)
+        current_info = os.fstat(current_work_fd)
+        current_identity = (current_info.st_dev, current_info.st_ino)
+        metadata_info = os.fstat(metadata_fd)
+        identity_key = (metadata_info.st_dev, metadata_info.st_ino)
+        try:
+            identity_state = _private_leaf_state_at(
+                metadata_fd, "work.identity", mode=0o600
+            )
+            identity_record = _read_regular_at(metadata_fd, "work.identity", 128)
+            if _private_leaf_state_at(
+                metadata_fd, "work.identity", mode=0o600
+            ) != identity_state:
+                raise NodeRemoteRunError(
+                    "Remote Run work identity changed during validation",
+                    code="layout_invalid",
+                )
+        except FileNotFoundError:
+            identity_record = None
+        except (OSError, NodeRemoteRunError) as exc:
+            os.close(current_work_fd)
+            raise NodeRemoteRunError(
+                "Remote Run work identity is invalid", code="layout_invalid"
+            ) from exc
+        if identity_record is None:
+            os.close(current_work_fd)
+            raise NodeRemoteRunError(
+                "Remote Run work identity is missing", code="layout_invalid"
+            )
+        else:
+            self._work_identity_states[identity_key] = identity_state
+            try:
+                state, recorded_identity, staging_identity = self._parse_work_identity(
+                    identity_record
+                )
+            except NodeRemoteRunError:
+                os.close(current_work_fd)
+                raise
+            authorized_change = False
+            if (
+                state == "git-pending"
+                and run_id not in self._work_staging_dir_fds
+                and current_identity != staging_identity
+            ):
+                os.close(current_work_fd)
+                raise NodeRemoteRunError(
+                    "Remote Run work directory was replaced", code="layout_invalid"
+                )
+            if state == "snapshot-pending":
+                staging_fd = self._work_staging_dir_fds.get(run_id)
+                if staging_fd is None:
+                    os.close(current_work_fd)
+                    raise NodeRemoteRunError(
+                        "Remote Run snapshot recovery is unavailable",
+                        code="layout_invalid",
+                    )
+                staged = os.fstat(staging_fd)
+                if (staged.st_dev, staged.st_ino) != staging_identity:
+                    os.close(current_work_fd)
+                    raise NodeRemoteRunError(
+                        "Remote Run snapshot staging was replaced",
+                        code="layout_invalid",
+                    )
+            if current_identity != recorded_identity:
+                if state != "git-pending" or current_identity != staging_identity:
+                    os.close(current_work_fd)
+                    raise NodeRemoteRunError(
+                        "Remote Run work directory was replaced", code="layout_invalid"
+                    )
+                staging_fd = self._work_staging_dir_fds.get(run_id)
+                if staging_fd is not None:
+                    staged = os.fstat(staging_fd)
+                    if (staged.st_dev, staged.st_ino) != staging_identity:
+                        os.close(current_work_fd)
+                        raise NodeRemoteRunError(
+                            "Remote Run work does not match its staged identity",
+                            code="layout_invalid",
+                        )
+                revision = None
+                with contextlib.suppress(OSError, UnicodeDecodeError):
+                    revision = _read_regular_at(
+                        metadata_fd, "git-revision", 128
+                    ).decode().strip()
+                if not revision or not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+                    os.close(current_work_fd)
+                    raise NodeRemoteRunError(
+                        "Remote Run work directory was replaced", code="layout_invalid"
+                    )
+                self._write_work_identity(
+                    metadata_fd,
+                    current_work_fd,
+                    "stable",
+                    expected_state=identity_state,
+                )
+                authorized_change = True
+        if work_fd is not None:
+            expected = os.fstat(work_fd)
+            if (expected.st_dev, expected.st_ino) != current_identity:
+                if not authorized_change:
+                    os.close(current_work_fd)
+                    raise NodeRemoteRunError(
+                        "Remote Run work directory was replaced", code="layout_invalid"
+                    )
+                staging_fd = self._work_staging_dir_fds.get(run_id)
+                if staging_fd is not None:
+                    staged = os.fstat(staging_fd)
+                    if (staged.st_dev, staged.st_ino) != current_identity:
+                        os.close(current_work_fd)
+                        raise NodeRemoteRunError(
+                            "Remote Run work does not match its staged identity",
+                            code="layout_invalid",
+                        )
+                    self._work_staging_dir_fds.pop(run_id)
+                    os.close(work_fd)
+                    os.close(current_work_fd)
+                    self._work_dir_fds[run_id] = staging_fd
+                else:
+                    os.close(work_fd)
+                    self._work_dir_fds[run_id] = current_work_fd
+            else:
+                os.close(current_work_fd)
+        else:
+            staging_fd = self._work_staging_dir_fds.get(run_id)
+            if authorized_change and staging_fd is not None:
+                staged = os.fstat(staging_fd)
+                if (staged.st_dev, staged.st_ino) != current_identity:
+                    os.close(current_work_fd)
+                    raise NodeRemoteRunError(
+                        "Remote Run work does not match its staged identity",
+                        code="layout_invalid",
+                    )
+                self._work_staging_dir_fds.pop(run_id)
+                os.close(current_work_fd)
+                self._work_dir_fds[run_id] = staging_fd
+            else:
+                self._work_dir_fds[run_id] = current_work_fd
+        return run_fd, metadata_fd
+
+    @staticmethod
+    def _parse_work_identity(
+        value: bytes,
+    ) -> tuple[str, tuple[int, int], tuple[int, int] | None]:
+        try:
+            parts = value.decode("ascii").strip().split(":")
+            state = parts[0]
+            if state == "stable" and len(parts) == 3:
+                _, device, inode = parts
+                return state, (int(device), int(inode)), None
+            if state in {"git-pending", "snapshot-pending"} and len(parts) == 5:
+                _, device, inode, staging_device, staging_inode = parts
+                return (
+                    state,
+                    (int(device), int(inode)),
+                    (int(staging_device), int(staging_inode)),
+                )
+            raise ValueError
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise NodeRemoteRunError(
+                "Remote Run work identity is invalid", code="layout_invalid"
+            ) from exc
+
+    def _write_work_identity(
+        self,
+        metadata_fd: int,
+        work_fd: int,
+        state: str,
+        *,
+        staging_fd: int | None = None,
+        expected_state: object = _PRIVATE_WRITE_UNSPECIFIED,
+    ) -> None:
+        metadata_info = os.fstat(metadata_fd)
+        identity_key = (metadata_info.st_dev, metadata_info.st_ino)
+        if expected_state is _PRIVATE_WRITE_UNSPECIFIED:
+            expected_state = self._work_identity_states.get(
+                identity_key, _PRIVATE_WRITE_UNSPECIFIED
+            )
+        if expected_state is _PRIVATE_WRITE_UNSPECIFIED:
+            expected_state = _private_leaf_state_at(metadata_fd, "work.identity", mode=0o600)
+        info = os.fstat(work_fd)
+        if state in {"git-pending", "snapshot-pending"}:
+            if staging_fd is None:
+                raise NodeRemoteRunError(
+                    "Remote Run work staging identity is unavailable",
+                    code="layout_invalid",
+                )
+            staging_info = os.fstat(staging_fd)
+            value = (
+                f"{state}:{info.st_dev}:{info.st_ino}:"
+                f"{staging_info.st_dev}:{staging_info.st_ino}\n"
+            )
+        elif state == "stable" and staging_fd is None:
+            value = f"stable:{info.st_dev}:{info.st_ino}\n"
+        else:
+            raise NodeRemoteRunError(
+                "Remote Run work identity state is invalid", code="layout_invalid"
+            )
+        self._work_identity_states[identity_key] = _atomic_private_write_at(
+            metadata_fd,
+            "work.identity",
+            value.encode("ascii"),
+            mode=0o600,
+            expected_state=expected_state,
+        )
+
+    def _set_work_identity_state(
+        self, run_id: str, state: str, *, staging_fd: int | None = None
+    ) -> None:
+        self._layout_handles(run_id)
+        self._write_work_identity(
+            self._metadata_dir_fds[run_id],
+            self._work_dir_fds[run_id],
+            state,
+            staging_fd=staging_fd,
+        )
+
+    def _create_git_work_staging(self, run_id: str) -> int:
+        run_fd = self._run_dir_fds[run_id]
+        try:
+            return _create_directory_handle_at(run_fd, "work.tmp")
+        except FileExistsError as exc:
+            self._invalid_run_ids.add(run_id)
+            raise NodeRemoteRunError(
+                "Remote Run staging directory already exists", code="layout_invalid"
+            ) from exc
+        except OSError as exc:
+            self._invalid_run_ids.add(run_id)
+            raise NodeRemoteRunError(
+                "Remote Run staging directory was replaced", code="layout_invalid"
+            ) from exc
+
+    def _discard_git_work_staging(self, run_id: str) -> None:
+        descriptor = self._work_staging_dir_fds.pop(run_id, None)
+        if descriptor is None:
+            return
+        try:
+            run_fd = self._run_dir_fds[run_id]
+            info = os.fstat(descriptor)
+            current = os.stat("work.tmp", dir_fd=run_fd, follow_symlinks=False)
+            if (
+                (info.st_dev, info.st_ino) == (current.st_dev, current.st_ino)
+                and not os.listdir(descriptor)
+            ):
+                os.rmdir("work.tmp", dir_fd=run_fd)
+            self._write_work_identity(
+                self._metadata_dir_fds[run_id], self._work_dir_fds[run_id], "stable"
+            )
+        except (FileNotFoundError, OSError):
+            pass
+        finally:
+            os.close(descriptor)
+
+    def _refresh_work_directory(
+        self, run_id: str, run_fd: int, metadata_fd: int
+    ) -> None:
+        current = _open_directory_at(run_fd, ("work",), create=False, mode=None)
+        try:
+            self._write_work_identity(metadata_fd, current, "stable")
+        except BaseException:
+            os.close(current)
+            raise
+        previous = self._work_dir_fds.get(run_id)
+        self._work_dir_fds[run_id] = current
+        if previous is not None:
+            os.close(previous)
+
+    def _relative_parts(self, path: Path) -> tuple[str, ...]:
+        try:
+            relative = path.relative_to(self._root_path)
+        except ValueError as exc:
+            raise NodeRemoteRunError("Remote Run path is invalid", code="path_invalid") from exc
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise NodeRemoteRunError("Remote Run path is invalid", code="path_invalid")
+        return relative.parts
+
+    def _open_directory(self, path: Path) -> int:
+        return _open_directory_at(
+            self._root_fd, self._relative_parts(path), create=False, mode=None
+        )
+
+    def _path_exists(self, path: Path) -> bool:
+        parent_fd = -1
+        try:
+            parent_fd, name = self._open_parent(path)
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+
+    def _replace(self, source: Path, destination: Path) -> None:
+        source_parent, source_name = self._open_parent(source)
+        try:
+            destination_parent, destination_name = self._open_parent(destination)
+            try:
+                os.replace(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_parent,
+                    dst_dir_fd=destination_parent,
+                )
+            finally:
+                os.close(destination_parent)
+        finally:
+            os.close(source_parent)
+
+    def _forget_layout_handles(self, run_id: str) -> None:
+        metadata_fd = self._metadata_dir_fds.get(run_id)
+        identity = None
+        first_error: OSError | None = None
+        if metadata_fd is not None:
+            try:
+                info = os.fstat(metadata_fd)
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    self._metadata_dir_fds.pop(run_id, None)
+                else:
+                    first_error = exc
+            else:
+                identity = (info.st_dev, info.st_ino)
+        for handles in (
+            self._metadata_dir_fds,
+            self._run_dir_fds,
+            self._work_dir_fds,
+            self._work_staging_dir_fds,
+        ):
+            descriptor = handles.get(run_id)
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError as state_error:
+                        if state_error.errno == errno.EBADF:
+                            handles.pop(run_id, None)
+                            if exc.errno != errno.EBADF and first_error is None:
+                                first_error = exc
+                        elif first_error is None:
+                            first_error = state_error
+                    else:
+                        if first_error is None:
+                            first_error = exc
+                    continue
+                handles.pop(run_id, None)
+        if run_id not in self._metadata_dir_fds and identity is not None:
+            self._work_identity_states.pop(identity, None)
+        if first_error is not None:
+            raise first_error
 
     def _staging_target(self, run_id: str, relative: str) -> Path:
         paths = self._assert_layout(run_id)
@@ -835,40 +2614,46 @@ class NodeRemoteRunRuntime:
             if not is_within(parent, staging):
                 raise NodeRemoteRunError("Source path escapes staging", code="path_outside")
             self._real_directory(parent, "Source parent")
-        if target.exists() or target.is_symlink():
+        if self._path_exists(target):
             raise NodeRemoteRunError(
                 "Remote Run Source path already exists", code="source_path_conflict"
             )
         return target
 
-    @staticmethod
-    def _real_directory(path: Path, label: str) -> Path:
+    def _real_directory(self, path: Path, label: str) -> Path:
         try:
-            info = path.lstat()
-            resolved = path.resolve(strict=True)
-        except OSError as exc:
+            try:
+                relative = path.relative_to(self._root_path)
+            except ValueError:
+                relative = path.relative_to(self.run_root)
+            run_fd = self._run_dir_fds.get(relative.parts[0]) if relative.parts else None
+            if run_fd is not None:
+                descriptor = _open_directory_at(
+                    run_fd, relative.parts[1:], create=False, mode=None
+                )
+            else:
+                descriptor = _open_directory_at(
+                    self._root_fd, relative.parts, create=False, mode=None
+                )
+            os.close(descriptor)
+        except (OSError, ValueError) as exc:
             raise NodeRemoteRunError(f"{label} is unavailable", code="path_invalid") from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or resolved != path:
-            raise NodeRemoteRunError(f"{label} is invalid", code="path_invalid")
         return path
 
-    @staticmethod
-    def _read_regular(path: Path, limit: int) -> bytes:
+    def _read_regular(self, path: Path, limit: int) -> bytes:
+        parent_fd = -1
         try:
-            info = path.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise NodeRemoteRunError("Remote Run metadata is invalid", code="metadata_invalid")
-            if info.st_size > limit:
-                raise NodeRemoteRunError(
-                    "Remote Run metadata is too large", code="metadata_invalid"
-                )
-            return path.read_bytes()
+            parent_fd, name = self._open_parent(path)
+            return _read_regular_at(parent_fd, name, limit)
         except NodeRemoteRunError:
             raise
         except OSError as exc:
             raise NodeRemoteRunError(
                 "Remote Run metadata is unavailable", code="metadata_invalid"
             ) from exc
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
 
     @staticmethod
     def _validate_source_manifest(value: dict[str, Any] | list[Any]) -> None:
@@ -945,14 +2730,18 @@ class NodeRemoteRunRuntime:
         with self.lock_for(run_id):
             paths = self._assert_layout(run_id)
             self._assert_not_started(run_id, paths)
-            _atomic_private_write(paths["metadata"] / name, content)
+            metadata_path = paths["metadata"] / name
+            expected_state = self._private_state_for_path(metadata_path, mode=0o600)
+            self._write_private(
+                metadata_path, content, expected_state=expected_state
+            )
 
     def _assert_not_started(
         self, run_id: str, paths: Mapping[str, Path]
     ) -> None:
-        if any(
-            paths[name].exists()
-            for name in ("state", "prepare_result", "stop", "completion")
+        if self._stop_requested(paths) or any(
+            self._path_exists(paths[name])
+            for name in ("state", "prepare_result", "completion")
         ) or self._tmux_status(run_id)["exists"]:
             raise NodeRemoteRunError(
                 "Remote Run Source cannot change after execution starts",
@@ -962,9 +2751,9 @@ class NodeRemoteRunRuntime:
     def _existing_start(
         self, run_id: str, paths: Mapping[str, Path]
     ) -> dict[str, Any] | None:
-        lifecycle = any(
-            paths[name].exists()
-            for name in ("state", "prepare_result", "stop", "completion")
+        lifecycle = self._stop_requested(paths) or any(
+            self._path_exists(paths[name])
+            for name in ("state", "prepare_result", "completion")
         )
         status = self._tmux_status(run_id)
         if not lifecycle and not status["exists"]:
@@ -978,48 +2767,213 @@ class NodeRemoteRunRuntime:
         return {
             **observation,
             "session_name": self._session_name(run_id),
-            "run_root": str(paths["root"]),
+            "run_root": str(self._display_path(paths["root"])),
             "replayed": True,
         }
 
-    def _start_tmux(self, run_id: str, cwd: Path, script: Path) -> None:
-        self._real_directory(cwd, "Remote Run working directory")
-        session = self._session_name(run_id)
-        if self._tmux("has-session", "-t", session, check=False).returncode == 0:
-            raise NodeRemoteRunError("Remote Run session already exists", code="run_exists")
-        self._tmux("new-session", "-d", "-s", session, "-c", str(cwd), "-n", "run")
+    def _handoff_tmux(
+        self,
+        tmux_args: tuple[str, ...],
+        descriptors: tuple[int, ...],
+        command: tuple[str, ...] = (),
+        *,
+        inherit: tuple[int, ...] = (),
+        environment: Mapping[str, str] | None = None,
+        rollback: Callable[[subprocess.CompletedProcess[str]], None] | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        if self._descriptor_handoff is None:
+            raise NodeRemoteRunError(
+                "Node tmux descriptor handoff is unavailable", code="capability_unsupported"
+            )
         try:
-            target = f"{session}:run"
-            self._tmux(
-                "set-option", "-t", session, "@termroom_remote_run_id", run_id
+            return self._descriptor_handoff(
+                tmux_args,
+                descriptors,
+                command,
+                inherit=inherit,
+                environment=environment,
+                rollback=rollback,
+                check=check,
             )
-            self._tmux("set-window-option", "-t", target, "remain-on-exit", "on")
-            self._tmux(
-                "set-window-option", "-t", target, "remain-on-exit-format", "", check=False
-            )
-            self._tmux("set-window-option", "-t", target, "window-size", "latest", check=False)
-            self._tmux("set-window-option", "-t", target, TMUX_TERMINAL_ROLE_OPTION, "remote_run")
-            self._tmux("set-window-option", "-t", target, TMUX_MANAGED_RUN_OPTION, run_id)
-            self._tmux(
-                "respawn-pane", "-k", "-t", f"{session}:run.0", "-c", str(cwd),
-                "/bin/bash", "--noprofile", "--norc", str(script)
-            )
-        except BaseException:
-            self._tmux("kill-session", "-t", session, check=False)
+        except NodeRemoteRunError:
             raise
+        except Exception as exc:
+            raise NodeRemoteRunError(
+                str(exc), code=str(getattr(exc, "code", "tmux_handoff_failed"))
+            ) from exc
+
+    def _start_tmux(self, run_id: str, *, mode: str) -> None:
+        paths = self._assert_layout(run_id)
+        if mode not in {"run", "git"}:
+            raise NodeRemoteRunError("Remote Run mode is invalid", code="path_invalid")
+        if self._tmux("has-session", "-t", self._session_name(run_id), check=False).returncode == 0:
+            raise NodeRemoteRunError("Remote Run session already exists", code="run_exists")
+
+        run_fd, metadata_fd = self._layout_handles(run_id)
+        work_fd = self._work_dir_fds[run_id]
+        cwd_rel = _read_regular_at(metadata_fd, "cwd", 4096).decode("utf-8").strip()
+        try:
+            cwd_rel = validate_cwd_rel(cwd_rel)
+        except (SourceValidationError, UnicodeDecodeError) as exc:
+            raise NodeRemoteRunError(
+                "Remote Run working directory is invalid", code="path_invalid"
+            ) from exc
+
+        launch_fds: list[int] = []
+        try:
+            if mode == "run":
+                cwd_fd = _open_directory_at(
+                    work_fd,
+                    () if cwd_rel == "." else cwd_rel.split("/"),
+                    create=False,
+                    mode=None,
+                )
+            else:
+                cwd_fd = os.dup(run_fd)
+            launch_fds.append(cwd_fd)
+            launch_fds.extend((os.dup(run_fd), os.dup(metadata_fd), os.dup(work_fd)))
+            command_fd = _sealed_regular_at(
+                metadata_fd, "command.sh", 256 * 1024
+            )
+            launch_fds.append(command_fd)
+            if _private_leaf_state_at(metadata_fd, "output-seal.json", mode=0o600) is not None:
+                raise NodeRemoteRunError(
+                    "Remote Run seal already exists", code="metadata_invalid"
+                )
+            self._write_private(paths["output"], b"", expected_state=None)
+            output_fd = _open_owned_regular_at(
+                metadata_fd, "output.log", flags=os.O_WRONLY | os.O_APPEND
+            )
+            launch_fds.append(output_fd)
+
+            environment = {
+                "TERMROOM_REMOTE_RUN_META_DIR": "{fd:2}",
+                "TERMROOM_REMOTE_RUN_ROOT_DIR": "{fd:1}",
+                "TERMROOM_REMOTE_RUN_COMMAND": "{fd:4}",
+                "TERMROOM_REMOTE_RUN_WORK_DIR": "{fd:3}",
+                "TERMROOM_REMOTE_RUN_CWD_DIR": "{fd:0}",
+                "TERMROOM_REMOTE_RUN_OUTPUT_FILE": "{fd:5}",
+                "TERMROOM_REMOTE_RUN_CWD_REL": cwd_rel,
+                "TERMROOM_REMOTE_RUN_PIPE": "true",
+                "TERMROOM_NODE_PYTHON": sys.executable,
+                "TERMROOM_REMOTE_RUN_LOG_HELPER_CODE": _NODE_REMOTE_RUN_LOG_HELPER_CODE,
+                "TERMROOM_REMOTE_RUN_LOG_VERIFY_CODE": _NODE_REMOTE_RUN_LOG_VERIFY_CODE,
+            }
+            command = (
+                "/bin/bash", "--noprofile", "--norc", "-c",
+                _node_remote_run_script(), "termroom-node-remote-run", run_id,
+            )
+            if mode == "git":
+                staging_fd = self._work_staging_dir_fds.get(run_id)
+                if staging_fd is None:
+                    raise NodeRemoteRunError(
+                        "Remote Run staging identity is unavailable", code="layout_invalid"
+                    )
+                git_argv_fd = _sealed_regular_at(
+                    metadata_fd, "git-argv", 256 * 1024
+                )
+                git_path_fd = _sealed_regular_at(metadata_fd, "git-path", 4096)
+                askpass_fd = _sealed_regular_at(
+                    metadata_fd, "git-askpass", 4096, mode=0o700
+                )
+                git_home_fd = _open_directory_at(
+                    metadata_fd, ("git-home",), create=False, mode=None
+                )
+                self._write_private(paths["prepare_log"], b"", expected_state=None)
+                prepare_log_fd = _open_owned_regular_at(
+                    metadata_fd,
+                    "prepare.log",
+                    flags=os.O_WRONLY | os.O_APPEND,
+                )
+                launch_fds.extend(
+                    (os.dup(staging_fd), git_argv_fd, git_path_fd, askpass_fd,
+                     git_home_fd, prepare_log_fd)
+                )
+                environment.update(
+                    {
+                        "TERMROOM_REMOTE_RUN_STAGING_DIR": "{fd:6}",
+                        "TERMROOM_REMOTE_RUN_GIT_ARGV": "{fd:7}",
+                        "TERMROOM_REMOTE_RUN_GIT_PATH_FILE": "{fd:8}",
+                        "TERMROOM_REMOTE_RUN_ASKPASS": "{fd:9}",
+                        "TERMROOM_REMOTE_RUN_GIT_HOME": "{fd:10}",
+                        "TERMROOM_REMOTE_RUN_PREPARE_LOG": "{fd:11}",
+                        "TERMROOM_NODE_PYTHON": sys.executable,
+                        "TERMROOM_REMOTE_RUN_GIT_FINISH_CODE": (
+                            _NODE_REMOTE_RUN_GIT_FINISH_CODE
+                        ),
+                        "TERMROOM_REMOTE_RUN_RUNNER_SCRIPT": _node_remote_run_script(),
+                    }
+                )
+                command = (
+                    "/bin/bash", "--noprofile", "--norc", "-c",
+                    _node_git_bootstrap_script(), "termroom-node-remote-git", run_id,
+                )
+
+            # Append after Git descriptors to preserve their existing handoff indices.
+            channel_index = len(launch_fds)
+            launch_fds.extend(os.pipe())
+            environment.update({
+                "TERMROOM_REMOTE_RUN_LOG_CHANNEL": f"{{fd:{channel_index}}}",
+                "TERMROOM_REMOTE_RUN_LOG_CHANNEL_WRITE": f"{{fd:{channel_index + 1}}}",
+            })
+            session = self._session_name(run_id)
+            self._tmux(
+                "new-session", "-d", "-s", session, "-c", "/", "-n", "run",
+                "/bin/sleep 2147483647",
+            )
+            target = f"{session}:run"
+            try:
+                self._tmux("set-option", "-t", session, "@termroom_remote_run_id", run_id)
+                self._tmux("set-window-option", "-t", target, "remain-on-exit", "on")
+                self._tmux(
+                    "set-window-option", "-t", target, "remain-on-exit-format", "", check=False
+                )
+                self._tmux(
+                    "set-window-option", "-t", target, "window-size", "latest", check=False
+                )
+                self._tmux(
+                    "set-window-option", "-t", target, TMUX_TERMINAL_ROLE_OPTION, "remote_run"
+                )
+                self._tmux(
+                    "set-window-option", "-t", target, TMUX_MANAGED_RUN_OPTION, run_id
+                )
+                result = self._handoff_tmux(
+                    ("respawn-pane", "-k", "-c", "/", "-t", f"{session}:run.0"),
+                    tuple(launch_fds),
+                    command,
+                    inherit=tuple(range(len(launch_fds))),
+                    environment=environment,
+                    rollback=lambda _result: self._tmux(
+                        "kill-session", "-t", session, check=False
+                    ),
+                    check=False,
+                )
+                if result.returncode:
+                    raise NodeRemoteRunError(
+                        result.stderr.strip() or "Remote Run could not start",
+                        code="tmux_failed",
+                    )
+            except BaseException:
+                self._tmux("kill-session", "-t", session, check=False)
+                raise
+        finally:
+            for descriptor in launch_fds:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
 
     def _reconcile(self, run_id: str, paths: dict[str, Path]) -> dict[str, Any]:
         tmux = self._tmux_status(run_id)
-        completion_exists = paths["completion"].exists()
+        completion_exists = self._path_exists(paths["completion"])
         completion = self._read_json_record(paths["completion"])
-        prepare_exists = paths["prepare_result"].exists()
+        prepare_exists = self._path_exists(paths["prepare_result"])
         prepare = self._read_json_record(paths["prepare_result"])
-        state_exists = paths["state"].exists()
+        state_exists = self._path_exists(paths["state"])
         state_record = self._read_json_record(paths["state"])
         completion_valid = self._valid_completion(completion)
         prepare_valid = self._valid_prepare(prepare)
         state_valid = self._valid_state(state_record)
-        stop_requested = paths["stop"].exists()
+        stop_requested = self._stop_requested(paths)
         errors = [
             name
             for name, exists, valid in (
@@ -1056,7 +3010,7 @@ class NodeRemoteRunRuntime:
                 completion_valid = self._valid_completion(completion)
                 prepare_valid = self._valid_prepare(prepare)
                 state_valid = self._valid_state(state_record)
-                stop_requested = paths["stop"].exists()
+                stop_requested = self._stop_requested(paths)
                 result.update(
                     phase=state_record.get("phase") if state_valid else None,
                     started_at=state_record.get("started_at") if state_valid else None,
@@ -1069,7 +3023,7 @@ class NodeRemoteRunRuntime:
                         ("prepare-result.json", paths["prepare_result"], prepare_valid),
                         ("state.json", paths["state"], state_valid),
                     )
-                    if path.exists() and not valid
+                    if self._path_exists(path) and not valid
                 ]
         if completion_valid:
             result.update(
@@ -1169,21 +3123,11 @@ class NodeRemoteRunRuntime:
             return []
         return [dict(item) for item in parse_tmux_terminal_records(result.stdout)]
 
-    @staticmethod
-    def _read_json_record(path: Path) -> dict[str, Any]:
-        if not path.exists():
-            return {}
+    def _read_json_record(self, path: Path) -> dict[str, Any]:
         try:
-            info = path.lstat()
-            if (
-                stat.S_ISLNK(info.st_mode)
-                or not stat.S_ISREG(info.st_mode)
-                or info.st_size > 1024 * 1024
-            ):
-                return {}
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(self._read_regular(path, 1024 * 1024).decode("utf-8"))
             return dict(value) if isinstance(value, dict) else {}
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (OSError, NodeRemoteRunError, UnicodeDecodeError, json.JSONDecodeError):
             return {}
 
     @staticmethod
@@ -1228,25 +3172,43 @@ class NodeRemoteRunRuntime:
             raise NodeRemoteRunError("Remote Run log limit is invalid", code="log_invalid")
         limit = min(limit, REMOTE_RUN_LOG_READ_LIMIT)
         path = paths["prepare_log"] if stream == "prepare" else paths["output"]
-        if not path.exists():
+        parent_fd = -1
+        descriptor = -1
+        try:
+            parent_fd, name = self._open_parent(path)
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if parent_fd >= 0:
+                os.close(parent_fd)
             return self._empty_log(stream, offset)
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise NodeRemoteRunError("Remote Run log is invalid", code="log_invalid")
-        size = info.st_size
-        start = max(0, size - REMOTE_RUN_INITIAL_TAIL) if offset is None else offset
-        if start < 0 or start > size:
-            raise NodeRemoteRunError("Remote Run log offset is invalid", code="log_invalid")
-        with path.open("rb") as handle:
+        except OSError as exc:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            raise NodeRemoteRunError("Remote Run log is invalid", code="log_invalid") from exc
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+            ):
+                raise NodeRemoteRunError("Remote Run log is invalid", code="log_invalid")
+            size = info.st_size
+            start = max(0, size - REMOTE_RUN_INITIAL_TAIL) if offset is None else offset
+            if start < 0 or start > size:
+                raise NodeRemoteRunError("Remote Run log offset is invalid", code="log_invalid")
             if offset is None and start:
-                handle.seek(start)
-                prefix = handle.read(4)
+                os.lseek(descriptor, start, os.SEEK_SET)
+                prefix = os.read(descriptor, 4)
                 skipped = 0
                 while skipped < len(prefix) and prefix[skipped] & 0xC0 == 0x80:
                     skipped += 1
                 start += skipped
-            handle.seek(start)
-            raw = handle.read(min(limit, size - start))
+            os.lseek(descriptor, start, os.SEEK_SET)
+            raw = os.read(descriptor, min(limit, size - start))
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
         next_offset = start + len(raw)
         return {
             "stream": stream,
@@ -1290,17 +3252,20 @@ class NodeRemoteRunRuntime:
             "layout_error": error,
         }
 
+    def _stop_requested(self, paths: Mapping[str, Path]) -> bool:
+        return self._private_state_for_path(paths["stop"], mode=0o600) is not None
+
     def _publish_stop(self, paths: Mapping[str, Path]) -> None:
-        if paths["stop"].exists():
+        if self._stop_requested(paths):
             return
         from datetime import UTC, datetime
 
         value = datetime.now(UTC).isoformat(timespec="seconds") + "\n"
-        _atomic_private_write(paths["stop"], value.encode())
+        self._write_private(paths["stop"], value.encode(), expected_state=None)
 
     def _finish_interrupted_delete(self, run_id: str) -> None:
-        quarantine = self.run_root / f".termroom-deleting-{run_id}"
-        if quarantine.exists() or quarantine.is_symlink():
+        quarantine = self._root_path / f".termroom-deleting-{run_id}"
+        if self._path_exists(quarantine):
             self._assert_marked_tree(quarantine, run_id)
             self._remove_owned_tree(quarantine, run_id)
 
@@ -1308,27 +3273,137 @@ class NodeRemoteRunRuntime:
         expected = self._paths(run_id)["work_staging"]
         if path != expected or path.parent != self._paths(run_id)["root"]:
             raise NodeRemoteRunError("Source staging path is invalid", code="path_invalid")
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise NodeRemoteRunError("Source staging is invalid", code="path_invalid")
-        shutil.rmtree(path)
+        parent_fd, name = self._open_parent(path)
+        try:
+            staging_fd = self._work_staging_dir_fds.get(run_id)
+            staging_identity = None
+            if staging_fd is not None:
+                staging_info = os.fstat(staging_fd)
+                staging_identity = (staging_info.st_dev, staging_info.st_ino)
+            _remove_tree_at(
+                parent_fd, name, expected_identity=staging_identity
+            )
+            staging_fd = self._work_staging_dir_fds.pop(run_id, None)
+            if staging_fd is not None:
+                os.close(staging_fd)
+        except OSError as exc:
+            raise NodeRemoteRunError("Source staging is invalid", code="path_invalid") from exc
+        finally:
+            os.close(parent_fd)
 
     def _remove_owned_tree(
         self, path: Path, run_id: str, *, allow_missing_marker: bool = False
     ) -> None:
         allowed = {
-            self.run_root / run_id,
-            self.run_root / f".termroom-creating-{run_id}",
-            self.run_root / f".termroom-deleting-{run_id}",
+            self._root_path / run_id,
+            self._root_path / f".termroom-creating-{run_id}",
+            self._root_path / f".termroom-deleting-{run_id}",
         }
-        if path not in allowed or path.parent != self.run_root:
+        if path not in allowed or path.parent != self._root_path:
             raise NodeRemoteRunError("Remote Run cleanup path is invalid", code="cleanup_invalid")
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise NodeRemoteRunError("Remote Run cleanup root is invalid", code="cleanup_invalid")
-        if not allow_missing_marker:
-            self._assert_marked_tree(path, run_id)
-        shutil.rmtree(path)
+        parent_fd, name = self._open_parent(path)
+        root_fd = -1
+        marker_validated = False
+        destructive_started = False
+        try:
+            root_fd = _open_directory_at(parent_fd, (name,), create=False, mode=None)
+            root_info = os.fstat(root_fd)
+            root_identity = (root_info.st_dev, root_info.st_ino, stat.S_IFMT(root_info.st_mode))
+            known_run_fd = self._run_dir_fds.get(run_id)
+            if known_run_fd is not None:
+                known_run = os.fstat(known_run_fd)
+                known_identity = (
+                    known_run.st_dev,
+                    known_run.st_ino,
+                    stat.S_IFMT(known_run.st_mode),
+                )
+                if known_identity != root_identity:
+                    raise NodeRemoteRunError(
+                        "Remote Run cleanup root was replaced", code="cleanup_invalid"
+                    )
+            parent_info = os.fstat(parent_fd)
+            parent_identity = (parent_info.st_dev, parent_info.st_ino)
+            try:
+                metadata_fd = _open_directory_at(
+                    root_fd, (".termroom",), create=False, mode=None
+                )
+            except FileNotFoundError:
+                if not allow_missing_marker:
+                    raise
+            else:
+                try:
+                    marker = _read_regular_at(metadata_fd, "marker", 128).decode().strip()
+                    if marker != run_id:
+                        raise NodeRemoteRunError(
+                            "Remote Run marker does not match", code="marker_mismatch"
+                        )
+                    marker_validated = True
+                finally:
+                    os.close(metadata_fd)
+            self._forget_layout_handles(run_id)
+
+            transient = {errno.ENOTEMPTY, errno.EEXIST}
+            for attempt in range(3):
+                self._assert_root_path_matches()
+                current_parent = os.fstat(parent_fd)
+                current_root = os.fstat(root_fd)
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    (current_parent.st_dev, current_parent.st_ino) != parent_identity
+                    or (current_root.st_dev, current_root.st_ino, stat.S_IFMT(current_root.st_mode))
+                    != root_identity
+                    or (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode))
+                    != root_identity
+                ):
+                    raise NodeRemoteRunError(
+                        "Remote Run cleanup root was replaced", code="cleanup_invalid"
+                    )
+                destructive_started = True
+                _remove_directory_contents(root_fd)
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    stat.S_IFMT(current.st_mode),
+                ) != root_identity:
+                    raise NodeRemoteRunError(
+                        "Remote Run cleanup root was replaced", code="cleanup_invalid"
+                    )
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno not in transient or attempt == 2:
+                        raise
+                    continue
+                break
+        except OSError as exc:
+            if destructive_started and marker_validated:
+                try:
+                    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    exc.add_note(
+                        "Cleanup marker restoration skipped; root identity was unavailable."
+                    )
+                else:
+                    if (
+                        current.st_dev,
+                        current.st_ino,
+                        stat.S_IFMT(current.st_mode),
+                    ) == root_identity:
+                        try:
+                            _restore_cleanup_marker(root_fd, run_id)
+                        except (OSError, NodeRemoteRunError) as restore_error:
+                            exc.add_note(
+                                "Cleanup marker restoration failed "
+                                f"({type(restore_error).__name__})."
+                            )
+            raise NodeRemoteRunError(
+                "Remote Run cleanup root is invalid", code="cleanup_invalid"
+            ) from exc
+        finally:
+            if root_fd >= 0:
+                os.close(root_fd)
+            os.close(parent_fd)
 
     def _kill_session(self, run_id: str) -> bool:
         session = self._session_name(run_id)
@@ -1342,15 +3417,11 @@ class NodeRemoteRunRuntime:
     def _session_name(run_id: str) -> str:
         return REMOTE_RUN_SESSION_PREFIX + _validate_run_id(run_id)
 
-    @staticmethod
-    def _read_optional_line(path: Path) -> str | None:
+    def _read_optional_line(self, path: Path) -> str | None:
         try:
-            info = path.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
-                return None
-            value = path.read_text(encoding="utf-8").strip()
+            value = self._read_regular(path, 4096).decode("utf-8").strip()
             return value or None
-        except (OSError, UnicodeDecodeError):
+        except (OSError, NodeRemoteRunError, UnicodeDecodeError):
             return None
 
     @staticmethod

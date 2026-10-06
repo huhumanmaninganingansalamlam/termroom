@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -581,12 +582,14 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
     class BrowserSocket:
         def __init__(self) -> None:
             self.text: list[str] = []
+            self.controls: list[dict[str, object]] = []
 
         async def send_text(self, value: str) -> None:
+            assert self.controls, "Pane state must precede application output"
             self.text.append(value)
 
         async def send_bytes(self, value: bytes) -> None:
-            raise AssertionError(f"Terminal output must be text, got {value!r}")
+            self.controls.append(json.loads(value))
 
         async def receive(self) -> dict[str, object]:
             await wait_forever.wait()
@@ -594,10 +597,17 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
 
     browser = BrowserSocket()
     monkeypatch.setattr(manager, "ensure_workspace", lambda _workspace: [terminal])
+
+    def run_tmux(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = ""
+        if args[0] == "display-message" and args[-1].endswith("#{mouse_sgr_flag}"):
+            output = f"{workspace['tmux_session']}|@1|%1|2147483647|0|0|0|0|0|0\n"
+        return subprocess.CompletedProcess(args, 0, output, "")
+
     monkeypatch.setattr(
         manager,
         "_run_tmux",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+        run_tmux,
     )
     monkeypatch.setattr(
         manager,
@@ -611,6 +621,25 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
     await manager.bridge(browser, workspace, terminal, device_id="browser-a")  # type: ignore[arg-type]
     after = store.get_terminal(terminal_id)
 
+    assert browser.controls
+    generation = browser.controls[0]["generation"]
+    assert isinstance(generation, str) and generation
+    for revision, control in enumerate(browser.controls, start=1):
+        assert control == {
+            "kind": "pane_mode",
+            "terminal_id": terminal_id,
+            "generation": generation,
+            "revision": revision,
+            "session": workspace["tmux_session"],
+            "window": "@1",
+            "pane": "%1",
+            "pane_pid": 2_147_483_647,
+            "alternate": False,
+            "mouse_tracking": False,
+            "mouse_flags": [0, 0, 0, 0, 0],
+        }
+        assert control["alternate"] is False
+        assert control["mouse_tracking"] is False
     assert browser.text == ["\x1b[2Jprompt"]
     assert after is not None
     assert after["activity_at"] == before["activity_at"] == _revision(100)

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import gc
+import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -14,6 +18,7 @@ from typing import Any
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
+from termroom import node_agent
 from termroom.file_runs import RUNNER_REGISTRY_VERSION
 from termroom.files import DirectoryListingLimitError
 from termroom.node_agent import (
@@ -21,16 +26,21 @@ from termroom.node_agent import (
     NodeAgentError,
     NodeConfig,
     NodeRuntime,
+    TerminalAgentStream,
+    ensure_node_identity,
     node_session_is_valid,
     normalize_allowed_roots,
+    save_node_config,
 )
 from termroom.node_core import NODE_STREAM_QUEUE_DEPTH, NodeCoreError
 from termroom.node_protocol import (
     NODE_REMOTE_RUN_SOURCE_STREAM_WINDOW,
     NODE_REMOTE_RUN_SOURCE_VERSION,
+    NODE_REMOTE_RUN_VERSION,
     NODE_WORKSPACE_USAGE_VERSION,
     generate_private_key,
 )
+from termroom.node_remote_runs import NodeRemoteRunError
 from termroom.remote_access import (
     RemoteAccess,
     RemoteAccessError,
@@ -48,6 +58,166 @@ def _payload(workspace: Path, **values: Any) -> dict[str, Any]:
         "tmux_session": f"termroom-node-test-{uuid.uuid4().hex[:12]}",
         **values,
     }
+
+
+def _terminal_resize_ack(payload: dict[str, Any]) -> dict[str, Any]:
+    active = payload["affects_grid"] and not payload["bootstrap"]
+    return {
+        **payload,
+        "ok": True,
+        "shared_applied": payload["affects_grid"],
+        "viewport_applied": True,
+        "passive_restored": not active,
+        "bootstrap_consumed": payload["bootstrap"],
+        "grid_active": active,
+        "retryable": False,
+        "cleanup_confirmed": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["none", "enable", "apply", "demote", "cleanup"])
+async def test_node_terminal_resize_bootstrap_ack_failure_retry_and_idempotency(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    events: list[Any] = []
+    failed_once = False
+
+    def role(enabled: bool) -> bool:
+        nonlocal failed_once
+        events.append(("role", enabled))
+        if failure == "enable" and enabled and not failed_once:
+            failed_once = True
+            return False
+        return enabled or failure not in {"demote", "cleanup"}
+
+    def ioctl(*_args: Any) -> None:
+        nonlocal failed_once
+        events.append("apply")
+        if failure == "apply" and not failed_once:
+            failed_once = True
+            raise OSError("resize failed before apply")
+
+    async def send(_message: Any) -> None:
+        return None
+
+    monkeypatch.setattr(node_agent.fcntl, "ioctl", ioctl)
+    monkeypatch.setattr(node_agent.os, "killpg", lambda *args: events.append(("signal", args)))
+    monkeypatch.setattr(node_agent, "_wait_for_pid", lambda *_args: True)
+    stream = TerminalAgentStream(
+        "d" * 32,
+        -1,
+        -1,
+        send,
+        {},
+        set_grid_resize=role,
+        grid_resize_applied=lambda: events.append("consumed"),
+        cleanup=lambda: failure != "cleanup",
+        wait_grid_resize=lambda *_args: True,
+    )
+    payload = {
+        "stream_id": stream.stream_id,
+        "revision": 1,
+        "rows": 22,
+        "cols": 124,
+        "affects_grid": True,
+        "bootstrap": True,
+    }
+    result = await stream.resize(payload)
+    before_duplicate = list(events)
+    assert await stream.resize(payload) == result
+    assert events == before_duplicate
+    with pytest.raises(NodeAgentError, match="stale"):
+        await stream.resize({**payload, "cols": 125})
+    if failure in {"enable", "apply"}:
+        assert not result["ok"] and result["retryable"]
+        assert not result["shared_applied"] and not result["bootstrap_consumed"]
+        assert stream.grid_resize_applied is not None
+        result = await stream.resize({**payload, "revision": 2})
+        assert result["ok"]
+    elif failure in {"demote", "cleanup"}:
+        assert not result["ok"] and not result["retryable"]
+        assert result["shared_applied"] and result["bootstrap_consumed"]
+        assert not result["passive_restored"] and stream.closed
+        assert result["cleanup_confirmed"] == (failure == "demote")
+        assert result["grid_active"] == (failure == "cleanup")
+        return
+    assert result["ok"] and result["shared_applied"]
+    assert result["passive_restored"] and not result["grid_active"]
+    assert events.index("consumed") < len(events) - 1
+    assert events[-1] == ("role", False)
+    with pytest.raises(NodeAgentError) as unacknowledged:
+        await stream.control("resize", payload)
+    assert unacknowledged.value.code == "terminal_resize_unacknowledged"
+    passive = await stream.resize(
+        {**payload, "revision": 3, "rows": 17, "affects_grid": False, "bootstrap": False}
+    )
+    assert passive["ok"] and not passive["shared_applied"]
+    active = await stream.resize({**payload, "revision": 4, "rows": 17, "bootstrap": False})
+    assert active["ok"] and active["grid_active"]
+    with pytest.raises(NodeAgentError) as stale:
+        await stream.resize({**payload, "revision": 3})
+    assert stale.value.code == "terminal_resize_stale"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rows", 3),
+        ("rows", True),
+        ("cols", 1001),
+        ("revision", 2**31),
+        ("revision", True),
+        ("affects_grid", "true"),
+        ("stream_id", "wrong"),
+    ],
+)
+async def test_node_terminal_resize_rejects_invalid_identity_without_backend_effect(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    async def send(_message: Any) -> None:
+        return None
+
+    def unexpected(*_args: Any) -> bool:
+        raise AssertionError("Invalid request reached backend")
+
+    stream = TerminalAgentStream("e" * 32, -1, -1, send, {}, set_grid_resize=unexpected)
+    payload = {
+        "stream_id": stream.stream_id,
+        "revision": 1,
+        "rows": 22,
+        "cols": 124,
+        "affects_grid": True,
+        "bootstrap": False,
+        field: value,
+    }
+    with pytest.raises(NodeAgentError) as invalid:
+        await stream.resize(payload)
+    assert invalid.value.code == "terminal_resize_invalid"
+
+
+def _node_runtime_with_private_state(home: Path) -> tuple[NodeRuntime, Path]:
+    state_root = home / ".local" / "state" / "termroom" / "node"
+    ensure_node_identity(state_root)
+    config = NodeConfig(
+        "http://127.0.0.1:1",
+        "a" * 32,
+        "private-state-test",
+        (home,),
+        state_dir=state_root,
+        run_root=state_root / "runs",
+    )
+    save_node_config(state_root, config)
+    return (
+        NodeRuntime(
+            config.allowed_roots,
+            file_run_root=state_root / "file-runs",
+            remote_run_root=config.run_root,
+            private_state_root=state_root,
+        ),
+        state_root,
+    )
 
 
 def _wait_for_node_file_run(
@@ -96,6 +266,67 @@ def test_node_rejects_invalid_workspace_session_names(session: str) -> None:
     assert not node_session_is_valid(session)
 
 
+def test_node_rejects_replaced_allowed_root_directory(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    workspace = allowed / "project"
+    workspace.mkdir(parents=True)
+    runtime = NodeRuntime([allowed])
+    moved = tmp_path / "original-allowed"
+    allowed.rename(moved)
+    workspace.mkdir(parents=True)
+
+    with pytest.raises(PathBoundaryError):
+        runtime._workspace_path({"workspace_path": str(workspace)})
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "real"])
+def test_node_workspace_replacement_is_rejected_before_tmux_launch(
+    tmp_path: Path,
+    replacement_kind: str,
+) -> None:
+    allowed = tmp_path / "allowed"
+    workspace = allowed / "project"
+    outside = tmp_path / "outside"
+    workspace.mkdir(parents=True)
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    runtime = NodeRuntime([allowed])
+    payload = _payload(workspace)
+    runtime._workspace_path(payload)
+    moved = allowed / "project-original"
+    calls: list[tuple[str, ...]] = []
+
+    def replace_before_new_session(
+        *arguments: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[0] == "has-session":
+            workspace.rename(moved)
+            if replacement_kind == "symlink":
+                workspace.symlink_to(outside, target_is_directory=True)
+            else:
+                workspace.mkdir(mode=0o755)
+                replacement_sentinel = workspace / "sentinel"
+                replacement_sentinel.write_bytes(b"replacement")
+                replacement_sentinel.chmod(0o640)
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        if arguments[0] == "list-sessions":
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    runtime._tmux = replace_before_new_session  # type: ignore[method-assign]
+    with pytest.raises(PathBoundaryError):
+        runtime._ensure_workspace(payload)
+
+    assert not any(arguments[0] == "new-session" for arguments in calls)
+    assert sentinel.read_bytes() == b"keep"
+    if replacement_kind == "real":
+        replacement_sentinel = workspace / "sentinel"
+        assert replacement_sentinel.read_bytes() == b"replacement"
+        assert stat.S_IMODE(replacement_sentinel.stat().st_mode) == 0o640
+
+
 @pytest.mark.asyncio
 async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
@@ -138,9 +369,7 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
             "include_noise": False,
         },
     )
-    assert [entry["relative_path"] for entry in search["entries"]] == [
-        "src/deep/node-needle.txt"
-    ]
+    assert [entry["relative_path"] for entry in search["entries"]] == ["src/deep/node-needle.txt"]
     assert search["skipped_noise"] == 1
     assert search["truncated"] is False
     recent = runtime._handle_sync("files.recent", {"workspace_path": str(workspace), "limit": 5})
@@ -217,6 +446,246 @@ async def test_node_allowed_roots_and_file_operations_are_bounded(tmp_path: Path
         },
     )
     assert (workspace / "new-dir").is_dir()
+
+
+def test_node_private_identity_cannot_be_previewed_from_allowed_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    runtime, _state_root = _node_runtime_with_private_state(home)
+
+    with pytest.raises(PathBoundaryError):
+        runtime._handle_sync(
+            "files.read_preview",
+            {
+                "workspace_path": str(home),
+                "path": ".local/state/termroom/node/node-key.pem",
+            },
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_node_workspace_admission_rejects_private_roots_but_allows_home_and_managed_runs(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    private_state = home / "node-state"
+    private_state.mkdir()
+    file_run_root = home / "file-runs"
+    remote_run_root = home / "remote-runs"
+    runtime = NodeRuntime(
+        [home],
+        private_state_root=private_state,
+        file_run_root=file_run_root,
+        remote_run_root=remote_run_root,
+    )
+    boundaries = runtime.source_private_boundaries
+    assert runtime._handle_sync("workspace.validate", {"path": str(home)})["path"] == str(home)
+
+    normal_payload = _payload(home)
+    session_names = [str(normal_payload["tmux_session"])]
+    remote_runs = runtime.remote_runs
+    assert remote_runs is not None
+    managed_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
+    managed_layouts = [
+        remote_runs.create(
+            {
+                "remote_run_version": NODE_REMOTE_RUN_VERSION,
+                "run_base": str(remote_runs.run_root),
+                "run_id": run_id,
+                "command": "true",
+            }
+        )
+        for run_id in managed_ids
+    ]
+    managed_path = Path(managed_layouts[0]["work"])
+    other_managed_path = Path(managed_layouts[1]["work"])
+    managed_payload = {
+        **_payload(managed_path),
+        "remote_run_id": managed_ids[0],
+    }
+    session_names.append(str(managed_payload["tmux_session"]))
+
+    try:
+        for index, boundary in enumerate(boundaries):
+            descendant = boundary / "nested"
+            descendant.mkdir()
+            alias = home / f"private-alias-{index}"
+            alias.symlink_to(boundary, target_is_directory=True)
+
+            for path in (boundary, descendant, alias):
+                with pytest.raises(PathBoundaryError):
+                    runtime._handle_sync("workspace.validate", {"path": str(path)})
+                blocked = _payload(path)
+                session_names.append(str(blocked["tmux_session"]))
+                with pytest.raises(PathBoundaryError):
+                    runtime._handle_sync("workspace.ensure", blocked)
+
+            with pytest.raises(PathBoundaryError):
+                runtime._handle_sync(
+                    "workspace.create_project",
+                    {"parent": str(boundary), "name": "must-not-create"},
+                )
+            with pytest.raises(PathBoundaryError):
+                runtime._handle_sync(
+                    "workspace.create_project",
+                    {"parent": str(home), "name": boundary.name},
+                )
+            assert not (boundary / "must-not-create").exists()
+
+        assert runtime._handle_sync("workspace.ensure", normal_payload)["terminals"]
+        created = runtime._handle_sync(
+            "workspace.create_project",
+            {"parent": str(home), "name": "ordinary-project"},
+        )
+        assert Path(str(created["path"])).is_dir()
+
+        assert runtime._handle_sync("workspace.validate", managed_payload)["path"] == str(
+            managed_path
+        )
+        assert runtime._handle_sync("workspace.ensure", managed_payload)["terminals"]
+        for mismatched in (
+            {**managed_payload, "workspace_path": str(other_managed_path)},
+            {**managed_payload, "remote_run_id": managed_ids[1]},
+        ):
+            with pytest.raises(NodeRemoteRunError):
+                runtime._handle_sync("workspace.validate", mismatched)
+            with pytest.raises(NodeRemoteRunError):
+                runtime._handle_sync("workspace.ensure", mismatched)
+    finally:
+        for session in session_names:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                check=False,
+                capture_output=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_node_private_state_is_excluded_from_files_and_file_run(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    visible = home / "visible.txt"
+    visible.write_text("ordinary sibling\n", encoding="utf-8")
+    runtime, state_root = _node_runtime_with_private_state(home)
+    state_sibling = state_root.parent / "ordinary-state.txt"
+    state_sibling.write_text("ordinary state sibling\n", encoding="utf-8")
+    private_files = (state_root / "node-key.pem", state_root / "node.json")
+
+    def private_fingerprint(path: Path) -> tuple[str, int, int]:
+        info = path.stat()
+        return (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            info.st_mode & 0o777,
+            info.st_mtime_ns,
+        )
+
+    before = tuple(private_fingerprint(path) for path in private_files)
+    alias = home / "private-alias"
+    alias.symlink_to(state_root, target_is_directory=True)
+    payload = _payload(home)
+    key_path = ".local/state/termroom/node/node-key.pem"
+    state_parent = ".local/state/termroom"
+
+    listed = runtime._handle_sync(
+        "files.list",
+        {**payload, "path": ".", "max_entries": 2, "max_metadata_bytes": 300},
+    )
+    siblings = runtime._handle_sync(
+        "files.list", {**payload, "path": state_parent, "max_entries": 1}
+    )
+    assert {entry["name"] for entry in listed["entries"]} == {".local", "visible.txt"}
+    assert [entry["name"] for entry in siblings["entries"]] == ["ordinary-state.txt"]
+    assert all(entry["name"] != alias.name for entry in listed["entries"])
+    recent = runtime._handle_sync("files.recent", {**payload, "limit": 20})
+    assert "visible.txt" in {entry["name"] for entry in recent["entries"]}
+    search = runtime._handle_sync(
+        "files.search",
+        {**payload, "path": ".", "query": "node-key", "include_noise": True},
+    )
+    assert search["entries"] == []
+
+    for operation, extra in (
+        ("files.list", {"path": ".local/state/termroom/node"}),
+        ("files.search", {"path": ".local/state/termroom/node", "query": "node-key"}),
+        ("files.stat", {"path": key_path}),
+        ("files.read_preview", {"path": key_path}),
+        ("files.stat", {"path": "private-alias/node-key.pem"}),
+        ("files.create", {"parent": ".local/state/termroom/node", "name": "new.txt"}),
+        ("files.create", {"parent": ".", "name": ".local"}),
+        ("files.rename", {"path": key_path, "new_name": "renamed.pem"}),
+        ("files.rename", {"path": state_parent, "new_name": "renamed-state"}),
+        ("files.delete", {"path": key_path}),
+        ("files.delete", {"path": state_parent}),
+        ("terminal.editor.open", {"path": key_path}),
+        (
+            "file_run.inspect",
+            {"path": key_path, "runner_registry_version": RUNNER_REGISTRY_VERSION},
+        ),
+        (
+            "file_run.start",
+            {
+                "path": key_path,
+                "runner_registry_version": RUNNER_REGISTRY_VERSION,
+            },
+        ),
+    ):
+        with pytest.raises(PathBoundaryError):
+            runtime._handle_sync(operation, {**payload, **extra})
+
+    assert visible.read_text(encoding="utf-8") == "ordinary sibling\n"
+    assert state_sibling.read_text(encoding="utf-8") == "ordinary state sibling\n"
+    assert tuple(private_fingerprint(path) for path in private_files) == before
+
+    async def send(_message: Any) -> None:
+        return None
+
+    remote_runs = runtime.remote_runs
+    assert remote_runs is not None
+    run_id = str(uuid.uuid4())
+    run_request = {
+        "remote_run_version": NODE_REMOTE_RUN_VERSION,
+        "run_base": str(remote_runs.run_root),
+        "run_id": run_id,
+        "command": "true",
+    }
+    layout = remote_runs.create(run_request)
+    run_work = Path(layout["work"])
+    (run_work / "ordinary.txt").write_text("managed output\n", encoding="utf-8")
+    run_alias = run_work / "private-alias"
+    run_alias.symlink_to(state_root, target_is_directory=True)
+    managed_payload = {
+        **payload,
+        "workspace_path": str(run_work),
+        "remote_run_id": run_id,
+    }
+    managed_entries = runtime._handle_sync("files.list", {**managed_payload, "path": "."})[
+        "entries"
+    ]
+    assert [entry["name"] for entry in managed_entries] == ["ordinary.txt"]
+    with pytest.raises(PathBoundaryError):
+        runtime._handle_sync(
+            "files.read_preview",
+            {**managed_payload, "path": "private-alias/node-key.pem"},
+        )
+
+    for operation, extra in (
+        ("files.read_text.open", {"path": key_path}),
+        ("files.write_text.open", {"path": key_path}),
+        ("files.download.open", {"path": key_path}),
+        (
+            "files.upload.open",
+            {"parent": ".local/state/termroom/node", "filename": "upload.txt"},
+        ),
+    ):
+        stream_id = uuid.uuid4().hex
+        with pytest.raises(PathBoundaryError):
+            await runtime.handle(
+                operation,
+                {**payload, **extra, "stream_id": stream_id},
+                send,
+            )
+        assert stream_id not in runtime.streams
 
 
 @pytest.mark.asyncio
@@ -573,6 +1042,403 @@ def test_node_identity_rejects_symlink_allowed_root(tmp_path: Path) -> None:
     assert exc_info.value.code == "root_invalid"
 
 
+def test_node_file_run_root_rejects_symlink_replaced_during_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "file-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    moved_root = tmp_path / "original-file-runs"
+    original_open = node_agent._open_directory_components
+    replaced = False
+
+    def replace_after_open(path: Path, *, create: bool, mode: int | None) -> tuple[int, Path]:
+        nonlocal replaced
+        descriptor, candidate = original_open(path, create=create, mode=mode)
+        if path == root and create and not replaced:
+            replaced = True
+            path.rename(moved_root)
+            path.symlink_to(outside, target_is_directory=True)
+        return descriptor, candidate
+
+    monkeypatch.setattr(node_agent, "_open_directory_components", replace_after_open)
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime([tmp_path], file_run_root=root)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert replaced
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_rejects_symlink_present_at_entry(tmp_path: Path) -> None:
+    root = tmp_path / "file-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime([tmp_path], file_run_root=root)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime([tmp_path], file_run_root=alias / "file-runs")
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "real"])
+def test_node_file_run_root_rejects_replacement_after_directory_validation(
+    tmp_path: Path,
+    replacement_kind: str,
+) -> None:
+    root = tmp_path / "file-runs"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    runtime = NodeRuntime([tmp_path], file_run_root=root)
+    moved_root = tmp_path / "original-file-runs"
+    root.rename(moved_root)
+    if replacement_kind == "symlink":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir(mode=0o755)
+        (root / "replacement-sentinel").write_bytes(b"keep")
+    with pytest.raises(NodeAgentError) as invalid:
+        runtime._file_run_metadata_dir("workspace", str(uuid.uuid4()), create=True)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert runtime.file_run_root == root
+    assert root.is_symlink() is (replacement_kind == "symlink")
+    if replacement_kind == "real":
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+        assert (root / "replacement-sentinel").read_bytes() == b"keep"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_metadata_rejects_replaced_descendant_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "file-runs"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    outside.chmod(0o755)
+    runtime = NodeRuntime([tmp_path], file_run_root=root)
+    run_id = str(uuid.uuid4())
+    metadata = runtime._file_run_metadata_dir("workspace", run_id, create=True)
+    moved = tmp_path / "original-metadata"
+    metadata.rename(moved)
+    metadata.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        runtime._file_run_metadata_dir("workspace", run_id, create=True)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_metadata_rejects_real_directory_replacement_without_chmod(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "file-runs"
+    runtime = NodeRuntime([tmp_path], file_run_root=root)
+    run_id = str(uuid.uuid4())
+    metadata = runtime._file_run_metadata_dir("workspace", run_id, create=True)
+    moved = tmp_path / "original-metadata"
+    metadata.rename(moved)
+    replacement = tmp_path / "replacement-metadata"
+    replacement.mkdir(mode=0o755)
+    sentinel = replacement / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    replacement.chmod(0o755)
+    replacement.rename(metadata)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        runtime._file_run_metadata_dir("workspace", run_id, create=True)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(metadata.stat().st_mode) == 0o755
+    replacement_sentinel = metadata / "sentinel"
+    assert replacement_sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(replacement_sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in metadata.iterdir()) == ["sentinel"]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.parametrize("mutation", ["replace", "in_place"])
+def test_node_file_run_runner_change_before_respawn(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    workspace = tmp_path / "allowed"
+    workspace.mkdir()
+    source = workspace / "script.py"
+    source.write_text("print('approved')\n", encoding="utf-8")
+    outside_sentinel = tmp_path / "outside-sentinel"
+    runtime = NodeRuntime([workspace], file_run_root=tmp_path / "private" / "file-runs")
+    base = _payload(
+        workspace,
+        workspace_id="workspace-runner-replacement",
+        runner_registry_version=RUNNER_REGISTRY_VERSION,
+    )
+    inspected = runtime._handle_sync("file_run.inspect", {**base, "path": source.name})
+    run_id = str(uuid.uuid4())
+    start_payload = {
+        **base,
+        "run_id": run_id,
+        "path": source.name,
+        "expected_digest": inspected["runnable"]["digest"],
+        "runner_id": "python3",
+        "runner_version": RUNNER_REGISTRY_VERSION,
+    }
+    metadata = runtime.file_run_root / str(base["workspace_id"]) / run_id
+    moved_runner = tmp_path / "approved-runner"
+    original_tmux = runtime._tmux
+    original_handoff = runtime._tmux_with_descriptors
+    calls: list[tuple[str, ...]] = []
+    replaced = False
+    source_changed = False
+
+    def replace_runner_before_respawn(
+        *arguments: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal replaced
+        calls.append(arguments)
+        if arguments[0] == "set-window-option" and not replaced:
+            replaced = True
+            runner_path = metadata / "runner.sh"
+            if mutation == "replace":
+                runner_path.rename(moved_runner)
+                runner_path.write_text(f"#!/bin/sh\ntouch {outside_sentinel}\n", encoding="utf-8")
+                runner_path.chmod(0o700)
+            else:
+                before = runner_path.stat()
+                with runner_path.open("r+b") as runner_file:
+                    runner_file.write(f"#!/bin/sh\ntouch {outside_sentinel}\n".encode())
+                    runner_file.truncate()
+                after = runner_path.stat()
+                assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        return original_tmux(*arguments, check=check)
+
+    def mutate_source_before_handoff(
+        tmux_args: tuple[str, ...],
+        descriptors: tuple[int, ...],
+        command: tuple[str, ...] = (),
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal source_changed
+        if mutation == "in_place" and tmux_args[0] == "respawn-pane":
+            source_fd = descriptors[3]
+            before = source.stat()
+            with source.open("r+b") as source_file:
+                source_file.seek(0)
+                source_file.write(
+                    (
+                        "from pathlib import Path\n"
+                        f"Path({str(outside_sentinel)!r}).write_text('pwned')\n"
+                    ).encode()
+                )
+                source_file.truncate()
+            after = source.stat()
+            assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+            required_seals = (
+                getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+                | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+            )
+            assert (
+                fcntl.fcntl(source_fd, getattr(fcntl, "F_GET_SEALS", 1034)) & required_seals
+                == required_seals
+            )
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            assert os.read(source_fd, 1024) == b"print('approved')\n"
+            source_changed = True
+        return original_handoff(tmux_args, descriptors, command, **kwargs)
+
+    runtime._tmux = replace_runner_before_respawn  # type: ignore[method-assign]
+    runtime._tmux_with_descriptors = mutate_source_before_handoff  # type: ignore[method-assign]
+    try:
+        if mutation == "replace":
+            with pytest.raises(NodeAgentError) as invalid:
+                runtime._handle_sync("file_run.start", start_payload)
+            assert invalid.value.code == "file_run_state_invalid"
+            assert not any(arguments[0] == "respawn-pane" for arguments in calls)
+        else:
+            started = runtime._handle_sync("file_run.start", start_payload)
+            assert any(arguments[0] == "respawn-pane" for arguments in calls)
+            assert source_changed
+            completed = _wait_for_node_file_run(
+                runtime, {**base, "run_id": run_id}, states={"finished"}
+            )
+            assert completed["observation"]["exit_code"] == 0
+            output = runtime._handle_sync(
+                "terminal.scrollback",
+                {
+                    **base,
+                    "tmux_window": started["terminal"]["tmux_window"],
+                    "lines": 200,
+                },
+            )["output"]
+            assert "approved" in output
+        assert replaced
+        assert not outside_sentinel.exists()
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", str(base["tmux_session"])],
+            check=False,
+            capture_output=True,
+        )
+
+
+def test_node_file_run_root_rejects_wrong_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "file-runs"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+
+    with pytest.raises(NodeAgentError) as invalid:
+        NodeRuntime._prepare_file_run_root(root)
+
+    assert invalid.value.code == "file_run_state_invalid"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+    assert list(root.iterdir()) == []
+
+
+def test_node_file_run_rejects_wrong_owner_descendant_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "file-runs"
+    workspace = root / "workspace"
+    root.mkdir(mode=0o700)
+    workspace.mkdir(mode=0o755)
+    sentinel = workspace / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    workspace.chmod(0o755)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+    try:
+        with pytest.raises(OSError):
+            node_agent._open_directory_at(
+                root_fd,
+                ("workspace",),
+                create=False,
+                mode=0o700,
+                require_owner=True,
+            )
+    finally:
+        os.close(root_fd)
+
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in workspace.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_under_private_state_rejects_wrong_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_state_root = tmp_path / "node-state"
+    file_run_root = private_state_root / "file-runs"
+    private_state_root.mkdir(mode=0o700)
+    file_run_root.mkdir(mode=0o755)
+    sentinel = file_run_root / "sentinel"
+    sentinel.write_bytes(b"keep")
+    sentinel.chmod(0o640)
+    file_run_root.chmod(0o755)
+    private_state_fd = os.open(private_state_root, os.O_RDONLY | os.O_DIRECTORY)
+    actual_euid = os.geteuid()
+    try:
+        with monkeypatch.context() as ownership:
+            ownership.setattr(node_agent.os, "geteuid", lambda: actual_euid + 1)
+            with pytest.raises(NodeAgentError) as invalid:
+                NodeRuntime._open_file_run_root(
+                    file_run_root,
+                    private_state_fd=private_state_fd,
+                    private_state_root=private_state_root,
+                )
+        assert invalid.value.code == "file_run_state_invalid"
+    finally:
+        os.close(private_state_fd)
+
+    assert stat.S_IMODE(file_run_root.stat().st_mode) == 0o755
+    assert sentinel.read_bytes() == b"keep"
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sorted(path.name for path in file_run_root.iterdir()) == ["sentinel"]
+
+
+def test_node_file_run_root_preserves_real_directory_behavior(tmp_path: Path) -> None:
+    assert NodeRuntime([tmp_path], file_run_root=None).file_run_root is None
+
+    missing_root = tmp_path / "new-file-runs"
+    runtime = NodeRuntime([tmp_path], file_run_root=missing_root)
+    assert runtime.file_run_root == missing_root
+    assert missing_root.is_dir()
+    assert not missing_root.is_symlink()
+    assert stat.S_IMODE(missing_root.stat().st_mode) == 0o700
+
+    existing_root = tmp_path / "existing-file-runs"
+    existing_root.mkdir(mode=0o755)
+    existing_root.chmod(0o755)
+    accepted = NodeRuntime([tmp_path], file_run_root=existing_root)
+    assert accepted.file_run_root == existing_root
+    assert not existing_root.is_symlink()
+    assert stat.S_IMODE(existing_root.stat().st_mode) == 0o700
+
+
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
@@ -623,11 +1489,11 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
             "send-keys",
             "-t",
             window,
-                (
-                    "printf '\\033[31mNODE_HISTORY_OLD\\033[0m\\n'; "
-                    "seq -f 'NODE_HISTORY_%02g' 1 24; "
-                    "printf 'NODE_HISTORY_%s\\n' LIVE"
-                ),
+            (
+                "printf '\\033[31mNODE_HISTORY_OLD\\033[0m\\n'; "
+                "seq -f 'NODE_HISTORY_%02g' 1 24; "
+                "printf 'NODE_HISTORY_%s\\n' LIVE"
+            ),
             "Enter",
         )
         deadline = time.monotonic() + 4
@@ -647,10 +1513,7 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
                     "history_only": True,
                 },
             )["output"]
-            if (
-                live_marker in full.splitlines()
-                and old_marker in history.splitlines()
-            ):
+            if live_marker in full.splitlines() and old_marker in history.splitlines():
                 break
             time.sleep(0.05)
 
@@ -789,9 +1652,7 @@ async def test_remote_access_falls_back_to_recursive_listing_for_older_nodes() -
     access._workspace_request = request  # type: ignore[method-assign]
     result = await access.search_files(workspace, ".", "needle")
 
-    assert [entry.relative_path for entry in result.entries] == [
-        "src/deep/node-needle.txt"
-    ]
+    assert [entry.relative_path for entry in result.entries] == ["src/deep/node-needle.txt"]
     assert result.skipped_noise == 1
     assert result.truncated is False
     assert [payload["path"] for operation, payload in calls if operation == "files.list"] == [
@@ -814,12 +1675,8 @@ def test_node_terminal_editor_reuses_the_live_file_window(tmp_path: Path) -> Non
     payload = _payload(workspace)
     session = str(payload["tmux_session"])
     try:
-        first = runtime._handle_sync(
-            "terminal.editor.open", {**payload, "path": "note.txt"}
-        )
-        second = runtime._handle_sync(
-            "terminal.editor.open", {**payload, "path": "note.txt"}
-        )
+        first = runtime._handle_sync("terminal.editor.open", {**payload, "path": "note.txt"})
+        second = runtime._handle_sync("terminal.editor.open", {**payload, "path": "note.txt"})
         assert first["terminal"]["tmux_window"] == second["terminal"]["tmux_window"]
         assert first["terminal"]["name"] == "vim-note.txt"
     finally:
@@ -873,10 +1730,13 @@ def test_node_workspace_usage_is_versioned_fixed_and_tracks_descendants(
 def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "allowed" / "project"
-    workspace.mkdir(parents=True)
+    workspace = tmp_path / "allowed"
+    source_parent = workspace / "project"
+    source_parent.mkdir(parents=True)
+    private_state = workspace / ".node-private"
+    private_state.mkdir()
     script_name = "한글 ;$(touch NODE_FILE_RUN_PWNED).py"
-    script = workspace / script_name
+    script = source_parent / script_name
     script.write_text(
         "from pathlib import Path\n"
         "path = Path('count.txt')\n"
@@ -886,8 +1746,9 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         encoding="utf-8",
     )
     runtime = NodeRuntime(
-        [tmp_path / "allowed"],
+        [workspace],
         file_run_root=tmp_path / "node-state" / "file-runs",
+        private_state_root=private_state,
     )
     base = _payload(
         workspace,
@@ -896,7 +1757,9 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
     )
     session = str(base["tmux_session"])
     try:
-        inspected = runtime._handle_sync("file_run.inspect", {**base, "path": script_name})
+        inspected = runtime._handle_sync(
+            "file_run.inspect", {**base, "path": f"project/{script_name}"}
+        )
         assert inspected["runner"] == {
             "id": "python3",
             "version": RUNNER_REGISTRY_VERSION,
@@ -906,7 +1769,7 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         start_payload = {
             **base,
             "run_id": run_id,
-            "path": script_name,
+            "path": f"project/{script_name}",
             "expected_digest": digest,
             "runner_id": "python3",
             "runner_version": RUNNER_REGISTRY_VERSION,
@@ -940,12 +1803,39 @@ def test_node_file_run_revalidates_registry_and_replays_without_reexecution(
         assert replayed["observation"]["state"] == "finished"
         assert (workspace / "count.txt").read_text(encoding="utf-8") == "1"
 
+        shutil.rmtree(source_parent)
+        replayed_after_source_removal = runtime._handle_sync("file_run.start", start_payload)
+        assert replayed_after_source_removal["replayed"] is True
+        assert replayed_after_source_removal["observation"]["state"] == "finished"
+        assert (workspace / "count.txt").read_text(encoding="utf-8") == "1"
+
+        with pytest.raises(PathBoundaryError):
+            runtime._handle_sync(
+                "file_run.start",
+                {**start_payload, "path": ".node-private/secret.py"},
+            )
+
         with pytest.raises(NodeAgentError) as conflict:
             runtime._handle_sync(
                 "file_run.start",
                 {**start_payload, "path": "different.py"},
             )
         assert conflict.value.code == "idempotency_conflict"
+
+        with pytest.raises(NodeAgentError) as digest_conflict:
+            runtime._handle_sync(
+                "file_run.start",
+                {**start_payload, "expected_digest": "0" * 64},
+            )
+        assert digest_conflict.value.code == "idempotency_conflict"
+
+        with pytest.raises(NodeAgentError) as runner_conflict:
+            runtime._handle_sync(
+                "file_run.start",
+                {**start_payload, "runner_id": "nodejs"},
+            )
+        assert runner_conflict.value.code == "idempotency_conflict"
+        assert (workspace / "count.txt").read_text(encoding="utf-8") == "1"
 
         metadata = tmp_path / "node-state" / "file-runs"
         assert metadata.is_dir()
@@ -967,8 +1857,10 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
     )
     stubborn = workspace / "stubborn.py"
     stubborn.write_text(
+        "from pathlib import Path\n"
         "import signal, time\n"
         "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "Path('stubborn-ready').write_text('ready')\n"
         "while True: time.sleep(0.1)\n",
         encoding="utf-8",
     )
@@ -1020,6 +1912,11 @@ def test_node_file_run_keeps_interactive_pty_and_targets_only_managed_slot(
             },
         )
         _wait_for_node_file_run(runtime, {**base, "run_id": stubborn_id}, states={"running"})
+        readiness = workspace / "stubborn-ready"
+        deadline = time.monotonic() + 4
+        while not readiness.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert readiness.read_text(encoding="utf-8") == "ready"
         assert runtime._handle_sync("file_run.interrupt", {**base, "run_id": stubborn_id})["sent"]
         time.sleep(0.2)
         assert (
@@ -1120,6 +2017,80 @@ async def test_node_file_streams_are_chunked_atomic_and_abortable(tmp_path: Path
     await runtime.close_streams()
     assert not (workspace / "partial.txt").exists()
     assert not list(workspace.glob(".partial.txt.termroom-*"))
+
+
+@pytest.mark.asyncio
+async def test_node_download_rejects_replaced_leaf_before_streaming(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    source = workspace / "source.txt"
+    source.write_bytes(b"admitted")
+    outside = tmp_path / "outside-secret"
+    outside.write_bytes(b"must not leak")
+    runtime = NodeRuntime([tmp_path])
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: Any) -> None:
+        sent.append(dict(message))
+
+    opened = await runtime.handle(
+        "files.download.open",
+        {
+            "workspace_path": str(workspace),
+            "path": source.name,
+            "stream_id": "a" * 32,
+        },
+        send,
+    )
+    source.unlink()
+    source.symlink_to(outside)
+
+    assert opened.start is not None
+    await opened.start()
+    assert not any(message["type"] == "stream.data" for message in sent)
+    assert sent[-1]["type"] == "stream.error"
+    assert sent[-1]["code"] == "path_changed"
+    assert outside.read_bytes() == b"must not leak"
+
+
+@pytest.mark.asyncio
+async def test_node_upload_finishes_in_open_parent_after_parent_replacement(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    parent = workspace / "nested"
+    workspace.mkdir()
+    parent.mkdir()
+    runtime = NodeRuntime([tmp_path])
+    stream_id = "b" * 32
+
+    async def send(_message: Any) -> None:
+        raise AssertionError("This operation must not send an unsolicited frame")
+
+    await runtime.handle(
+        "files.upload.open",
+        {
+            "workspace_path": str(workspace),
+            "parent": "nested",
+            "filename": "uploaded.txt",
+            "overwrite": False,
+            "max_bytes": 100,
+            "stream_id": stream_id,
+        },
+        send,
+    )
+    await runtime.streams[stream_id].feed(b"pinned parent")
+    moved = workspace / "nested-original"
+    parent.rename(moved)
+    parent.mkdir()
+
+    await runtime.streams[stream_id].close()
+
+    assert (moved / "uploaded.txt").read_bytes() == b"pinned parent"
+    assert not (parent / "uploaded.txt").exists()
+    assert not list(parent.glob(".uploaded.txt.termroom-*"))
 
 
 def test_node_operation_set_does_not_expose_arbitrary_shell(tmp_path: Path) -> None:
@@ -1238,7 +2209,19 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            stream.stream_id = "a" * 32
             return {}, stream
+
+        async def request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "terminal.resize"
+            events.append(
+                (
+                    "control",
+                    "resize",
+                    {key: payload[key] for key in ("rows", "cols", "affects_grid")},
+                )
+            )
+            return _terminal_resize_ack(payload)
 
     class FakeNodes:
         def connection(self, _computer_id: str) -> FakeConnection:
@@ -1390,7 +2373,16 @@ async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            stream.stream_id = "b" * 32
             return {"bootstrap_grid": True}, stream
+
+        async def request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "terminal.resize"
+            assert payload["bootstrap"] is True
+            events.append(
+                ("resize", {key: payload[key] for key in ("rows", "cols", "affects_grid")})
+            )
+            return _terminal_resize_ack(payload)
 
     class FakeNodes:
         def connection(self, _computer_id: str) -> FakeConnection:
@@ -1439,9 +2431,7 @@ async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
         device_id="device",
     )
 
-    assert events == [
-        ("resize", {"rows": 33, "cols": 162, "affects_grid": True})
-    ]
+    assert events == [("resize", {"rows": 33, "cols": 162, "affects_grid": True})]
     assert control.presence("terminal")["input_revision"] == 0
 
 
@@ -1483,7 +2473,17 @@ async def test_node_terminal_bridge_demotes_owner_that_changes_during_control() 
         async def open_stream(
             self, _operation: str, _payload: dict[str, Any]
         ) -> tuple[dict[str, Any], FakeStream]:
+            stream.stream_id = "c" * 32
             return {}, stream
+
+        async def request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+            assert operation == "terminal.resize"
+            events.append(
+                ("resize", {key: payload[key] for key in ("rows", "cols", "affects_grid")})
+            )
+            if len(events) == 1:
+                control.mark_input("terminal", competing_client)
+            return _terminal_resize_ack(payload)
 
     class FakeNodes:
         def connection(self, _computer_id: str) -> FakeConnection:

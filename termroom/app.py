@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import secrets
+import sqlite3
 import tempfile
 import uuid
 import zipfile
@@ -175,7 +176,7 @@ RESULT_COLLECTION_REASON_KEYS = {
     "source_path_exists": "remote_run.collect.reason.source_conflict",
     "source_changed_since_run": "remote_run.collect.reason.source_changed",
     "source_changed_during_review": "remote_run.collect.reason.source_changed",
-    "source_changed_during_apply": "remote_run.collect.reason.source_changed",
+    "source_changed_during_apply": "remote_run.collect.reason.source_changed_during_apply",
     "source_file_missing": "remote_run.collect.reason.source_missing",
     "source_path_unsupported": "remote_run.collect.reason.source_unsupported",
     "source_not_editable_text": "remote_run.collect.reason.source_unsupported",
@@ -1335,11 +1336,22 @@ def create_app(settings: Settings) -> FastAPI:
         requested = {
             str(workspace["id"]): workspace for workspace in scoped_workspaces
         }
+
+        def clear(
+            completed: asyncio.Task[None],
+            *,
+            key: tuple[str, str] = provider_key,
+        ) -> None:
+            current = terminal_activity_refreshes.get(key)
+            if current is not None and current[1] is completed:
+                terminal_activity_refreshes.pop(key, None)
+
         while requested:
             in_flight = terminal_activity_refreshes.get(provider_key)
             if in_flight is not None:
                 covered, task = in_flight
                 await asyncio.shield(task)
+                clear(task)
                 requested = {
                     workspace_id: workspace
                     for workspace_id, workspace in requested.items()
@@ -1354,18 +1366,9 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             )
             terminal_activity_refreshes[provider_key] = (covered, task)
-
-            def clear(
-                completed: asyncio.Task[None],
-                *,
-                key: tuple[str, str] = provider_key,
-            ) -> None:
-                current = terminal_activity_refreshes.get(key)
-                if current is not None and current[1] is completed:
-                    terminal_activity_refreshes.pop(key, None)
-
             task.add_done_callback(clear)
             await asyncio.shield(task)
+            clear(task)
             return
 
     async def refresh_terminal_activity_scope(
@@ -1621,9 +1624,43 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         try:
             run = await asyncio.to_thread(remote_runs.get, run_id)
-            plan = await run_results.review(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Remote Run not found") from exc
+        report_id = request.query_params.get("report")
+        if report_id:
+            report = await asyncio.to_thread(
+                store.get_remote_run_collection_report, run_id, report_id
+            )
+            if report is None:
+                return templates.TemplateResponse(
+                    request=request,
+                    name="remote_run_collect.html",
+                    context=_context(
+                        settings,
+                        title=translate(locale, "remote_run.collect.heading"),
+                        run=run,
+                        plan=None,
+                        report=None,
+                        action_error=translate(
+                            locale, "remote_run.collect.error.report_missing"
+                        ),
+                    ),
+                    status_code=409,
+                )
+            return templates.TemplateResponse(
+                request=request,
+                name="remote_run_collect.html",
+                context=_context(
+                    settings,
+                    title=translate(locale, "remote_run.collect.heading"),
+                    run=run,
+                    plan=None,
+                    report=_remote_run_collection_view(report, locale),
+                    action_error=None,
+                ),
+            )
+        try:
+            plan = await run_results.review(run_id)
         except ResultCollectionError as exc:
             return _error_page(
                 request,
@@ -1645,7 +1682,6 @@ def create_app(settings: Settings) -> FastAPI:
                 run=run,
                 plan=_remote_run_collection_view(plan, locale),
                 report=None,
-                collection_result=_remote_run_collection_result_query(request),
                 action_error=None,
             ),
         )
@@ -1703,16 +1739,25 @@ def create_app(settings: Settings) -> FastAPI:
                 translate(locale, "remote_run.collect.error.unavailable"),
                 502,
             )
-        summary = report.as_dict()["summary"]
+        try:
+            report_id = await asyncio.to_thread(
+                store.save_remote_run_collection_report, run_id, report.as_dict()
+            )
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            message_key = (
+                "remote_run.collect.error.report_save_failed_applied"
+                if report.as_dict()["summary"]["applied"]
+                else "remote_run.collect.error.report_save_failed"
+            )
+            return _error_page(
+                request,
+                translate(locale, message_key),
+                500,
+            )
         return RedirectResponse(
             _url_with_query(
                 f"/remote-runs/{run_id}/collect",
-                collected=1,
-                applied=summary.get("applied", 0),
-                conflict=summary.get("conflict", 0),
-                already_result=summary.get("already_result", 0),
-                skipped=summary.get("skipped", 0),
-                failed=summary.get("failed", 0),
+                report=report_id,
             ),
             status_code=303,
         )
@@ -3451,6 +3496,27 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=303,
             )
         launch_id = str(form.get("launch_id") or "")
+        command_digest = workspace_command_digest(commands[slot])
+        try:
+            admission = store.claim_workspace_command(
+                workspace_id, launch_id, slot, command_digest
+            )
+        except ValueError:
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.already_submitted"),
+                ),
+                status_code=303,
+            )
+        if admission == "replayed":
+            return RedirectResponse(
+                _url_with_query(
+                    f"/w/{workspace_id}/terminal",
+                    error=translate(locale, "workspace.run.error.already_submitted"),
+                ),
+                status_code=303,
+            )
         try:
             if is_remote(workspace):
                 terminal = await remote.run_workspace_command(
@@ -4436,6 +4502,7 @@ def create_app(settings: Settings) -> FastAPI:
         editor_unsaved: bool,
         terminal_editor_error: str | None = None,
         submitted_content: str | None = None,
+        submitted_newline_style: str | None = None,
         selected_run_id: str | None = None,
         idempotency_key: str | None = None,
         status_code: int = 200,
@@ -4443,7 +4510,7 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         values: dict[str, Any] = {
             "snapshot": snapshot,
-            "newline_style": editor_newline_style(snapshot.content),
+            "newline_style": submitted_newline_style or editor_newline_style(snapshot.content),
             "saved": saved,
             "conflict": conflict,
             "save_error": save_error,
@@ -4508,10 +4575,29 @@ def create_app(settings: Settings) -> FastAPI:
         content = normalize_editor_newlines(
             str(form.get("content", "")), str(form.get("newline", "lf"))
         )
+        submitted_newline_style = "crlf" if str(form.get("newline", "")) == "crlf" else "lf"
         expected_digest = str(form.get("digest", ""))
         expected_mtime_ns = int(str(form.get("mtime_ns", "0")))
         intent = str(form.get("intent", "save"))
         idempotency_key = str(form.get("file_run_idempotency_key", ""))
+
+        async def recovery_snapshot() -> FileSnapshot:
+            try:
+                return await read_workspace_text(workspace, file_path)
+            except (
+                OSError,
+                RemoteAccessError,
+                SSHBackendError,
+                UnsupportedFileError,
+                ValueError,
+            ):
+                return FileSnapshot(
+                    path=Path(file_path),
+                    relative_path=file_path,
+                    content="",
+                    digest=expected_digest,
+                    mtime_ns=expected_mtime_ns,
+                )
 
         if intent == "save_and_run":
             existing = store.get_file_run_by_idempotency(
@@ -4527,7 +4613,7 @@ def create_app(settings: Settings) -> FastAPI:
                         _file_run_destination(store, existing, prefer_terminal=True),
                         status_code=303,
                     )
-                current = await read_workspace_text(workspace, file_path)
+                current = await recovery_snapshot()
                 return await render_editor(
                     request,
                     workspace,
@@ -4538,6 +4624,7 @@ def create_app(settings: Settings) -> FastAPI:
                     run_error=translate(locale, "file_run.error.idempotency_conflict"),
                     editor_unsaved=True,
                     submitted_content=content,
+                    submitted_newline_style=submitted_newline_style,
                     idempotency_key=idempotency_key,
                     status_code=409,
                 )
@@ -4550,7 +4637,7 @@ def create_app(settings: Settings) -> FastAPI:
                 expected_mtime_ns=expected_mtime_ns,
             )
         except FileConflictError as exc:
-            current = await read_workspace_text(workspace, file_path)
+            current = await recovery_snapshot()
             return await render_editor(
                 request,
                 workspace,
@@ -4561,6 +4648,7 @@ def create_app(settings: Settings) -> FastAPI:
                 save_error=None,
                 run_error=None,
                 editor_unsaved=True,
+                submitted_newline_style=submitted_newline_style,
                 idempotency_key=idempotency_key or None,
                 status_code=409,
             )
@@ -4571,22 +4659,7 @@ def create_app(settings: Settings) -> FastAPI:
             UnsupportedFileError,
             ValueError,
         ) as exc:
-            try:
-                current = await read_workspace_text(workspace, file_path)
-            except (
-                OSError,
-                RemoteAccessError,
-                SSHBackendError,
-                UnsupportedFileError,
-                ValueError,
-            ):
-                current = FileSnapshot(
-                    path=Path(file_path),
-                    relative_path=file_path,
-                    content="",
-                    digest=expected_digest,
-                    mtime_ns=expected_mtime_ns,
-                )
+            current = await recovery_snapshot()
             return await render_editor(
                 request,
                 workspace,
@@ -4597,6 +4670,7 @@ def create_app(settings: Settings) -> FastAPI:
                 save_error=_localized_exception(locale, exc),
                 run_error=None,
                 editor_unsaved=True,
+                submitted_newline_style=submitted_newline_style,
                 idempotency_key=idempotency_key or None,
                 status_code=502
                 if isinstance(exc, (RemoteAccessError, SSHBackendError))
@@ -5969,7 +6043,7 @@ def _localized_result_collection_exception(
 
 
 def _remote_run_collection_view(value: Any, locale: str) -> dict[str, Any]:
-    payload = value.as_dict()
+    payload = value.as_dict() if hasattr(value, "as_dict") else dict(value)
     for item in payload["items"]:
         change = str(item["change"])
         item["change_label"] = translate(
@@ -5985,19 +6059,6 @@ def _remote_run_collection_view(value: Any, locale: str) -> dict[str, Any]:
         )
         item["reason_label"] = translate(locale, reason_key)
     return payload
-
-
-def _remote_run_collection_result_query(request: Request) -> dict[str, int] | None:
-    if request.query_params.get("collected") != "1":
-        return None
-    result: dict[str, int] = {}
-    for key in ("applied", "conflict", "already_result", "skipped", "failed"):
-        try:
-            value = int(request.query_params.get(key, "0"))
-        except ValueError:
-            value = 0
-        result[key] = min(max(value, 0), 1_000_000_000)
-    return result
 
 
 def _localized_remote_run_error_detail(

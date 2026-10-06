@@ -337,9 +337,7 @@ class RemoteAccess:
         self, workspace: dict[str, Any], relative_path: str
     ) -> dict[str, Any]:
         if not self.is_node(workspace):
-            return await asyncio.to_thread(
-                self.ssh.open_terminal_editor, workspace, relative_path
-            )
+            return await asyncio.to_thread(self.ssh.open_terminal_editor, workspace, relative_path)
         if not self.supports_capability(workspace, "terminal_editor"):
             raise RemoteAccessError(
                 "This Node does not support Vim file editing; update Termroom Node",
@@ -353,11 +351,7 @@ class RemoteAccess:
         expected = self._terminal_record(result.get("terminal"))
         terminals = self._reconcile_terminals(workspace, result.get("terminals"))
         terminal = next(
-            (
-                item
-                for item in terminals
-                if item["tmux_window"] == expected["tmux_window"]
-            ),
+            (item for item in terminals if item["tmux_window"] == expected["tmux_window"]),
             None,
         )
         if terminal is None:
@@ -1136,7 +1130,10 @@ class RemoteAccess:
                 )
             if bootstrap_grid:
                 self.control.mark_grid_fresh(terminal_id, client_id=client_id)
+            else:
+                self.control.mark_grid_existing(terminal_id)
             grid_active = False
+            resize_revision = 0
             last_viewport: tuple[int, int] | None = None
 
             async def output_to_browser() -> None:
@@ -1155,44 +1152,106 @@ class RemoteAccess:
                     )
                     await websocket.send_text(tail)
 
-            async def resize_browser_view(payload: dict[str, Any]) -> None:
-                nonlocal grid_active, last_viewport
+            async def resize_browser_view(payload: dict[str, Any]) -> bool:
+                nonlocal grid_active, last_viewport, resize_revision
                 if "rows" not in payload or "cols" not in payload:
-                    return
+                    return True
                 size = terminal_size(payload)
                 if size is None:
-                    return
+                    return False
                 rows, cols = size
                 async with resize_lock:
-                    controls_grid, grid_resize = self.control.resize_plan(
-                        terminal_id, client_id, rows=rows, cols=cols
-                    )
+                    plan = self.control.begin_resize(terminal_id, client_id, rows=rows, cols=cols)
+                    controls_grid = plan is not None
                     viewport = (rows, cols)
-                    if (
-                        controls_grid == grid_active
-                        and viewport == last_viewport
-                        and not grid_resize
-                    ):
-                        return
-                    await stream.control(
-                        "resize",
-                        rows=rows,
-                        cols=cols,
-                        affects_grid=controls_grid,
-                    )
-                    grid_active = controls_grid
-                    last_viewport = viewport
-                    if controls_grid and not self.control.can_resize(
-                        terminal_id,
-                        client_id,
-                    ):
-                        await stream.control(
-                            "resize",
-                            rows=rows,
-                            cols=cols,
-                            affects_grid=False,
+
+                    async def request_resize(
+                        *, affects_grid: bool, bootstrap: bool
+                    ) -> dict[str, Any]:
+                        nonlocal resize_revision
+                        resize_revision += 1
+                        identity = {
+                            "stream_id": stream.stream_id,
+                            "revision": resize_revision,
+                            "rows": rows,
+                            "cols": cols,
+                            "affects_grid": affects_grid,
+                            "bootstrap": bootstrap,
+                        }
+                        result = await connection.request("terminal.resize", identity)
+                        flags = (
+                            "ok",
+                            "shared_applied",
+                            "viewport_applied",
+                            "passive_restored",
+                            "bootstrap_consumed",
+                            "grid_active",
+                            "retryable",
+                            "cleanup_confirmed",
                         )
-                        grid_active = False
+                        if (
+                            any(
+                                type(result.get(key)) is not type(value) or result.get(key) != value
+                                for key, value in identity.items()
+                            )
+                            or any(type(result.get(key)) is not bool for key in flags)
+                            or (
+                                result["ok"]
+                                and (
+                                    not result["viewport_applied"]
+                                    or result["shared_applied"] != affects_grid
+                                    or result["grid_active"] != (affects_grid and not bootstrap)
+                                    or (
+                                        bootstrap
+                                        and (
+                                            not result["passive_restored"]
+                                            or not result["bootstrap_consumed"]
+                                        )
+                                    )
+                                )
+                            )
+                        ):
+                            raise RemoteAccessError(
+                                "Node returned an invalid Terminal resize result",
+                                code="node_response_invalid",
+                            )
+                        return result
+
+                    try:
+                        if (
+                            controls_grid == grid_active
+                            and viewport == last_viewport
+                            and (plan is None or not plan.apply)
+                        ):
+                            if plan is not None:
+                                self.control.commit_resize(plan)
+                            return True
+                        result = await request_resize(
+                            affects_grid=controls_grid, bootstrap=bool(plan and plan.bootstrap)
+                        )
+                        if plan is not None and result["shared_applied"]:
+                            self.control.resize_applied(plan)
+                        if not result["ok"]:
+                            if not result["retryable"]:
+                                raise RemoteAccessError(
+                                    "Node Terminal resize failed closed",
+                                    code="terminal_resize_failed",
+                                )
+                            return False
+                        grid_active = result["grid_active"]
+                        last_viewport = viewport
+                        if plan is not None and not self.control.commit_resize(plan):
+                            demotion = await request_resize(affects_grid=False, bootstrap=False)
+                            if not demotion["ok"] or not demotion["passive_restored"]:
+                                raise RemoteAccessError(
+                                    "Stale Node Terminal demotion failed",
+                                    code="terminal_resize_failed",
+                                )
+                            grid_active = False
+                        return True
+                    finally:
+                        if plan is not None:
+                            self.control.abort_resize(plan)
 
             async def browser_to_input() -> None:
                 while True:
@@ -1205,10 +1264,10 @@ class RemoteAccess:
                             await websocket.close(code=1009, reason="Terminal input is too large")
                             return
                         self.control.mark_input(terminal_id, client_id, device_id)
-                        if last_viewport is not None:
-                            await resize_browser_view(
-                                {"rows": last_viewport[0], "cols": last_viewport[1]}
-                            )
+                        if last_viewport is not None and not await resize_browser_view(
+                            {"rows": last_viewport[0], "cols": last_viewport[1]}
+                        ):
+                            continue
                         await stream.send(value)
                         continue
                     raw = message.get("text") or ""
@@ -1238,9 +1297,10 @@ class RemoteAccess:
                     elif kind == "resize":
                         await resize_browser_view(payload)
                     elif kind in {"input", "command"}:
-                        if kind == "command" or terminal_input_claims_grid(payload):
+                        if kind == "input" and terminal_input_claims_grid(payload):
                             self.control.mark_input(terminal_id, client_id, device_id)
-                        await resize_browser_view(payload)
+                        if not await resize_browser_view(payload):
+                            continue
                         data = str(payload.get("data") or "")
                         if kind == "command":
                             self.store.add_command(str(workspace["id"]), terminal_id, data)

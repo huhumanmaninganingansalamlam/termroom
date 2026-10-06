@@ -28,6 +28,7 @@ from termroom.node_protocol import (
     public_key_text,
     sign_challenge,
     validate_protocol_version,
+    validate_request_operation,
     verify_challenge,
 )
 
@@ -95,10 +96,12 @@ def test_node_messages_and_capabilities_are_bounded_and_typed() -> None:
 
 
 def test_node_protocol_rejects_legacy_terminal_resize_contract() -> None:
-    assert NODE_PROTOCOL_VERSION == 2
-    with pytest.raises(NodeProtocolError) as exc_info:
-        validate_protocol_version(1)
-    assert exc_info.value.code == "version_incompatible"
+    assert NODE_PROTOCOL_VERSION == 3
+    assert validate_request_operation("terminal.resize") == "terminal.resize"
+    for version in (1, 2, 4):
+        with pytest.raises(NodeProtocolError) as exc_info:
+            validate_protocol_version(version)
+        assert exc_info.value.code == "version_incompatible"
 
 
 def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
@@ -149,6 +152,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "terminal.create",
         "terminal.editor.open",
         "terminal.rename",
+        "terminal.resize",
         "terminal.scrollback",
     }
     file_run_operations = {

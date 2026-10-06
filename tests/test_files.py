@@ -143,6 +143,44 @@ def test_file_search_recurses_and_respects_noise_symlinks_and_bounds(tmp_path: P
     assert bounded.truncated is True
 
 
+def test_excluded_roots_do_not_consume_file_scan_limits_or_follow_aliases(
+    tmp_path: Path,
+) -> None:
+    service = FileService()
+    private = tmp_path / "runtime-state"
+    private.mkdir()
+    (private / "needle-secret.txt").write_text("secret\n", encoding="utf-8")
+    (tmp_path / "private-alias").symlink_to(private, target_is_directory=True)
+    (tmp_path / "needle-one.txt").write_text("visible\n", encoding="utf-8")
+    (tmp_path / "needle-two.txt").write_text("visible\n", encoding="utf-8")
+    excluded = frozenset({"runtime-state"})
+
+    _directory, listed = service.list_dir(tmp_path, max_entries=2, excluded_paths=excluded)
+    searched = service.search_files(
+        tmp_path, ".", "needle", max_entries=2, excluded_paths=excluded
+    )
+    recent = service.recent_files(
+        tmp_path, limit=2, max_files=2, excluded_paths=excluded
+    )
+
+    assert {entry.name for entry in listed} == {"needle-one.txt", "needle-two.txt"}
+    assert searched.scanned_entries == 2
+    assert searched.truncated is False
+    assert {entry.name for entry in searched.entries} == {
+        "needle-one.txt",
+        "needle-two.txt",
+    }
+    assert recent.scanned_files == 2
+    assert recent.truncated is False
+    assert {entry.name for entry in recent.entries} == {
+        "needle-one.txt",
+        "needle-two.txt",
+    }
+
+    with pytest.raises(PathBoundaryError):
+        service.list_dir(tmp_path, "runtime-state", excluded_paths=excluded)
+
+
 def test_binary_file_is_not_editable(tmp_path: Path) -> None:
     (tmp_path / "binary.dat").write_bytes(b"abc\x00def")
     with pytest.raises(UnsupportedFileError):

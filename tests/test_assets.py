@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,7 @@ from termroom.assets import (
     XTERM_UNICODE11_VERSION,
     XTERM_VERSION,
     XTERM_VERSION_FILE,
+    static_asset_version,
 )
 
 
@@ -45,9 +47,8 @@ def test_vendored_xterm_matches_declared_scoped_release() -> None:
     assert (VENDOR_DIR / "addon-unicode11.js").stat().st_size > 12_000
     for filename in ("xterm.js", "xterm.css"):
         assert f"@xterm/xterm@{XTERM_VERSION}" in str(ASSETS[filename]["url"])
-    assert (
-        f"@xterm/addon-unicode11@{XTERM_UNICODE11_VERSION}"
-        in str(ASSETS["addon-unicode11.js"]["url"])
+    assert f"@xterm/addon-unicode11@{XTERM_UNICODE11_VERSION}" in str(
+        ASSETS["addon-unicode11.js"]["url"]
     )
     for filename, details in ASSETS.items():
         digest = hashlib.sha256((VENDOR_DIR / filename).read_bytes()).hexdigest()
@@ -180,16 +181,12 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         "U+EC60-EC84, U+ED00-EFCF, U+F000-F385, U+F400-F533, "
         "U+F900-FFFF, U+F0001-F1AF0"
     )
-    korean_ranges = (
-        "U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF, U+FFA0-FFDC"
-    )
+    korean_ranges = "U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF, U+FFA0-FFDC"
 
     faces = re.findall(r"@font-face\s*\{(.*?)\}", stylesheet, flags=re.DOTALL)
     assert len(faces) == 5
     korean_face = next(
-        candidate
-        for candidate in faces
-        if 'font-family: "Termroom Korean Terminal"' in candidate
+        candidate for candidate in faces if 'font-family: "Termroom Korean Terminal"' in candidate
     )
     assert stylesheet.count('font-family: "Termroom D2Koding Nerd Mono"') == 4
     assert stylesheet.count('font-family: "Termroom Korean Terminal"') == 1
@@ -273,7 +270,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
         assert str(TERMINAL_FONT_ASSETS[key]["filename"]) not in terminal_template
     terminal_script = (VENDOR_DIR.parent / "terminal.js").read_text(encoding="utf-8")
-    assert 'KOREAN_TERMINAL_FONT_FAMILY = \'"Termroom Korean Terminal"\'' in terminal_script
+    assert "KOREAN_TERMINAL_FONT_FAMILY = '\"Termroom Korean Terminal\"'" in terminal_script
     assert 'BUNDLED_TERMINAL_FONT_PROBE = "M"' in terminal_script
     assert (
         "`${KOREAN_TERMINAL_FONT_FAMILY}, ${BUNDLED_TERMINAL_FONT_FAMILY}, "
@@ -293,7 +290,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
     assert "screenReaderMode: false," in terminal_script
     assert (
-        'const screenReaderModeToggle = document.querySelector('
+        "const screenReaderModeToggle = document.querySelector("
         '"#terminal-screen-reader-mode");' in terminal_script
     )
     assert "screenReaderModeToggle.checked = false;" in terminal_script
@@ -306,7 +303,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         terminal_script,
     )
     screen_reader_query_at = terminal_script.index(
-        'const screenReaderModeToggle = document.querySelector('
+        "const screenReaderModeToggle = document.querySelector("
     )
     screen_reader_checked_reset_at = terminal_script.index(
         "screenReaderModeToggle.checked = false;"
@@ -314,9 +311,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     first_font_await_at = terminal_script.index("await bundledTerminalFontLoad.initial")
     terminal_constructor_at = terminal_script.index("new window.Terminal(")
     terminal_open_at = terminal_script.index("term.open(host);")
-    screen_reader_option_reset_at = terminal_script.index(
-        "term.options.screenReaderMode = false;"
-    )
+    screen_reader_option_reset_at = terminal_script.index("term.options.screenReaderMode = false;")
     screen_reader_listener_at = terminal_script.index(
         'screenReaderModeToggle?.addEventListener("change"'
     )
@@ -334,6 +329,30 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "const terminalStringCellWidth = (value) =>" in terminal_script
     assert 'service.getStringCellWidth(String(value || ""))' in terminal_script
     assert 'Object.defineProperty(host, "termroomStringCellWidth"' in terminal_script
+    buffer_mode_property = re.search(
+        r'Object\.defineProperty\(host, "termroomActiveBufferType", \{.*?\n  \}\);',
+        terminal_script,
+        re.S,
+    )
+    assert buffer_mode_property is not None
+    mode_probe = (
+        """
+const assert = require('node:assert/strict');
+const host = {};
+const term = {buffer:{active:{type:'normal'}}};
+"""
+        + buffer_mode_property.group()
+        + """
+assert.equal(host.termroomActiveBufferType, 'normal');
+term.buffer.active = {type:'alternate'};
+assert.equal(host.termroomActiveBufferType, 'alternate');
+const descriptor = Object.getOwnPropertyDescriptor(host, 'termroomActiveBufferType');
+assert.equal(descriptor.set, undefined);
+assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
+"""
+    )
+    mode_result = subprocess.run(["node", "-e", mode_probe], capture_output=True, text=True)
+    assert mode_result.returncode == 0, mode_result.stderr
     assert "const publishTerminalMetrics = (cell) =>" in terminal_script
     assert 'new CustomEvent("termroom:terminal-metrics"' in terminal_script
     assert "publishTerminalMetrics(cell);" in terminal_script
@@ -350,10 +369,9 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert 'kind: "command"' in terminal_script
     assert "rows: term.rows" in terminal_script
     assert "cols: term.cols" in terminal_script
-    assert 'const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;' in terminal_script
+    assert "const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;" in terminal_script
     assert (
-        'const unicode11Available = typeof Unicode11AddonClass === "function";'
-        in terminal_script
+        'const unicode11Available = typeof Unicode11AddonClass === "function";' in terminal_script
     )
     assert "allowProposedApi: unicode11Available" in terminal_script
     assert 'host.dataset.terminalUnicode = "default";' in terminal_script
@@ -386,42 +404,641 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "if (epoch !== connectionEpoch || nextSocket !== socket) return;" in terminal_script
     assert re.search(
         r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
-        r'if \(document\.visibilityState !== "visible"\) return;\s*'
-        r'if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{',
+        r'if \(document\.visibilityState !== "visible"\) \{\s*'
+        r"cancelPresenceRequest\(\);\s*return;\s*\}\s*"
+        r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{",
         terminal_script,
     )
     assert re.search(
         r'window\.addEventListener\("focus", \(\) => \{\s*'
-        r'if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{\s*'
-        r'connect\(\);\s*return;\s*\}\s*'
-        r'scheduleActivityAcknowledge\(\);\s*\}\);',
+        r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{\s*"
+        r"connect\(\);\s*return;\s*\}\s*"
+        r"scheduleActivityAcknowledge\(\);\s*\}\);",
         terminal_script,
     )
 
 
-def test_template_static_asset_versions_are_consistent() -> None:
-    versions: dict[str, set[str]] = {}
+def test_template_static_asset_versions_match_file_hashes() -> None:
+    hashed_assets: dict[str, set[str]] = {}
+    fixed_versions: dict[str, set[str]] = {}
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    pattern = re.compile(r"url_for\('static', path='([^']+)'\) }}\?v=([0-9.]+)")
+    pattern = re.compile(
+        r"url_for\('static', path='([^']+)'\) }}\?v={{ static_asset_version\('([^']+)'\) }}"
+    )
+    fixed_pattern = re.compile(r"url_for\('static', path='([^']+)'\) }}\?v=([0-9.]+)")
     for template in templates_dir.glob("*.html"):
-        for asset, version in pattern.findall(template.read_text(encoding="utf-8")):
-            versions.setdefault(asset, set()).add(version)
+        source = template.read_text(encoding="utf-8")
+        for asset, hashed_asset in pattern.findall(source):
+            assert asset == hashed_asset
+            hashed_assets.setdefault(asset, set()).add(hashed_asset)
+        for asset, version in fixed_pattern.findall(source):
+            fixed_versions.setdefault(asset, set()).add(version)
 
-    assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"62"}
-    assert versions["app.js"] == {"71"}
-    assert versions["remote_run.js"] == {"12"}
-    assert versions["terminal-font.css"] == {"3"}
-    assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"57"}
+    assert all(len(assets) == 1 for assets in hashed_assets.values())
+    expected_app_assets = {
+        "app.css",
+        "app.js",
+        "mobile_scrollback.css",
+        "mobile_scrollback.js",
+        "remote_run.js",
+        "terminal-font.css",
+        "terminal.js",
+        "terminal_selection.js",
+    }
+    assert expected_app_assets <= hashed_assets.keys()
+    for asset, paths in hashed_assets.items():
+        assert paths == {asset}
+        path = VENDOR_DIR.parent / asset
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert static_asset_version(path) == expected
+    assert fixed_versions["vendor/addon-unicode11.js"] == {"0.8.0"}
+
+
+def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> None:
+    ROOT = Path(__file__).resolve().parents[1]
+    script = (ROOT / "termroom/static/terminal.js").read_text()
+    handler = script[
+        script.index("  const acceptPaneMode =") : script.index(
+            "  term.options.screenReaderMode", script.index("  const acceptPaneMode =")
+        )
+    ]
+    probe = (
+        """
+const assert = require('node:assert/strict');
+const host = {dataset:{paneModeCapable:'true',terminalId:'t'}};
+let paneMode = null;
+"""
+        + handler
+        + """
+const mode = {kind:'pane_mode',terminal_id:'t',generation:'a',revision:1,
+ alternate:true,mouse_tracking:false};
+acceptPaneMode(mode);
+assert.equal(paneMode.alternate, true);
+assert.ok(Object.isFrozen(paneMode));
+acceptPaneMode({...mode,revision:2,alternate:false});
+assert.equal(paneMode.alternate, false);
+acceptPaneMode(mode);
+acceptPaneMode({...mode,generation:'old',revision:99});
+acceptPaneMode({...mode,terminal_id:'other',revision:99});
+assert.equal(paneMode.revision, 2);
+paneMode = null; // each new socket resets state, socket/epoch guards reject old events
+acceptPaneMode({...mode,generation:'b'});
+assert.equal(paneMode.generation, 'b');
+host.dataset.paneModeCapable = 'false';
+paneMode = null;
+acceptPaneMode(mode);
+assert.equal(paneMode, null);
+"""
+    )
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    binary_at = script.index("if (event.data instanceof ArrayBuffer)")
+    output_at = script.index("term.write(event.data", binary_at)
+    assert binary_at < output_at
+    assert "epoch !== connectionEpoch || nextSocket !== socket" in script
+    assert 'data-pane-mode-capable="' in (ROOT / "termroom/templates/terminal.html").read_text()
+
+
+def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None:
+    script = (VENDOR_DIR.parent / "terminal.js").read_text()
+    cancel = script[script.index("  const cancelPresenceRequest = () => {"):
+                    script.index("  const updatePresence = async () => {")]
+    switch = script[script.index("  const resetTerminalActivityState ="):
+                    script.index("  terminalTabs.forEach((tab) => {")]
+    message = script[script.index('    nextSocket.addEventListener("message",'):
+                     script.index('    nextSocket.addEventListener("close",')]
+    probe = r"""
+const assert = require('node:assert/strict');
+const events = [], connections = [], queue = [];
+const host = {dataset:{terminalId:'A',workspaceId:'w',terminalRole:'shell'}};
+const tabs = ['A','B','C'].map(id => ({dataset:{terminalSwitch:id,terminalRole:'shell'},
+  classList:{toggle(){}},setAttribute(){},removeAttribute(){},getAttribute(){return '/'+id;}}));
+const terminalTabs = tabs;
+const window = {clearTimeout(){},dispatchEvent(e){events.push(e);}};
+const document = {body:{classList:{remove(){}}},querySelector(){return null;}};
+const CustomEvent = function(kind, options){this.type=kind;this.detail=options.detail;};
+const WebSocket = {OPEN:1,CLOSING:2};
+let connectionEpoch=0, pendingTerminalId='', socket={readyState:1,close(){this.readyState=3;}};
+let presenceAborted=false;
+let presenceRequest={controller:{abort(){presenceAborted=true;}}};
+let shellTerminal=true, reconnectTimer, otherInputTimer, reconnectAllowed=true, reconnectDelay=500;
+let presenceInitialized=true,lastInputRevision=1,activityAckTimer=0,pendingActivityAt=10,
+ acknowledgedActivityAt=0,renderedActivityAt=0,outputRenderSequence=0,acknowledgedRenderSequence=0;
+const terminalOutputLink=null,terminalManageForm=null,terminalNameInput=null,
+ terminalCommandClearTarget=null;
+const history={pushState(){}},location={href:'/A'},terminalHistoryState=id=>({id});
+const setComposerOpen=()=>{},closeMoreKeys=()=>{},closeTerminalPopovers=()=>{},
+ setStatus=()=>{},tr=x=>x;
+const term={buffer:[],write(data,callback){
+ queue.push(()=>{if(data)this.buffer.push(data);callback();});},
+ reset(){this.buffer=[];},clearSelection(){}};
+const connect=()=>{connections.push(host.dataset.terminalId);connectionEpoch++;
+  socket={readyState:1,close(){this.readyState=3;}};};
+const scheduleActivityAcknowledge=()=>events.push({type:'ack-scheduled',
+ terminalId:host.dataset.terminalId});
+const acceptPaneMode=()=>{};
+CANCEL_HANDLER
+function attachMessage(nextSocket,epoch) {
+  let receive;
+  nextSocket.addEventListener=(_,listener)=>{receive=listener;};
+MESSAGE_HANDLER
+  return receive;
+}
+SWITCH_HANDLER
+const oldSocket=socket, oldReceive=attachMessage(oldSocket,connectionEpoch);
+oldReceive({data:'OLD-A'});
+assert.equal(switchShellTerminal(tabs[1]),true);
+assert.equal(presenceAborted,true,'switching must cancel the in-flight presence request');
+assert.equal(host.dataset.terminalId,'A','identity must not change until native queue drains');
+assert.equal(connections.length,0);
+queue.shift()(); // old A parses while still A; stale callback is ignored
+assert.equal(outputRenderSequence,0);
+assert.equal(events.filter(e=>e.type==='termroom:terminal-output').length,0);
+queue.shift()(); // drain fence resets before assigning B and reconnecting
+assert.equal(host.dataset.terminalId,'B');
+assert.deepEqual(term.buffer,[]);
+assert.deepEqual(connections,['B']);
+const bReceive=attachMessage(socket,connectionEpoch);
+pendingActivityAt=20;
+bReceive({data:'CURRENT-B'});queue.shift()();
+assert.deepEqual(term.buffer,['CURRENT-B']);
+assert.equal(events.filter(e=>e.type==='termroom:terminal-output').at(-1).detail.terminal_id,'B');
+assert.equal(renderedActivityAt,20);
+// Multiple pending clicks: only the latest target fence may reset/connect.
+switchShellTerminal(tabs[2]);switchShellTerminal(tabs[1]);
+queue.shift()();assert.equal(host.dataset.terminalId,'B');
+queue.shift()();assert.deepEqual(connections,['B','B']);
+// Same terminal ID, new socket: stale reconnect callback must not render/ack.
+const staleReceive=attachMessage(socket,connectionEpoch);
+staleReceive({data:'OLD-CONNECTION'});socket={readyState:1};
+const count=outputRenderSequence;queue.shift()();assert.equal(outputRenderSequence,count);
+assert.equal(pendingTerminalId,'');
+""".replace("CANCEL_HANDLER", cancel).replace("MESSAGE_HANDLER", message).replace(
+    "SWITCH_HANDLER", switch
+)
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_terminal_presence_poll_does_not_overlap_slow_requests() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise terminal presence polling")
+    source = (VENDOR_DIR.parent / "terminal.js").read_text()
+    cancel_start = source.index("  const cancelPresenceRequest = () => {")
+    start = source.index("  const updatePresence = async () => {", cancel_start)
+    end = source.index("\n\n  const send =", start)
+    presence = source[start:end].replace("  const updatePresence =", "const updatePresence =")
+    cancel = source[cancel_start:start].replace(
+        "  const cancelPresenceRequest =", "const cancelPresenceRequest ="
+    )
+    probe = r"""
+const assert=require('node:assert/strict');
+let isConnected=true,presenceInitialized=true,lastInputRevision=4,otherInputTimer=77;
+let presenceRequest=null,connectionEpoch=1,launched=0,outstanding=0,maximum=0;
+let failNext=false;
+const urls=[],jsonBodies=[],statusUpdates=[],cleared=[],scheduled=[];
+const host={dataset:{terminalId:'same-terminal',deviceId:'fixture-device'}};
+const window={
+  clearTimeout(value){cleared.push(value);},
+  setTimeout(_callback,delay){scheduled.push(delay);return scheduled.length;}
+};
+const document={visibilityState:'visible'};
+const tr=value=>value;
+const setStatusMessage=value=>statusUpdates.push(value);
+global.fetch=(_url,options)=>{
+  launched++;outstanding++;maximum=Math.max(maximum,outstanding);
+  urls.push(_url);
+  let active=true;
+  options.signal.addEventListener(
+    'abort',()=>{if(active){active=false;outstanding--;}}, {once:true}
+  );
+  if(failNext){
+    failNext=false;active=false;outstanding--;
+    return Promise.reject(new Error('fixture failure'));
+  }
+  return Promise.resolve({ok:true,json:()=>new Promise(resolve=>{
+    jsonBodies.push(value=>{if(active){active=false;outstanding--;}resolve(value);});
+  })});
+};
+__PRESENCE_CANCEL__
+__PRESENCE_UPDATE__
+(async()=>{
+  const state=()=>({presenceInitialized,lastInputRevision,otherInputTimer,
+    statusUpdates:[...statusUpdates],cleared:[...cleared],scheduled:[...scheduled]});
+  const old=updatePresence();
+  const overlapping=updatePresence();
+  assert.equal(launched,1,'slow polls must be single-flight');
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,1,'the first response body must be pending');
+  const before=state();
+  document.visibilityState='hidden';
+  cancelPresenceRequest();
+  document.visibilityState='visible';
+  const reopened=updatePresence();
+  assert.equal(launched,2,'same-terminal reopen must start its own request');
+  jsonBodies[0]({count:2,input_revision:9,last_input_device_id:'other-device'});
+  await Promise.all([old,overlapping]);
+  assert.deepEqual(
+    state(),before,'a successful response queued before cancellation must not update reopened state'
+  );
+  const duplicateAfterOld=updatePresence();
+  await duplicateAfterOld;
+  assert.equal(launched,2,'the old finally must not clear the reopened request guard');
+  assert.equal(outstanding,1);
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,2);
+  jsonBodies[1]({count:1,input_revision:4});
+  await reopened;
+  assert.equal(
+    statusUpdates.at(-1),'terminal.status.connected','the current response must still update status'
+  );
+  assert.equal(outstanding,0);
+  assert.equal(maximum,1);
+
+  failNext=true;
+  const beforeFailure=launched;
+  await updatePresence();
+  assert.equal(launched,beforeFailure+1);
+  assert.equal(presenceRequest,null,'failed requests must release the single-flight guard');
+  const recovered=updatePresence();
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,3);
+  jsonBodies[2]({count:1,input_revision:4});
+  await recovered;
+  assert.equal(launched,beforeFailure+2,'a poll after failure must recover');
+
+  document.visibilityState='hidden';
+  const beforeHidden=launched;
+  await updatePresence();
+  assert.equal(launched,beforeHidden,'hidden pages must not fetch presence');
+  document.visibilityState='visible';
+  const visible=updatePresence();
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,4);
+  jsonBodies[3]({count:1,input_revision:4});
+  await visible;
+  assert.equal(launched,beforeHidden+1,'visible pages must resume polling');
+
+  const oldTerminal=updatePresence();
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,5);
+  const beforeSwitch=state();
+  host.dataset.terminalId='other-terminal';
+  connectionEpoch++;
+  cancelPresenceRequest();
+  const switched=updatePresence();
+  assert.equal(urls.at(-1),'/api/terminals/other-terminal/presence');
+  jsonBodies[4]({count:2,input_revision:12,last_input_device_id:'other-device'});
+  await oldTerminal;
+  assert.deepEqual(state(),beforeSwitch,'old terminal/epoch success must not update current state');
+  await Promise.resolve();
+  assert.equal(jsonBodies.length,6);
+  jsonBodies[5]({count:1,input_revision:4});
+  await switched;
+  assert.equal(outstanding,0);
+  assert.equal(maximum,1);
+  process.stdout.write('PRESENCE_ASSERTIONS_COMPLETE\n');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""".replace("__PRESENCE_CANCEL__", cancel).replace("__PRESENCE_UPDATE__", presence)
+    result = subprocess.run(
+        [node, "-e", probe], capture_output=True, text=True, timeout=3
+    )
+    assert result.returncode == 0, result.stderr
+    assert "PRESENCE_ASSERTIONS_COMPLETE" in result.stdout, result.stdout
+
+
+def test_remote_run_form_reuses_one_submission_identity_until_intent_changes() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the Remote Run form")
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+class Target {
+  constructor() { this.listeners = {}; this.hidden = false; this.disabled = false; }
+  addEventListener(type, handler) { (this.listeners[type] ||= []).push(handler); }
+  emit(type, event = {}) { for (const handler of this.listeners[type] || []) handler(event); }
+  scrollIntoView() {}
+}
+
+const source = new Target();
+source.value = process.argv[2];
+source.checked = true;
+const submit = new Target();
+const error = new Target();
+const archive = new Target();
+archive.files = [];
+const form = new Target();
+form.dataset = { createUrl: "/api/remote-runs", uploadPrefix: "/api/remote-runs", csrf: "csrf" };
+form.values = {
+  target_computer_id: "target", command: "echo first", source_workspace_id: "source",
+  source_path: ".", source_url: "https://example.test/repo.git",
+};
+form.querySelectorAll = (selector) => selector === "input[name='source_kind']" ? [source] : [];
+form.querySelector = (selector) => ({
+  "#remote-run-form-error": error,
+  "button[type='submit']": submit,
+  "#remote-run-upload-progress": null,
+  "input[name='archive']": archive,
+}[selector] || null);
+form.setAttribute = () => {};
+form.removeAttribute = () => {};
+
+global.document = {
+  documentElement: { lang: "en" },
+  querySelector: (selector) => selector === "#remote-run-form" ? form : null,
+  querySelectorAll: () => [],
+};
+global.FormData = class {
+  constructor(value) { this.value = value; }
+  get(key) { return this.value.values[key] || ""; }
+};
+let sequence = 0;
+const requestIds = [];
+const requestBodies = [];
+global.window = {
+  crypto: { randomUUID: () => `run-${++sequence}` },
+  location: { assign: () => {} },
+  TermroomI18n: {},
+};
+global.fetch = async (_url, options) => {
+  const body = JSON.parse(options.body);
+  const id = body.id;
+  requestIds.push(id);
+  requestBodies.push(body);
+  if (requestIds.length === 1) throw new Error("response lost");
+  return { ok: true, json: async () => ({ ok: true, detail_url: `/remote-runs/${id}` }) };
+};
+let uploadOutcomes = ["error", "load", "load"];
+global.XMLHttpRequest = class {
+  constructor() {
+    this.listeners = {}; this.upload = new Target(); this.status = 202;
+    this.response = { ok: true };
+  }
+  open() {}
+  setRequestHeader() {}
+  addEventListener(type, handler) { this.listeners[type] = handler; }
+  send() { queueMicrotask(() => this.listeners[uploadOutcomes.shift()]()); }
+};
+
+vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+const submitForm = async () => {
+  const event = { preventDefault() {} };
+  for (const handler of form.listeners.submit || []) await handler(event);
+};
+
+(async () => {
+  const first = submitForm();
+  await submitForm();
+  await first;
+  await submitForm();
+
+  process.stdout.write(JSON.stringify({ ids: requestIds, bodies: requestBodies }));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    for source_kind in ("workspace", "git"):
+        result = subprocess.run(
+            [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js"), source_kind],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(result.stdout)
+        assert observed["ids"] == ["run-1", "run-1"]
+        assert observed["bodies"][0] == observed["bodies"][1]
+        assert observed["bodies"][0]["source_kind"] == source_kind
+        if source_kind == "git":
+            assert observed["bodies"][0]["source_url"] == "https://example.test/repo.git"
+
+
+def test_remote_run_archive_retry_checks_status_before_retransmitting() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the Remote Run form")
+    script = r"""
+const fs=require("fs"),vm=require("vm");
+class T {
+  constructor(){this.l={};this.disabled=false;this.hidden=false;this.checked=false;this.files=[];this.value=""}
+  addEventListener(n,f){(this.l[n]??=[]).push(f)}
+  emit(n,e={}){for(const f of this.l[n]??[])f(e)}
+  scrollIntoView(){}
+}
+
+function harness(scenario) {
+  const source=new T(); source.value="archive"; source.checked=true;
+  const submit=new T(), error=new T(), archive=new T(), form=new T();
+  const fileA={name:"same.zip",size:7,lastModified:123,bytes:"A"};
+  const fileB={name:"same.zip",size:7,lastModified:123,bytes:"B"};
+  archive.files=[fileA];
+  form.dataset={createUrl:"/api/remote-runs",uploadPrefix:"/api/remote-runs",csrf:"x"};
+  form.values={target_computer_id:"target",command:"run"};
+  form.querySelectorAll=(s)=>s==="input[name='source_kind']"?[source]
+    :s==="button, input, select, textarea"?[source,submit,archive]:[];
+  form.querySelector=(s)=>({"#remote-run-form-error":error,"button[type='submit']":submit,"#remote-run-upload-progress":null,"input[name='archive']":archive}[s]||null);
+  form.setAttribute=()=>{}; form.removeAttribute=()=>{};
+  let sequence=0, statusCount=0;
+  const createIds=[], uploadBodies=[], uploadUrls=[], assignments=[];
+  const statusResponses = {
+    "create-loss": [{state:"preparing",phase:"waiting_upload"}],
+    uploading: [{state:"preparing",phase:"uploading"},{state:"preparing",phase:"uploading"}],
+    accepted: [{state:"preparing",phase:"uploading"},{state:"preparing",phase:"checking"}],
+    unknown: [{state:"preparing"},{state:"preparing"}],
+    replacement: [{state:"preparing",phase:"waiting_upload"}],
+  }[scenario] || [];
+  const createOutcomes = scenario==="create-loss" || scenario==="replacement"
+    ? ["lost","ok"] : ["ok","ok"];
+  const uploadOutcomes = scenario==="uploading" || scenario==="accepted" || scenario==="unknown"
+    ? ["error"] : ["load"];
+  const context={
+    console,queueMicrotask,
+    document:{documentElement:{lang:"en"},querySelector:s=>s==="#remote-run-form"?form:null,querySelectorAll:()=>[]},
+    FormData:class{constructor(value){this.value=value}get(k){return this.value.values[k]||""}},
+    window:{crypto:{randomUUID:()=>`run-${++sequence}`},location:{assign:url=>assignments.push(url)},TermroomI18n:{}},
+    fetch:async(_url,options)=>{
+      if(options?.body){
+        const body=JSON.parse(options.body); createIds.push(body.id);
+        if(createOutcomes.shift()==="lost") throw new Error("create response lost");
+        return {ok:true,json:async()=>({ok:true,detail_url:`/remote-runs/${body.id}`})};
+      }
+      statusCount++;
+      const response=statusResponses.shift() || {state:"preparing",phase:"waiting_upload"};
+      return {ok:true,json:async()=>response};
+    },
+    XMLHttpRequest:class{
+      constructor(){this.l={};this.upload=new T();this.status=202;this.response={ok:true}}
+      open(_method,url){this.url=url;uploadUrls.push(url)}
+      setRequestHeader(){}
+      addEventListener(n,f){this.l[n]=f}
+      send(body){
+        uploadBodies.push(body);
+        const outcome=uploadOutcomes.shift()||"load";
+        queueMicrotask(()=>this.l[outcome]());
+      }
+    },
+  };
+  vm.runInNewContext(fs.readFileSync(process.argv[1],"utf8"),context);
+  const send=async()=>{for(const f of form.l.submit||[])await f({preventDefault(){}})};
+  return {
+    source,archive,fileA,fileB,form,send,createIds,uploadBodies,uploadUrls,assignments,
+    statusCount:()=>statusCount,error,
+  };
+}
+
+(async()=>{
+  const scenario=process.argv[2];
+  const h=harness(scenario);
+  if(scenario==="replacement"){
+    await h.send();
+    h.archive.files=[h.fileB];
+    h.form.emit("change");
+    await h.send();
+  } else if(scenario==="accepted"){
+    await h.send();
+    await h.send();
+    await h.send();
+  } else {
+    await h.send();
+    await h.send();
+  }
+  process.stdout.write(JSON.stringify({
+    createIds:h.createIds,
+    statusCalls:h.statusCount(),
+    uploadCount:h.uploadBodies.length,
+    uploadedA:h.uploadBodies[0]===h.fileA,
+    uploadedB:h.uploadBodies[0]===h.fileB,
+    assignments:h.assignments,
+    uploadUrls:h.uploadUrls,
+    error:h.error.textContent||"",
+  }));
+})().catch(e=>{console.error(e);process.exitCode=1});
+"""
+    expected = {
+        "create-loss": {
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 1,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": ["/remote-runs/run-1"],
+        },
+        "uploading": {
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 2,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": [],
+        },
+        "accepted": {
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 2,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": ["/remote-runs/run-1"],
+        },
+        "unknown": {
+            "createIds": ["run-1", "run-1"],
+            "statusCalls": 2,
+            "uploadCount": 1,
+            "uploadedA": True,
+            "uploadedB": False,
+            "assignments": [],
+        },
+        "replacement": {
+            "createIds": ["run-1", "run-2"],
+            "statusCalls": 1,
+            "uploadCount": 1,
+            "uploadedA": False,
+            "uploadedB": True,
+            "assignments": ["/remote-runs/run-2"],
+        },
+    }
+    for scenario, assertions in expected.items():
+        result = subprocess.run(
+            [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js"), scenario],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(result.stdout)
+        for key, value in assertions.items():
+            assert observed[key] == value, (scenario, key, observed)
+        expected_upload_url = (
+            "/api/remote-runs/run-2/archive?filename=same.zip"
+            if scenario == "replacement"
+            else "/api/remote-runs/run-1/archive?filename=same.zip"
+        )
+        assert observed["uploadUrls"] == [expected_upload_url]
+
+
+def test_remote_run_archive_validation_and_uploading_recovery_stay_retryable() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the Remote Run form")
+    script = r"""
+const fs=require("fs"),vm=require("vm");
+class T {
+  constructor(){this.l={};this.disabled=false;this.hidden=false}
+  addEventListener(n,f){(this.l[n]??=[]).push(f)}
+  emit(n){for(const f of this.l[n]??[])f()}
+  scrollIntoView(){}
+}
+const source=new T(); source.value="archive"; source.checked=true;
+const submit=new T(), error=new T(), archive=new T(), form=new T(); archive.files=[];
+form.dataset={createUrl:"/api/remote-runs",uploadPrefix:"/api/remote-runs",csrf:"x"};
+form.values={target_computer_id:"target",command:"run"};
+form.querySelectorAll=(s)=>s==="input[name='source_kind']"?[source]
+  :s==="button, input, select, textarea"?[source,submit,archive]:[];
+form.querySelector=(s)=>({"#remote-run-form-error":error,"button[type='submit']":submit,"#remote-run-upload-progress":null,"input[name='archive']":archive}[s]||null);
+form.setAttribute=()=>{};form.removeAttribute=()=>{};
+let calls=0, assigned=0;
+const context={
+  console,queueMicrotask,
+  document:{documentElement:{lang:"en"},querySelector:s=>s==="#remote-run-form"?form:null,querySelectorAll:()=>[]},
+  FormData:class{constructor(){}get(k){return form.values[k]||""}},
+  window:{crypto:{randomUUID:()=>"run-1"},location:{assign:()=>assigned++},TermroomI18n:{}},
+  fetch:async(_url, options)=>{
+    calls++;
+    if(options.body)return{ok:true,json:async()=>({ok:true,detail_url:"/remote-runs/run-1"})};
+    return{ok:true,json:async()=>({ok:true,state:"preparing",phase:"uploading"})};
+  },
+  XMLHttpRequest:class{
+    constructor(){this.l={};this.upload=new T();this.status=202;this.response={ok:true}}
+    open(){} setRequestHeader(){} addEventListener(n,f){this.l[n]=f}
+    send(){queueMicrotask(()=>this.l.error())}
+  },
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1],"utf8"),context);
+const send=async()=>{for(const f of form.l.submit||[])await f({preventDefault(){}})};
+(async()=>{
+  await send();
+  const empty=[calls,error.textContent];
+  archive.files=[{name:"same.zip"}];
+  form.emit("change");
+  await send();
+  process.stdout.write(JSON.stringify({empty,calls,assigned}));
+})().catch(e=>{console.error(e);process.exitCode=1});
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(VENDOR_DIR.parent / "remote_run.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "empty": [0, "remote_run.error.zip_required"],
+        "calls": 2,
+        "assigned": 0,
+    }
 
 
 def test_recursive_file_search_keeps_live_controls_consistent() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     files_template = (templates_dir / "files.html").read_text(encoding="utf-8")
-    results_template = (templates_dir / "_file_results.html").read_text(
-        encoding="utf-8"
-    )
+    results_template = (templates_dir / "_file_results.html").read_text(encoding="utf-8")
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     assert "data-file-visibility-form" in files_template
@@ -435,16 +1052,20 @@ def test_recursive_file_search_keeps_live_controls_consistent() -> None:
 
 def test_mobile_editor_toolbar_uses_balanced_rows() -> None:
     stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
-    assert """@media (max-width: 520px) {
+    assert (
+        """@media (max-width: 520px) {
   .editor-toolbar {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-""" in stylesheet
+"""
+        in stylesheet
+    )
 
 
 def test_mobile_terminal_more_keys_panel_is_anchored_to_the_viewport() -> None:
     stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
-    assert """@media (max-width: 520px) {
+    assert (
+        """@media (max-width: 520px) {
   .quick-keys {
     position: relative;
   }
@@ -460,12 +1081,15 @@ def test_mobile_terminal_more_keys_panel_is_anchored_to_the_viewport() -> None:
     min-width: 0;
   }
 }
-""" in stylesheet
+"""
+        in stylesheet
+    )
 
 
 def test_mobile_workspace_usage_popover_is_anchored_to_the_viewport() -> None:
     stylesheet = (VENDOR_DIR.parents[1] / "static/app.css").read_text(encoding="utf-8")
-    assert """@media (max-width: 1023px) {
+    assert (
+        """@media (max-width: 1023px) {
   .workspace-mobile-actions .workspace-usage-popover {
     position: fixed;
     top: calc(var(--topbar-height) + env(safe-area-inset-top) + 8px);
@@ -476,7 +1100,9 @@ def test_mobile_workspace_usage_popover_is_anchored_to_the_viewport() -> None:
     transform: translateX(-50%);
     overscroll-behavior: contain;
   }
-}""" in stylesheet
+}"""
+        in stylesheet
+    )
 
 
 def test_global_header_layers_settings_menu_above_transformed_page_actions() -> None:
@@ -491,12 +1117,8 @@ def test_global_header_layers_settings_menu_above_transformed_page_actions() -> 
 def test_remote_run_result_zip_is_the_primary_completed_run_action() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     wait_template = (templates_dir / "remote_run_wait.html").read_text(encoding="utf-8")
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
-    collect_template = (templates_dir / "remote_run_collect.html").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
+    collect_template = (templates_dir / "remote_run_collect.html").read_text(encoding="utf-8")
 
     result_link = 'class="primary-button" href="/remote-runs/{{'
     assert result_link in wait_template
@@ -509,16 +1131,10 @@ def test_remote_run_result_zip_is_the_primary_completed_run_action() -> None:
 
 def test_remote_workspace_connection_freshness_is_transition_deduped() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
-    remote_run_script = (VENDOR_DIR.parent / "remote_run.js").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
+    remote_run_script = (VENDOR_DIR.parent / "remote_run.js").read_text(encoding="utf-8")
 
-    status_wrapper = re.search(
-        r"<span[^>]*data-run-workspace-connection[^>]*>", workspace_template
-    )
+    status_wrapper = re.search(r"<span[^>]*data-run-workspace-connection[^>]*>", workspace_template)
     assert status_wrapper is not None
     assert 'role="status"' in status_wrapper.group(0)
     assert 'aria-live="polite"' in status_wrapper.group(0)
@@ -578,30 +1194,21 @@ def test_file_run_connection_freshness_is_transition_deduped() -> None:
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     for template in templates:
-        status_wrapper = re.search(
-            r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>", template
-        )
+        status_wrapper = re.search(r"<span[^>]*data-file-run-connection(?:\s|>)[^>]*>", template)
         assert status_wrapper is not None
         assert 'role="status"' in status_wrapper.group(0)
         assert 'aria-live="polite"' in status_wrapper.group(0)
         assert 'aria-atomic="true"' in status_wrapper.group(0)
         assert " hidden" not in status_wrapper.group(0)
 
-        visual_chip = re.search(
-            r"<small[^>]*data-file-run-connection-chip[^>]*>", template
-        )
+        visual_chip = re.search(r"<small[^>]*data-file-run-connection-chip[^>]*>", template)
         assert visual_chip is not None
         assert 'class="file-run-error"' in visual_chip.group(0)
         assert 'aria-hidden="true"' in visual_chip.group(0)
         assert " hidden" in visual_chip.group(0)
         assert "{{ t('file_run.connection_offline') }}" in template
-        assert (
-            '<span class="sr-only" data-file-run-connection-announcer></span>'
-            in template
-        )
-        assert template.index("data-file-run-state") < template.index(
-            "data-file-run-connection"
-        )
+        assert '<span class="sr-only" data-file-run-connection-announcer></span>' in template
+        assert template.index("data-file-run-state") < template.index("data-file-run-connection")
 
     file_run_start = app_script.index(
         '  document.querySelectorAll("[data-file-run]").forEach((panel) => {'
@@ -626,22 +1233,16 @@ def test_file_run_connection_freshness_is_transition_deduped() -> None:
     ):
         assert behavior in file_run_script
     assert file_run_script.count("setConnectionUnavailable(true);") == 2
-    connection_handler = file_run_script.index(
-        "const renderConnectionAwareResult = (result) =>"
-    )
+    connection_handler = file_run_script.index("const renderConnectionAwareResult = (result) =>")
     offline_check = file_run_script.index(
         'if (result.connection !== "online") {', connection_handler
     )
     render_call = file_run_script.index("render(result);", offline_check)
     assert offline_check < render_call
-    assert file_run_script.index("setConnectionUnavailable(false);", offline_check) < (
-        render_call
-    )
+    assert file_run_script.index("setConnectionUnavailable(false);", offline_check) < (render_call)
     poll_start = file_run_script.index("    const poll = async () => {")
     failure_reset = file_run_script.index("failures = 0;", poll_start)
-    connection_render = file_run_script.index(
-        "renderConnectionAwareResult(result);", failure_reset
-    )
+    connection_render = file_run_script.index("renderConnectionAwareResult(result);", failure_reset)
     assert failure_reset < connection_render
     catch_start = file_run_script.index("      } catch {")
     failure_increment = file_run_script.index("failures += 1;", catch_start)
@@ -659,12 +1260,11 @@ def test_mobile_file_run_terminal_freshness_preserves_action_geometry() -> None:
     mobile_900_start = stylesheet.index(
         "@media (max-width: 900px)", stylesheet.index(".file-run-terminal-bar")
     )
-    mobile_760_start = stylesheet.index(
-        "@media (max-width: 760px)", mobile_900_start
-    )
+    mobile_760_start = stylesheet.index("@media (max-width: 760px)", mobile_900_start)
     mobile_900_styles = stylesheet[mobile_900_start:mobile_760_start]
 
-    assert """  .file-run-terminal-bar .file-run-summary {
+    assert (
+        """  .file-run-terminal-bar .file-run-summary {
     position: relative;
   }
 
@@ -688,7 +1288,9 @@ def test_mobile_file_run_terminal_freshness_preserves_action_geometry() -> None:
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-""" in mobile_900_styles
+"""
+        in mobile_900_styles
+    )
 
 
 def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
@@ -716,7 +1318,7 @@ def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
         'link.setAttribute("aria-busy", "true")',
         'link.setAttribute("aria-disabled", "true")',
         'if (link.dataset.workspaceOpening === "true")',
-        'delete link.dataset.workspaceOpening',
+        "delete link.dataset.workspaceOpening",
         'link.removeAttribute("aria-busy")',
         'link.removeAttribute("aria-disabled")',
         'window.addEventListener("pageshow"',
@@ -739,9 +1341,7 @@ def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
 
 def test_workspace_command_pending_contract_is_wired() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     for marker in (
@@ -778,9 +1378,7 @@ def test_workspace_command_pending_contract_is_wired() -> None:
 
 def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    workspace_template = (templates_dir / "workspace_base.html").read_text(
-        encoding="utf-8"
-    )
+    workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
     app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
 
     assert (
@@ -802,28 +1400,20 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     )
     assert "const createTerminalActivityChannel = () =>" in terminal_script
     assert "new window.BroadcastChannel(TERMINAL_ACTIVITY_CHANNEL_NAME)" in terminal_script
-    assert "const terminalActivityChannel = createTerminalActivityChannel();" in (
-        terminal_script
-    )
+    assert "const terminalActivityChannel = createTerminalActivityChannel();" in (terminal_script)
     assert "const terminalActivityWorkspaceNeedsRefresh = new Map(" in terminal_script
     assert "const terminalActivityUnreadByTerminal = new Map();" in terminal_script
     assert "const terminalActivityRevisionByTerminal = new Map();" in terminal_script
     assert "const terminalActivityRequestedWorkspaceIds = () =>" in terminal_script
     assert "if (!requestedWorkspaceIds.length) return null;" in terminal_script
-    assert "const hasUnread = items.some((item) => Boolean(item?.unread));" in (
-        terminal_script
-    )
+    assert "const hasUnread = items.some((item) => Boolean(item?.unread));" in (terminal_script)
     assert "items.length > 0 && !hasUnread" in terminal_script
     assert "const rememberedUnreadTerminalIds = (workspaceId) =>" in terminal_script
     assert "const renderRememberedTerminalActivity = (workspaceId) =>" in terminal_script
-    assert "terminalActivityWorkspaceNeedsRefresh.get(workspaceId) === false" in (
-        terminal_script
-    )
+    assert "terminalActivityWorkspaceNeedsRefresh.get(workspaceId) === false" in (terminal_script)
     assert "terminalActivityUnreadByTerminal.get(terminalId) === true" in terminal_script
     assert "|| !terminalActivityRequest()" in terminal_script
-    assert "const firstSignalInBurst = terminalActivitySignalTimer === 0;" in (
-        terminal_script
-    )
+    assert "const firstSignalInBurst = terminalActivitySignalTimer === 0;" in (terminal_script)
     assert "scheduleTerminalActivityRefresh();" in terminal_script
     assert "scheduleTerminalActivitySignalRefresh" in terminal_script
     assert 'window.addEventListener("termroom:terminal-output"' in terminal_script
@@ -848,9 +1438,7 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert 'data-workspace-id="{{ workspace.id }}"' in workspace_template
 
     usage_start = app_script.index("  const workspaceUsageViews =")
-    usage_end = app_script.index(
-        '  document.querySelectorAll("[data-file-run]")', usage_start
-    )
+    usage_end = app_script.index('  document.querySelectorAll("[data-file-run]")', usage_start)
     usage_script = app_script[usage_start:usage_end]
     assert 'view.addEventListener("toggle"' in usage_script
     assert "workspaceUsageViews.some((view) => view.open" in usage_script

@@ -63,6 +63,7 @@ from termroom.terminals import (
     FILE_RUN_WRAPPER_SCRIPT,
     MAX_TERMINAL_MESSAGE_BYTES,
     TERMINAL_EDITOR_WRAPPER,
+    TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
     TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
@@ -74,9 +75,10 @@ from termroom.terminals import (
     TMUX_WORKSPACE_COMMAND_OPTIONS,
     TMUX_WORKSPACE_COMMAND_RECORD_FORMAT,
     TMUX_WORKSPACE_COMMAND_SLOT_OPTION,
+    TMUX_WORKSPACE_COMMAND_STATE_OPTION,
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
-    WORKSPACE_COMMAND_WRAPPER,
+    WORKSPACE_COMMAND_WRAPPER_ARGV,
     TerminalOutputDecoder,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
@@ -94,6 +96,7 @@ from termroom.terminals import (
     touch_terminal_output_if_present,
     validate_workspace_command_launch,
     validate_workspace_command_slot,
+    wait_tmux_browser_grid_size,
     workspace_command_digest,
     workspace_command_history_name,
 )
@@ -729,6 +732,7 @@ class SSHBackend:
         self._browser_grid_locks: dict[str, threading.RLock] = {}
         self._browser_grid_locks_guard = threading.Lock()
         self._browser_grid_owners: dict[str, str] = {}
+        self._terminal_resize_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def managed_key_path(self) -> Path:
@@ -1058,13 +1062,27 @@ class SSHBackend:
 
     def test_connection(self, computer: dict[str, Any]) -> dict[str, str]:
         self._require_ssh_client()
-        client = self._connect(computer)
-        return self._connection_info(client, computer, refresh_command_path=True)
+        target = self._effective_connection_target(computer)
+        try:
+            client = self._connect(target, record_connection=False)
+            result = self._connection_info(client, target, refresh_command_path=True)
+        except SSHBackendError as exc:
+            self._record_connection(target, error=exc)
+            raise
+        self._record_connection(target)
+        return result
 
     def test_password_connection(self, computer: dict[str, Any], password: str) -> dict[str, str]:
         self._require_ssh_client()
-        client = self._connect_password(self._effective_connection_target(computer), password)
-        return self._connection_info(client, computer, refresh_command_path=True)
+        target = self._effective_connection_target(computer)
+        try:
+            client = self._connect_password(target, password)
+            result = self._connection_info(client, target, refresh_command_path=True)
+        except SSHBackendError as exc:
+            self._record_connection(target, error=exc)
+            raise
+        self._record_connection(target)
+        return result
 
     @staticmethod
     def _require_ssh_client() -> None:
@@ -1089,6 +1107,8 @@ class SSHBackend:
             )
             script = (
                 "printf 'shell=%s\\n' \"${SHELL:-unknown}\"; "
+                "test -f /bin/bash && test -x /bin/bash || "
+                "{ echo '__TERMROOM_NO_BASH__' >&2; exit 47; }; "
                 "command -v tmux >/dev/null 2>&1 || "
                 "{ echo '__TERMROOM_NO_TMUX__' >&2; exit 45; }; "
                 "tmux -V"
@@ -3163,20 +3183,20 @@ class SSHBackend:
             f"recovery=$({browser_view_listing} | "
             "while IFS='|' read -r view group attached; do "
             f'case "$view" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
-            f"[ \"$group\" = {quoted_session} ] || continue; "
-            'printf \'%s\\n\' "$view"; break; done); '
+            f'[ "$group" = {quoted_session} ] || continue; '
+            "printf '%s\\n' \"$view\"; break; done); "
         )
         detached_view_cleanup = (
             f"{browser_view_listing} | while IFS='|' read -r view group attached; do "
             f'case "$view" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
-            f"[ \"$group\" = {quoted_session} ] || continue; "
+            f'[ "$group" = {quoted_session} ] || continue; '
             '[ "$attached" = 0 ] || continue; '
             'tmux kill-session -t "$view" >/dev/null 2>&1 || true; done; '
         )
         all_view_cleanup = (
             f"{browser_view_listing} | while IFS='|' read -r view group attached; do "
             f'case "$view" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
-            f"[ \"$group\" = {quoted_session} ] || continue; "
+            f'[ "$group" = {quoted_session} ] || continue; '
             'tmux kill-session -t "$view" >/dev/null 2>&1 || true; done; '
         )
         managed_identity = ""
@@ -3198,7 +3218,7 @@ class SSHBackend:
             f"if tmux has-session -t {quoted_session} 2>/dev/null; then "
             "created=0; else "
             f"{recovery_lookup}"
-            f"if [ -n \"$recovery\" ] && tmux new-session -d -s {quoted_session} "
+            f'if [ -n "$recovery" ] && tmux new-session -d -s {quoted_session} '
             '-t "$recovery"; then '
             f"created=0; {detached_view_cleanup}"
             "else "
@@ -3207,8 +3227,8 @@ class SSHBackend:
             "created=1; fi; fi; "
             f"printf '%s%s\\n' {shlex.quote(created_marker)} \"$created\"; "
             f"{managed_identity}"
-            f"tmux set-window-option -t {quoted_session} window-size latest "
-            ">/dev/null 2>&1 || true; "
+            f'if [ "$created" = 1 ]; then tmux set-window-option -t {quoted_session} '
+            "window-size latest >/dev/null 2>&1 || true; fi; "
             f"tmux list-windows -t {quoted_session} "
             f"-F {shlex.quote(TMUX_TERMINAL_RECORD_FORMAT)}"
         )
@@ -3736,9 +3756,7 @@ class SSHBackend:
         self.control.mark_grid_fresh(str(terminal["id"]))
         return terminal
 
-    def open_terminal_editor(
-        self, workspace: dict[str, Any], relative_path: str
-    ) -> dict[str, Any]:
+    def open_terminal_editor(self, workspace: dict[str, Any], relative_path: str) -> dict[str, Any]:
         normalized = normalize_terminal_editor_path(relative_path)
         target = self._remote_path(workspace, normalized)
         digest = terminal_editor_digest(normalized)
@@ -3774,11 +3792,7 @@ class SSHBackend:
             existing = next((item for item in records if item["digest"] == digest), None)
             if existing is not None and not existing["dead"]:
                 terminal = next(
-                    (
-                        item
-                        for item in terminals
-                        if item["tmux_window"] == existing["tmux_window"]
-                    ),
+                    (item for item in terminals if item["tmux_window"] == existing["tmux_window"]),
                     None,
                 )
                 if terminal is None:
@@ -3787,8 +3801,7 @@ class SSHBackend:
             if existing is not None:
                 self._exec(
                     computer,
-                    "tmux kill-window "
-                    f"-t {shlex.quote(str(existing['tmux_window']))}",
+                    f"tmux kill-window -t {shlex.quote(str(existing['tmux_window']))}",
                 )
 
             create = " ".join(
@@ -3801,11 +3814,7 @@ class SSHBackend:
                     "-t",
                     shlex.quote(session),
                     "-n",
-                    shlex.quote(
-                        normalize_terminal_name(
-                            f"vim-{PurePosixPath(normalized).name}"
-                        )
-                    ),
+                    shlex.quote(normalize_terminal_name(f"vim-{PurePosixPath(normalized).name}")),
                     "-c",
                     shlex.quote(self._remote_root(workspace)),
                     shlex.quote(TERMINAL_EDITOR_WRAPPER),
@@ -3813,10 +3822,7 @@ class SSHBackend:
             )
             readiness_attempts = max(
                 1,
-                int(
-                    WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS
-                    / WORKSPACE_COMMAND_READY_POLL_SECONDS
-                ),
+                int(WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS / WORKSPACE_COMMAND_READY_POLL_SECONDS),
             )
             start = (
                 f"window=$({create}) || exit $?; attempt=0; "
@@ -3824,7 +3830,7 @@ class SSHBackend:
                 'ready=$(tmux display-message -p -t "$window" '
                 f"{shlex.quote(f'#{{{TMUX_TERMINAL_EDITOR_DIGEST_OPTION}}}')} "
                 "2>/dev/null || true); "
-                f"if test \"$ready\" = {shlex.quote(digest)}; then "
+                f'if test "$ready" = {shlex.quote(digest)}; then '
                 "printf '%s\\n' \"$window\"; exit 0; fi; "
                 "attempt=$((attempt + 1)); "
                 f"sleep {WORKSPACE_COMMAND_READY_POLL_SECONDS}; done; "
@@ -3832,9 +3838,7 @@ class SSHBackend:
             )
             window = self._exec(computer, start).strip()
             terminals = self.ensure_workspace(workspace)
-            terminal = next(
-                (item for item in terminals if item["tmux_window"] == window), None
-            )
+            terminal = next((item for item in terminals if item["tmux_window"] == window), None)
             if terminal is None:
                 raise SSHBackendError("Vim Terminal disappeared while starting")
             return terminal
@@ -3908,14 +3912,11 @@ class SSHBackend:
                 else:
                     quoted_window = shlex.quote(str(existing["tmux_window"]))
                     detach = "; ".join(
-                        "tmux set-window-option -u "
-                        f"-t {quoted_window} {shlex.quote(option)}"
+                        f"tmux set-window-option -u -t {quoted_window} {shlex.quote(option)}"
                         for option in TMUX_WORKSPACE_COMMAND_OPTIONS
                     )
                     history_name = shlex.quote(
-                        workspace_command_history_name(
-                            safe_slot, str(existing["launch_id"])
-                        )
+                        workspace_command_history_name(safe_slot, str(existing["launch_id"]))
                     )
                     self._exec(
                         computer,
@@ -3953,7 +3954,7 @@ class SSHBackend:
                     process_options,
                     "-t",
                     shlex.quote(window),
-                    shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+                    " ".join(map(shlex.quote, WORKSPACE_COMMAND_WRAPPER_ARGV)),
                     "|| exit $?;",
                     f"window={shlex.quote(window)};",
                 )
@@ -3970,7 +3971,7 @@ class SSHBackend:
                     shlex.quote(f"run-{safe_slot + 1}"),
                     "-c",
                     shlex.quote(self._remote_root(workspace)),
-                    shlex.quote(WORKSPACE_COMMAND_WRAPPER),
+                    " ".join(map(shlex.quote, WORKSPACE_COMMAND_WRAPPER_ARGV)),
                 )
             )
             launch = f"window=$({create}) || exit $?;"
@@ -3980,9 +3981,14 @@ class SSHBackend:
                 f"#{{{TMUX_WORKSPACE_COMMAND_SLOT_OPTION}}}",
                 f"#{{{TMUX_WORKSPACE_COMMAND_LAUNCH_OPTION}}}",
                 f"#{{{TMUX_WORKSPACE_COMMAND_DIGEST_OPTION}}}",
+                f"#{{{TMUX_WORKSPACE_COMMAND_STATE_OPTION}}}",
             )
         )
         expected_readiness = f"{safe_slot}|{safe_launch}|{digest}"
+        ready_states = "|".join(
+            shlex.quote(f"{expected_readiness}|{state}")
+            for state in ("running", "settling", "shell")
+        )
         readiness_attempts = max(
             1,
             int(WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS / WORKSPACE_COMMAND_READY_POLL_SECONDS),
@@ -3993,8 +3999,8 @@ class SSHBackend:
             f'while test "$attempt" -lt {readiness_attempts}; do '
             'ready=$(tmux display-message -p -t "$window" '
             f"{shlex.quote(readiness_format)} 2>/dev/null || true); "
-            f'if test "$ready" = {shlex.quote(expected_readiness)}; then '
-            "printf '%s\\n' \"$window\"; exit 0; fi; "
+            f'case "$ready" in {ready_states}) '
+            "printf '%s\\n' \"$window\"; exit 0;; esac; "
             "attempt=$((attempt + 1)); "
             f"sleep {WORKSPACE_COMMAND_READY_POLL_SECONDS}; done; "
             f"{timeout_cleanup}; exit 1"
@@ -4073,10 +4079,9 @@ class SSHBackend:
         terminal_id = str(terminal["id"])
         client_id = self.control.register(terminal_id, device_id=device_id)
         view_session = tmux_browser_view_session(client_id)
+        resize_lock = self._terminal_resize_locks.setdefault(terminal_id, asyncio.Lock())
         try:
-            process_pid, master_fd = self._spawn_ssh_tmux_client(
-                workspace, terminal, view_session
-            )
+            process_pid, master_fd = self._spawn_ssh_tmux_client(workspace, terminal, view_session)
         except Exception:
             self.control.unregister(terminal_id, client_id)
             self._forget_ssh_browser_grid_owner(terminal_id, client_id)
@@ -4111,54 +4116,87 @@ class SSHBackend:
                     )
                     await websocket.send_text(decoded)
 
-        async def resize_browser_view(payload: dict[str, Any]) -> None:
+        async def apply_browser_resize(payload: dict[str, Any]) -> bool:
             nonlocal last_viewport
             if "rows" not in payload or "cols" not in payload:
-                return
+                return True
             size = terminal_size(payload)
             if size is None:
-                return
+                return False
             rows, cols = size
-            controls_grid, grid_resize = self.control.resize_plan(
-                terminal_id, client_id, rows=rows, cols=cols
-            )
-            role_changed = await asyncio.to_thread(
-                self._ssh_browser_grid_role_changed,
-                terminal_id,
-                client_id,
-                enabled=controls_grid,
-            )
-            if role_changed:
+            plan = self.control.begin_resize(terminal_id, client_id, rows=rows, cols=cols)
+            current = True
+            try:
                 changed = await asyncio.to_thread(
                     self._sync_ssh_browser_grid_role,
                     terminal_id,
                     client_id,
                     workspace,
                     view_session,
-                    enabled=controls_grid,
+                    enabled=plan is not None,
                 )
                 if not changed:
-                    return
-            if controls_grid and not self.control.can_resize(terminal_id, client_id):
-                changed = await asyncio.to_thread(
-                    self._sync_ssh_browser_grid_role,
-                    terminal_id,
-                    client_id,
-                    workspace,
-                    view_session,
-                    enabled=False,
-                )
-                if not changed:
-                    return
-                controls_grid = False
-                grid_resize = False
-            viewport = (rows, cols)
-            if viewport == last_viewport and not grid_resize:
-                return
-            self._set_window_size(master_fd, rows=rows, cols=cols)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process_pid, signal.SIGWINCH)
-            last_viewport = viewport
+                    return False
+                if plan is not None and not self.control.resize_plan_current(plan):
+                    if not await asyncio.to_thread(
+                        self._sync_ssh_browser_grid_role,
+                        terminal_id,
+                        client_id,
+                        workspace,
+                        view_session,
+                        enabled=False,
+                    ):
+                        raise SSHBackendError("Terminal grid demotion failed")
+                    self.control.abort_resize(plan)
+                    plan = None
+                    current = False
+                viewport = (rows, cols)
+                if viewport != last_viewport or (plan is not None and plan.apply):
+                    self._set_window_size(master_fd, rows=rows, cols=cols)
+                    os.killpg(process_pid, signal.SIGWINCH)
+                    last_viewport = viewport
+                if plan is not None:
+                    if plan.apply and not await asyncio.to_thread(
+                        self._wait_ssh_browser_view_size,
+                        workspace,
+                        view_session,
+                        rows=rows,
+                        cols=cols,
+                    ):
+                        raise SSHBackendError("Terminal grid resize was not applied")
+                    self.control.resize_applied(plan)
+                    if plan.bootstrap and not await asyncio.to_thread(
+                        self._freeze_ssh_browser_grid, workspace, str(terminal["tmux_window"])
+                    ):
+                        raise SSHBackendError("Terminal bootstrap grid freeze failed")
+                    if plan.bootstrap and not await asyncio.to_thread(
+                        self._sync_ssh_browser_grid_role,
+                        terminal_id,
+                        client_id,
+                        workspace,
+                        view_session,
+                        enabled=False,
+                    ):
+                        raise SSHBackendError("Terminal bootstrap demotion failed")
+                    if not self.control.commit_resize(plan):
+                        if not await asyncio.to_thread(
+                            self._sync_ssh_browser_grid_role,
+                            terminal_id,
+                            client_id,
+                            workspace,
+                            view_session,
+                            enabled=False,
+                        ):
+                            raise SSHBackendError("Stale Terminal grid demotion failed")
+                        return False
+                return current
+            finally:
+                if plan is not None:
+                    self.control.abort_resize(plan)
+
+        async def resize_browser_view(payload: dict[str, Any]) -> bool:
+            async with resize_lock:
+                return await apply_browser_resize(payload)
 
         async def browser_to_input() -> None:
             while True:
@@ -4171,10 +4209,10 @@ class SSHBackend:
                         await websocket.close(code=1009, reason="Terminal input is too large")
                         return
                     self.control.mark_input(terminal_id, client_id, device_id)
-                    if last_viewport is not None:
-                        await resize_browser_view(
-                            {"rows": last_viewport[0], "cols": last_viewport[1]}
-                        )
+                    if last_viewport is not None and not await resize_browser_view(
+                        {"rows": last_viewport[0], "cols": last_viewport[1]}
+                    ):
+                        continue
                     os.write(master_fd, payload_bytes)
                     continue
                 raw = message.get("text") or ""
@@ -4204,7 +4242,6 @@ class SSHBackend:
                 elif kind == "resize":
                     await resize_browser_view(payload)
                 elif kind == "command":
-                    self.control.mark_input(terminal_id, client_id, device_id)
                     await resize_browser_view(payload)
                     command = str(payload.get("data", ""))
                     await asyncio.to_thread(
@@ -4217,7 +4254,8 @@ class SSHBackend:
                 elif kind == "input":
                     if terminal_input_claims_grid(payload):
                         self.control.mark_input(terminal_id, client_id, device_id)
-                    await resize_browser_view(payload)
+                    if not await resize_browser_view(payload):
+                        continue
                     os.write(master_fd, str(payload.get("data", "")).encode())
 
         output_task = asyncio.create_task(output_to_browser())
@@ -4233,7 +4271,11 @@ class SSHBackend:
                     await task
         finally:
             self.control.unregister(terminal_id, client_id)
-            self._forget_ssh_browser_grid_owner(terminal_id, client_id)
+            if self.control.client_count(terminal_id) == 0:
+                self._terminal_resize_locks.pop(terminal_id, None)
+            self._forget_ssh_browser_grid_owner(
+                terminal_id, client_id, workspace=workspace, window=str(terminal["tmux_window"])
+            )
             for task in (output_task, input_task):
                 if not task.done():
                     task.cancel()
@@ -4450,7 +4492,9 @@ class SSHBackend:
             if int(attr.st_size or 0) > max_bytes:
                 raise UnsupportedFileError("File exceeds the editable size limit")
             with sftp.open(remote, "rb") as handle:
-                raw = handle.read()
+                raw = handle.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise UnsupportedFileError("File exceeds the editable size limit")
             if b"\x00" in raw:
                 raise UnsupportedFileError("Binary files cannot be executed")
             try:
@@ -4551,9 +4595,13 @@ class SSHBackend:
                 if checked != remote or not stat_module.S_ISREG(current_attr.st_mode):
                     raise FileConflictError("The file changed after it was opened")
                 with sftp.open(checked, "rb") as current_handle:
-                    current = current_handle.read()
+                    current = current_handle.read(max_bytes + 1)
                 current_mtime = int(current_attr.st_mtime or 0) * 1_000_000_000
-                if current_mtime != expected_mtime_ns or file_digest(current) != expected_digest:
+                if (
+                    len(current) > max_bytes
+                    or current_mtime != expected_mtime_ns
+                    or file_digest(current) != expected_digest
+                ):
                     raise FileConflictError("The file changed after it was opened")
                 return current_attr
 
@@ -4877,10 +4925,7 @@ class SSHBackend:
                 try:
                     children = sftp.listdir_iter(directory, read_aheads=1)
                     for attr in children:
-                        if (
-                            scanned >= REMOTE_RECENT_MAX_FILES
-                            or time.monotonic() >= deadline
-                        ):
+                        if scanned >= REMOTE_RECENT_MAX_FILES or time.monotonic() >= deadline:
                             truncated = True
                             stop = True
                             break
@@ -4917,18 +4962,14 @@ class SSHBackend:
                 except OSError:
                     continue
 
-            entries = [
-                item[2] for item in sorted(heap, key=lambda item: item[:2], reverse=True)
-            ]
+            entries = [item[2] for item in sorted(heap, key=lambda item: item[:2], reverse=True)]
             return RecentFiles(entries=entries, scanned_files=scanned, truncated=truncated)
         finally:
             sftp.close()
             client.close()
 
     @staticmethod
-    def _recent_ignore_patterns_from_sftp(
-        sftp: paramiko.SFTPClient, root: str
-    ) -> tuple[str, ...]:
+    def _recent_ignore_patterns_from_sftp(sftp: paramiko.SFTPClient, root: str) -> tuple[str, ...]:
         remote = posixpath.join(root, RECENT_IGNORE_FILE)
         try:
             attr = sftp.lstat(remote)
@@ -5116,10 +5157,15 @@ class SSHBackend:
         if close_client:
             client.close()
 
-    def _connect(self, computer: dict[str, Any]) -> paramiko.SSHClient | _SSHClientLease:
+    def _connect(
+        self,
+        computer: dict[str, Any],
+        *,
+        record_connection: bool = True,
+    ) -> paramiko.SSHClient | _SSHClientLease:
         target = self._effective_connection_target(computer)
         if not self._reuse_connections:
-            client = self._connect_fresh(target)
+            client = self._connect_fresh(target, record_connection=record_connection)
             self._seed_client_remote_command_path(client, str(target.get("id") or ""))
             return client
         key = self._connection_cache_key(target)
@@ -5145,10 +5191,11 @@ class SSHBackend:
         self._close_clients(closing)
 
         if reused is not None:
-            self._record_connection(target)
+            if record_connection:
+                self._record_connection(target)
             return _SSHClientLease(self, key, computer_id, reused)
 
-        client = self._connect_fresh(target)
+        client = self._connect_fresh(target, record_connection=record_connection)
         self._seed_client_remote_command_path(client, computer_id)
         transport = client.get_transport()
         if transport is not None:
@@ -5186,14 +5233,21 @@ class SSHBackend:
                 continue
         return blobs
 
-    def _connect_fresh(self, computer: dict[str, Any]) -> paramiko.SSHClient:
+    def _connect_fresh(
+        self,
+        computer: dict[str, Any],
+        *,
+        record_connection: bool = True,
+    ) -> paramiko.SSHClient:
         if str(computer.get("auth_kind") or "key") == "password":
             try:
                 client = self._connect_password(computer, self._stored_password(computer))
             except SSHBackendError as exc:
-                self._record_connection(computer, error=exc)
+                if record_connection:
+                    self._record_connection(computer, error=exc)
                 raise
-            self._record_connection(computer)
+            if record_connection:
+                self._record_connection(computer)
             return client
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(
@@ -5218,7 +5272,8 @@ class SSHBackend:
                 error = SSHBackendError(
                     "Could not connect to the SSH agent configured for this alias"
                 )
-                self._record_connection(computer, error=error)
+                if record_connection:
+                    self._record_connection(computer, error=error)
                 client.close()
                 raise error from exc
             client._agent = custom_agent
@@ -5241,7 +5296,8 @@ class SSHBackend:
         try:
             client.connect(**connect_kwargs)
         except SSHHostKeyChanged as exc:
-            self._record_connection(computer, error=exc)
+            if record_connection:
+                self._record_connection(computer, error=exc)
             client.close()
             raise
         except paramiko.BadHostKeyException as exc:
@@ -5249,19 +5305,22 @@ class SSHBackend:
                 "SSH host key no longer matches the approved fingerprint",
                 locale_key="ssh.backend.host_key_changed",
             )
-            self._record_connection(computer, error=error)
+            if record_connection:
+                self._record_connection(computer, error=error)
             client.close()
             raise error from exc
         except (OSError, paramiko.SSHException) as exc:
             error = self.connection_error(exc, str(computer["host"]), int(computer["port"]))
-            self._record_connection(computer, error=error)
+            if record_connection:
+                self._record_connection(computer, error=error)
             client.close()
             raise error from exc
         finally:
             if custom_agent is not None:
                 custom_agent.close()
                 client._agent = None
-        self._record_connection(computer)
+        if record_connection:
+            self._record_connection(computer)
         return client
 
     def _connect_password(self, computer: dict[str, Any], password: str) -> paramiko.SSHClient:
@@ -5421,7 +5480,7 @@ class SSHBackend:
         probe = f"printf '{REMOTE_LOGIN_PATH_MARKER}%s\\n' \"$PATH\""
         inner = f"exec /bin/sh -c {shlex.quote(probe)} >&3"
         bootstrap = (
-            'shell=${SHELL:-/bin/sh}; '
+            "shell=${SHELL:-/bin/sh}; "
             'case "$shell" in /*) ;; *) shell=/bin/sh ;; esac; '
             'test -x "$shell" || shell=/bin/sh; '
             f'exec "$shell" -l -c {shlex.quote(inner)} '
@@ -5565,15 +5624,18 @@ class SSHBackend:
         if status < 0:
             raise SSHCommandStatusUnknown("SSH command completion status is unknown")
         if status:
-            if "__TERMROOM_NO_DIR__" in error:
-                raise SSHBackendError("Remote Workspace directory does not exist")
             if "__TERMROOM_NO_TMUX__" in error:
                 raise SSHBackendError(
                     "tmux is not installed on the remote computer",
                     locale_key="ssh.backend.tmux_missing",
                 )
+            if "__TERMROOM_NO_DIR__" in error:
+                raise SSHBackendError("Remote Workspace directory does not exist")
             if "__TERMROOM_NO_BASH__" in error:
-                raise SSHBackendError("/bin/bash is not installed on the remote computer")
+                raise SSHBackendError(
+                    "/bin/bash is not executable on the remote computer",
+                    locale_key="ssh.backend.bash_missing",
+                )
             if "__TERMROOM_NO_GIT__" in error:
                 raise SSHBackendError("git is not installed on the remote computer")
             if "__TERMROOM_RUN_EXISTS__" in error:
@@ -5710,7 +5772,7 @@ class SSHBackend:
         peer_update = ""
         if enabled:
             peer_update = (
-                'window=${target#*|}; '
+                "window=${target#*|}; "
                 "tmux list-clients -F '#{client_name}|#{session_name}|#{window_id}' "
                 "2>/dev/null | while IFS='|' read -r peer peer_session peer_window; do "
                 f'case "$peer_session" in {TMUX_BROWSER_VIEW_PREFIX}*) ;; *) continue ;; esac; '
@@ -5723,19 +5785,49 @@ class SSHBackend:
                 "fi; "
                 "done || exit 1; "
             )
+        finish_role = (
+            'exec tmux set-window-option -t "${target#*|}" window-size latest; '
+            if enabled
+            else "exit 0; "
+        )
         command = (
             "attempt=0; "
             'while [ "$attempt" -lt 20 ]; do '
             f"target=$(tmux list-clients -t {quoted_view} "
             "-F '#{client_name}|#{window_id}' "
             "2>/dev/null | head -n 1); "
-            'client=${target%%|*}; '
+            "client=${target%%|*}; "
             'if [ -n "$client" ] && [ "$target" != "$client" ]; then '
             f"{peer_update}"
-            f'exec tmux refresh-client -t "$client" -f {client_flag}; '
+            f'tmux refresh-client -t "$client" -f {client_flag} || exit 1; '
+            f"{finish_role}"
             "fi; "
             "attempt=$((attempt + 1)); sleep 0.05; "
             "done; exit 1"
+        )
+        try:
+            self._exec(self._computer(workspace), command)
+        except SSHBackendError:
+            return False
+        return True
+
+    def _wait_ssh_browser_view_size(
+        self, workspace: dict[str, Any], view_session: str, *, rows: int, cols: int
+    ) -> bool:
+        command = (
+            f"tmux list-clients -t {shlex.quote(view_session)} "
+            f"-F {shlex.quote(TMUX_BROWSER_SIZE_FORMAT)}"
+        )
+        return wait_tmux_browser_grid_size(
+            lambda: self._exec(self._computer(workspace), command), rows=rows, cols=cols
+        )
+
+    def _freeze_ssh_browser_grid(self, workspace: dict[str, Any], window: str) -> bool:
+        quoted = shlex.quote(window)
+        command = (
+            f"size=$(tmux display-message -p -t {quoted} '#{{window_width}} #{{window_height}}') "
+            '&& set -- $size && [ "$#" = 2 ] '
+            f'&& tmux resize-window -t {quoted} -x "$1" -y "$2"'
         )
         try:
             self._exec(self._computer(workspace), command)
@@ -5809,9 +5901,18 @@ class SSHBackend:
                     self._browser_grid_owners.pop(terminal_id, None)
             return True
 
-    def _forget_ssh_browser_grid_owner(self, terminal_id: str, client_id: str) -> None:
+    def _forget_ssh_browser_grid_owner(
+        self,
+        terminal_id: str,
+        client_id: str,
+        *,
+        workspace: dict[str, Any] | None = None,
+        window: str = "",
+    ) -> None:
         with self._ssh_browser_grid_lock(terminal_id):
             if self._browser_grid_owners.get(terminal_id) == client_id:
+                if workspace is not None and window:
+                    self._freeze_ssh_browser_grid(workspace, window)
                 self._browser_grid_owners.pop(terminal_id, None)
 
     def _ssh_argv(self, computer: dict[str, Any]) -> list[str]:

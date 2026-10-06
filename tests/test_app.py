@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
+import inspect
 import io
+import multiprocessing
 import re
 import shutil
 import subprocess
@@ -18,7 +21,7 @@ import pytest
 from fastapi.responses import PlainTextResponse
 
 from termroom.app import MAX_INLINE_IMAGE_BYTES, PACKAGE_ROOT, create_app
-from termroom.assets import TERMINAL_FONT_ASSETS
+from termroom.assets import TERMINAL_FONT_ASSETS, static_asset_version
 from termroom.config import Settings
 from termroom.files import FileEntry, RecentFiles
 from termroom.i18n import messages
@@ -30,6 +33,426 @@ _TERMINAL_ACTIVITY_EPOCH_SECONDS = 1_700_000_000
 
 def _terminal_activity_seconds(offset: int) -> int:
     return _TERMINAL_ACTIVITY_EPOCH_SECONDS + offset
+
+
+def _static_asset_hash(filename: str) -> str:
+    return hashlib.sha256((PACKAGE_ROOT / "static" / filename).read_bytes()).hexdigest()
+
+
+def _terminal_activity_provider_helpers(app):
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None)
+        == "/api/workspaces/{workspace_id}/terminal-activity"
+    )
+    scope = inspect.getclosurevars(endpoint).nonlocals[
+        "refresh_terminal_activity_scope"
+    ]
+    refresh = inspect.getclosurevars(scope).nonlocals[
+        "refresh_terminal_activity_provider"
+    ]
+    helpers = inspect.getclosurevars(refresh).nonlocals
+    return refresh, helpers["terminal_activity_refreshes"]
+
+
+def _probe_terminal_activity_cleanup_race(report, work_dir: str) -> None:
+    async def run() -> None:
+        root = Path(work_dir) / "root"
+        root.mkdir()
+        app = create_app(
+            Settings.create(root, state_dir=Path(work_dir) / "state", access_token="test")
+        )
+        refresh, registry = _terminal_activity_provider_helpers(app)
+        key = ("remote", "cleanup-probe")
+        calls: list[list[str]] = []
+        held: list[tuple[asyncio.Task[None], object]] = []
+
+        async def provider(workspaces: list[dict[str, str]]) -> None:
+            calls.append([workspace["id"] for workspace in workspaces])
+
+        app.state.remote.refresh_terminal_activity = provider
+        loop = asyncio.get_running_loop()
+
+        class DelayedCleanupTask(asyncio.Task[None]):
+            def add_done_callback(self, callback, *, context=None) -> None:
+                if getattr(callback, "__name__", "") == "clear":
+                    held.append((self, callback))
+                else:
+                    super().add_done_callback(callback, context=context)
+
+        loop.set_task_factory(
+            lambda loop, coroutine, context=None: DelayedCleanupTask(
+                coroutine, loop=loop, context=context
+            )
+        )
+        try:
+            await refresh(key, [{"id": "A"}])
+            assert key not in registry and len(held) == 1
+            report.send({"stage": "A complete; cleanup held", "calls": calls.copy()})
+
+            progress = asyncio.Event()
+
+            async def request_b() -> None:
+                report.send({"stage": "B helper entered", "calls": calls.copy()})
+                await refresh(key, [{"id": "B"}])
+
+            second = asyncio.create_task(request_b())
+            loop.call_soon(
+                lambda: (progress.set(), report.send({"stage": "same-loop sentinel"}))
+            )
+            await second
+            assert progress.is_set()
+            report.send({"stage": "B complete", "calls": calls, "progress": True})
+        finally:
+            loop.set_task_factory(None)
+
+    asyncio.run(run())
+
+
+def test_terminal_activity_provider_retires_completed_entry(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_probe_terminal_activity_cleanup_race,
+        args=(sender, str(tmp_path)),
+    )
+    process.start()
+    sender.close()
+    process.join(timeout=2)
+    timed_out = process.is_alive()
+    if timed_out:
+        process.terminate()
+        process.join(timeout=1)
+    reports = []
+    while receiver.poll():
+        try:
+            reports.append(receiver.recv())
+        except EOFError:
+            break
+    receiver.close()
+    process.close()
+
+    assert not timed_out, f"bounded child timed out: {reports!r}"
+    assert reports[-1] == {
+        "stage": "B complete",
+        "calls": [["A"], ["B"]],
+        "progress": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_provider_coalesces_and_refreshes_only_uncovered(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test")
+    )
+    refresh, _ = _terminal_activity_provider_helpers(app)
+    key = ("remote", "coalescing-probe")
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    first_workspace = app.state.workspaces.open("a")
+    second_workspace = app.state.workspaces.open("b")
+    first_id = str(first_workspace["id"])
+    second_id = str(second_workspace["id"])
+    app.state.store.create_terminal(first_id, "first", "@1")
+    app.state.store.create_terminal(second_id, "second", "@2")
+    calls: list[list[str]] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    uncovered_started = asyncio.Event()
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [workspace["id"] for workspace in workspaces]
+        calls.append(workspace_ids)
+        if workspace_ids == [first_id]:
+            first_started.set()
+            await release_first.wait()
+        elif workspace_ids == [second_id]:
+            uncovered_started.set()
+        for workspace_id in workspace_ids:
+            app.state.store.observe_terminal_activity(
+                workspace_id,
+                [
+                    {
+                        "tmux_window": "@1" if workspace_id == first_id else "@2",
+                        "activity_at": _terminal_activity_seconds(50),
+                    }
+                ],
+            )
+
+    app.state.remote.refresh_terminal_activity = provider
+
+    async def request(
+        workspace_ids: list[str], entered: asyncio.Event
+    ) -> dict[str, object]:
+        entered.set()
+        await refresh(key, [{"id": workspace_id} for workspace_id in workspace_ids])
+        return app.state.store.terminal_activity_summary(workspace_ids=workspace_ids)
+
+    owner = asyncio.create_task(request([first_id], asyncio.Event()))
+    await first_started.wait()
+    covered_entered = asyncio.Event()
+    overlap_entered = asyncio.Event()
+    covered = asyncio.create_task(request([first_id], covered_entered))
+    overlap = asyncio.create_task(request([first_id, second_id], overlap_entered))
+    await covered_entered.wait()
+    await overlap_entered.wait()
+
+    release_first.set()
+    owner_result, covered_result, overlap_result = await asyncio.wait_for(
+        asyncio.gather(owner, covered, overlap), timeout=2
+    )
+
+    assert uncovered_started.is_set()
+    assert calls == [[first_id], [second_id]]
+    assert owner_result == covered_result
+    assert {
+        workspace["workspace_id"] for workspace in overlap_result["workspaces"]
+    } == {first_id, second_id}
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_provider_preserves_newer_entry_on_both_cleanups(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test")
+    )
+    refresh, registry = _terminal_activity_provider_helpers(app)
+    key = ("remote", "identity-probe")
+    calls: list[list[str]] = []
+    first_started = asyncio.Event()
+    newer_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_newer = asyncio.Event()
+    held: list[tuple[asyncio.Task[None], object]] = []
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [workspace["id"] for workspace in workspaces]
+        calls.append(workspace_ids)
+        if workspace_ids == ["A"]:
+            first_started.set()
+            await release_first.wait()
+        elif workspace_ids == ["C"]:
+            newer_started.set()
+            await release_newer.wait()
+
+    app.state.remote.refresh_terminal_activity = provider
+    loop = asyncio.get_running_loop()
+
+    class DelayedCleanupTask(asyncio.Task[None]):
+        def add_done_callback(self, callback, *, context=None) -> None:
+            if getattr(callback, "__name__", "") == "clear":
+                held.append((self, callback))
+            else:
+                super().add_done_callback(callback, context=context)
+
+    loop.set_task_factory(
+        lambda loop, coroutine, context=None: DelayedCleanupTask(
+            coroutine, loop=loop, context=context
+        )
+    )
+    try:
+        first_caller = asyncio.create_task(refresh(key, [{"id": "A"}]))
+        await first_started.wait()
+        first_task = registry[key][1]
+        first_clear = next(callback for task, callback in held if task is first_task)
+
+        registry.pop(key)
+        newer_caller = asyncio.create_task(refresh(key, [{"id": "C"}]))
+        await newer_started.wait()
+        newer_task = registry[key][1]
+        newer_clear = next(callback for task, callback in held if task is newer_task)
+
+        release_first.set()
+        await first_caller
+        assert registry[key][1] is newer_task
+        first_clear(first_task)
+        assert registry[key][1] is newer_task
+
+        release_newer.set()
+        await newer_caller
+        assert key not in registry
+        newer_clear(newer_task)
+        assert key not in registry
+        assert calls == [["A"], ["C"]]
+    finally:
+        release_first.set()
+        release_newer.set()
+        loop.set_task_factory(None)
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_provider_shield_and_failure_fallback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test")
+    )
+    refresh, registry = _terminal_activity_provider_helpers(app)
+    key = ("remote", "cancellation-probe")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    newer_started = asyncio.Event()
+    release_newer = asyncio.Event()
+    calls: list[list[str]] = []
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [workspace["id"] for workspace in workspaces]
+        calls.append(workspace_ids)
+        if workspace_ids == ["A"]:
+            started.set()
+            await release.wait()
+        elif workspace_ids == ["C"]:
+            newer_started.set()
+            await release_newer.wait()
+        else:
+            raise RuntimeError("provider unavailable")
+
+    app.state.remote.refresh_terminal_activity = provider
+    owner = asyncio.create_task(refresh(key, [{"id": "A"}]))
+    await started.wait()
+    first_task = registry[key][1]
+    waiter_entered = asyncio.Event()
+
+    async def wait_for_a() -> None:
+        waiter_entered.set()
+        await refresh(key, [{"id": "A"}])
+
+    waiter = asyncio.create_task(wait_for_a())
+    await waiter_entered.wait()
+    registry.pop(key)
+    newer = asyncio.create_task(refresh(key, [{"id": "C"}]))
+    await newer_started.wait()
+    newer_task = registry[key][1]
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert registry[key][1] is newer_task
+    assert not first_task.cancelled() and not first_task.done()
+
+    release.set()
+    await owner
+    assert registry[key][1] is newer_task
+    release_newer.set()
+    await newer
+    await refresh(key, [{"id": "failed"}])
+
+    assert key not in registry
+    assert calls == [["A"], ["C"], ["failed"]]
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_summary_refreshes_two_remote_workspaces(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root, state_dir=tmp_path / "state", access_token="test-token"
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="Activity QA",
+        ssh_alias="",
+        host="activity.example.test",
+        port=22,
+        username="qa",
+        identity_file="",
+        auth_kind="existing_key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    first = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/first", "first"
+    )
+    second = app.state.workspaces.open_remote(
+        str(computer["id"]), "/srv/second", "second"
+    )
+    first_terminal = app.state.store.create_terminal(str(first["id"]), "first", "@1")
+    second_terminal = app.state.store.create_terminal(
+        str(second["id"]), "second", "@2"
+    )
+    calls: list[list[str]] = []
+    fail = False
+
+    async def provider(workspaces: list[dict[str, str]]) -> None:
+        workspace_ids = [str(workspace["id"]) for workspace in workspaces]
+        calls.append(workspace_ids)
+        if fail:
+            raise RuntimeError("provider unavailable")
+        for workspace in workspaces:
+            window = "@1" if workspace["id"] == first["id"] else "@2"
+            app.state.store.observe_terminal_activity(
+                str(workspace["id"]),
+                [{"tmux_window": window, "activity_at": _terminal_activity_seconds(50)}],
+            )
+
+    app.state.remote.refresh_terminal_activity = provider
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    params = [
+        ("workspace_id", str(first["id"])),
+        ("workspace_id", str(second["id"])),
+    ]
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        response = await asyncio.wait_for(
+            client.get("/api/terminal-activity/summary", params=params), timeout=2
+        )
+        fail = True
+        fallback = await client.get("/api/terminal-activity/summary", params=params)
+
+    assert response.status_code == 200
+    assert fallback.status_code == 200
+    assert fallback.json() == response.json()
+    assert calls == [
+        [str(first["id"]), str(second["id"])],
+        [str(first["id"]), str(second["id"])],
+    ]
+    payload = response.json()
+    assert set(payload) == {
+        "ok",
+        "terminals",
+        "workspaces",
+        "unread_count",
+        "latest_unread_terminal_id",
+    }
+    assert payload["ok"] is True
+    assert payload["unread_count"] == 0
+    assert payload["latest_unread_terminal_id"] is None
+    assert {
+        terminal["workspace_id"] for terminal in payload["terminals"]
+    } == {str(first["id"]), str(second["id"])}
+    assert {
+        terminal["terminal_id"] for terminal in payload["terminals"]
+    } == {str(first_terminal["id"]), str(second_terminal["id"])}
+    assert all(
+        terminal["activity_at"] == _terminal_activity_seconds(50)
+        and terminal["acknowledged_activity_at"] == _terminal_activity_seconds(50)
+        and terminal["unread"] is False
+        for terminal in payload["terminals"]
+    )
+    assert {
+        workspace["workspace_id"] for workspace in payload["workspaces"]
+    } == {str(first["id"]), str(second["id"])}
+    assert all(
+        workspace["terminal_count"] == 1
+        and workspace["unread_terminal_count"] == 0
+        and workspace["unread_count"] == 0
+        and workspace["latest_unread_terminal_id"] is None
+        for workspace in payload["workspaces"]
+    )
 
 
 async def _login(client: httpx.AsyncClient, password: str = "test-token") -> None:
@@ -118,8 +541,14 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=62'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=71'
+    css_url = (
+        f'{expected_scheme}://termroom.example.com/static/app.css'
+        f'?v={_static_asset_hash("app.css")}'
+    )
+    script_url = (
+        f'{expected_scheme}://termroom.example.com/static/app.js'
+        f'?v={_static_asset_hash("app.js")}'
+    )
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -127,6 +556,87 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
     assert response.headers.get_list("permissions-policy") == [
         "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
     ]
+
+
+def test_static_asset_version_hashes_changed_bytes_and_caches_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "app.js"
+    original = b"window.value = 1;"
+    changed = b"window.value = 2;"
+    path.write_bytes(original)
+    expected_original = hashlib.sha256(original).hexdigest()
+    expected_changed = hashlib.sha256(changed).hexdigest()
+    static_asset_version.cache_clear()
+    read_bytes = Path.read_bytes
+    reads = 0
+
+    def counted_read_bytes(file_path: Path) -> bytes:
+        nonlocal reads
+        reads += 1
+        return read_bytes(file_path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    assert static_asset_version(path) == expected_original
+    assert static_asset_version(path) == expected_original
+    assert reads == 1
+
+    path.write_bytes(changed)
+    static_asset_version.cache_clear()
+    assert static_asset_version(path) == expected_changed
+    assert expected_changed != expected_original
+    assert reads == 2
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    static_asset_version.cache_clear()
+    for filename in (
+        "app.css",
+        "app.js",
+        "mobile_scrollback.css",
+        "mobile_scrollback.js",
+        "remote_run.js",
+        "terminal-font.css",
+        "terminal.js",
+        "terminal_selection.js",
+    ):
+        static_asset_version(PACKAGE_ROOT / "static" / filename)
+
+
+@pytest.mark.asyncio
+async def test_rendered_pages_use_actual_asset_hashes_and_reuse_cached_versions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    before_pages = static_asset_version.cache_info()
+    assert before_pages.currsize == 8
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        home = await client.get("/")
+        after_home = static_asset_version.cache_info()
+        activity = await client.get("/activity")
+        after_activity = static_asset_version.cache_info()
+
+    assert home.status_code == activity.status_code == 200
+    assert after_home.misses == before_pages.misses
+    assert after_home.hits > before_pages.hits
+    for filename, tag in (
+        ("app.css", "href"),
+        ("mobile_scrollback.css", "href"),
+        ("app.js", "src"),
+        ("terminal_selection.js", "src"),
+        ("mobile_scrollback.js", "src"),
+    ):
+        url = f'http://testserver/static/{filename}?v={_static_asset_hash(filename)}'
+        assert f'{tag}="{url}"' in home.text
+        assert f'{tag}="{url}"' in activity.text
+    assert after_activity.misses == after_home.misses
+    assert after_activity.hits > after_home.hits
 
 
 @pytest.mark.asyncio
@@ -676,7 +1186,7 @@ async def test_terminal_page_exposes_shell_tabs_for_in_place_switching(tmp_path:
         assert "data-terminal-output-link" in response.text
         assert "data-terminal-manage-form" in response.text
         assert "data-terminal-name-input" in response.text
-        assert 'terminal.js?v=57' in response.text
+        assert f'terminal.js?v={_static_asset_hash("terminal.js")}' in response.text
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
@@ -2602,6 +3112,42 @@ async def test_editor_conflict_marks_preserved_content_as_unsaved(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_editor_conflict_keeps_draft_when_reread_is_oversized(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "note.txt"
+    target.write_bytes(b"before\r\n")
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "note.txt")
+    oversized = b"x" * (settings.max_edit_bytes + 1)
+    target.write_bytes(oversized)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        response = await client.post(
+            f"/w/{workspace['id']}/edit/note.txt",
+            data={
+                "_csrf": settings.csrf_token,
+                "digest": snapshot.digest,
+                "mtime_ns": str(snapshot.mtime_ns),
+                "newline": "crlf",
+                "content": "draft\r\nline",
+            },
+        )
+
+    assert response.status_code == 409
+    assert "외부 변경을 감지했습니다" in response.text
+    assert "draft" in response.text
+    assert 'name="newline" value="crlf"' in response.text
+    assert 'data-unsaved="1"' in response.text
+    assert target.read_bytes() == oversized
+
+
+@pytest.mark.asyncio
 async def test_save_and_run_conflict_creates_no_run_or_managed_terminal(
     tmp_path: Path,
 ) -> None:
@@ -2989,6 +3535,123 @@ async def test_persisted_ssh_error_renders_in_current_locale(
         await client.get("/locale/en", params={"next": f"/computers/{computer['id']}"})
         english = await client.get(f"/computers/{computer['id']}")
         assert "SSH password authentication failed" in english.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_key", "english_error", "korean_error"),
+    [
+        (
+            "ssh.backend.tmux_missing",
+            "tmux was not found",
+            "원격 계정의 login 환경에서 tmux를 찾지 못했습니다",
+        ),
+        (
+            "ssh.backend.bash_missing",
+            "An executable /bin/bash is required",
+            "원격 컴퓨터에서 실행 가능한 /bin/bash가 필요합니다",
+        ),
+    ],
+)
+async def test_ssh_prerequisite_retry_preserves_last_success_until_check_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_key: str,
+    english_error: str,
+    korean_error: str,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = Settings.create(
+        root,
+        state_dir=tmp_path / "state",
+        access_token="test-token",
+    )
+    app = create_app(settings)
+    computer = app.state.store.create_computer(
+        name="QA server",
+        ssh_alias="",
+        host="127.0.0.1",
+        port=22,
+        username="qa",
+        identity_file="/tmp/key",
+        auth_kind="key",
+        host_key_type="ssh-ed25519",
+        host_key_data="AAAATESTKEY",
+        host_fingerprint="SHA256:test",
+    )
+    computer_id = str(computer["id"])
+    app.state.store.update_computer_connection(computer_id)
+    last_seen = app.state.store.get_computer(computer_id)["last_seen_at"]
+    failing = True
+
+    monkeypatch.setattr(
+        app.state.ssh,
+        "_connect",
+        lambda _computer, *, record_connection=True: object(),
+    )
+
+    def connection_info(
+        _client: object, _computer: object, **_kwargs: object
+    ) -> dict[str, str]:
+        if failing:
+            raise SSHBackendError(
+                "Remote prerequisite is missing",
+                locale_key=error_key,
+            )
+        return {"shell": "/bin/zsh", "tmux": "tmux 3.6"}
+
+    monkeypatch.setattr(app.state.ssh, "_connection_info", connection_info)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        client.cookies.set("termroom_locale", "en")
+        before = await client.get(f"/computers/{computer_id}")
+        assert "Available" in before.text
+        last_success = "2000-01-01T00:00:00+00:00"
+        with app.state.store.connect() as db:
+            db.execute(
+                "UPDATE computers SET last_connected_at = ? WHERE id = ?",
+                (last_success, computer_id),
+            )
+
+        for _ in range(2):
+            failed = await client.post(
+                f"/computers/{computer_id}/test",
+                data={"_csrf": settings.csrf_token},
+                follow_redirects=True,
+            )
+            assert 'state-chip remote unavailable' in failed.text
+            assert english_error in failed.text
+            assert "Test connection again" in failed.text
+            assert "Last successful contact" in failed.text
+            assert "SSH + /bin/bash + tmux" in failed.text
+        failed_record = app.state.store.get_computer(computer_id)
+        assert failed_record is not None
+        assert failed_record["last_connected_at"] == last_success
+        assert failed_record["last_seen_at"] == last_seen
+        assert str(failed_record["last_error"]).startswith("termroom-i18n:")
+        with app.state.store.connect() as db:
+            assert db.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 0
+            assert db.execute("SELECT count(*) FROM terminals").fetchone()[0] == 0
+        client.cookies.set("termroom_locale", "ko")
+        korean = await client.get(f"/computers/{computer_id}")
+        assert korean_error in korean.text
+        client.cookies.set("termroom_locale", "en")
+
+        failing = False
+        recovered = await client.post(
+            f"/computers/{computer_id}/test",
+            data={"_csrf": settings.csrf_token},
+            follow_redirects=True,
+        )
+
+    recovered_record = app.state.store.get_computer(computer_id)
+    assert recovered_record is not None
+    assert recovered_record["last_connected_at"] != last_success
+    assert recovered_record["last_error"] is None
+    assert 'state-chip remote available' in recovered.text
+    assert "Connection verified" in recovered.text
 
 
 @pytest.mark.asyncio
@@ -3593,7 +4256,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=71")
+        script = await client.get(f"/static/app.js?v={_static_asset_hash('app.js')}")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3628,7 +4291,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=71")
+        script = await client.get(f"/static/app.js?v={_static_asset_hash('app.js')}")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3640,7 +4303,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=71" in korean_page.text
+    assert f'/static/app.js?v={_static_asset_hash("app.js")}' in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -3883,11 +4546,13 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
         access_token="test-token",
     )
     transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+    app_css_url = f"/static/app.css?v={_static_asset_hash('app.css')}"
+    app_js_url = f"/static/app.js?v={_static_asset_hash('app.js')}"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         async with client.stream(
             "GET",
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip"},
         ) as compressed:
             raw_content = b"".join([chunk async for chunk in compressed.aiter_raw()])
@@ -3901,34 +4566,34 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             assert gzip.decompress(raw_content) == (PACKAGE_ROOT / "static/app.css").read_bytes()
 
         identity = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "identity"},
         )
         gzip_disabled = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip;q=0, *;q=1"},
         )
         gzip_not_modified = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip", "If-None-Match": gzip_etag},
         )
         identity_not_modified = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "identity", "If-None-Match": identity.headers["etag"]},
         )
         cross_encoding_validator = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "identity", "If-None-Match": gzip_etag},
         )
         head = await client.head(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip"},
         )
         unversioned = await client.get(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=71",
+            app_js_url,
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]

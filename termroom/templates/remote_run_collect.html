@@ -7,23 +7,15 @@
       <a class="text-back-link" href="/remote-runs/{{ run.id }}">← {{ t('remote_run.collect.back') }}</a>
       <p class="eyebrow">{{ t('remote_run.collect.eyebrow') }}</p>
       <h1>{{ t('remote_run.collect.heading') }}</h1>
-      <p class="page-copy">{{ t('remote_run.collect.copy', source=run.source_label) }}</p>
+      <p class="page-copy">{{ t(
+        'remote_run.collect.result_page_copy' if report else 'remote_run.collect.copy',
+        source=run.source_label
+      ) }}</p>
     </div>
     <a class="secondary-button" href="/remote-runs/{{ run.id }}/result.zip" download>{{ t('remote_run.result_download') }}</a>
   </header>
 
   {% if action_error %}<p class="notice error" role="alert">{{ action_error }}</p>{% endif %}
-  {% if collection_result %}
-  <p class="notice success" role="status">{{ t(
-    'remote_run.collect.success',
-    applied=collection_result['applied'],
-    conflict=collection_result['conflict'],
-    already_result=collection_result['already_result'],
-    skipped=collection_result['skipped'],
-    failed=collection_result['failed']
-  ) }}</p>
-  {% endif %}
-
   {% if plan %}
   <section class="panel remote-run-collect-summary" aria-label="{{ t('remote_run.collect.summary') }}">
     <span><strong>{{ plan['summary']['ready'] }}</strong><small>{{ t('remote_run.collect.status.ready') }}</small></span>

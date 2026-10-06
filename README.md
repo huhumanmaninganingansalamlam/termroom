@@ -577,8 +577,11 @@ node --check termroom/static/terminal.js
 docker compose config
 ```
 
-User-facing changes should also be exercised in real browsers across mobile, tablet,
-and desktop layouts.
+User-facing changes should be checked at mobile, tablet, and desktop responsive widths.
+Those viewport checks are useful layout evidence, but they are not physical-device evidence.
+The current real-browser release gate is Safari on an actual macOS desktop. Physical smartphone
+Safari/Chrome and installed-PWA checks are a separate, user-owned follow-up and do not block the
+current release; Chrome on the same Mac is optional comparison evidence.
 
 ## Documentation
 

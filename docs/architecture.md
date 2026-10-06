@@ -311,9 +311,11 @@ and relevant list/browse operations, and users may delete a Run immediately.
 
 ## Recent scan
 
-Local scanning is bounded by file count and wall time. Remote scanning uses a
-bounded `find`. Common dependency/cache directories are excluded. Projects may add
-`.termroomignore`.
+Local scanning is bounded by file count and wall time. SSH Recent uses bounded SFTP
+directory traversal, skips symlinks and common dependency/cache/hidden directories,
+honors `.termroomignore`, and reports truncated results when its file-count or wall-time
+limit is reached. Node Recent goes through the Node `files.recent` operation and its
+local file-service bounds. Projects may add `.termroomignore`.
 
 Recent does not infer command→file causality.
 

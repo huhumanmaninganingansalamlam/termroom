@@ -21,7 +21,7 @@
               value="save_and_vim">{{ t('terminal_editor.open') }}</button>
       {% endif %}
       <button class="secondary-button" type="submit" name="intent" value="save">{{ t('common.save') }}</button>
-      {% if file_run_supported %}
+      {% if file_run_supported and not conflict %}
         {% if active_file_run %}
         <button class="primary-button" type="button" data-file-run-submit disabled>{{ t('file_run.running') }}</button>
         {% else %}
