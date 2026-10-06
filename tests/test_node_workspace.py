@@ -2224,7 +2224,10 @@ async def test_node_terminal_bridge_retrieves_the_canceled_direction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_node_terminal_binary_and_structured_input_take_over_before_send() -> None:
+@pytest.mark.parametrize("paste_data", [None, "\x1b[200~pwd\x1b[201~"])
+async def test_node_terminal_binary_and_structured_input_take_over_before_send(
+    paste_data: str | None,
+) -> None:
     events: list[tuple[Any, ...]] = []
     attach_payload: dict[str, Any] = {}
 
@@ -2338,7 +2341,10 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
         },
         {
             "type": "websocket.receive",
-            "text": json.dumps({"kind": "command", "data": "pwd", "rows": 38, "cols": 112}),
+            "text": json.dumps({
+                "kind": "command", "data": "pwd", "rows": 38, "cols": 112,
+                **({"paste_data": paste_data} if paste_data is not None else {}),
+            }),
         },
         {
             "type": "websocket.receive",
@@ -2416,7 +2422,7 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send()
             {"rows": 38, "cols": 112, "affects_grid": True},
         ),
         ("command", "pwd"),
-        ("send", b"pwd\r"),
+        ("send", (paste_data or "pwd").encode() + b"\r"),
         ("send", b"legacy"),
     ]
     assert browser_frames == [

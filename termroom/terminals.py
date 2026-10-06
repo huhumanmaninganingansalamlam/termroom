@@ -1958,7 +1958,8 @@ class TerminalManager:
                     await asyncio.to_thread(
                         self.store.add_command, workspace["id"], terminal["id"], command
                     )
-                    await write_to_pty(command.encode() + b"\r")
+                    paste = str(payload.get("paste_data", command))
+                    await write_to_pty(paste.encode() + b"\r")
                 elif kind == "input":
                     if master_fd is None:
                         return

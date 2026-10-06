@@ -4343,7 +4343,8 @@ class SSHBackend:
                         str(terminal["id"]),
                         command,
                     )
-                    os.write(master_fd, command.encode() + b"\r")
+                    paste = str(payload.get("paste_data", command))
+                    os.write(master_fd, paste.encode() + b"\r")
                 elif kind == "input":
                     if terminal_input_claims_grid(payload):
                         self.control.mark_input(terminal_id, client_id, device_id)

@@ -514,6 +514,51 @@ assert.equal(paneMode, null);
     assert 'data-pane-mode-capable="' in (ROOT / "termroom/templates/terminal.html").read_text()
 
 
+def test_command_editor_uses_native_paste_once_and_keeps_plain_history() -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = (VENDOR_DIR.parent / "terminal.js").read_text()
+    input_handler = script[script.index("  let pastedCommand = null;"):
+                           script.index("  term.onBinary(")]
+    submit = script[script.index('  commandForm?.addEventListener("submit",'):
+                    script.index('  commandInput?.addEventListener("input",')]
+    probe = r"""
+const assert = require('node:assert/strict');
+const {Terminal} = require('./termroom/static/vendor/xterm.js');
+const term = new Terminal();
+term._core.textarea = {value:''}; // paste clears the native textarea after dispatch
+const sent = [], send = value => sent.push(value);
+let nextTerminalDataIsUserInput = false;
+const hasUserInputSignal = false;
+const commandInput = {value:'',blur(){}}, composerComposing = false;
+const updateCommandComposer = () => {}, setComposerOpen = () => {};
+let submit;
+const commandForm = {addEventListener(_, callback){submit = callback;}};
+INPUT_HANDLER
+SUBMIT_HANDLER
+const text = '격리된 한국어 문장\n두 번째 줄';
+(async () => {
+  for (const bracketed of [true, false]) {
+    await new Promise(resolve => term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l', resolve));
+    commandInput.value = text;
+    submit({preventDefault(){}});
+    const frame = sent.at(-1);
+    assert.equal(frame.kind, 'command');
+    assert.equal(frame.data, text, 'history must contain plain user text');
+    const normalized = text.replaceAll('\n','\r');
+    const expected = bracketed ? '\x1b[200~'+normalized+'\x1b[201~' : normalized;
+    assert.equal(frame.paste_data, expected);
+  }
+  assert.equal(sent.length, 2, 'one frame per submit, not a duplicate input frame');
+  term.input('\t');
+  assert.equal(sent.at(-1).kind, 'input', 'native keys must not reuse command state');
+  assert.equal(sent.at(-1).data, '\t');
+  term.dispose();
+})().catch(error => {console.error(error);process.exitCode=1;});
+""".replace("INPUT_HANDLER", input_handler).replace("SUBMIT_HANDLER", submit)
+    result = subprocess.run(["node", "-e", probe], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None:
     script = (VENDOR_DIR.parent / "terminal.js").read_text()
     cancel = script[script.index("  const cancelPresenceRequest = () => {"):

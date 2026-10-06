@@ -660,9 +660,20 @@
       nextTerminalDataIsUserInput = true;
     });
   }
+  let pastedCommand = null;
   term.onData((data) => {
     const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;
     nextTerminalDataIsUserInput = false;
+    if (pastedCommand !== null) {
+      send({
+        kind: "command",
+        data: pastedCommand,
+        paste_data: data,
+        rows: term.rows,
+        cols: term.cols,
+      });
+      return;
+    }
     send({
       kind: "input",
       data,
@@ -848,12 +859,14 @@
     event.preventDefault();
     if (composerComposing) return;
     if (!commandInput.value.trim()) return;
-    send({
-      kind: "command",
-      data: commandInput.value,
-      rows: term.rows,
-      cols: term.cols,
-    });
+    // Preserve xterm's negotiated paste protocol, while saving the plain
+    // command rather than terminal escape sequences in command history.
+    pastedCommand = commandInput.value;
+    try {
+      term.paste(pastedCommand);
+    } finally {
+      pastedCommand = null;
+    }
     commandInput.value = "";
     updateCommandComposer();
     commandInput.blur();

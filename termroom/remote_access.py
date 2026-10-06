@@ -1360,7 +1360,7 @@ class RemoteAccess:
                         data = str(payload.get("data") or "")
                         if kind == "command":
                             self.store.add_command(str(workspace["id"]), terminal_id, data)
-                            data += "\r"
+                            data = str(payload.get("paste_data", data)) + "\r"
                         await stream.send(data.encode())
 
             output_task = asyncio.create_task(output_to_browser())
