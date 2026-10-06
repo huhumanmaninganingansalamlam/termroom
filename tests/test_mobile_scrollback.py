@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,10 @@ from termroom.app import create_app
 from termroom.config import Settings
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _asset_hash(filename: str) -> str:
+    return hashlib.sha256((ROOT / "termroom/static" / filename).read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -188,11 +193,20 @@ def test_base_loads_mobile_scrollback_assets() -> None:
     template = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
     terminal_template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
 
-    assert "mobile_scrollback.css') }}?v=15" in template
-    assert "terminal_selection.js') }}?v=1\" defer" in template
-    assert "mobile_scrollback.js') }}?v=39\" defer" in template
+    assert (
+        "mobile_scrollback.css') }}?v={{ static_asset_version('mobile_scrollback.css') }}"
+        in template
+    )
+    assert (
+        "terminal_selection.js') }}?v={{ static_asset_version('terminal_selection.js') }}\" defer"
+        in template
+    )
+    assert (
+        "mobile_scrollback.js') }}?v={{ static_asset_version('mobile_scrollback.js') }}\" defer"
+        in template
+    )
     assert "__termroomTerminalOutputHookInstalled" not in template
-    assert "terminal.js') }}?v=61" in terminal_template
+    assert "terminal.js') }}?v={{ static_asset_version('terminal.js') }}" in terminal_template
 
 
 @pytest.mark.asyncio
@@ -209,14 +223,17 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         page = await client.get("/")
-        stylesheet = await client.get("/static/mobile_scrollback.css?v=15")
-        ownership = await client.get("/static/terminal_selection.js?v=1")
-        script = await client.get("/static/mobile_scrollback.js?v=39")
+        stylesheet_version = _asset_hash("mobile_scrollback.css")
+        ownership_version = _asset_hash("terminal_selection.js")
+        script_version = _asset_hash("mobile_scrollback.js")
+        stylesheet = await client.get(f"/static/mobile_scrollback.css?v={stylesheet_version}")
+        ownership = await client.get(f"/static/terminal_selection.js?v={ownership_version}")
+        script = await client.get(f"/static/mobile_scrollback.js?v={script_version}")
 
     assert page.status_code == 401
-    assert "/static/mobile_scrollback.css?v=15" in page.text
-    assert "/static/terminal_selection.js?v=1" in page.text
-    assert "/static/mobile_scrollback.js?v=39" in page.text
+    assert f"/static/mobile_scrollback.css?v={stylesheet_version}" in page.text
+    assert f"/static/terminal_selection.js?v={ownership_version}" in page.text
+    assert f"/static/mobile_scrollback.js?v={script_version}" in page.text
     assert ownership.status_code == 200
     assert stylesheet.status_code == 200
     assert "overflow-y: auto" in stylesheet.text

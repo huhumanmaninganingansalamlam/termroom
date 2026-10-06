@@ -137,5 +137,5 @@
 {% endif %}
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', path='remote_run.js') }}?v=14" defer></script>
+<script src="{{ url_for('static', path='remote_run.js') }}?v={{ static_asset_version('remote_run.js') }}" defer></script>
 {% endblock %}

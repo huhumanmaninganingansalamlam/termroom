@@ -21,6 +21,7 @@ from termroom.assets import (
     XTERM_UNICODE11_VERSION,
     XTERM_VERSION,
     XTERM_VERSION_FILE,
+    static_asset_version,
 )
 
 
@@ -417,22 +418,40 @@ assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
     )
 
 
-def test_template_static_asset_versions_are_consistent() -> None:
-    versions: dict[str, set[str]] = {}
+def test_template_static_asset_versions_match_file_hashes() -> None:
+    hashed_assets: dict[str, set[str]] = {}
+    fixed_versions: dict[str, set[str]] = {}
     templates_dir = VENDOR_DIR.parents[1] / "templates"
-    pattern = re.compile(r"url_for\('static', path='([^']+)'\) }}\?v=([0-9.]+)")
+    pattern = re.compile(
+        r"url_for\('static', path='([^']+)'\) }}\?v={{ static_asset_version\('([^']+)'\) }}"
+    )
+    fixed_pattern = re.compile(r"url_for\('static', path='([^']+)'\) }}\?v=([0-9.]+)")
     for template in templates_dir.glob("*.html"):
-        for asset, version in pattern.findall(template.read_text(encoding="utf-8")):
-            versions.setdefault(asset, set()).add(version)
+        source = template.read_text(encoding="utf-8")
+        for asset, hashed_asset in pattern.findall(source):
+            assert asset == hashed_asset
+            hashed_assets.setdefault(asset, set()).add(hashed_asset)
+        for asset, version in fixed_pattern.findall(source):
+            fixed_versions.setdefault(asset, set()).add(version)
 
-    assert all(len(asset_versions) == 1 for asset_versions in versions.values())
-    assert versions["app.css"] == {"62"}
-    assert versions["app.js"] == {"72"}
-    assert versions["remote_run.js"] == {"14"}
-    assert versions["terminal-font.css"] == {"3"}
-    assert versions["vendor/addon-unicode11.js"] == {"0.8.0"}
-    assert versions["terminal.js"] == {"61"}
-    assert versions["mobile_scrollback.js"] == {"39"}
+    assert all(len(assets) == 1 for assets in hashed_assets.values())
+    expected_app_assets = {
+        "app.css",
+        "app.js",
+        "mobile_scrollback.css",
+        "mobile_scrollback.js",
+        "remote_run.js",
+        "terminal-font.css",
+        "terminal.js",
+        "terminal_selection.js",
+    }
+    assert expected_app_assets <= hashed_assets.keys()
+    for asset, paths in hashed_assets.items():
+        assert paths == {asset}
+        path = VENDOR_DIR.parent / asset
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert static_asset_version(path) == expected
+    assert fixed_versions["vendor/addon-unicode11.js"] == {"0.8.0"}
 
 
 def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> None:

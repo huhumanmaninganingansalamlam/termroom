@@ -121,8 +121,8 @@
   <link rel="icon" type="image/svg+xml" href="/static/termroom-icon.svg">
   <link rel="apple-touch-icon" sizes="180x180" href="/icons/termroom-180.png?v={{ pwa_icon_version }}">
   <link rel="manifest" href="/static/manifest.webmanifest?v=4">
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=62">
-  <link rel="stylesheet" href="{{ url_for('static', path='mobile_scrollback.css') }}?v=15">
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ static_asset_version('app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='mobile_scrollback.css') }}?v={{ static_asset_version('mobile_scrollback.css') }}">
   <script nonce="{{ request.state.csp_nonce }}">
     window.TermroomLocale = {{ locale | tojson }};
     window.TermroomI18n = {{ i18n_messages | tojson }};
@@ -168,9 +168,9 @@
     {% block content %}{% endblock %}
   </main>
   {% endblock %}
-  <script src="{{ url_for('static', path='app.js') }}?v=72" defer></script>
-  <script src="{{ url_for('static', path='terminal_selection.js') }}?v=1" defer></script>
-  <script src="{{ url_for('static', path='mobile_scrollback.js') }}?v=39" defer></script>
+  <script src="{{ url_for('static', path='app.js') }}?v={{ static_asset_version('app.js') }}" defer></script>
+  <script src="{{ url_for('static', path='terminal_selection.js') }}?v={{ static_asset_version('terminal_selection.js') }}" defer></script>
+  <script src="{{ url_for('static', path='mobile_scrollback.js') }}?v={{ static_asset_version('mobile_scrollback.js') }}" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

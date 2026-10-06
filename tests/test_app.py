@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import io
 import re
 import shutil
@@ -18,7 +19,7 @@ import pytest
 from fastapi.responses import PlainTextResponse
 
 from termroom.app import MAX_INLINE_IMAGE_BYTES, PACKAGE_ROOT, create_app
-from termroom.assets import TERMINAL_FONT_ASSETS
+from termroom.assets import TERMINAL_FONT_ASSETS, static_asset_version
 from termroom.config import Settings
 from termroom.files import FileEntry, RecentFiles
 from termroom.i18n import messages
@@ -30,6 +31,10 @@ _TERMINAL_ACTIVITY_EPOCH_SECONDS = 1_700_000_000
 
 def _terminal_activity_seconds(offset: int) -> int:
     return _TERMINAL_ACTIVITY_EPOCH_SECONDS + offset
+
+
+def _static_asset_hash(filename: str) -> str:
+    return hashlib.sha256((PACKAGE_ROOT / "static" / filename).read_bytes()).hexdigest()
 
 
 async def _login(client: httpx.AsyncClient, password: str = "test-token") -> None:
@@ -118,8 +123,14 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = f'{expected_scheme}://termroom.example.com/static/app.css?v=62'
-    script_url = f'{expected_scheme}://termroom.example.com/static/app.js?v=72'
+    css_url = (
+        f'{expected_scheme}://termroom.example.com/static/app.css'
+        f'?v={_static_asset_hash("app.css")}'
+    )
+    script_url = (
+        f'{expected_scheme}://termroom.example.com/static/app.js'
+        f'?v={_static_asset_hash("app.js")}'
+    )
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
@@ -127,6 +138,87 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
     assert response.headers.get_list("permissions-policy") == [
         "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
     ]
+
+
+def test_static_asset_version_hashes_changed_bytes_and_caches_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "app.js"
+    original = b"window.value = 1;"
+    changed = b"window.value = 2;"
+    path.write_bytes(original)
+    expected_original = hashlib.sha256(original).hexdigest()
+    expected_changed = hashlib.sha256(changed).hexdigest()
+    static_asset_version.cache_clear()
+    read_bytes = Path.read_bytes
+    reads = 0
+
+    def counted_read_bytes(file_path: Path) -> bytes:
+        nonlocal reads
+        reads += 1
+        return read_bytes(file_path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    assert static_asset_version(path) == expected_original
+    assert static_asset_version(path) == expected_original
+    assert reads == 1
+
+    path.write_bytes(changed)
+    static_asset_version.cache_clear()
+    assert static_asset_version(path) == expected_changed
+    assert expected_changed != expected_original
+    assert reads == 2
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    static_asset_version.cache_clear()
+    for filename in (
+        "app.css",
+        "app.js",
+        "mobile_scrollback.css",
+        "mobile_scrollback.js",
+        "remote_run.js",
+        "terminal-font.css",
+        "terminal.js",
+        "terminal_selection.js",
+    ):
+        static_asset_version(PACKAGE_ROOT / "static" / filename)
+
+
+@pytest.mark.asyncio
+async def test_rendered_pages_use_actual_asset_hashes_and_reuse_cached_versions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    app = create_app(
+        Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    before_pages = static_asset_version.cache_info()
+    assert before_pages.currsize == 8
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        await _login(client)
+        home = await client.get("/")
+        after_home = static_asset_version.cache_info()
+        activity = await client.get("/activity")
+        after_activity = static_asset_version.cache_info()
+
+    assert home.status_code == activity.status_code == 200
+    assert after_home.misses == before_pages.misses
+    assert after_home.hits > before_pages.hits
+    for filename, tag in (
+        ("app.css", "href"),
+        ("mobile_scrollback.css", "href"),
+        ("app.js", "src"),
+        ("terminal_selection.js", "src"),
+        ("mobile_scrollback.js", "src"),
+    ):
+        url = f'http://testserver/static/{filename}?v={_static_asset_hash(filename)}'
+        assert f'{tag}="{url}"' in home.text
+        assert f'{tag}="{url}"' in activity.text
+    assert after_activity.misses == after_home.misses
+    assert after_activity.hits > after_home.hits
 
 
 @pytest.mark.asyncio
@@ -676,7 +768,7 @@ async def test_terminal_page_exposes_shell_tabs_for_in_place_switching(tmp_path:
         assert "data-terminal-output-link" in response.text
         assert "data-terminal-manage-form" in response.text
         assert "data-terminal-name-input" in response.text
-        assert 'terminal.js?v=57' in response.text
+        assert f'terminal.js?v={_static_asset_hash("terminal.js")}' in response.text
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", str(workspace["tmux_session"])],
@@ -3746,7 +3838,7 @@ async def test_remote_connection_status_is_shared_actionable_and_current(
 
         app.state.store.update_computer_connection(computer_id, error="connection refused")
         unavailable = await client.get(f"/computers/{computer_id}")
-        script = await client.get("/static/app.js?v=72")
+        script = await client.get(f"/static/app.js?v={_static_asset_hash('app.js')}")
 
     assert 'state-chip remote unchecked' in unchecked.text
     assert "Not checked yet" in unchecked.text
@@ -3775,13 +3867,12 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
         access_token="test-token",
     )
     transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
-
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
         korean_page = await client.get("/")
         client.cookies.set("termroom_locale", "en")
         english_page = await client.get("/")
-        script = await client.get("/static/app.js?v=72")
+        script = await client.get(f"/static/app.js?v={_static_asset_hash('app.js')}")
 
     assert korean_page.status_code == 200
     assert korean_page.text.count("data-pwa-install-action") == 1
@@ -3793,7 +3884,7 @@ async def test_settings_menu_exposes_click_only_pwa_install_guidance(
     assert 'role="status"' in korean_page.text
     assert 'aria-live="polite"' in korean_page.text
     assert "beforeinstallprompt" not in korean_page.text
-    assert "/static/app.js?v=72" in korean_page.text
+    assert f'/static/app.js?v={_static_asset_hash("app.js")}' in korean_page.text
 
     assert english_page.status_code == 200
     assert "Install Termroom" in english_page.text
@@ -4036,11 +4127,13 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
         access_token="test-token",
     )
     transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+    app_css_url = f"/static/app.css?v={_static_asset_hash('app.css')}"
+    app_js_url = f"/static/app.js?v={_static_asset_hash('app.js')}"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         async with client.stream(
             "GET",
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip"},
         ) as compressed:
             raw_content = b"".join([chunk async for chunk in compressed.aiter_raw()])
@@ -4054,34 +4147,34 @@ async def test_static_assets_use_selective_compression_and_versioned_cache(
             assert gzip.decompress(raw_content) == (PACKAGE_ROOT / "static/app.css").read_bytes()
 
         identity = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "identity"},
         )
         gzip_disabled = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip;q=0, *;q=1"},
         )
         gzip_not_modified = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip", "If-None-Match": gzip_etag},
         )
         identity_not_modified = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "identity", "If-None-Match": identity.headers["etag"]},
         )
         cross_encoding_validator = await client.get(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "identity", "If-None-Match": gzip_etag},
         )
         head = await client.head(
-            "/static/app.css?v=25",
+            app_css_url,
             headers={"Accept-Encoding": "gzip"},
         )
         unversioned = await client.get(
             "/static/app.css", headers={"Accept-Encoding": "identity"}
         )
         ranged = await client.get(
-            "/static/app.js?v=72",
+            app_js_url,
             headers={"Accept-Encoding": "gzip", "Range": "bytes=0-31"},
         )
         font_filename = TERMINAL_FONT_ASSETS["core_hangul"]["filename"]
