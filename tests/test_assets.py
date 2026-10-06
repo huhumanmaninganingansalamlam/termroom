@@ -465,7 +465,10 @@ def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> Non
     probe = (
         """
 const assert = require('node:assert/strict');
-const host = {dataset:{paneModeCapable:'true',terminalId:'t'}};
+const host = new EventTarget();
+host.dataset = {paneModeCapable:'true',terminalId:'t'};
+let modeEvents = 0;
+host.addEventListener('termroom:pane-mode', () => modeEvents++);
 let paneMode = null;
 let paneModeGeneration = null;
 let paneModeRevision = 0;
@@ -483,8 +486,10 @@ acceptPaneMode(mode);
 acceptPaneMode({...mode,generation:'old',revision:99});
 acceptPaneMode({...mode,terminal_id:'other',revision:99});
 assert.equal(paneMode.revision, 2);
+assert.equal(modeEvents, 2);
 acceptPaneMode({kind:'pane_mode',terminal_id:'t',generation:'a',revision:3,available:false});
 assert.equal(paneMode, null);
+assert.equal(modeEvents, 3);
 acceptPaneMode(mode);
 assert.equal(paneMode, null);
 paneMode = null; // each new socket resets state, socket/epoch guards reject old events
