@@ -43,11 +43,17 @@ def test_workspace_run_menu_dismissal_preserves_terminal_focus_contract() -> Non
     assert "restoreFocus: true" not in behavior[outside_click:outside_close]
 
 
-def test_workspace_run_menu_asset_versions_are_bumped() -> None:
+def test_workspace_run_menu_asset_urls_use_content_hashes() -> None:
     base = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
 
-    assert "app.css') }}?v=62" in base
-    assert "app.js') }}?v=72" in base
+    assert (
+        "{{ url_for('static', path='app.css') }}?v={{ static_asset_version('app.css') }}"
+        in base
+    )
+    assert (
+        "{{ url_for('static', path='app.js') }}?v={{ static_asset_version('app.js') }}"
+        in base
+    )
 
 
 def test_workspace_command_editing_stays_inside_each_command_card() -> None:
