@@ -2,6 +2,18 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.3] - 2026-10-07
+
+### Fixed
+
+- Preserve native bracketed paste for command-editor input on Local, SSH and Node terminals.
+- Let actual command-editor input claim the shared terminal grid across browser views.
+- Retire cached page connection errors only after verified recovery of the current terminal.
+- Keep idle SSH terminal reads from occupying the shared executor used by pane queries and database operations.
+
+These fixes do not establish the cause of the earlier production CPU100/504 incidents
+or confirm resolution of the reported partial-output stall on 0.4.2.
+
 ## [0.4.0] - 2026-10-02
 
 ### Changed
