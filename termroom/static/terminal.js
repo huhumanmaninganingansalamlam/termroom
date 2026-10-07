@@ -608,7 +608,13 @@
       if (epoch !== connectionEpoch || nextSocket !== socket) return;
       if (event.data instanceof ArrayBuffer) {
         try {
+          const previousPaneMode = paneMode;
           acceptPaneMode(JSON.parse(new TextDecoder().decode(event.data)));
+          // A current successful pane query supersedes the page-load SSH failure.
+          // Transport open, arbitrary output, and unrelated errors are not recovery.
+          if (paneMode && paneMode !== previousPaneMode) {
+            document.querySelector("[data-terminal-connection-error]")?.remove();
+          }
         } catch {
           // Invalid controls are never rendered or forwarded as terminal input.
         }

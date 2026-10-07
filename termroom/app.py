@@ -3581,6 +3581,7 @@ def create_app(settings: Settings) -> FastAPI:
         locale = locale_from_request(request)
         workspace = _require_workspace(workspaces, workspace_id)
         terminal_error = error
+        terminal_connection_error = False
         try:
             terminal_list = await ensure_terminal_list(workspace)
         except (SSHBackendError, RemoteAccessError) as exc:
@@ -3590,6 +3591,7 @@ def create_app(settings: Settings) -> FastAPI:
             if not terminal_list:
                 raise
             terminal_error = _localized_exception(locale, exc)
+            terminal_connection_error = True
         selected = next((item for item in terminal_list if item["id"] == terminal), None)
         if terminal is not None and selected is None:
             return RedirectResponse(
@@ -3633,6 +3635,7 @@ def create_app(settings: Settings) -> FastAPI:
                 commands=store.list_commands(workspace_id),
                 file_run=selected_file_run,
                 error=terminal_error,
+                terminal_connection_error=terminal_connection_error,
                 current_device_id=str(getattr(request.state, "session", {}).get("id", "")),
                 **_workspace_status(store, terminals, workspace),
             ),

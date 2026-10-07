@@ -514,6 +514,74 @@ assert.equal(paneMode, null);
     assert 'data-pane-mode-capable="' in (ROOT / "termroom/templates/terminal.html").read_text()
 
 
+def test_recovered_socket_retires_only_its_page_connection_error() -> None:
+    source = (VENDOR_DIR.parent / "terminal.js").read_text()
+    mode = source[source.index("  const acceptPaneMode ="):
+                  source.index("  term.options.screenReaderMode")]
+    connect = source[source.index("  const connect = () => {"):
+                     source.index("  let nextTerminalDataIsUserInput")]
+    probe = r"""
+const assert = require('node:assert/strict');
+const host = new EventTarget();
+host.dataset = {terminalId:'t',paneModeCapable:'true'};
+let connectionError = true, unrelatedError = true;
+const document = {querySelector(selector) {
+  if (selector === '[data-terminal-connection-error]') {
+    return connectionError ? {remove(){connectionError=false;}} : null;
+  }
+  if (selector === '.terminal-error-banner') {
+    return {remove(){unrelatedError=false;}};
+  }
+}};
+const window = {clearTimeout(){},setTimeout(){},dispatchEvent(){}};
+const location = {protocol:'https:',host:'fixture.invalid'};
+let socket=null,connectionEpoch=0,reconnectTimer,reconnectDelay=500,reconnectAllowed=true;
+let paneMode=null,paneModeGeneration=null,paneModeRevision=0,isConnected=false,status;
+let outputRenderSequence=0,pendingActivityAt=0,acknowledgedActivityAt=0,renderedActivityAt=0;
+const term={write(_,callback){callback();},focus(){}};
+const coarsePrimaryPointer={matches:true};
+const tr=x=>x, setStatus=(value,connected=false)=>{status=value;isConnected=connected;};
+const scheduleResize=()=>{},updatePresence=()=>{},cancelPresenceRequest=()=>{};
+const scheduleActivityAcknowledge=()=>{};
+const CustomEvent=class {};
+class WebSocket {
+  constructor(){this.listeners={};}
+  addEventListener(name,callback){this.listeners[name]=callback;}
+  close(){this.listeners.close({code:1006});}
+  emit(name,event={}){this.listeners[name](event);}
+}
+MODE_HANDLER
+CONNECT_HANDLER
+const control = (revision,extra={}) => ({data:new TextEncoder().encode(JSON.stringify({
+  kind:'pane_mode',terminal_id:'t',generation:'current',revision,
+  alternate:false,mouse_tracking:false,...extra
+})).buffer});
+connect();const old=socket;
+old.emit('open');
+assert.equal(connectionError,true,'transport open alone must not dismiss an SSH failure');
+connect();const current=socket;current.emit('open');
+const liveStatus=status;
+old.emit('close',{code:4403});
+old.emit('error');
+old.emit('message',control(1));
+assert.equal(status,liveStatus,'old errors/close cannot replace current connection status');
+assert.equal(connectionError,true,'an old connection cannot prove recovery');
+current.emit('message',control(1,{available:false}));
+current.emit('message',{data:'ssh: connection timed out'});
+assert.equal(connectionError,true,'unavailable pane and arbitrary text are not recovery');
+current.emit('message',control(2,{terminal_id:'other'}));
+assert.equal(connectionError,true,'another terminal cannot clear this error');
+current.emit('message',control(2));
+assert.equal(connectionError,false,'a verified current pane must retire its stale timeout');
+assert.equal(unrelatedError,true,'unrelated page errors must remain visible');
+current.emit('close',{code:4403});
+assert.equal(isConnected,false);
+assert.equal(status,'terminal.status.rejected','a genuine current rejection must remain visible');
+""".replace("MODE_HANDLER", mode).replace("CONNECT_HANDLER", connect)
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_command_editor_uses_native_paste_once_and_keeps_plain_history() -> None:
     root = Path(__file__).resolve().parents[1]
     script = (VENDOR_DIR.parent / "terminal.js").read_text()

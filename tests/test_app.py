@@ -3479,11 +3479,18 @@ async def test_remote_terminal_page_stays_available_while_ssh_is_down(
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
         response = await client.get(f"/w/{workspace['id']}/terminal")
+        monkeypatch.setattr(app.state.ssh, "ensure_workspace", lambda _: [terminal])
+        unrelated = await client.get(
+            f"/w/{workspace['id']}/terminal", params={"error": "Command could not be saved"}
+        )
 
     assert response.status_code == 200
     assert "shell" in response.text
     assert str(terminal["id"]) in response.text
     assert "SSH 연결이 거부되었습니다" in response.text
+    assert "data-terminal-connection-error" in response.text
+    assert "Command could not be saved" in unrelated.text
+    assert "data-terminal-connection-error" not in unrelated.text
     assert "QA server" in response.text
     assert "원격 작업공간" in response.text
     assert "로컬 전용" not in response.text
