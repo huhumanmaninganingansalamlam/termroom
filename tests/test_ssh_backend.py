@@ -17,6 +17,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -125,6 +126,65 @@ async def test_ssh_bridge_sends_selected_pane_mode_and_cleans_up(
         assert controls[0]["alternate"] is True and controls[0]["mouse_tracking"] is False
     assert backend.control.client_count("terminal") == 0
     assert "terminal" not in backend._browser_grid_owners
+
+
+def test_idle_ssh_bridge_leaves_executor_available_and_delivers_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, tmp_path)
+    workspace = {"id": "workspace", "tmux_session": "session"}
+    terminal = {"id": "terminal", "tmux_window": "@7"}
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(backend, "ensure_workspace", lambda _workspace: [])
+    monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, read_fd))
+    monkeypatch.setattr(backend, "current_pane_mode", lambda *_args: {"pane": "%1"})
+    monkeypatch.setattr(backend, "_wait_for_pid", lambda *_args: True)
+    monkeypatch.setattr("termroom.ssh_backend.os.killpg", lambda *_args: None)
+
+    async def observe() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        idle, disconnect, delivered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        output: list[str] = []
+
+        class Browser:
+            async def receive(self) -> dict[str, object]:
+                # Let the previously scheduled PTY reader begin waiting, not a timed sleep.
+                await asyncio.sleep(0)
+                idle.set()
+                await disconnect.wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def send_bytes(self, _data: bytes) -> None:
+                pass
+
+            async def send_text(self, data: str) -> None:
+                output.append(data)
+                delivered.set()
+
+        bridge = asyncio.create_task(backend.bridge(Browser(), workspace, terminal))
+        try:
+            await asyncio.wait_for(idle.wait(), 1)
+            started = loop.time()
+            try:
+                result = await asyncio.wait_for(asyncio.to_thread(lambda: "available"), 0.5)
+            except TimeoutError:
+                pytest.fail("Idle SSH PTY read monopolizes the shared executor")
+            print(f"idle_executor_probe_ms={(loop.time() - started) * 1000:.3f}")
+            assert result == "available"
+            os.write(write_fd, b"benign-output")
+            await asyncio.wait_for(delivered.wait(), 1)
+            assert output == ["benign-output"]
+        finally:
+            # Release any real blocking read before waiting for bridge/executor shutdown.
+            os.close(write_fd)
+            disconnect.set()
+            await asyncio.wait_for(bridge, 2)
+        assert backend.control.client_count("terminal") == 0
+
+    asyncio.run(observe())
 
 
 @contextlib.contextmanager

@@ -4175,11 +4175,23 @@ class SSHBackend:
             chunks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
 
             async def read_pty() -> None:
+                loop = asyncio.get_running_loop()
                 while True:
+                    readable = loop.create_future()
+
+                    def ready(waiter: asyncio.Future[None] = readable) -> None:
+                        if not waiter.done():
+                            waiter.set_result(None)
+
                     try:
-                        chunk = await asyncio.to_thread(os.read, master_fd, 65536)
+                        # Idle SSH views must not occupy the executor used by pane queries and DB.
+                        loop.add_reader(master_fd, ready)
+                        await readable
+                        chunk = os.read(master_fd, 65536)
                     except OSError:
                         chunk = b""
+                    finally:
+                        loop.remove_reader(master_fd)
                     await chunks.put(chunk)
                     if not chunk:
                         return
