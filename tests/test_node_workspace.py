@@ -2224,9 +2224,12 @@ async def test_node_terminal_bridge_retrieves_the_canceled_direction() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("paste_data", [None, "\x1b[200~pwd\x1b[201~"])
+@pytest.mark.parametrize(
+    ("paste_data", "competing_input"),
+    [(None, False), ("\x1b[200~pwd\x1b[201~", False), ("\x1b[200~pwd\x1b[201~", True)],
+)
 async def test_node_terminal_binary_and_structured_input_take_over_before_send(
-    paste_data: str | None,
+    paste_data: str | None, competing_input: bool,
 ) -> None:
     events: list[tuple[Any, ...]] = []
     attach_payload: dict[str, Any] = {}
@@ -2355,7 +2358,10 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
 
     class FakeWebSocket:
         async def receive(self) -> dict[str, Any]:
-            return messages.pop(0)
+            message = messages.pop(0)
+            if competing_input and '"kind": "command"' in str(message.get("text", "")):
+                control.mark_input("terminal", existing_owner)
+            return message
 
         async def send_bytes(self, value: bytes) -> None:
             browser_frames.append(("control", json.loads(value)))

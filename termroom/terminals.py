@@ -1953,6 +1953,7 @@ class TerminalManager:
                 elif kind == "command":
                     if master_fd is None:
                         return
+                    self.control.mark_input(terminal_id, client_id, device_id)
                     await resize_browser_view(payload)
                     command = str(payload.get("data", ""))
                     await asyncio.to_thread(

@@ -4335,6 +4335,7 @@ class SSHBackend:
                 elif kind == "resize":
                     await resize_browser_view(payload)
                 elif kind == "command":
+                    self.control.mark_input(terminal_id, client_id, device_id)
                     await resize_browser_view(payload)
                     command = str(payload.get("data", ""))
                     await asyncio.to_thread(

@@ -1353,7 +1353,7 @@ class RemoteAccess:
                     elif kind == "resize":
                         await resize_browser_view(payload)
                     elif kind in {"input", "command"}:
-                        if kind == "input" and terminal_input_claims_grid(payload):
+                        if kind == "command" or terminal_input_claims_grid(payload):
                             self.control.mark_input(terminal_id, client_id, device_id)
                         if not await resize_browser_view(payload):
                             continue
