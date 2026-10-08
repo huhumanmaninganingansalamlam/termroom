@@ -4126,6 +4126,22 @@ class SSHBackend:
         mode_revision = 0
         previous_mode: dict[str, Any] | None = None
         mode_available: bool | None = None
+        mode_query: asyncio.Task[None] | None = None
+
+        async def mark_pane_mode_unavailable() -> None:
+            nonlocal mode_revision, previous_mode, mode_available
+            if mode_available is False:
+                return
+            mode_available = False
+            previous_mode = None
+            mode_revision += 1
+            await websocket.send_bytes(json.dumps({
+                "kind": "pane_mode",
+                "terminal_id": terminal_id,
+                "generation": client_id,
+                "revision": mode_revision,
+                "available": False,
+            }).encode("utf-8"))
 
         async def send_pane_mode() -> None:
             nonlocal mode_revision, previous_mode, mode_available
@@ -4138,19 +4154,7 @@ class SSHBackend:
                 paramiko.SSHException,
                 ValueError,
             ):
-                if mode_available is False:
-                    return
-                mode_available = False
-                previous_mode = None
-                mode_revision += 1
-                control = {
-                    "kind": "pane_mode",
-                    "terminal_id": terminal_id,
-                    "generation": client_id,
-                    "revision": mode_revision,
-                    "available": False,
-                }
-                await websocket.send_bytes(json.dumps(control).encode("utf-8"))
+                await mark_pane_mode_unavailable()
                 return
             if mode_available is True and mode == previous_mode:
                 return
@@ -4169,6 +4173,27 @@ class SSHBackend:
                     }
                 ).encode("utf-8")
             )
+
+        async def refresh_pane_mode() -> None:
+            nonlocal mode_query
+            if mode_query is not None and not mode_query.done() and mode_available is False:
+                return
+            if mode_query is not None and mode_query.done():
+                await mode_query
+                mode_query = None
+            if mode_query is None:
+                mode_query = asyncio.create_task(send_pane_mode())
+            # Metadata must not hold already-read PTY output behind a 20s SSH exec.
+            # Keep one owned query; its eventual result publishes even without new output.
+            done, _ = await asyncio.wait(
+                {mode_query}, timeout=PANE_MODE_REFRESH_INTERVAL_SECONDS
+            )
+            if done:
+                await mode_query
+                mode_query = None
+            else:
+                # Do not advertise a stale selected-pane mode while the query is late.
+                await mark_pane_mode_unavailable()
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
@@ -4207,7 +4232,7 @@ class SSHBackend:
                         await asyncio.sleep(delay)
                     while not chunks.empty() and len(batch) < 16 and batch[-1]:
                         batch.append(chunks.get_nowait())
-                    await send_pane_mode()
+                    await refresh_pane_mode()
                     last_mode_refresh = loop.time()
                     decoded = decoder.feed(b"".join(batch), final=not batch[-1])
                     if decoded:
@@ -4368,7 +4393,7 @@ class SSHBackend:
         output_task: asyncio.Task[None] | None = None
         input_task: asyncio.Task[None] | None = None
         try:
-            await send_pane_mode()
+            await refresh_pane_mode()
             output_task = asyncio.create_task(output_to_browser())
             input_task = asyncio.create_task(browser_to_input())
             done, pending = await asyncio.wait(
@@ -4386,7 +4411,7 @@ class SSHBackend:
             self._forget_ssh_browser_grid_owner(
                 terminal_id, client_id, workspace=workspace, window=str(terminal["tmux_window"])
             )
-            for task in (output_task, input_task):
+            for task in (output_task, input_task, mode_query):
                 if task is not None and not task.done():
                     task.cancel()
             with contextlib.suppress(ProcessLookupError):
@@ -4396,9 +4421,9 @@ class SSHBackend:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process_pid, signal.SIGKILL)
                 await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
-            if output_task is not None or input_task is not None:
+            if output_task is not None or input_task is not None or mode_query is not None:
                 await asyncio.gather(
-                    *(task for task in (output_task, input_task) if task is not None),
+                    *(task for task in (output_task, input_task, mode_query) if task is not None),
                     return_exceptions=True,
                 )
             with contextlib.suppress(OSError):

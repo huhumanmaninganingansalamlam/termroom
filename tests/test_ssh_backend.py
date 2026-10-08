@@ -19,6 +19,7 @@ import zipfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import httpx
 import pytest
@@ -185,6 +186,82 @@ def test_idle_ssh_bridge_leaves_executor_available_and_delivers_output(
         assert backend.control.client_count("terminal") == 0
 
     asyncio.run(observe())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_query", [1, 2])
+async def test_ssh_output_continues_during_a_slow_pane_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slow_query: int
+) -> None:
+    store = StateStore(tmp_path / "termroom.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, tmp_path)
+    read_fd, write_fd = os.pipe()
+    release = Event()
+    querying, delivered, disconnect = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    recovered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    queries = 0
+    output: list[str] = []
+    controls: list[dict[str, object]] = []
+
+    def pane_mode(*_args):  # type: ignore[no-untyped-def]
+        nonlocal queries
+        queries += 1
+        if queries >= slow_query:
+            loop.call_soon_threadsafe(querying.set)
+            if not release.wait(3):
+                raise SSHBackendError("bounded fixture pane timeout")
+        return {"pane": "%1", "alternate": True, "mouse_tracking": True}
+
+    monkeypatch.setattr(backend, "ensure_workspace", lambda *_args: [])
+    monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, read_fd))
+    monkeypatch.setattr(backend, "current_pane_mode", pane_mode)
+    monkeypatch.setattr(backend, "_wait_for_pid", lambda *_args: True)
+    monkeypatch.setattr("termroom.ssh_backend.os.killpg", lambda *_args: None)
+
+    class Browser:
+        async def receive(self) -> dict[str, object]:
+            await disconnect.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+
+        async def send_bytes(self, data: bytes) -> None:
+            control = json.loads(data)
+            controls.append(control)
+            if control["available"] and release.is_set():
+                recovered.set()
+
+        async def send_text(self, data: str) -> None:
+            output.append(data)
+            delivered.set()
+
+    bridge = asyncio.create_task(backend.bridge(
+        Browser(), {"id": "workspace", "tmux_session": "session"},  # type: ignore[arg-type]
+        {"id": "terminal", "tmux_window": "@7"},
+    ))
+    started = loop.time()
+    try:
+        os.write(write_fd, b"complete-benign-output")
+        await asyncio.wait_for(querying.wait(), 1)
+        await asyncio.wait_for(delivered.wait(), 0.5)
+        assert not release.is_set() and output == ["complete-benign-output"]
+        assert controls[-1]["available"] is False
+        print(f"slow_pane_output_ms={(loop.time() - started) * 1000:.3f}")
+        delivered.clear()
+        os.write(write_fd, b"-next-output")
+        await asyncio.wait_for(delivered.wait(), 0.5)
+        assert "".join(output) == "complete-benign-output-next-output"
+        assert queries == slow_query  # Multiple output batches share the same pending query.
+        release.set()
+        await asyncio.wait_for(recovered.wait(), 1)
+        assert controls[-1]["available"] is True
+        assert [c["revision"] for c in controls] == list(range(1, len(controls) + 1))
+    finally:
+        release.set()
+        os.close(write_fd)
+        disconnect.set()
+        await asyncio.wait_for(bridge, 2)
+    assert backend.control.client_count("terminal") == 0
 
 
 @contextlib.contextmanager
@@ -1422,10 +1499,18 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
             and mode["terminal_id"] == terminal_id
             and isinstance(mode["generation"], str)
             and isinstance(mode["revision"], int)
-            and isinstance(mode["alternate"], bool)
-            and isinstance(mode["mouse_tracking"], bool)
+            and isinstance(mode["available"], bool)
+            and (
+                isinstance(mode.get("alternate"), bool)
+                and isinstance(mode.get("mouse_tracking"), bool)
+                if mode["available"]
+                else "alternate" not in mode and "mouse_tracking" not in mode
+            )
             for mode in pane_modes
         )
+        assert {mode["generation"] for mode in pane_modes if mode["available"]} == {
+            mode["generation"] for mode in pane_modes
+        }
 
 
 @pytest.mark.asyncio
