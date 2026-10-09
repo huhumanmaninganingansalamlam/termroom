@@ -803,17 +803,23 @@ async def terminal_output_tracking(
     store: StateStore, terminal_id: str
 ) -> AsyncIterator[Callable[[], None]]:
     """Coalesce bookkeeping without holding PTY output behind executor work."""
-    pending: asyncio.Task[bool] | None = None
+    pending: asyncio.Task[None] | None = None
+    dirty = False
+
+    async def persist_output() -> None:
+        nonlocal dirty
+        while dirty:
+            dirty = False
+            await asyncio.to_thread(touch_terminal_output_if_present, store, terminal_id)
 
     def record_output() -> None:
-        nonlocal pending
+        nonlocal pending, dirty
+        dirty = True
         if pending is not None:
             if not pending.done():
                 return
             pending.result()
-        pending = asyncio.create_task(
-            asyncio.to_thread(touch_terminal_output_if_present, store, terminal_id)
-        )
+        pending = asyncio.create_task(persist_output())
 
     try:
         yield record_output
