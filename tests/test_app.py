@@ -1114,13 +1114,26 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "path", "operation", "expected_status"),
+    ("method", "path", "operation", "expected_status", "form_data"),
     [
-        ("GET", "/w/{workspace_id}/terminal", "ensure_workspace", 200),
-        ("GET", "/w/{workspace_id}/recent", "ensure_workspace", 200),
-        ("POST", "/api/workspaces", "ensure_workspace", 303),
-        ("GET", "/w/{workspace_id}/files", "session_exists", 200),
-        ("GET", "/", "existing_sessions", 200),
+        ("GET", "/w/{workspace_id}/terminal", "ensure_workspace", 200, {}),
+        ("GET", "/w/{workspace_id}/recent", "ensure_workspace", 200, {}),
+        ("POST", "/api/workspaces", "ensure_workspace", 303, {"path": "project"}),
+        ("GET", "/w/{workspace_id}/files", "session_exists", 200, {}),
+        ("GET", "/", "existing_sessions", 200, {}),
+        ("POST", "/w/{workspace_id}/terminals", "create_terminal", 303, {"name": "logs"}),
+        (
+            "POST", "/w/{workspace_id}/terminals/{terminal_id}",
+            "rename_terminal", 303, {"name": "renamed"},
+        ),
+        (
+            "POST", "/w/{workspace_id}/terminals/{terminal_id}",
+            "close_terminal", 303, {"action": "delete"},
+        ),
+        (
+            "GET", "/w/{workspace_id}/terminal/{terminal_id}/scrollback",
+            "capture_scrollback", 200, {},
+        ),
     ],
 )
 async def test_slow_local_tmux_request_keeps_core_responsive(
@@ -1130,13 +1143,14 @@ async def test_slow_local_tmux_request_keeps_core_responsive(
     path: str,
     operation: str,
     expected_status: int,
+    form_data: dict[str, str],
 ) -> None:
     root = tmp_path / "root"
     (root / "project").mkdir(parents=True)
     settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
     app = create_app(settings)
     workspace = app.state.workspaces.open("project")
-    app.state.terminals.ensure_workspace(workspace)
+    terminal = app.state.terminals.ensure_workspace(workspace)[0]
     original = getattr(app.state.terminals, operation)
     entered = threading.Event()
     release = threading.Event()
@@ -1156,12 +1170,12 @@ async def test_slow_local_tmux_request_keeps_core_responsive(
         pending = asyncio.create_task(
             client.request(
                 method,
-                path.format(workspace_id=workspace["id"]),
+                path.format(workspace_id=workspace["id"], terminal_id=terminal["id"]),
                 data=(
                     {
                         "_csrf": settings.csrf_token,
                         "root_id": app.state.workspaces.root_record["id"],
-                        "path": "project",
+                        **form_data,
                     } if method == "POST" else None
                 ),
             )

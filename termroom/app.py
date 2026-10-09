@@ -3657,7 +3657,7 @@ def create_app(settings: Settings) -> FastAPI:
         if is_remote(workspace):
             terminal = await remote.create_terminal(workspace, name)
         else:
-            terminal = terminals.create_terminal(workspace, name)
+            terminal = await asyncio.to_thread(terminals.create_terminal, workspace, name)
         return RedirectResponse(
             f"/w/{workspace_id}/terminal?terminal={terminal['id']}", status_code=303
         )
@@ -3692,7 +3692,9 @@ def create_app(settings: Settings) -> FastAPI:
                 if is_remote(workspace):
                     updated = await remote.rename_terminal(workspace, terminal, name)
                 else:
-                    updated = terminals.rename_terminal(workspace, terminal, name)
+                    updated = await asyncio.to_thread(
+                        terminals.rename_terminal, workspace, terminal, name
+                    )
                 return RedirectResponse(
                     f"/w/{workspace_id}/terminal?terminal={updated['id']}", status_code=303
                 )
@@ -3700,7 +3702,9 @@ def create_app(settings: Settings) -> FastAPI:
                 if is_remote(workspace):
                     remaining = await remote.close_terminal(workspace, terminal)
                 else:
-                    remaining = terminals.close_terminal(workspace, terminal)
+                    remaining = await asyncio.to_thread(
+                        terminals.close_terminal, workspace, terminal
+                    )
                 selected = remaining[0]
                 return RedirectResponse(
                     f"/w/{workspace_id}/terminal?terminal={selected['id']}", status_code=303
@@ -3737,7 +3741,8 @@ def create_app(settings: Settings) -> FastAPI:
                 ansi=styled_history,
             )
         else:
-            output = terminals.capture_scrollback(
+            output = await asyncio.to_thread(
+                terminals.capture_scrollback,
                 workspace,
                 terminal,
                 recent,
