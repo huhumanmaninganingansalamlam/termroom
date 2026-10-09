@@ -92,9 +92,9 @@ from termroom.terminals import (
     parse_tmux_workspace_command_records,
     terminal_editor_digest,
     terminal_input_claims_grid,
+    terminal_output_tracking,
     terminal_size,
     tmux_browser_view_session,
-    touch_terminal_output_if_present,
     validate_workspace_command_launch,
     validate_workspace_command_slot,
     wait_tmux_browser_grid_size,
@@ -4224,24 +4224,23 @@ class SSHBackend:
             reader = asyncio.create_task(read_pty())
             last_mode_refresh = asyncio.get_running_loop().time()
             try:
-                while True:
-                    batch = [await chunks.get()]
-                    loop = asyncio.get_running_loop()
-                    delay = last_mode_refresh + PANE_MODE_REFRESH_INTERVAL_SECONDS - loop.time()
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    while not chunks.empty() and len(batch) < 16 and batch[-1]:
-                        batch.append(chunks.get_nowait())
-                    await refresh_pane_mode()
-                    last_mode_refresh = loop.time()
-                    decoded = decoder.feed(b"".join(batch), final=not batch[-1])
-                    if decoded:
-                        await asyncio.to_thread(
-                            touch_terminal_output_if_present, self.store, terminal_id
-                        )
-                        await websocket.send_text(decoded)
-                    if not batch[-1]:
-                        return
+                async with terminal_output_tracking(self.store, terminal_id) as record_output:
+                    while True:
+                        batch = [await chunks.get()]
+                        loop = asyncio.get_running_loop()
+                        delay = last_mode_refresh + PANE_MODE_REFRESH_INTERVAL_SECONDS - loop.time()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        while not chunks.empty() and len(batch) < 16 and batch[-1]:
+                            batch.append(chunks.get_nowait())
+                        await refresh_pane_mode()
+                        last_mode_refresh = loop.time()
+                        decoded = decoder.feed(b"".join(batch), final=not batch[-1])
+                        if decoded:
+                            record_output()
+                            await websocket.send_text(decoded)
+                        if not batch[-1]:
+                            return
             finally:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)

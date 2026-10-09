@@ -42,8 +42,8 @@ from termroom.terminals import (
     MAX_TERMINAL_MESSAGE_BYTES,
     TerminalOutputDecoder,
     terminal_input_claims_grid,
+    terminal_output_tracking,
     terminal_size,
-    touch_terminal_output_if_present,
 )
 from termroom.workspace_usage import (
     RawWorkspaceUsage,
@@ -1139,74 +1139,71 @@ class RemoteAccess:
 
             async def output_to_browser() -> None:
                 decoder = TerminalOutputDecoder()
-                while (event := await stream.receive_event()) is not None:
-                    if isinstance(event, dict):
-                        mode = event.get("mode")
-                        available = event.get("available")
-                        valid = (
-                            event.get("kind") == "pane_mode"
-                            and type(event.get("revision")) is int
-                            and event["revision"] >= 1
-                            and type(available) is bool
-                            and (
-                                not available
-                                or (
-                                    isinstance(mode, dict)
-                                    and mode.get("session") == str(workspace["tmux_session"])
-                                    and mode.get("window") == str(terminal["tmux_window"])
-                                    and isinstance(mode.get("pane"), str)
-                                    and mode["pane"].startswith("%")
-                                    and type(mode.get("pane_pid")) is int
-                                    and mode["pane_pid"] > 0
-                                    and type(mode.get("alternate")) is bool
-                                    and type(mode.get("mouse_tracking")) is bool
-                                    and isinstance(mode.get("mouse_flags"), list)
-                                    and len(mode["mouse_flags"]) == 5
-                                    and all(
-                                        type(flag) is int and flag in (0, 1)
-                                        for flag in mode["mouse_flags"]
+                async with terminal_output_tracking(self.store, terminal_id) as record_output:
+                    while (event := await stream.receive_event()) is not None:
+                        if isinstance(event, dict):
+                            mode = event.get("mode")
+                            available = event.get("available")
+                            valid = (
+                                event.get("kind") == "pane_mode"
+                                and type(event.get("revision")) is int
+                                and event["revision"] >= 1
+                                and type(available) is bool
+                                and (
+                                    not available
+                                    or (
+                                        isinstance(mode, dict)
+                                        and mode.get("session") == str(workspace["tmux_session"])
+                                        and mode.get("window") == str(terminal["tmux_window"])
+                                        and isinstance(mode.get("pane"), str)
+                                        and mode["pane"].startswith("%")
+                                        and type(mode.get("pane_pid")) is int
+                                        and mode["pane_pid"] > 0
+                                        and type(mode.get("alternate")) is bool
+                                        and type(mode.get("mouse_tracking")) is bool
+                                        and isinstance(mode.get("mouse_flags"), list)
+                                        and len(mode["mouse_flags"]) == 5
+                                        and all(
+                                            type(flag) is int and flag in (0, 1)
+                                            for flag in mode["mouse_flags"]
+                                        )
                                     )
                                 )
                             )
-                        )
-                        if valid:
-                            control = {
-                                "kind": "pane_mode",
-                                "terminal_id": terminal_id,
-                                "generation": client_id,
-                                "revision": event["revision"],
-                                "available": available,
-                            }
-                            if available:
-                                control.update(
-                                    {
-                                        key: mode[key]
-                                        for key in (
-                                            "session",
-                                            "window",
-                                            "pane",
-                                            "pane_pid",
-                                            "alternate",
-                                            "mouse_tracking",
-                                            "mouse_flags",
-                                        )
-                                    }
-                                )
-                            await websocket.send_bytes(json.dumps(control).encode("utf-8"))
-                        continue
-                    chunk = event
-                    decoded = decoder.feed(chunk)
-                    if decoded:
-                        await asyncio.to_thread(
-                            touch_terminal_output_if_present, self.store, terminal_id
-                        )
-                        await websocket.send_text(decoded)
-                tail = decoder.feed(b"", final=True)
-                if tail:
-                    await asyncio.to_thread(
-                        touch_terminal_output_if_present, self.store, terminal_id
-                    )
-                    await websocket.send_text(tail)
+                            if valid:
+                                control = {
+                                    "kind": "pane_mode",
+                                    "terminal_id": terminal_id,
+                                    "generation": client_id,
+                                    "revision": event["revision"],
+                                    "available": available,
+                                }
+                                if available:
+                                    control.update(
+                                        {
+                                            key: mode[key]
+                                            for key in (
+                                                "session",
+                                                "window",
+                                                "pane",
+                                                "pane_pid",
+                                                "alternate",
+                                                "mouse_tracking",
+                                                "mouse_flags",
+                                            )
+                                        }
+                                    )
+                                await websocket.send_bytes(json.dumps(control).encode("utf-8"))
+                            continue
+                        chunk = event
+                        decoded = decoder.feed(chunk)
+                        if decoded:
+                            record_output()
+                            await websocket.send_text(decoded)
+                    tail = decoder.feed(b"", final=True)
+                    if tail:
+                        record_output()
+                        await websocket.send_text(tail)
 
             async def resize_browser_view(payload: dict[str, Any]) -> bool:
                 nonlocal grid_active, last_viewport, resize_revision

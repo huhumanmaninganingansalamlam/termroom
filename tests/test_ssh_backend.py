@@ -195,12 +195,17 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
 ) -> None:
     store = StateStore(tmp_path / "termroom.sqlite3")
     store.initialize()
+    root = store.ensure_root(tmp_path)
+    workspace = store.create_workspace(str(root["id"]), ".", "fixture", "session")
+    terminal = store.create_terminal(str(workspace["id"]), "fixture", "@7")
     backend = SSHBackend(store, tmp_path)
     read_fd, write_fd = os.pipe()
     release = Event()
     querying, delivered, disconnect = asyncio.Event(), asyncio.Event(), asyncio.Event()
     recovered = asyncio.Event()
     loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
     queries = 0
     output: list[str] = []
     controls: list[dict[str, object]] = []
@@ -236,8 +241,7 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
             delivered.set()
 
     bridge = asyncio.create_task(backend.bridge(
-        Browser(), {"id": "workspace", "tmux_session": "session"},  # type: ignore[arg-type]
-        {"id": "terminal", "tmux_window": "@7"},
+        Browser(), workspace, terminal,  # type: ignore[arg-type]
     ))
     started = loop.time()
     try:
@@ -260,8 +264,14 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
         release.set()
         os.close(write_fd)
         disconnect.set()
-        await asyncio.wait_for(bridge, 2)
-    assert backend.control.client_count("terminal") == 0
+        try:
+            await asyncio.wait_for(bridge, 2)
+        finally:
+            executor.shutdown(wait=True)
+    assert backend.control.client_count(str(terminal["id"])) == 0
+    updated = store.get_terminal(str(terminal["id"]))
+    assert updated is not None and updated["last_output_at"] is not None
+    assert updated["activity_at"] is None  # Output bookkeeping must not invent an unread revision.
 
 
 @contextlib.contextmanager

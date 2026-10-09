@@ -17,7 +17,7 @@ import termios
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -796,6 +796,32 @@ def touch_terminal_output_if_present(store: StateStore, terminal_id: str) -> boo
     except KeyError:
         return False
     return True
+
+
+@contextlib.asynccontextmanager
+async def terminal_output_tracking(
+    store: StateStore, terminal_id: str
+) -> AsyncIterator[Callable[[], None]]:
+    """Coalesce bookkeeping without holding PTY output behind executor work."""
+    pending: asyncio.Task[bool] | None = None
+
+    def record_output() -> None:
+        nonlocal pending
+        if pending is not None:
+            if not pending.done():
+                return
+            pending.result()
+        pending = asyncio.create_task(
+            asyncio.to_thread(touch_terminal_output_if_present, store, terminal_id)
+        )
+
+    try:
+        yield record_output
+    finally:
+        if pending is not None:
+            _, cancelled = await _await_owned_task(pending)
+            if cancelled:
+                raise asyncio.CancelledError
 
 
 class TerminalManager:
@@ -1779,29 +1805,28 @@ class TerminalManager:
             reader = asyncio.create_task(read_output())
             last_refresh = asyncio.get_running_loop().time()
             try:
-                while True:
-                    batch = [await chunks.get()]
-                    loop = asyncio.get_running_loop()
-                    delay = last_refresh + PANE_MODE_REFRESH_INTERVAL_SECONDS - loop.time()
-                    if delay > 0:
-                        ready = loop.create_future()
-                        timer = loop.call_later(delay, ready.set_result, None)
-                        try:
-                            await ready
-                        finally:
-                            timer.cancel()
-                    while not chunks.empty() and len(batch) < 16 and batch[-1]:
-                        batch.append(chunks.get_nowait())
-                    await send_pane_mode()
-                    last_refresh = loop.time()
-                    decoded = decoder.feed(b"".join(batch), final=not batch[-1])
-                    if decoded:
-                        await asyncio.to_thread(
-                            touch_terminal_output_if_present, self.store, terminal_id
-                        )
-                        await websocket.send_text(decoded)
-                    if not batch[-1]:
-                        return
+                async with terminal_output_tracking(self.store, terminal_id) as record_output:
+                    while True:
+                        batch = [await chunks.get()]
+                        loop = asyncio.get_running_loop()
+                        delay = last_refresh + PANE_MODE_REFRESH_INTERVAL_SECONDS - loop.time()
+                        if delay > 0:
+                            ready = loop.create_future()
+                            timer = loop.call_later(delay, ready.set_result, None)
+                            try:
+                                await ready
+                            finally:
+                                timer.cancel()
+                        while not chunks.empty() and len(batch) < 16 and batch[-1]:
+                            batch.append(chunks.get_nowait())
+                        await send_pane_mode()
+                        last_refresh = loop.time()
+                        decoded = decoder.feed(b"".join(batch), final=not batch[-1])
+                        if decoded:
+                            record_output()
+                            await websocket.send_text(decoded)
+                        if not batch[-1]:
+                            return
             finally:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
