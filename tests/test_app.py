@@ -12,8 +12,10 @@ import subprocess
 import threading
 import uuid
 import zipfile
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from urllib.parse import quote
 
 import httpx
@@ -1108,6 +1110,107 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
             check=False,
             capture_output=True,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "operation", "expected_status"),
+    [
+        ("GET", "/w/{workspace_id}/terminal", "ensure_workspace", 200),
+        ("GET", "/w/{workspace_id}/recent", "ensure_workspace", 200),
+        ("POST", "/api/workspaces", "ensure_workspace", 303),
+        ("GET", "/w/{workspace_id}/files", "session_exists", 200),
+        ("GET", "/", "existing_sessions", 200),
+    ],
+)
+async def test_slow_local_tmux_request_keeps_core_responsive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    path: str,
+    operation: str,
+    expected_status: int,
+) -> None:
+    root = tmp_path / "root"
+    (root / "project").mkdir(parents=True)
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    app.state.terminals.ensure_workspace(workspace)
+    original = getattr(app.state.terminals, operation)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed_tmux(*args, **kwargs):  # type: ignore[no-untyped-def]
+        entered.set()
+        assert release.wait(3), "isolated tmux hold was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.terminals, operation, delayed_tmux)
+    # An independent watchdog must release even if the application's loop blocks.
+    watchdog = threading.Timer(2, release.set)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        started = perf_counter()
+        pending = asyncio.create_task(
+            client.request(
+                method,
+                path.format(workspace_id=workspace["id"]),
+                data=(
+                    {
+                        "_csrf": settings.csrf_token,
+                        "root_id": app.state.workspaces.root_record["id"],
+                        "path": "project",
+                    } if method == "POST" else None
+                ),
+            )
+        )
+        watchdog.start()
+        try:
+            assert await asyncio.to_thread(entered.wait, 1), "tmux path was not reached"
+            health = await client.get("/health")
+            elapsed_ms = (perf_counter() - started) * 1000
+            assert health.status_code == 200 and health.text == "ok"
+            assert not release.is_set(), f"Core blocked until tmux release ({elapsed_ms:.1f}ms)"
+            print(f"{method} {path}: /health progressed while tmux held, {elapsed_ms:.1f}ms")
+        finally:
+            release.set()
+            watchdog.cancel()
+            watchdog.join()
+            response = await pending
+        assert response.status_code == expected_status
+
+
+@pytest.mark.asyncio
+async def test_concurrent_local_terminal_open_preserves_one_tmux_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    (root / "project").mkdir(parents=True)
+    app = create_app(Settings.create(root, state_dir=tmp_path / "state", access_token="test-token"))
+    workspace = app.state.workspaces.open("project")
+    original = app.state.terminals.session_exists
+    simultaneous = threading.Barrier(2, timeout=1)
+
+    def fresh_session(*args, **kwargs):  # type: ignore[no-untyped-def]
+        exists = original(*args, **kwargs)
+        if not exists:
+            # A serialized opener cannot reach the barrier twice.
+            with suppress(threading.BrokenBarrierError):
+                simultaneous.wait()
+        return exists
+
+    monkeypatch.setattr(app.state.terminals, "session_exists", fresh_session)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        responses = await asyncio.gather(
+            client.get(f"/w/{workspace['id']}/terminal"),
+            client.get(f"/w/{workspace['id']}/terminal"),
+        )
+    assert [response.status_code for response in responses] == [200, 200]
+    assert len(app.state.store.list_terminals(str(workspace["id"]))) == 1
 
 
 @pytest.mark.asyncio

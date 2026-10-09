@@ -655,7 +655,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def ensure_terminal_list(workspace: dict[str, Any]) -> list[dict[str, Any]]:
         if is_remote(workspace):
             return await remote.ensure_workspace(workspace)
-        return terminals.ensure_workspace(workspace)
+        return await asyncio.to_thread(terminals.ensure_workspace, workspace)
 
     async def list_workspace_dir(
         workspace: dict[str, Any], relative_path: str
@@ -1180,10 +1180,10 @@ def create_app(settings: Settings) -> FastAPI:
             if settings.allow_local_workspaces or is_remote(workspace)
         ]
         recent_runs = remote_runs.list_recent(limit=6)
-        active_sessions = terminals.existing_sessions()
+        active_sessions = await asyncio.to_thread(terminals.existing_sessions)
         for workspace in recent:
             workspace.update(
-                _workspace_status(
+                await _workspace_status(
                     store,
                     terminals,
                     workspace,
@@ -3249,7 +3249,7 @@ def create_app(settings: Settings) -> FastAPI:
         workspace = workspaces.open_local(
             str(root_record["path"]), str(form.get("path", "."))
         )
-        terminals.ensure_workspace(workspace)
+        await ensure_terminal_list(workspace)
         return RedirectResponse(f"/w/{workspace['id']}/terminal", status_code=303)
 
     @app.get("/w/{workspace_id}")
@@ -3637,7 +3637,7 @@ def create_app(settings: Settings) -> FastAPI:
                 error=terminal_error,
                 terminal_connection_error=terminal_connection_error,
                 current_device_id=str(getattr(request.state, "session", {}).get("id", "")),
-                **_workspace_status(store, terminals, workspace),
+                **await _workspace_status(store, terminals, workspace),
             ),
         )
 
@@ -3773,7 +3773,7 @@ def create_app(settings: Settings) -> FastAPI:
                 recent_supported=remote.supports_capability(workspace, "recent"),
                 terminal=terminal,
                 output=output,
-                **_workspace_status(store, terminals, workspace),
+                **await _workspace_status(store, terminals, workspace),
             ),
         )
 
@@ -3869,7 +3869,7 @@ def create_app(settings: Settings) -> FastAPI:
             max_upload_bytes=settings.max_upload_bytes,
             format_size=_format_size,
             format_time_ns=lambda value: _relative_time_ns(value, locale),
-            **_workspace_status(store, terminals, workspace),
+            **await _workspace_status(store, terminals, workspace),
         )
         template_name = (
             "_file_results.html"
@@ -4016,7 +4016,7 @@ def create_app(settings: Settings) -> FastAPI:
                 ),
                 format_size=_format_size,
                 format_time_ns=lambda value: _relative_time_ns(value, locale),
-                **_workspace_status(store, terminals, workspace),
+                **await _workspace_status(store, terminals, workspace),
             ),
         )
 
@@ -4530,7 +4530,7 @@ def create_app(settings: Settings) -> FastAPI:
                 selected_run_id=selected_run_id,
                 idempotency_key=idempotency_key,
             ),
-            **_workspace_status(store, terminals, workspace),
+            **await _workspace_status(store, terminals, workspace),
         }
         if submitted_content is not None:
             values["submitted_content"] = submitted_content
@@ -5039,7 +5039,7 @@ def create_app(settings: Settings) -> FastAPI:
                 refresh_error=" · ".join(dict.fromkeys(refresh_errors)),
                 format_size=_format_size,
                 format_time_ns=lambda value: _relative_time_ns(value, locale),
-                **_workspace_status(store, terminals, workspace),
+                **await _workspace_status(store, terminals, workspace),
             ),
         )
 
@@ -5227,7 +5227,7 @@ def _workspace_context(
     )
 
 
-def _workspace_status(
+async def _workspace_status(
     store: StateStore,
     terminals: TerminalManager,
     workspace: Mapping[str, Any],
@@ -5243,7 +5243,7 @@ def _workspace_status(
             "session_status_class": "remote",
         }
     local_active = (
-        terminals.session_exists(str(workspace["tmux_session"]))
+        await asyncio.to_thread(terminals.session_exists, str(workspace["tmux_session"]))
         if session_active is None
         else session_active
     )

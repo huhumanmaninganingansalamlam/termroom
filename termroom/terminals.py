@@ -964,6 +964,15 @@ class TerminalManager:
         *,
         tmux_timeout: float | None = None,
     ) -> list[dict[str, Any]]:
+        with self._workspace_command_lock(str(workspace["id"])):
+            return self._ensure_workspace_locked(workspace, tmux_timeout=tmux_timeout)
+
+    def _ensure_workspace_locked(
+        self,
+        workspace: dict[str, Any],
+        *,
+        tmux_timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
         run_tmux = self._tmux_runner(tmux_timeout)
         session = workspace["tmux_session"]
         workspace_path = Path(workspace["path"])
