@@ -1491,16 +1491,39 @@ def test_node_file_run_root_preserves_real_directory_behavior(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Path) -> None:
+def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     workspace = tmp_path / "project"
     workspace.mkdir()
     runtime = NodeRuntime([tmp_path])
     payload = _payload(workspace)
     session = str(payload["tmux_session"])
+    list_terminals = runtime._list_terminals
+    activity_revision = 1_700_000_000
+
+    def later_activity(session: str) -> list[dict[str, Any]]:
+        nonlocal activity_revision
+        records = list_terminals(session)
+        activity_revision += 1
+        for record in records:
+            record["activity_at"] = activity_revision
+        return records
+
+    # Keep real tmux identities; only make changing observation time deterministic.
+    monkeypatch.setattr(runtime, "_list_terminals", later_activity)
+
+    def identities(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {key: value for key, value in record.items() if key != "activity_at"}
+            for record in records
+        ]
+
     try:
         first = runtime._handle_sync("workspace.ensure", payload)["terminals"]
         second = runtime._handle_sync("workspace.ensure", payload)["terminals"]
-        assert first == second
+        assert identities(first) == identities(second)
         assert len(first) == 1
 
         created = runtime._handle_sync("terminal.create", {**payload, "name": "한글 shell"})[
@@ -1518,7 +1541,7 @@ def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(tmp_path: Pa
         terminals = runtime._handle_sync(
             "terminal.close", {**payload, "tmux_window": created["tmux_window"]}
         )["terminals"]
-        assert terminals == first
+        assert identities(terminals) == identities(first)
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
 
