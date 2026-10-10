@@ -514,6 +514,54 @@ assert.equal(paneMode, null);
     assert 'data-pane-mode-capable="' in (ROOT / "termroom/templates/terminal.html").read_text()
 
 
+def test_hidden_terminal_resize_preserves_alternate_screen() -> None:
+    source = (VENDOR_DIR.parent / "terminal.js").read_text()
+    resize = source[source.index("  const resizeTerminal ="):
+                    source.index("  const scheduleResize =")]
+    probe = r"""
+const assert = require('node:assert/strict');
+const {Terminal} = require('./termroom/static/vendor/xterm.js');
+(async () => {
+  const real = new Terminal({cols:80,rows:24});
+  const term = {get cols(){return real.cols;},get rows(){return real.rows;},
+    resize:(c,r)=>real.resize(c,r),
+    _core:{_renderService:{dimensions:{css:{cell:{width:10,height:20}}}}}};
+  const host = {clientWidth:800,clientHeight:480};
+  const sent = [], send = value => sent.push(value), publishTerminalMetrics = () => {};
+  const window = {getComputedStyle(){return {
+    paddingLeft:'0',paddingRight:'0',paddingTop:'0',paddingBottom:'0',
+  };}};
+RESIZE_HANDLER
+  const text = () => Array.from({length:real.buffer.active.length},(_,i) =>
+    real.buffer.active.getLine(i).translateToString(true)).filter(Boolean);
+  try {
+    await new Promise(resolve => real.write(
+      '\x1b[?1049h\x1b[H\x1b[2JOWNED TOP FRAME\x1b[24;1H',resolve));
+    for (const [width,height] of [[0,0],[0,480],[800,0]]) {
+      host.clientWidth=width;host.clientHeight=height;
+      resizeTerminal(true);
+      assert.deepEqual(text(),['OWNED TOP FRAME'],'hidden resize must not erase the frame');
+      assert.equal(real.cols,80);assert.equal(real.rows,24);
+      assert.equal(sent.length,0,'hidden geometry must not reach the shared PTY');
+    }
+    host.clientWidth=800;host.clientHeight=480;
+    resizeTerminal(true); // reconnect must still send an unchanged visible viewport
+    assert.deepEqual(sent,[{kind:'resize',rows:24,cols:80}]);
+    host.clientWidth=600;host.clientHeight=600;
+    resizeTerminal(); // ordinary visible resize is still applied and transmitted
+    assert.equal(real.cols,60);assert.equal(real.rows,30);
+    assert.deepEqual(sent.at(-1),{kind:'resize',rows:30,cols:60});
+    assert.deepEqual(text(),['OWNED TOP FRAME']);
+  } finally {real.dispose();}
+})().catch(error => {console.error(error);process.exitCode=1;});
+""".replace("RESIZE_HANDLER", resize)
+    result = subprocess.run(
+        ["node", "-e", probe], cwd=VENDOR_DIR.parents[2],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_recovered_socket_retires_only_its_page_connection_error() -> None:
     source = (VENDOR_DIR.parent / "terminal.js").read_text()
     mode = source[source.index("  const acceptPaneMode ="):

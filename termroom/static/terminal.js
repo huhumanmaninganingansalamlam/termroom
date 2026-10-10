@@ -465,6 +465,8 @@
   };
 
   const resizeTerminal = (forceSend = false) => {
+    // A hidden host has no viewport; clamping it would erase alternate-screen rows.
+    if (host.clientWidth <= 0 || host.clientHeight <= 0) return;
     const cell = term._core?._renderService?.dimensions?.css?.cell;
     if (!cell?.width || !cell?.height) return;
     publishTerminalMetrics(cell);
