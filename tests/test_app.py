@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import io
 import multiprocessing
+import os
 import re
 import shutil
 import subprocess
@@ -1134,9 +1135,29 @@ async def test_local_project_route_creates_folder_workspace_and_terminal(tmp_pat
             "GET", "/w/{workspace_id}/terminal/{terminal_id}/scrollback",
             "capture_scrollback", 200, {},
         ),
+        pytest.param(
+            "GET", "/w/{workspace_id}/files", "files.list_dir", 200, {},
+            id="local_file_io_list",
+        ),
+        pytest.param(
+            "GET", "/w/{workspace_id}/view/notes.txt", "files.stat", 200, {},
+            id="local_file_io_stat",
+        ),
+        pytest.param(
+            "GET", "/w/{workspace_id}/edit/notes.txt", "files.read_text", 200, {},
+            id="local_file_io_read",
+        ),
+        pytest.param(
+            "POST", "/w/{workspace_id}/edit/notes.txt", "files.write_text", 303,
+            {"content": "updated owned fixture\n"}, id="local_file_io_write",
+        ),
+        pytest.param(
+            "GET", "/w/{workspace_id}/view/notes.txt", "files.read_text_preview", 200, {},
+            id="local_file_io_preview",
+        ),
     ],
 )
-async def test_slow_local_tmux_request_keeps_core_responsive(
+async def test_slow_local_workspace_io_keeps_core_responsive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     method: str,
@@ -1151,16 +1172,25 @@ async def test_slow_local_tmux_request_keeps_core_responsive(
     app = create_app(settings)
     workspace = app.state.workspaces.open("project")
     terminal = app.state.terminals.ensure_workspace(workspace)[0]
-    original = getattr(app.state.terminals, operation)
+    service_name, _, method_name = operation.rpartition(".")
+    service = getattr(app.state, service_name or "terminals")
+    if service_name == "files":
+        (root / "project" / "notes.txt").write_text("owned fixture\n", encoding="utf-8")
+        if method_name == "write_text":
+            snapshot = service.read_text(workspace["path"], "notes.txt")
+            form_data = {
+                **form_data, "digest": snapshot.digest, "mtime_ns": str(snapshot.mtime_ns),
+            }
+    original = getattr(service, method_name)
     entered = threading.Event()
     release = threading.Event()
 
-    def delayed_tmux(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def delayed_operation(*args, **kwargs):  # type: ignore[no-untyped-def]
         entered.set()
-        assert release.wait(3), "isolated tmux hold was not released"
+        assert release.wait(3), "isolated Local I/O hold was not released"
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(app.state.terminals, operation, delayed_tmux)
+    monkeypatch.setattr(service, method_name, delayed_operation)
     # An independent watchdog must release even if the application's loop blocks.
     watchdog = threading.Timer(2, release.set)
     transport = httpx.ASGITransport(app=app)
@@ -1182,12 +1212,14 @@ async def test_slow_local_tmux_request_keeps_core_responsive(
         )
         watchdog.start()
         try:
-            assert await asyncio.to_thread(entered.wait, 1), "tmux path was not reached"
+            assert await asyncio.to_thread(entered.wait, 1), "Local I/O path was not reached"
             health = await client.get("/health")
             elapsed_ms = (perf_counter() - started) * 1000
             assert health.status_code == 200 and health.text == "ok"
-            assert not release.is_set(), f"Core blocked until tmux release ({elapsed_ms:.1f}ms)"
-            print(f"{method} {path}: /health progressed while tmux held, {elapsed_ms:.1f}ms")
+            assert not release.is_set(), (
+                f"Core blocked until Local I/O release ({elapsed_ms:.1f}ms)"
+            )
+            print(f"{operation}: /health progressed while Local I/O held, {elapsed_ms:.1f}ms")
         finally:
             release.set()
             watchdog.cancel()
@@ -3190,6 +3222,52 @@ async def test_editor_preserves_submitted_content_when_file_disappears(tmp_path:
     assert "저장하지 못했습니다" in response.text
     assert "my unsaved content" in response.text
     assert 'data-unsaved="1"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_local_editor_saves_preserve_conflicting_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    project = root / "project"
+    project.mkdir(parents=True)
+    target = project / "note.txt"
+    target.write_text("before\n", encoding="utf-8")
+    settings = Settings.create(root, state_dir=tmp_path / "state", access_token="test-token")
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    snapshot = app.state.files.read_text(project, "note.txt")
+    original_replace = os.replace
+    publishers = threading.Barrier(2, timeout=1)
+
+    def concurrent_publish(source, destination):  # type: ignore[no-untyped-def]
+        if Path(destination) == target:
+            # A serialized saver cannot reach publication twice at the same time.
+            with suppress(threading.BrokenBarrierError):
+                publishers.wait()
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", concurrent_publish)
+    contents = ["first owned edit\n", "second owned edit\n"]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        responses = await asyncio.gather(*(
+            client.post(
+                f"/w/{workspace['id']}/edit/note.txt",
+                data={
+                    "_csrf": settings.csrf_token, "digest": snapshot.digest,
+                    "mtime_ns": str(snapshot.mtime_ns), "content": content,
+                },
+            ) for content in contents
+        ))
+    assert sorted(response.status_code for response in responses) == [303, 409]
+    for content, response in zip(contents, responses, strict=True):
+        if response.status_code == 303:
+            assert target.read_text(encoding="utf-8") == content
+        else:
+            assert content.strip() in response.text
+            assert 'data-unsaved="1"' in response.text
 
 
 @pytest.mark.asyncio

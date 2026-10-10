@@ -12,11 +12,12 @@ import os
 import secrets
 import sqlite3
 import tempfile
+import threading
 import uuid
 import zipfile
 import zlib
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
@@ -657,13 +658,24 @@ def create_app(settings: Settings) -> FastAPI:
             return await remote.ensure_workspace(workspace)
         return await asyncio.to_thread(terminals.ensure_workspace, workspace)
 
+    # Keep Core editor saves serialized when moving their I/O off the loop.
+    # ponytail: one local edit writer; per-file locks only if edit throughput needs it.
+    local_edit_lock = threading.Lock()
+
+    def local_file_call(
+        operation: Callable[..., Any], workspace: dict[str, Any], relative_path: str,
+        *args: Any, **kwargs: Any,
+    ) -> Any:
+        with local_edit_lock if operation == files.write_text else contextlib.nullcontext():
+            ensure_exposed_local_path(workspace, relative_path)
+            return operation(workspace["path"], relative_path, *args, **kwargs)
+
     async def list_workspace_dir(
         workspace: dict[str, Any], relative_path: str
     ) -> tuple[Any, list[Any]]:
         if is_remote(workspace):
             return await remote.list_dir(workspace, relative_path)
-        ensure_exposed_local_path(workspace, relative_path)
-        return files.list_dir(workspace["path"], relative_path)
+        return await asyncio.to_thread(local_file_call, files.list_dir, workspace, relative_path)
 
     async def search_workspace_files(
         workspace: dict[str, Any],
@@ -703,8 +715,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def stat_workspace_file(workspace: dict[str, Any], relative_path: str):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
             return await remote.stat(workspace, relative_path)
-        ensure_exposed_local_path(workspace, relative_path)
-        return files.stat(workspace["path"], relative_path)
+        return await asyncio.to_thread(local_file_call, files.stat, workspace, relative_path)
 
     async def open_workspace_terminal_editor(
         workspace: dict[str, Any], relative_path: str
@@ -718,8 +729,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def read_workspace_text(workspace: dict[str, Any], relative_path: str):  # type: ignore[no-untyped-def]
         if is_remote(workspace):
             return await remote.read_text(workspace, relative_path, settings.max_edit_bytes)
-        ensure_exposed_local_path(workspace, relative_path)
-        return files.read_text(workspace["path"], relative_path)
+        return await asyncio.to_thread(local_file_call, files.read_text, workspace, relative_path)
 
     async def write_workspace_text(
         workspace: dict[str, Any],
@@ -738,9 +748,10 @@ def create_app(settings: Settings) -> FastAPI:
                 expected_mtime_ns=expected_mtime_ns,
                 max_bytes=settings.max_edit_bytes,
             )
-        ensure_exposed_local_path(workspace, relative_path)
-        return files.write_text(
-            workspace["path"],
+        return await asyncio.to_thread(
+            local_file_call,
+            files.write_text,
+            workspace,
             relative_path,
             content,
             expected_digest=expected_digest,
@@ -758,9 +769,10 @@ def create_app(settings: Settings) -> FastAPI:
                 offset=offset,
                 max_bytes=settings.max_preview_bytes,
             )
-        ensure_exposed_local_path(workspace, relative_path)
-        return files.read_text_preview(
-            workspace["path"],
+        return await asyncio.to_thread(
+            local_file_call,
+            files.read_text_preview,
+            workspace,
             relative_path,
             mode=mode,
             offset=offset,
