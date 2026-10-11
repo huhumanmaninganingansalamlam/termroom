@@ -41,6 +41,8 @@ from termroom.terminal_control import TerminalControl
 from termroom.terminals import (
     MAX_TERMINAL_MESSAGE_BYTES,
     TerminalOutputDecoder,
+    acknowledge_terminal_command,
+    complete_terminal_command,
     terminal_input_claims_grid,
     terminal_output_tracking,
     terminal_size,
@@ -1370,6 +1372,9 @@ class RemoteAccess:
                         if kind in {"input", "command"} and not self.control.can_input(
                             terminal_id, client_id
                         ):
+                            await acknowledge_terminal_command(
+                                websocket, payload, terminal_id, client_id, accepted=False
+                            )
                             await websocket.send_bytes(
                                 json.dumps(
                                     self.control.control_state(terminal_id, client_id)
@@ -1390,15 +1395,29 @@ class RemoteAccess:
                                 continue
                         elif kind == "resize":
                             await resize_browser_view(payload)
-                        elif kind in {"input", "command"}:
-                            if kind == "command" or terminal_input_claims_grid(payload):
+                        elif kind == "command":
+                            self.control.mark_input(terminal_id, client_id, device_id)
+
+                            async def deliver_command(command_payload: dict[str, Any]) -> None:
+                                await resize_browser_view(command_payload)
+                                data = str(command_payload.get("data") or "")
+                                # Node ACK means Core forwarding/history, not target execution.
+                                paste = str(command_payload.get("paste_data", data))
+                                await stream.send((paste + "\r").encode())
+                                await asyncio.to_thread(
+                                    self.store.add_command, str(workspace["id"]), terminal_id, data
+                                )
+
+                            await complete_terminal_command(deliver_command(payload))
+                            await acknowledge_terminal_command(
+                                websocket, payload, terminal_id, client_id, accepted=True
+                            )
+                        elif kind == "input":
+                            if terminal_input_claims_grid(payload):
                                 self.control.mark_input(terminal_id, client_id, device_id)
                             # A stale grid resize must not discard this terminal's input.
                             await resize_browser_view(payload)
                             data = str(payload.get("data") or "")
-                            if kind == "command":
-                                self.store.add_command(str(workspace["id"]), terminal_id, data)
-                                data = str(payload.get("paste_data", data)) + "\r"
                             await stream.send(data.encode())
 
             output_task = asyncio.create_task(output_to_browser())

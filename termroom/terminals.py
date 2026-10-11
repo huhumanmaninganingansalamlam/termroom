@@ -17,7 +17,7 @@ import termios
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -765,6 +765,31 @@ async def write_terminal_input(fd: int, data: bytes) -> None:
     # Keep the FD owned until even a cancelled write has stopped using it.
     task = asyncio.create_task(asyncio.to_thread(write_all, fd, data))
     _, cancelled = await _await_owned_task(task)
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def acknowledge_terminal_command(
+    websocket: WebSocket, payload: dict[str, Any], terminal_id: str, client_id: str,
+    *, accepted: bool,
+) -> None:
+    command_id = payload.get("command_id")
+    if (
+        payload.get("kind") != "command"
+        or not isinstance(command_id, str)
+        or not 0 < len(command_id) <= 128
+    ):
+        return
+    await websocket.send_bytes(json.dumps({
+        "kind": "command_ack", "terminal_id": terminal_id, "generation": client_id,
+        "command_id": command_id, "accepted": accepted,
+    }).encode())
+
+
+async def complete_terminal_command(operation: Awaitable[None]) -> None:
+    # Admission owns resize, the complete paste and history, not just os.write.
+    # A browser departure cannot release the input lock or PTY halfway through.
+    _, cancelled = await _await_owned_task(asyncio.create_task(operation))
     if cancelled:
         raise asyncio.CancelledError
 
@@ -2014,6 +2039,9 @@ class TerminalManager:
                     if kind in {"input", "command"} and not self.control.can_input(
                         terminal_id, client_id
                     ):
+                        await acknowledge_terminal_command(
+                            websocket, payload, terminal_id, client_id, accepted=False
+                        )
                         await websocket.send_bytes(
                             json.dumps(self.control.control_state(terminal_id, client_id)).encode()
                         )
@@ -2036,13 +2064,20 @@ class TerminalManager:
                         if master_fd is None:
                             return
                         self.control.mark_input(terminal_id, client_id, device_id)
-                        await resize_browser_view(payload)
-                        command = str(payload.get("data", ""))
-                        await asyncio.to_thread(
-                            self.store.add_command, workspace["id"], terminal["id"], command
+
+                        async def deliver_command(command_payload: dict[str, Any]) -> None:
+                            await resize_browser_view(command_payload)
+                            command = str(command_payload.get("data", ""))
+                            paste = str(command_payload.get("paste_data", command))
+                            await write_to_pty(paste.encode() + b"\r")
+                            await asyncio.to_thread(
+                                self.store.add_command, workspace["id"], terminal["id"], command
+                            )
+
+                        await complete_terminal_command(deliver_command(payload))
+                        await acknowledge_terminal_command(
+                            websocket, payload, terminal_id, client_id, accepted=True
                         )
-                        paste = str(payload.get("paste_data", command))
-                        await write_to_pty(paste.encode() + b"\r")
                     elif kind == "input":
                         if master_fd is None:
                             return
@@ -2089,6 +2124,9 @@ class TerminalManager:
             for task in (output_task, input_task):
                 if task is not None and not task.done():
                     task.cancel()
+            tasks = [task for task in (output_task, input_task) if task is not None]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             cleanup_error = await asyncio.to_thread(
                 self._release_browser_terminal,
                 terminal_id,
@@ -2096,9 +2134,6 @@ class TerminalManager:
                 str(terminal["tmux_window"]),
                 process_pid,
             )
-            tasks = [task for task in (output_task, input_task) if task is not None]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
             self.control.unregister(terminal_id, client_id)
             if self.control.client_count(terminal_id) == 0:
                 self._terminal_resize_locks.pop(terminal_id, None)

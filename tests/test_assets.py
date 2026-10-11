@@ -652,8 +652,15 @@ def test_command_editor_uses_native_paste_once_and_keeps_plain_history() -> None
             '  commandInput?.addEventListener("input",'
         )
     ]
+    delivery = script[
+        script.index("  let commandUnconfirmed = false;") : script.index(
+            "  let composerComposing = false;"
+        )
+    ]
     probe = r"""
 const assert = require('node:assert/strict');
+const window = globalThis;
+window.addEventListener = () => {};
 const {Terminal} = require('./termroom/static/vendor/xterm.js');
 const term = new Terminal();
 term._core.textarea = {value:''}; // paste clears the native textarea after dispatch
@@ -665,10 +672,16 @@ const send = value => {if (!connected) return false; sent.push(value); return tr
 let nextTerminalDataIsUserInput = false;
 const hasUserInputSignal = false;
 const commandInput = {value:'',blur(){}}, composerComposing = false;
+const host = {dataset:{workspaceId:'w',terminalId:'t'}};
+let controlGeneration = 'current';
+const drafts = new Map();
+const sessionStorage = {setItem:(key,value)=>drafts.set(key,value),
+ getItem:key=>drafts.get(key) ?? null,removeItem:key=>drafts.delete(key)};
 const updateCommandComposer = () => {}, setComposerOpen = () => {};
 let submit;
 const commandForm = {addEventListener(_, callback){submit = callback;}};
 INPUT_HANDLER
+DELIVERY
 SUBMIT_HANDLER
 const text = '한글'.repeat(3300)+'\n끝!!';
 assert.equal(Buffer.byteLength(text),19806);
@@ -685,6 +698,14 @@ assert.equal(Buffer.byteLength(text),19806);
     const normalized = text.replaceAll('\n','\r');
     const expected = bracketed ? '\x1b[200~'+normalized+'\x1b[201~' : normalized;
     assert.equal(frame.paste_data, expected);
+    assert.equal(commandInput.value, text, 'enqueue is not server acceptance');
+    acceptCommandDelivery({terminal_id:'wrong',generation:'current',command_id:frame.command_id,accepted:true});
+    assert.equal(commandInput.value, text, 'wrong-terminal ACK cannot erase a draft');
+    acceptCommandDelivery({terminal_id:'t',generation:'old',command_id:frame.command_id,accepted:true});
+    assert.equal(commandInput.value, text, 'stale-generation ACK cannot erase a draft');
+    acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:frame.command_id,accepted:true});
+    assert.equal(commandInput.value, '', 'only matching server acceptance clears a draft');
+    assert.equal(drafts.size, 0);
   }
   assert.equal(sent.length, 2, 'one frame per submit, not a duplicate input frame');
   term.input('\t');
@@ -712,11 +733,37 @@ assert.equal(Buffer.byteLength(text),19806);
   await new Promise(resolve => term.write('', resolve));
   assert.equal(sent.at(-1).data, text, 'send only the explicitly submitted snapshot');
   assert.equal(commandInput.value, 'new unsent draft', 'do not clear a newer edit');
+  acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent.at(-1).command_id,accepted:true});
+  assert.equal(commandInput.value, 'new unsent draft', 'ACK must also preserve newer edits');
+  commandInput.value = 'rejected draft';
+  submit({preventDefault(){}});
+  await new Promise(resolve => term.write('', resolve));
+  acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent.at(-1).command_id,accepted:false});
+  assert.equal(commandInput.value, 'rejected draft', 'rejection never erases the draft');
+  assert.equal(commandPending, false, 'explicit rejection must release the submit guard');
+  commandInput.value = 'unconfirmed navigation draft';
+  submit({preventDefault(){}});
+  await new Promise(resolve => term.write('', resolve));
+  const beforeNavigation = sent.length;
+  resetCommandDelivery();
+  commandInput.value = '';
+  restoreCommandDraft();
+  assert.equal(commandInput.value, 'unconfirmed navigation draft');
+  assert.equal(commandUnconfirmed, true);
+  assert.equal(sent.length, beforeNavigation, 'restore never replays a command');
+  host.dataset.terminalId = 'other';
+  restoreCommandDraft();
+  assert.equal(commandInput.value, '', 'drafts belong to their original terminal');
+  host.dataset.terminalId = 't';
+  restoreCommandDraft();
+  assert.equal(commandInput.value, 'unconfirmed navigation draft');
   term.dispose();
 })().catch(error => {console.error(error);process.exitCode=1;});
-""".replace("INPUT_HANDLER", input_handler).replace("SUBMIT_HANDLER", submit)
+""".replace("INPUT_HANDLER", input_handler).replace("DELIVERY", delivery).replace(
+        "SUBMIT_HANDLER", submit
+    )
     result = subprocess.run(["node", "-e", probe], cwd=root, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None:
@@ -764,6 +811,7 @@ const term={buffer:[],write(data,callback){
  reset(){this.buffer=[];},clearSelection(){}};
 const connect=()=>{connections.push(host.dataset.terminalId);connectionEpoch++;
   socket={readyState:1,close(){this.readyState=3;}};};
+const persistCommandDraft=()=>{},restoreCommandDraft=()=>{};
 const scheduleActivityAcknowledge=()=>events.push({type:'ack-scheduled',
  terminalId:host.dataset.terminalId});
 const acceptPaneMode=()=>{},acceptInputControl=()=>{},resetInputControl=()=>{};
@@ -1701,6 +1749,7 @@ const frames=[];
 let socket={readyState:1,send:frame=>frames.push(frame),close:()=>{closed=true}};
 const commandInput={value:'',blur:()=>blurs++};
 const updateCommandComposer=()=>clears++,setComposerOpen=()=>{};
+const resetCommandDelivery=()=>{};
 CONTROLS
 SEND
 const state=(revision,owner,generation='current',extra={})=>({kind:'terminal_control',
@@ -1718,7 +1767,7 @@ windowListeners.focus();
 assert.equal(JSON.parse(frames[0]).kind,'control_claim');
 assert.equal(term.options.disableStdin,false,'first real input is enabled while ACK is pending');
 commandInput.value='original draft';
-assert.equal(send({kind:'command',data:'original draft'}),false);
+assert.equal(send({kind:'command',data:'original draft'}),true);
 assert.equal(send({kind:'command',data:'original draft'}),false);
 assert.equal(send({kind:'input',data:'한',user_input:true}),true);
 assert.equal(send({kind:'input',data:'protocol reply',user_input:false}),false);
@@ -1733,7 +1782,8 @@ assert.equal(frames.length,3,'repeated ACK cannot resend queued commands');
 claimInputControl();commandInput.value='confirmed draft';
 send({kind:'command',data:'confirmed draft'});
 acceptInputControl(state(3,'current','current',{claim_id:controlClaimId}));
-assert.equal(commandInput.value,'');assert.equal(clears,1);assert.equal(blurs,1);
+assert.equal(commandInput.value,'confirmed draft','control ACK alone cannot confirm delivery');
+assert.equal(clears,0);assert.equal(blurs,0);
 claimInputControl();commandInput.value='unsent reconnect draft';
 send({kind:'command',data:commandInput.value});
 const oldClaim=controlClaimId;

@@ -81,6 +81,8 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER_ARGV,
     TerminalOutputDecoder,
+    acknowledge_terminal_command,
+    complete_terminal_command,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
     file_run_dead_pane_fallback,
@@ -4390,6 +4392,9 @@ class SSHBackend:
                     if kind in {"input", "command"} and not self.control.can_input(
                         terminal_id, client_id
                     ):
+                        await acknowledge_terminal_command(
+                            websocket, payload, terminal_id, client_id, accepted=False
+                        )
                         await websocket.send_bytes(
                             json.dumps(self.control.control_state(terminal_id, client_id)).encode()
                         )
@@ -4410,16 +4415,21 @@ class SSHBackend:
                         await resize_browser_view(payload)
                     elif kind == "command":
                         self.control.mark_input(terminal_id, client_id, device_id)
-                        await resize_browser_view(payload)
-                        command = str(payload.get("data", ""))
-                        await asyncio.to_thread(
-                            self.store.add_command,
-                            str(workspace["id"]),
-                            str(terminal["id"]),
-                            command,
+
+                        async def deliver_command(command_payload: dict[str, Any]) -> None:
+                            await resize_browser_view(command_payload)
+                            command = str(command_payload.get("data", ""))
+                            paste = str(command_payload.get("paste_data", command))
+                            await write_terminal_input(master_fd, paste.encode() + b"\r")
+                            await asyncio.to_thread(
+                                self.store.add_command,
+                                str(workspace["id"]), str(terminal["id"]), command,
+                            )
+
+                        await complete_terminal_command(deliver_command(payload))
+                        await acknowledge_terminal_command(
+                            websocket, payload, terminal_id, client_id, accepted=True
                         )
-                        paste = str(payload.get("paste_data", command))
-                        await write_terminal_input(master_fd, paste.encode() + b"\r")
                     elif kind == "input":
                         if terminal_input_claims_grid(payload):
                             self.control.mark_input(terminal_id, client_id, device_id)
@@ -4445,12 +4455,17 @@ class SSHBackend:
                 with contextlib.suppress(WebSocketDisconnect, asyncio.CancelledError):
                     await task
         finally:
-            self._forget_ssh_browser_grid_owner(
-                terminal_id, client_id, workspace=workspace, window=str(terminal["tmux_window"])
-            )
             for task in (output_task, input_task, mode_query):
                 if task is not None and not task.done():
                     task.cancel()
+            if output_task is not None or input_task is not None or mode_query is not None:
+                await asyncio.gather(
+                    *(task for task in (output_task, input_task, mode_query) if task is not None),
+                    return_exceptions=True,
+                )
+            self._forget_ssh_browser_grid_owner(
+                terminal_id, client_id, workspace=workspace, window=str(terminal["tmux_window"])
+            )
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process_pid, signal.SIGTERM)
             exited = await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
@@ -4458,11 +4473,6 @@ class SSHBackend:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process_pid, signal.SIGKILL)
                 await asyncio.to_thread(self._wait_for_pid, process_pid, 1.0)
-            if output_task is not None or input_task is not None or mode_query is not None:
-                await asyncio.gather(
-                    *(task for task in (output_task, input_task, mode_query) if task is not None),
-                    return_exceptions=True,
-                )
             self.control.unregister(terminal_id, client_id)
             if self.control.client_count(terminal_id) == 0:
                 self._terminal_resize_locks.pop(terminal_id, None)

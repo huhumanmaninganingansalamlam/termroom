@@ -2273,6 +2273,8 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
 ) -> None:
     events: list[tuple[Any, ...]] = []
     attach_payload: dict[str, Any] = {}
+    input_done = asyncio.Event()
+    command_acks: list[dict[str, Any]] = []
 
     class FakeStore:
         def touch_terminal(self, _terminal_id: str) -> None:
@@ -2295,6 +2297,9 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
         async def receive_event(self) -> bytes | dict[str, Any] | None:
             if not hasattr(self, "events"):
                 await asyncio.Event().wait()
+            if self.events[0] is None:
+                # Keep the target alive until browser input is actually consumed.
+                await input_done.wait()
             return self.events.pop(0)
 
         async def control(self, action: str, **values: Any) -> None:
@@ -2388,6 +2393,7 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
             "text": json.dumps(
                 {
                     "kind": "command",
+                    "command_id": "owned-node-command",
                     "data": "pwd",
                     "rows": 38,
                     "cols": 112,
@@ -2405,6 +2411,8 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
     class FakeWebSocket:
         async def receive(self) -> dict[str, Any]:
             message = messages.pop(0)
+            if message["type"] == "websocket.disconnect":
+                input_done.set()
             if competing_input and '"kind": "command"' in str(message.get("text", "")):
                 control.mark_input("terminal", existing_owner)
             return message
@@ -2413,6 +2421,9 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
             frame = json.loads(value)
             if frame["kind"] == "pane_mode":
                 browser_frames.append(("control", frame))
+            elif frame["kind"] == "command_ack":
+                assert events[-1] == ("command", "pwd"), "ACK must follow forwarding/history"
+                command_acks.append(frame)
 
         async def send_text(self, value: str) -> None:
             browser_frames.append(("text", value))
@@ -2475,8 +2486,8 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
             "resize",
             {"rows": 38, "cols": 112, "affects_grid": True},
         ),
-        ("command", "pwd"),
         ("send", (paste_data or "pwd").encode() + b"\r"),
+        ("command", "pwd"),
         ("send", b"legacy"),
     ]
     assert browser_frames == [
@@ -2503,6 +2514,11 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
         ),
         ("text", "remote output"),
     ]
+    assert command_acks == [{
+        "kind": "command_ack", "terminal_id": "terminal",
+        "generation": browser_frames[0][1]["generation"],
+        "command_id": "owned-node-command", "accepted": True,
+    }]
 
 
 @pytest.mark.asyncio

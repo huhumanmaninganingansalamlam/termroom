@@ -656,6 +656,8 @@
   "terminal.command_edit_close": "Close command editor",
   "terminal.command_placeholder": "Paste or type a command",
   "terminal.command_hint": "Enter adds a line · Ctrl/⌘+Enter runs",
+  "terminal.command_sending": "Waiting for server confirmation…",
+  "terminal.command_unconfirmed": "Delivery unconfirmed · check the terminal before running again",
   "terminal.run": "Run",
   "terminal.recent_commands": "Recent",
   "terminal.clear_recent": "Clear history",

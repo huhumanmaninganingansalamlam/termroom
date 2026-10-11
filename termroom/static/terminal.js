@@ -339,15 +339,9 @@
       const queued = pendingControlInput.splice(0);
       pendingControlBytes = 0;
       if (controlsInput && socket?.readyState === WebSocket.OPEN) {
-        queued.forEach(({ frame, command }) => {
-          socket.send(frame);
-          if (typeof command === "string" && commandInput?.value === command) {
-            commandInput.value = "";
-            updateCommandComposer();
-            commandInput.blur();
-            setComposerOpen(false, { focus: false });
-          }
-        });
+        queued.forEach(({ frame }) => socket.send(frame));
+      } else if (queued.some(({ command }) => typeof command === "string")) {
+        resetCommandDelivery();
       }
     }
     updateInputControl();
@@ -359,6 +353,7 @@
     controlClaimPending = false;
     pendingControlInput.length = 0;
     pendingControlBytes = 0;
+    resetCommandDelivery();
     updateInputControl();
   };
   const claimInputControl = () => {
@@ -382,8 +377,8 @@
       if (typeof command === "string" && pendingControlInput.some((entry) => entry.command === command)) return false;
       pendingControlInput.push({ frame, command });
       pendingControlBytes += bytes;
-      // The command editor clears a draft only after actual enqueue, never while waiting for control.
-      return typeof command !== "string";
+      // Enqueue is not delivery: only a matching server command ACK clears the draft.
+      return true;
     }
     if (!controlsInput) return false;
     socket.send(frame);
@@ -716,6 +711,7 @@
           const previousPaneMode = paneMode;
           const control = JSON.parse(new TextDecoder().decode(event.data));
           if (control.kind === "terminal_control" || control.kind === "pane_mode") acceptInputControl(control);
+          if (control.kind === "command_ack") acceptCommandDelivery(control);
           acceptPaneMode(control);
           // A current successful pane query supersedes the page-load SSH failure.
           // Transport open, arbitrary output, and unrelated errors are not recovery.
@@ -777,12 +773,15 @@
   let pastedCommand = null;
   let pastedCommandSent = false;
   let commandPending = false;
+  let pendingCommand = null;
+  let commandSequence = 0;
   term.onData((data) => {
     const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;
     nextTerminalDataIsUserInput = false;
     if (pastedCommand !== null) {
       pastedCommandSent = send({
         kind: "command",
+        command_id: pendingCommand?.id,
         data: pastedCommand,
         paste_data: data,
         rows: term.rows,
@@ -951,6 +950,60 @@
   const commandForm = document.querySelector("#command-form");
   const commandInput = document.querySelector("#command-input");
   const commandMeta = document.querySelector("#command-meta");
+  let commandUnconfirmed = false;
+  const commandDraftKey = () => `termroom:command-draft:${host.dataset.workspaceId}:${host.dataset.terminalId}`;
+  const persistCommandDraft = () => {
+    if (!commandInput) return;
+    try {
+      if (commandInput.value) {
+        sessionStorage.setItem(commandDraftKey(), JSON.stringify({
+          value: commandInput.value, unconfirmed: commandUnconfirmed,
+        }));
+      } else {
+        sessionStorage.removeItem(commandDraftKey());
+      }
+    } catch {
+      // Storage can be unavailable; the live draft still waits for server ACK.
+    }
+  };
+  const restoreCommandDraft = () => {
+    if (!commandInput) return;
+    commandInput.value = "";
+    commandUnconfirmed = false;
+    try {
+      const draft = JSON.parse(sessionStorage.getItem(commandDraftKey()));
+      if (typeof draft?.value === "string") {
+        commandInput.value = draft.value;
+        commandUnconfirmed = draft.unconfirmed === true;
+      }
+    } catch {
+      // A malformed or unavailable draft never becomes terminal input.
+    }
+    updateCommandComposer();
+  };
+  const resetCommandDelivery = () => {
+    commandPending = false;
+    pendingCommand = null;
+    updateCommandComposer();
+  };
+  const acceptCommandDelivery = (value) => {
+    if (
+      !pendingCommand || value.terminal_id !== host.dataset.terminalId ||
+      value.generation !== controlGeneration || value.command_id !== pendingCommand.id ||
+      typeof value.accepted !== "boolean"
+    ) return;
+    const command = pendingCommand.command;
+    resetCommandDelivery();
+    commandUnconfirmed = false;
+    if (value.accepted && commandInput.value === command) {
+      commandInput.value = "";
+      commandInput.blur();
+      setComposerOpen(false, { focus: false });
+    }
+    persistCommandDraft();
+    updateCommandComposer();
+  };
+  window.addEventListener("pagehide", persistCommandDraft);
   let composerComposing = false;
   commandInput?.addEventListener("compositionstart", () => {
     composerComposing = true;
@@ -967,7 +1020,9 @@
     const lines = commandInput.value ? commandInput.value.split("\n").length : 0;
     if (commandMeta) {
       commandMeta.textContent =
-        lines > 1
+        commandPending ? tr("terminal.command_sending")
+        : commandUnconfirmed ? tr("terminal.command_unconfirmed")
+        : lines > 1
           ? tr("terminal.command_multiline", { lines })
           : tr("terminal.command_hint");
     }
@@ -980,14 +1035,22 @@
     const epoch = connectionEpoch;
     const commandSocket = socket;
     commandPending = true;
+    pendingCommand = { id: String(++commandSequence), command };
+    const submission = pendingCommand;
+    commandUnconfirmed = true;
+    persistCommandDraft();
+    updateCommandComposer();
     // Parse already-received mode changes before negotiating native paste.
     // A switch/reconnect must not redirect this explicitly submitted command.
     term.write("", () => {
-      commandPending = false;
+      if (pendingCommand !== submission) return;
       if (
         epoch !== connectionEpoch || commandSocket !== socket ||
         socket?.readyState !== WebSocket.OPEN
-      ) return;
+      ) {
+        resetCommandDelivery();
+        return;
+      }
       pastedCommand = command;
       pastedCommandSent = false;
       try {
@@ -995,26 +1058,28 @@
       } finally {
         pastedCommand = null;
       }
-      if (!pastedCommandSent || commandInput.value !== command) return;
-      commandInput.value = "";
-      updateCommandComposer();
-      commandInput.blur();
-      setComposerOpen(false, { focus: false });
+      if (!pastedCommandSent) resetCommandDelivery();
     });
   });
-  commandInput?.addEventListener("input", updateCommandComposer);
+  commandInput?.addEventListener("input", () => {
+    commandUnconfirmed = pendingCommand?.command === commandInput.value;
+    persistCommandDraft();
+    updateCommandComposer();
+  });
   commandInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       commandForm?.requestSubmit();
     }
   });
-  updateCommandComposer();
+  restoreCommandDraft();
 
   document.querySelectorAll("[data-command-reuse]").forEach((button) => {
     button.addEventListener("click", () => {
       setComposerOpen(true, { focus: false });
       commandInput.value = button.dataset.commandReuse || "";
+      commandUnconfirmed = false;
+      persistCommandDraft();
       updateCommandComposer();
       commandInput.focus();
       commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
@@ -1056,6 +1121,7 @@
     if (targetId === (pendingTerminalId || host.dataset.terminalId)) return true;
     const previousTerminalId = host.dataset.terminalId || "";
 
+    persistCommandDraft();
     connectionEpoch += 1;
     resetInputControl();
     const epoch = connectionEpoch;
@@ -1087,6 +1153,7 @@
       term.reset();
       term.clearSelection?.();
       host.dataset.terminalId = targetId;
+      restoreCommandDraft();
       host.dataset.terminalRole = targetRole;
       shellTerminal = true;
       terminalTabs.forEach((candidate) => {

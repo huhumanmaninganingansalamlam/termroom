@@ -74,6 +74,131 @@ class _BridgeWebSocket:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend_kind", ["local", "ssh"])
+@pytest.mark.parametrize("depart", [True, False])
+async def test_command_admitted_before_navigation_finishes_before_detach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str, depart: bool
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    root = store.ensure_root(tmp_path)
+    workspace = store.create_workspace(str(root["id"]), ".", "fixture", "session")
+    terminal = store.create_terminal(str(workspace["id"]), "fixture", "@7")
+    master_fd, slave_fd = pty.openpty()
+    tty.setraw(slave_fd)
+    os.set_blocking(slave_fd, False)
+    loop = asyncio.get_running_loop()
+    entered, output_done = asyncio.Event(), asyncio.Event()
+    acknowledged = asyncio.Event()
+    acknowledgements: list[dict[str, object]] = []
+    generations: list[str] = []
+    release = threading.Event()
+    detached: list[bool] = []
+    command = "owned navigation 한글"
+    paste = "\x1b[200~" + command + "\x1b[201~"
+    received = bytearray()
+
+    def drain() -> None:
+        while True:
+            try:
+                chunk = os.read(slave_fd, 65536)
+            except (BlockingIOError, OSError):
+                return
+            if not chunk:
+                loop.remove_reader(slave_fd)
+                return
+            received.extend(chunk)
+
+    loop.add_reader(slave_fd, drain)
+
+    def delayed_resize(*_args: object, **_kwargs: object) -> bool:
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(3), "command resize barrier was not released"
+        return True
+
+    def detach(*_args: object, **_kwargs: object) -> None:
+        detached.append(release.is_set())
+
+    class Browser(_BridgeWebSocket):
+        async def receive(self) -> dict[str, object]:
+            if self.messages:
+                return self.messages.pop(0)
+            await acknowledged.wait()
+            return _terminal_disconnect()
+
+        async def send_bytes(self, data: bytes) -> None:
+            frame = json.loads(data)
+            if frame["kind"] == "terminal_control":
+                generations.append(frame["generation"])
+            elif frame["kind"] == "command_ack":
+                assert store.list_commands(str(workspace["id"])) == [command]
+                assert bytes(received) == paste.encode() + b"\r", "ACK preceded PTY delivery"
+                acknowledgements.append(frame)
+                acknowledged.set()
+
+        async def send_text(self, _value: str) -> None:
+            raise WebSocketDisconnect(1000)  # output after the page has departed
+
+    browser = Browser({"type": "websocket.receive", "text": json.dumps({
+        "kind": "command", "command_id": "owned-command", "data": command, "paste_data": paste,
+        "rows": 24, "cols": 80,
+    })})
+    monkeypatch.setattr(os, "killpg", lambda *_args: None)
+    if backend_kind == "local":
+        backend = TerminalManager(store)
+        monkeypatch.setattr(backend, "_setup_browser_terminal", lambda *_args: (999999, master_fd))
+        monkeypatch.setattr(backend, "_sync_browser_grid_role", delayed_resize)
+        monkeypatch.setattr(backend, "_wait_browser_view_size", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(backend, "_release_browser_terminal", detach)
+        monkeypatch.setattr(backend, "_finish_browser_terminal", lambda *_args: None)
+    else:
+        backend = SSHBackend(store, tmp_path)
+        monkeypatch.setattr(backend, "ensure_workspace", lambda *_args: [])
+        monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, master_fd))
+        monkeypatch.setattr(backend, "_sync_ssh_browser_grid_role", delayed_resize)
+        monkeypatch.setattr(backend, "_wait_ssh_browser_view_size", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(backend, "_wait_for_pid", lambda *_args: True)
+        monkeypatch.setattr(backend, "_forget_ssh_browser_grid_owner", detach)
+    monkeypatch.setattr(backend, "current_pane_mode", lambda *_args: {"pane": "%1"})
+    bridge = asyncio.create_task(backend.bridge(browser, workspace, terminal))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if depart:
+            output = next(
+                task for task in asyncio.all_tasks()
+                if task.get_coro().__qualname__.endswith("bridge.<locals>.output_to_browser")
+            )
+            output.add_done_callback(lambda _task: output_done.set())
+            os.write(slave_fd, b"departed")
+            await asyncio.wait_for(output_done.wait(), 2)
+            await asyncio.sleep(0)  # let bridge observe the completed output task
+        release.set()
+        await asyncio.wait_for(bridge, 2)
+        drain()
+        history = store.list_commands(str(workspace["id"]))
+        print(f"{backend_kind}: received={len(received)} history={history!r}")
+        assert bytes(received) == paste.encode() + b"\r", "navigation cancelled an admitted command"
+        assert store.list_commands(str(workspace["id"])) == [command]
+        assert detached == [True], "detach must follow the complete command transaction"
+        if not depart:
+            assert len(acknowledgements) == 1
+            assert acknowledgements[0] == {
+                "kind": "command_ack", "terminal_id": terminal["id"],
+                "generation": generations[0],
+                "command_id": "owned-command", "accepted": True,
+            }
+    finally:
+        loop.remove_reader(slave_fd)
+        release.set()
+        if not bridge.done():
+            bridge.cancel()
+        await asyncio.gather(bridge, return_exceptions=True)
+        for fd in (master_fd, slave_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backend_kind", ["local", "ssh", "node"])
 async def test_long_paste_short_pty_writes_preserve_tail_and_next_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str

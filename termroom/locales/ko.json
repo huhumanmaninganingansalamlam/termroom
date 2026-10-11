@@ -656,6 +656,8 @@
   "terminal.command_edit_close": "명령 편집 닫기",
   "terminal.command_placeholder": "명령을 붙여넣거나 입력하세요",
   "terminal.command_hint": "Enter는 줄바꿈 · Ctrl/⌘+Enter 실행",
+  "terminal.command_sending": "서버 확인을 기다리는 중…",
+  "terminal.command_unconfirmed": "전송 확인 안 됨 · 다시 실행하기 전에 터미널을 확인하세요",
   "terminal.run": "실행",
   "terminal.recent_commands": "최근",
   "terminal.clear_recent": "기록 지우기",
