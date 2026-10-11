@@ -642,7 +642,9 @@ const assert = require('node:assert/strict');
 const {Terminal} = require('./termroom/static/vendor/xterm.js');
 const term = new Terminal();
 term._core.textarea = {value:''}; // paste clears the native textarea after dispatch
-const sent = [], send = value => sent.push(value);
+const sent = [];
+let connected = true;
+const send = value => {if (!connected) return false; sent.push(value); return true;};
 let nextTerminalDataIsUserInput = false;
 const hasUserInputSignal = false;
 const commandInput = {value:'',blur(){}}, composerComposing = false;
@@ -651,7 +653,8 @@ let submit;
 const commandForm = {addEventListener(_, callback){submit = callback;}};
 INPUT_HANDLER
 SUBMIT_HANDLER
-const text = '격리된 한국어 문장\n두 번째 줄';
+const text = '한글'.repeat(3300)+'\n끝!!';
+assert.equal(Buffer.byteLength(text),19806);
 (async () => {
   for (const bracketed of [true, false]) {
     await new Promise(resolve => term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l', resolve));
@@ -668,6 +671,11 @@ const text = '격리된 한국어 문장\n두 번째 줄';
   term.input('\t');
   assert.equal(sent.at(-1).kind, 'input', 'native keys must not reuse command state');
   assert.equal(sent.at(-1).data, '\t');
+  connected = false;
+  commandInput.value = text;
+  submit({preventDefault(){}});
+  assert.equal(commandInput.value, text, 'failed send must retain the original draft');
+  assert.equal(sent.length, 3, 'disconnected submission must not enqueue or resend');
   term.dispose();
 })().catch(error => {console.error(error);process.exitCode=1;});
 """.replace("INPUT_HANDLER", input_handler).replace("SUBMIT_HANDLER", submit)

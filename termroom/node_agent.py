@@ -132,6 +132,7 @@ from termroom.terminals import (
     workspace_command_digest,
     workspace_command_history_name,
     workspace_command_record_is_ready,
+    write_terminal_input,
 )
 from termroom.workspace_usage import (
     WorkspaceUsageCollectionError,
@@ -3900,6 +3901,7 @@ class TerminalAgentStream:
         self.last_viewport: tuple[int, int] | None = None
         self.closed = False
         self.resize_lock = asyncio.Lock()
+        self.input_lock = asyncio.Lock()
         self.resize_revision = 0
         self.resize_payload: dict[str, Any] | None = None
         self.resize_result: dict[str, Any] | None = None
@@ -4104,8 +4106,9 @@ class TerminalAgentStream:
         )
 
     async def feed(self, chunk: bytes) -> None:
-        if not self.closed and chunk:
-            await asyncio.to_thread(os.write, self.master_fd, chunk)
+        async with self.input_lock:
+            if not self.closed and chunk:
+                await write_terminal_input(self.master_fd, chunk)
 
     async def control(self, kind: str, values: Mapping[str, Any]) -> None:
         if kind == "resize":
@@ -4128,8 +4131,9 @@ class TerminalAgentStream:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(self.process_pid, signal.SIGKILL)
             await asyncio.to_thread(_wait_for_pid, self.process_pid, 1.0)
-        with contextlib.suppress(OSError):
-            os.close(self.master_fd)
+        async with self.input_lock:
+            with contextlib.suppress(OSError):
+                os.close(self.master_fd)
         if self.cleanup is not None:
             try:
                 result = await asyncio.to_thread(self.cleanup)

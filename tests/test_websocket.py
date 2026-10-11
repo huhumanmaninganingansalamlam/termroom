@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import pty
 import select
 import shlex
 import shutil
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import tty
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,7 +25,10 @@ from starlette.websockets import WebSocketDisconnect
 
 from termroom.app import create_app
 from termroom.config import Settings
-from termroom.terminals import TerminalError
+from termroom.db import StateStore
+from termroom.node_agent import TerminalAgentStream
+from termroom.ssh_backend import SSHBackend
+from termroom.terminals import TerminalError, TerminalManager
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 
@@ -66,6 +71,140 @@ class _BridgeWebSocket:
 
     async def close(self, *, code: int, reason: str) -> None:
         raise AssertionError((code, reason))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_kind", ["local", "ssh", "node"])
+async def test_long_paste_short_pty_writes_preserve_tail_and_next_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    root = store.ensure_root(tmp_path)
+    workspace = store.create_workspace(str(root["id"]), ".", "fixture", "session")
+    terminal = store.create_terminal(str(workspace["id"]), "fixture", "@7")
+    master_fd, slave_fd = pty.openpty()
+    tty.setraw(slave_fd)
+    os.set_blocking(slave_fd, False)
+    text = "한글" * 3300 + "종료"
+    assert len(text.encode()) == 19806
+    paste = "\x1b[200~" + text + "\x1b[201~"
+    confirmation = "\x1b[200~confirm\x1b[201~"
+    expected = (paste + "\r" + confirmation + "\r\tlegacy").encode() + b"binary"
+    received = bytearray()
+    original_write = os.write
+
+    def short_write(fd: int, data: bytes) -> int:
+        # A real PTY accepts the prefix; its reported count is the contract.
+        return original_write(fd, data[:1024] if fd == master_fd else data)
+
+    def drain() -> None:
+        while True:
+            try:
+                chunk = os.read(slave_fd, 65536)
+            except BlockingIOError:
+                return
+            if not chunk:
+                loop.remove_reader(slave_fd)
+                return
+            received.extend(chunk)
+
+    monkeypatch.setattr(os, "write", short_write)
+    loop = asyncio.get_running_loop()
+    loop.add_reader(slave_fd, drain)
+    browser = _BridgeWebSocket(
+        *({"type": "websocket.receive", "text": json.dumps(payload)} for payload in (
+            {"kind": "command", "data": text, "paste_data": paste},
+            {"kind": "command", "data": "confirm", "paste_data": confirmation},
+            {"kind": "input", "data": "\t"},
+        )),
+        {"type": "websocket.receive", "text": "legacy"},
+        {"type": "websocket.receive", "bytes": b"binary"},
+        _terminal_disconnect(),
+    )
+    try:
+        if backend_kind == "node":
+            async def send(_message: object) -> None:
+                pass
+
+            stream = TerminalAgentStream("d" * 32, 999999, master_fd, send, {})
+            for chunk in (paste.encode() + b"\r", confirmation.encode() + b"\r",
+                          b"\t", b"legacy", b"binary"):
+                await asyncio.wait_for(stream.feed(chunk), 2)
+        else:
+            if backend_kind == "local":
+                backend = TerminalManager(store)
+                monkeypatch.setattr(backend, "_setup_browser_terminal",
+                                    lambda *_args: (999999, master_fd))
+                monkeypatch.setattr(backend, "_release_browser_terminal", lambda *_args: None)
+                monkeypatch.setattr(backend, "_finish_browser_terminal", lambda *_args: None)
+            else:
+                backend = SSHBackend(store, tmp_path)
+                monkeypatch.setattr(backend, "ensure_workspace", lambda *_args: [])
+                monkeypatch.setattr(backend, "_spawn_ssh_tmux_client",
+                                    lambda *_args: (999999, master_fd))
+                monkeypatch.setattr(backend, "_wait_for_pid", lambda *_args: True)
+                monkeypatch.setattr(os, "killpg", lambda *_args: None)
+            monkeypatch.setattr(backend, "current_pane_mode", lambda *_args: {"pane": "%1"})
+            await asyncio.wait_for(backend.bridge(browser, workspace, terminal), 3)
+            assert sorted(store.list_commands(str(workspace["id"]))) == sorted([text, "confirm"])
+        drain()
+        print(f"{backend_kind}: expected={len(expected)} received={len(received)}")
+        assert bytes(received) == expected, "PTY lost paste tail/terminator or joined next input"
+    finally:
+        loop.remove_reader(slave_fd)
+        for fd in (master_fd, slave_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+@pytest.mark.asyncio
+async def test_node_cancelled_input_retains_fd_until_write_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original_write = os.write
+    data = b"\x1b[200~owned-input\x1b[201~\r"
+
+    def blocked_write(fd: int, value: bytes) -> int:
+        if fd == write_fd:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(3), "owned input writer was not released"
+        return original_write(fd, value)
+
+    async def send(_message: object) -> None:
+        pass
+
+    monkeypatch.setattr(os, "write", blocked_write)
+    monkeypatch.setattr(os, "killpg", lambda *_args: None)
+    monkeypatch.setattr("termroom.node_agent._wait_for_pid", lambda *_args: True)
+    stream = TerminalAgentStream("d" * 32, 999999, write_fd, send, {})
+    feeding = asyncio.create_task(stream.feed(data))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        feeding.cancel()
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(stream.close())
+        await asyncio.sleep(0)
+        assert not feeding.done(), "cancellation must not release a live writer"
+        assert not closing.done()
+        os.fstat(write_fd)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(feeding, 1)
+        await asyncio.wait_for(closing, 1)
+        assert os.read(read_fd, 65536) == data
+        with pytest.raises(OSError):
+            os.fstat(write_fd)
+    finally:
+        release.set()
+        await asyncio.gather(feeding, *([closing] if closing else []), return_exceptions=True)
+        for fd in (read_fd, write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _receive_terminal_text(websocket) -> str:  # type: ignore[no-untyped-def]

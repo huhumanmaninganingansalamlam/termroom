@@ -100,6 +100,7 @@ from termroom.terminals import (
     wait_tmux_browser_grid_size,
     workspace_command_digest,
     workspace_command_history_name,
+    write_terminal_input,
 )
 from termroom.workspace_usage import (
     WORKSPACE_USAGE_PANES_MARKER,
@@ -4342,7 +4343,7 @@ class SSHBackend:
                         {"rows": last_viewport[0], "cols": last_viewport[1]}
                     ):
                         continue
-                    os.write(master_fd, payload_bytes)
+                    await write_terminal_input(master_fd, payload_bytes)
                     continue
                 raw = message.get("text") or ""
                 if len(raw.encode("utf-8")) > MAX_TERMINAL_MESSAGE_BYTES:
@@ -4351,7 +4352,7 @@ class SSHBackend:
                 try:
                     payload = json.loads(raw)
                 except json.JSONDecodeError:
-                    os.write(master_fd, raw.encode())
+                    await write_terminal_input(master_fd, raw.encode())
                     continue
                 if not isinstance(payload, dict):
                     continue
@@ -4381,13 +4382,13 @@ class SSHBackend:
                         command,
                     )
                     paste = str(payload.get("paste_data", command))
-                    os.write(master_fd, paste.encode() + b"\r")
+                    await write_terminal_input(master_fd, paste.encode() + b"\r")
                 elif kind == "input":
                     if terminal_input_claims_grid(payload):
                         self.control.mark_input(terminal_id, client_id, device_id)
                     if not await resize_browser_view(payload):
                         continue
-                    os.write(master_fd, str(payload.get("data", "")).encode())
+                    await write_terminal_input(master_fd, str(payload.get("data", "")).encode())
 
         output_task: asyncio.Task[None] | None = None
         input_task: asyncio.Task[None] | None = None

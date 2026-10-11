@@ -12,6 +12,16 @@ import termios
 from collections.abc import Mapping, Sequence
 
 
+def write_all(fd: int, data: bytes) -> None:
+    """Finish a PTY input frame before its caller accepts the next one."""
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("PTY input write made no progress")
+        remaining = remaining[written:]
+
+
 def spawn_pty_process(
     argv: Sequence[str],
     *,

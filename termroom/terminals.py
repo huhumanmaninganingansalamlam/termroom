@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import WebSocket, WebSocketDisconnect
 
 from termroom.db import MAX_WORKSPACE_COMMANDS, StateStore, normalize_workspace_commands
-from termroom.pty_process import spawn_pty_process
+from termroom.pty_process import spawn_pty_process, write_all
 from termroom.terminal_control import TerminalControl
 from termroom.workspace_usage import (
     RawWorkspaceUsage,
@@ -759,6 +759,14 @@ async def _await_owned_task(task: asyncio.Task[Any]) -> tuple[Any, bool]:
         except asyncio.CancelledError:
             cancelled = True
     return task.result(), cancelled
+
+
+async def write_terminal_input(fd: int, data: bytes) -> None:
+    # Keep the FD owned until even a cancelled write has stopped using it.
+    task = asyncio.create_task(asyncio.to_thread(write_all, fd, data))
+    _, cancelled = await _await_owned_task(task)
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def normalize_terminal_name(value: str) -> str:
@@ -2013,10 +2021,7 @@ class TerminalManager:
         async def write_to_pty(data: bytes) -> None:
             if master_fd is None:
                 return
-            write_task = asyncio.create_task(asyncio.to_thread(os.write, master_fd, data))
-            _, cancelled = await _await_owned_task(write_task)
-            if cancelled:
-                raise asyncio.CancelledError
+            await write_terminal_input(master_fd, data)
 
         output_task: asyncio.Task[None] | None = None
         input_task: asyncio.Task[None] | None = None
