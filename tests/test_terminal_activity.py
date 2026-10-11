@@ -585,7 +585,7 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
             self.controls: list[dict[str, object]] = []
 
         async def send_text(self, value: str) -> None:
-            assert self.controls, "Pane state must precede application output"
+            assert any(frame["kind"] == "pane_mode" for frame in self.controls)
             self.text.append(value)
 
         async def send_bytes(self, value: bytes) -> None:
@@ -624,11 +624,22 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
     assert browser.controls
     generation = browser.controls[0]["generation"]
     assert isinstance(generation, str) and generation
-    for revision, control in enumerate(browser.controls, start=1):
+    assert browser.controls[0] == {
+        "kind": "terminal_control",
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "controller_client_id": generation,
+        "control_revision": 1,
+    }
+    pane_controls = [frame for frame in browser.controls if frame["kind"] == "pane_mode"]
+    assert pane_controls
+    for revision, control in enumerate(pane_controls, start=1):
         assert control == {
             "kind": "pane_mode",
             "terminal_id": terminal_id,
             "generation": generation,
+            "controller_client_id": generation,
+            "control_revision": 1,
             "revision": revision,
             "session": workspace["tmux_session"],
             "window": "@1",

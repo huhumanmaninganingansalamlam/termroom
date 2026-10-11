@@ -215,7 +215,7 @@ def _receive_terminal_text(websocket) -> str:  # type: ignore[no-untyped-def]
             raise WebSocketDisconnect(message.get("code", 1000))
         if message.get("text") is not None:
             return message["text"]
-        assert json.loads(message["bytes"])["kind"] == "pane_mode"
+        assert json.loads(message["bytes"])["kind"] in {"pane_mode", "terminal_control"}
 
 
 async def _assert_bridge_barrier_keeps_loop_live(
@@ -472,7 +472,9 @@ async def test_two_idle_local_pty_readers_leave_shared_executor_available(
                 while marker not in "".join(socket.text):
                     await asyncio.wait_for(socket.delivered.wait(), 2)
                     socket.delivered.clear()
-                assert "".join(socket.text).count(marker) == 1
+                # tmux may redraw an existing screen after a new client attaches.
+                assert marker in "".join(socket.text)
+            assert manager.capture_scrollback(workspace, terminal).count(marker) == 1
             assert all(q.empty() for q in queues)
 
         await emit(first, sockets)
@@ -589,7 +591,9 @@ async def test_pane_controls_are_ordered_binary_and_do_not_count_as_output(
             return _terminal_disconnect()
 
         async def send_bytes(self, value: bytes) -> None:
-            trace.append(("control", json.loads(value)))
+            frame = json.loads(value)
+            if frame["kind"] == "pane_mode":
+                trace.append(("control", frame))
 
         async def send_text(self, value: str) -> None:
             nonlocal alternate
@@ -944,6 +948,19 @@ async def test_terminal_blocked_pty_write_does_not_stall_shared_loop_or_duplicat
     target_fd: int | None = None
     writes: list[bytes] = []
     marker = "TERMROOM_BLOCKED_WRITE_ONCE"
+    ready = tmp_path / "command-reader-ready"
+    reader = (
+        f"printf ready > {shlex.quote(str(ready))}; "
+        'IFS= read -r value; eval "$value"; sleep 30'
+    )
+    manager._run_tmux(
+        "respawn-pane", "-k", "-t", str(terminal["tmux_window"]),
+        shlex.join(["/bin/bash", "--noprofile", "--norc", "-c", reader]),
+    )
+    deadline = time.monotonic() + 3
+    while not ready.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert ready.exists()
     command = "echo TERMROOM_BLOCKED_''WRITE_ONCE\r"
 
     def record_write(fd: int, data: bytes) -> int:
@@ -1128,7 +1145,7 @@ def test_terminal_presence_deduplicates_tabs_in_same_session(tmp_path: Path) -> 
         _cleanup(app, workspace)
 
 
-def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
+def test_terminal_viewers_cannot_write_or_take_control_until_activation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, workspace, terminal = _app(tmp_path)
@@ -1174,15 +1191,33 @@ def test_terminal_binary_input_takes_over_but_raw_text_stays_passive(
                     assert control.can_resize(terminal_id, first_id)
                     revision = control.presence(terminal_id)["input_revision"]
 
-                    second.send_text(f"printf '%s\\n' '{marker}'\r")
-                    deadline = time.monotonic() + 2
-                    while marker not in app.state.terminals.capture_scrollback(workspace, terminal):
-                        assert time.monotonic() < deadline
-                        time.sleep(0.01)
+                    rejected_command = f"printf '%s\\n' '{marker}'\r"
+                    second.send_text(rejected_command)
+                    second.send_bytes(rejected_command.encode())
+                    second.send_json(
+                        {"kind": "input", "data": rejected_command, "user_input": True}
+                    )
+                    second.send_json({"kind": "command", "data": rejected_command})
+                    denied = 0
+                    while denied < 4:
+                        message = second.receive()
+                        if message.get("bytes") is not None:
+                            frame = json.loads(message["bytes"])
+                            denied += frame["kind"] == "terminal_control"
+                    assert marker not in app.state.terminals.capture_scrollback(workspace, terminal)
+                    assert control.can_input(terminal_id, first_id)
+                    assert not control.can_input(terminal_id, second_id)
                     assert control.can_resize(terminal_id, first_id)
                     assert not control.can_resize(terminal_id, second_id)
                     assert control.presence(terminal_id)["input_revision"] == revision
 
+                    second.send_json({"kind": "control_claim", "claim_id": 1})
+                    deadline = time.monotonic() + 2
+                    while not control.can_input(terminal_id, second_id):
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+                    assert not control.can_input(terminal_id, first_id)
+                    assert control.presence(terminal_id)["input_revision"] == revision
                     second.send_bytes(b"")
                     deadline = time.monotonic() + 2
                     while not control.can_resize(terminal_id, second_id):
@@ -1278,6 +1313,7 @@ def test_terminal_passive_view_resizes_pty_without_controlling_shared_grid(
                     while (30, 90) not in applied_sizes and time.monotonic() < deadline:
                         time.sleep(0.01)
                     assert (30, 90) in applied_sizes
+                    second.send_json({"kind": "control_claim"})
                     second.send_json(
                         {
                             "kind": "input",
@@ -1309,14 +1345,11 @@ def test_terminal_one_shot_bootstrap_passive_resize_input_and_reconnect(tmp_path
         f"printf ready > {shlex.quote(str(ready))}; "
         f"IFS= read -r -n 1 value; printf '%s' \"$value\" > {shlex.quote(str(effect))}"
     )
+    command += "; sleep 30"
     manager._run_tmux(
-        "send-keys",
-        "-t",
-        str(terminal["tmux_window"]),
-        "-l",
-        f"/bin/bash --noprofile --norc -c {shlex.quote(command)}",
+        "respawn-pane", "-k", "-t", str(terminal["tmux_window"]),
+        shlex.join(["/bin/bash", "--noprofile", "--norc", "-c", command]),
     )
-    manager._run_tmux("send-keys", "-t", str(terminal["tmux_window"]), "Enter")
 
     def wait_for(predicate) -> None:  # type: ignore[no-untyped-def]
         deadline = time.monotonic() + 3
@@ -1447,7 +1480,7 @@ def test_terminal_bootstrap_role_failure_retry_or_fail_closed(
 
 
 @pytest.mark.parametrize("binary", [False, True])
-def test_terminal_input_waits_for_grid_promotion_retry(
+def test_terminal_input_survives_grid_promotion_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binary: bool
 ) -> None:
     app, workspace, terminal = _app(tmp_path)
@@ -1457,9 +1490,9 @@ def test_terminal_input_waits_for_grid_promotion_retry(
     ready = tmp_path / "ready"
     command = "bash -c " + shlex.quote(
         f"printf ready > {shlex.quote(str(ready))}; "
-        f'read -r -n1 value; printf %s "$value" > {shlex.quote(str(effect))}'
+        f'read -r -n1 value; printf %s "$value" > {shlex.quote(str(effect))}; sleep 30'
     )
-    manager._run_tmux("send-keys", "-t", terminal["tmux_window"], command, "Enter")
+    manager._run_tmux("respawn-pane", "-k", "-t", terminal["tmux_window"], command)
     original_role = manager._set_browser_view_grid_resize
     original_write = os.write
     failed = False
@@ -1483,8 +1516,8 @@ def test_terminal_input_waits_for_grid_promotion_retry(
 
     def write(fd: int, data: bytes) -> int:
         if data == b"z":
-            assert grid() == "124x17"
-            writes.append(data)
+            assert grid() == "124x22"
+            writes.append(bytes(data))
         return original_write(fd, data)
 
     monkeypatch.setattr(manager, "_set_browser_view_grid_resize", role)
@@ -1517,18 +1550,15 @@ def test_terminal_input_waits_for_grid_promotion_retry(
                 while not failed and time.monotonic() < deadline:
                     time.sleep(0.01)
                 time.sleep(0.1)
-                assert failed and not effect.exists() and not writes
+                assert failed and writes == [b"z"]
                 assert grid() == "124x22"
                 assert manager.control.presence(terminal_id)["input_revision"] == 1
-                if binary:
-                    ws.send_bytes(b"z")
-                else:
-                    ws.send_json(payload)
+                ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
                 deadline = time.monotonic() + 3
                 while not effect.exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 assert effect.read_text() == "z" and writes == [b"z"]
-                assert manager.control.presence(terminal_id)["input_revision"] == 2
+                assert manager.control.presence(terminal_id)["input_revision"] == 1
                 ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
                 time.sleep(0.1)
                 assert grid() == "124x17" and writes == [b"z"]

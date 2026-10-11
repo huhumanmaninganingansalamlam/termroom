@@ -365,7 +365,7 @@ assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
     assert "const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;" in terminal_script
     assert "user_input: userInput" in terminal_script
     assert "term.onBinary((data) =>" in terminal_script
-    assert "socket.send(Uint8Array.from(data" in terminal_script
+    assert "sendInputFrame(Uint8Array.from(data" in terminal_script
     assert 'kind: "command"' in terminal_script
     assert "rows: term.rows" in terminal_script
     assert "cols: term.cols" in terminal_script
@@ -406,6 +406,7 @@ assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
         r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
         r'if \(document\.visibilityState !== "visible"\) \{\s*'
         r"cancelPresenceRequest\(\);\s*return;\s*\}\s*"
+        r"if \(document\.hasFocus\(\)\) claimInputControl\(\);\s*"
         r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{",
         terminal_script,
     )
@@ -516,8 +517,9 @@ assert.equal(paneMode, null);
 
 def test_hidden_terminal_resize_preserves_alternate_screen() -> None:
     source = (VENDOR_DIR.parent / "terminal.js").read_text()
-    resize = source[source.index("  const resizeTerminal ="):
-                    source.index("  const scheduleResize =")]
+    resize = source[
+        source.index("  const resizeTerminal =") : source.index("  const scheduleResize =")
+    ]
     probe = r"""
 const assert = require('node:assert/strict');
 const {Terminal} = require('./termroom/static/vendor/xterm.js');
@@ -556,18 +558,25 @@ RESIZE_HANDLER
 })().catch(error => {console.error(error);process.exitCode=1;});
 """.replace("RESIZE_HANDLER", resize)
     result = subprocess.run(
-        ["node", "-e", probe], cwd=VENDOR_DIR.parents[2],
-        capture_output=True, text=True, timeout=10,
+        ["node", "-e", probe],
+        cwd=VENDOR_DIR.parents[2],
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     assert result.returncode == 0, result.stderr
 
 
 def test_recovered_socket_retires_only_its_page_connection_error() -> None:
     source = (VENDOR_DIR.parent / "terminal.js").read_text()
-    mode = source[source.index("  const acceptPaneMode ="):
-                  source.index("  term.options.screenReaderMode")]
-    connect = source[source.index("  const connect = () => {"):
-                     source.index("  let nextTerminalDataIsUserInput")]
+    mode = source[
+        source.index("  const acceptPaneMode =") : source.index("  term.options.screenReaderMode")
+    ]
+    connect = source[
+        source.index("  const connect = () => {") : source.index(
+            "  let nextTerminalDataIsUserInput"
+        )
+    ]
     probe = r"""
 const assert = require('node:assert/strict');
 const host = new EventTarget();
@@ -585,6 +594,8 @@ const window = {clearTimeout(){},setTimeout(){},dispatchEvent(){}};
 const location = {protocol:'https:',host:'fixture.invalid'};
 let socket=null,connectionEpoch=0,reconnectTimer,reconnectDelay=500,reconnectAllowed=true;
 let paneMode=null,paneModeGeneration=null,paneModeRevision=0,isConnected=false,status;
+let activationPending=false,programmaticTerminalFocus=false;
+const claimInputControl=()=>{},resetInputControl=()=>{},acceptInputControl=()=>{};
 let outputRenderSequence=0,pendingActivityAt=0,acknowledgedActivityAt=0,renderedActivityAt=0;
 const term={write(_,callback){callback();},focus(){}};
 const coarsePrimaryPointer={matches:true};
@@ -633,10 +644,14 @@ assert.equal(status,'terminal.status.rejected','a genuine current rejection must
 def test_command_editor_uses_native_paste_once_and_keeps_plain_history() -> None:
     root = Path(__file__).resolve().parents[1]
     script = (VENDOR_DIR.parent / "terminal.js").read_text()
-    input_handler = script[script.index("  let pastedCommand = null;"):
-                           script.index("  term.onBinary(")]
-    submit = script[script.index('  commandForm?.addEventListener("submit",'):
-                    script.index('  commandInput?.addEventListener("input",')]
+    input_handler = script[
+        script.index("  let pastedCommand = null;") : script.index("  term.onBinary(")
+    ]
+    submit = script[
+        script.index('  commandForm?.addEventListener("submit",') : script.index(
+            '  commandInput?.addEventListener("input",'
+        )
+    ]
     probe = r"""
 const assert = require('node:assert/strict');
 const {Terminal} = require('./termroom/static/vendor/xterm.js');
@@ -644,6 +659,8 @@ const term = new Terminal();
 term._core.textarea = {value:''}; // paste clears the native textarea after dispatch
 const sent = [];
 let connected = true;
+let connectionEpoch = 0, socket = {readyState:1};
+const WebSocket = {OPEN:1};
 const send = value => {if (!connected) return false; sent.push(value); return true;};
 let nextTerminalDataIsUserInput = false;
 const hasUserInputSignal = false;
@@ -657,9 +674,11 @@ const text = '한글'.repeat(3300)+'\n끝!!';
 assert.equal(Buffer.byteLength(text),19806);
 (async () => {
   for (const bracketed of [true, false]) {
-    await new Promise(resolve => term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l', resolve));
+    term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l');
     commandInput.value = text;
     submit({preventDefault(){}});
+    submit({preventDefault(){}});
+    await new Promise(resolve => term.write('', resolve));
     const frame = sent.at(-1);
     assert.equal(frame.kind, 'command');
     assert.equal(frame.data, text, 'history must contain plain user text');
@@ -674,8 +693,25 @@ assert.equal(Buffer.byteLength(text),19806);
   connected = false;
   commandInput.value = text;
   submit({preventDefault(){}});
+  await new Promise(resolve => term.write('', resolve));
   assert.equal(commandInput.value, text, 'failed send must retain the original draft');
   assert.equal(sent.length, 3, 'disconnected submission must not enqueue or resend');
+  connected = true;
+  for (const change of [() => connectionEpoch++, () => socket = {readyState:1},
+                        () => socket.readyState = 3]) {
+    socket = {readyState:1};
+    submit({preventDefault(){}});
+    change();
+    await new Promise(resolve => term.write('', resolve));
+    assert.equal(sent.length, 3, 'pending command must never retarget or replay');
+    assert.equal(commandInput.value, text, 'stale connection must retain the draft');
+  }
+  socket = {readyState:1};
+  submit({preventDefault(){}});
+  commandInput.value = 'new unsent draft';
+  await new Promise(resolve => term.write('', resolve));
+  assert.equal(sent.at(-1).data, text, 'send only the explicitly submitted snapshot');
+  assert.equal(commandInput.value, 'new unsent draft', 'do not clear a newer edit');
   term.dispose();
 })().catch(error => {console.error(error);process.exitCode=1;});
 """.replace("INPUT_HANDLER", input_handler).replace("SUBMIT_HANDLER", submit)
@@ -685,13 +721,23 @@ assert.equal(Buffer.byteLength(text),19806);
 
 def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None:
     script = (VENDOR_DIR.parent / "terminal.js").read_text()
-    cancel = script[script.index("  const cancelPresenceRequest = () => {"):
-                    script.index("  const updatePresence = async () => {")]
-    switch = script[script.index("  const resetTerminalActivityState ="):
-                    script.index("  terminalTabs.forEach((tab) => {")]
-    message = script[script.index('    nextSocket.addEventListener("message",'):
-                     script.index('    nextSocket.addEventListener("close",')]
-    probe = r"""
+    cancel = script[
+        script.index("  const cancelPresenceRequest = () => {") : script.index(
+            "  const updatePresence = async () => {"
+        )
+    ]
+    switch = script[
+        script.index("  const resetTerminalActivityState =") : script.index(
+            "  terminalTabs.forEach((tab) => {"
+        )
+    ]
+    message = script[
+        script.index('    nextSocket.addEventListener("message",') : script.index(
+            '    nextSocket.addEventListener("close",'
+        )
+    ]
+    probe = (
+        r"""
 const assert = require('node:assert/strict');
 const events = [], connections = [], queue = [];
 const host = {dataset:{terminalId:'A',workspaceId:'w',terminalRole:'shell'}};
@@ -720,7 +766,7 @@ const connect=()=>{connections.push(host.dataset.terminalId);connectionEpoch++;
   socket={readyState:1,close(){this.readyState=3;}};};
 const scheduleActivityAcknowledge=()=>events.push({type:'ack-scheduled',
  terminalId:host.dataset.terminalId});
-const acceptPaneMode=()=>{};
+const acceptPaneMode=()=>{},acceptInputControl=()=>{},resetInputControl=()=>{};
 CANCEL_HANDLER
 function attachMessage(nextSocket,epoch) {
   let receive;
@@ -757,9 +803,10 @@ const staleReceive=attachMessage(socket,connectionEpoch);
 staleReceive({data:'OLD-CONNECTION'});socket={readyState:1};
 const count=outputRenderSequence;queue.shift()();assert.equal(outputRenderSequence,count);
 assert.equal(pendingTerminalId,'');
-""".replace("CANCEL_HANDLER", cancel).replace("MESSAGE_HANDLER", message).replace(
-    "SWITCH_HANDLER", switch
-)
+""".replace("CANCEL_HANDLER", cancel)
+        .replace("MESSAGE_HANDLER", message)
+        .replace("SWITCH_HANDLER", switch)
+    )
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
@@ -780,6 +827,8 @@ def test_terminal_presence_poll_does_not_overlap_slow_requests() -> None:
 const assert=require('node:assert/strict');
 let isConnected=true,presenceInitialized=true,lastInputRevision=4,otherInputTimer=77;
 let presenceRequest=null,connectionEpoch=1,launched=0,outstanding=0,maximum=0;
+let controlGeneration=null;
+const acceptInputControl=()=>{};
 let failNext=false;
 const urls=[],jsonBodies=[],statusUpdates=[],cleared=[],scheduled=[];
 const host={dataset:{terminalId:'same-terminal',deviceId:'fixture-device'}};
@@ -885,9 +934,7 @@ __PRESENCE_UPDATE__
   process.stdout.write('PRESENCE_ASSERTIONS_COMPLETE\n');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """.replace("__PRESENCE_CANCEL__", cancel).replace("__PRESENCE_UPDATE__", presence)
-    result = subprocess.run(
-        [node, "-e", probe], capture_output=True, text=True, timeout=3
-    )
+    result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=3)
     assert result.returncode == 0, result.stderr
     assert "PRESENCE_ASSERTIONS_COMPLETE" in result.stdout, result.stdout
 
@@ -1628,3 +1675,92 @@ def test_terminal_activity_refresh_is_visible_bounded_and_output_driven() -> Non
     assert "workspaceUsageViews.some((view) => view.open" in usage_script
     assert "usageRefreshInFlight || document.hidden" in usage_script
     assert "pollWorkspaceUsage();" in usage_script
+
+
+def test_terminal_activation_ack_preserves_drafts_and_queues_each_frame_once() -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is required")
+    script = (VENDOR_DIR.parent / "terminal.js").read_text()
+    controls = script[
+        script.index("  let controlGeneration = null;") : script.index("  const setStatusMessage =")
+    ]
+    send = script[
+        script.index("  const send = (payload) => {") : script.index("  const terminalAtBottom =")
+    ]
+    probe = r"""
+const assert=require('node:assert/strict');
+const host={dataset:{terminalId:'t'}};
+const term={options:{}};
+const windowListeners={},documentListeners={};
+let focused=true,visible='visible',clears=0,blurs=0,closed=false;
+const document={get visibilityState(){return visible},hasFocus:()=>focused,
+ addEventListener:(name,callback)=>{documentListeners[name]=callback}};
+const window={addEventListener:(name,callback)=>{windowListeners[name]=callback}};
+const WebSocket={OPEN:1};
+const frames=[];
+let socket={readyState:1,send:frame=>frames.push(frame),close:()=>{closed=true}};
+const commandInput={value:'',blur:()=>blurs++};
+const updateCommandComposer=()=>clears++,setComposerOpen=()=>{};
+CONTROLS
+SEND
+const state=(revision,owner,generation='current',extra={})=>({kind:'terminal_control',
+ terminal_id:'t',generation,control_revision:revision,controller_client_id:owner,...extra});
+acceptInputControl(state(1,'peer'));
+assert.equal(term.options.disableStdin,true);
+assert.equal(send({kind:'input',data:'stale focused key',user_input:true}),false);
+assert.equal(send({kind:'command',data:'spectator command'}),false);
+assert.equal(sendInputFrame(new Uint8Array([1,2])),false);
+assert.equal(send({kind:'input',data:'protocol reply',user_input:false}),false);
+assert.equal(frames.length,0,'an already-focused viewer cannot steal by typing');
+programmaticTerminalFocus=true;claimInputControl();programmaticTerminalFocus=false;
+assert.equal(frames.length,0,'programmatic reconnect focus cannot activate');
+windowListeners.focus();
+assert.equal(JSON.parse(frames[0]).kind,'control_claim');
+assert.equal(term.options.disableStdin,false,'first real input is enabled while ACK is pending');
+commandInput.value='original draft';
+assert.equal(send({kind:'command',data:'original draft'}),false);
+assert.equal(send({kind:'command',data:'original draft'}),false);
+assert.equal(send({kind:'input',data:'한',user_input:true}),true);
+assert.equal(send({kind:'input',data:'protocol reply',user_input:false}),false);
+assert.equal(frames.length,1,'queued frames wait for activation ACK');
+commandInput.value='newer edited draft';
+acceptInputControl(state(2,'current','current',{claim_id:controlClaimId}));
+assert.deepEqual(frames.slice(1).map(value=>JSON.parse(value).data),['original draft','한']);
+assert.equal(commandInput.value,'newer edited draft');
+assert.equal(clears,0);assert.equal(blurs,0);
+acceptInputControl(state(2,'current','current',{claim_id:controlClaimId}));
+assert.equal(frames.length,3,'repeated ACK cannot resend queued commands');
+claimInputControl();commandInput.value='confirmed draft';
+send({kind:'command',data:'confirmed draft'});
+acceptInputControl(state(3,'current','current',{claim_id:controlClaimId}));
+assert.equal(commandInput.value,'');assert.equal(clears,1);assert.equal(blurs,1);
+claimInputControl();commandInput.value='unsent reconnect draft';
+send({kind:'command',data:commandInput.value});
+const oldClaim=controlClaimId;
+resetInputControl();
+acceptInputControl(state(1,'peer','new-generation'));
+const beforeOldAck=frames.length;
+acceptInputControl(state(99,'current','current',{claim_id:oldClaim}));
+assert.equal(frames.length,beforeOldAck,'old-generation ACK cannot replay after reconnect');
+assert.equal(commandInput.value,'unsent reconnect draft');
+assert.equal(host.termroomControlsInput,false);
+assert.equal(send({kind:'input',data:'stale after reconnect',user_input:true}),false);
+assert.equal(frames.length,beforeOldAck,'background reconnect remains a viewer');
+claimInputControl();send({kind:'command',data:commandInput.value});
+acceptInputControl(state(7,'third','new-generation'));
+acceptInputControl(state(6,'new-generation','new-generation',{claim_id:controlClaimId}));
+assert.equal(commandInput.value,'unsent reconnect draft');
+assert.equal(host.termroomControlsInput,false,'a stale ACK cannot restore superseded ownership');
+assert.equal(JSON.parse(frames.at(-1)).kind,'control_claim');
+// Pointer activation runs in capture phase before a helper button emits its first key.
+const beforeHelper=frames.length;
+documentListeners.pointerdown({target:{closest:selector=>selector.includes('.terminal-composer')}});
+assert.equal(term.options.disableStdin,false);
+assert.equal(send({kind:'input',data:'\x1b',user_input:true}),true);
+assert.equal(frames.length,beforeHelper+1,'helper input queues behind its claim');
+acceptInputControl(state(8,'new-generation','new-generation',{claim_id:controlClaimId}));
+assert.equal(JSON.parse(frames.at(-1)).data,'\x1b','first helper key survives its ACK');
+assert.equal(closed,false);
+""".replace("CONTROLS", controls).replace("SEND", send)
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0, result.stderr

@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -85,10 +86,24 @@ async def test_node_terminal_mode_control_is_opt_in_and_precedes_first_pty_outpu
     os.close(write_fd)
     modes = iter(
         [
-            {"session": "s", "window": "@1", "pane": "%1", "pane_pid": 1,
-             "alternate": False, "mouse_tracking": False, "mouse_flags": [0] * 5},
-            {"session": "s", "window": "@1", "pane": "%1", "pane_pid": 1,
-             "alternate": True, "mouse_tracking": True, "mouse_flags": [1] * 5},
+            {
+                "session": "s",
+                "window": "@1",
+                "pane": "%1",
+                "pane_pid": 1,
+                "alternate": False,
+                "mouse_tracking": False,
+                "mouse_flags": [0] * 5,
+            },
+            {
+                "session": "s",
+                "window": "@1",
+                "pane": "%1",
+                "pane_pid": 1,
+                "alternate": True,
+                "mouse_tracking": True,
+                "mouse_flags": [1] * 5,
+            },
         ]
     )
     sent: list[dict[str, Any]] = []
@@ -1560,15 +1575,16 @@ def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> N
         window = str(terminal["tmux_window"])
         runtime._tmux("resize-window", "-t", window, "-x", "80", "-y", "6")
         runtime._tmux(
-            "send-keys",
+            "respawn-pane",
+            "-k",
             "-t",
             window,
-            (
+            shlex.join([
+                "/bin/bash", "--noprofile", "--norc", "-c",
                 "printf '\\033[31mNODE_HISTORY_OLD\\033[0m\\n'; "
                 "seq -f 'NODE_HISTORY_%02g' 1 24; "
-                "printf 'NODE_HISTORY_%s\\n' LIVE"
-            ),
-            "Enter",
+                "printf 'NODE_HISTORY_%s\\n' LIVE; exec /bin/bash --noprofile --norc",
+            ]),
         )
         deadline = time.monotonic() + 4
         full = ""
@@ -2252,7 +2268,8 @@ async def test_node_terminal_bridge_retrieves_the_canceled_direction() -> None:
     [(None, False), ("\x1b[200~pwd\x1b[201~", False), ("\x1b[200~pwd\x1b[201~", True)],
 )
 async def test_node_terminal_binary_and_structured_input_take_over_before_send(
-    paste_data: str | None, competing_input: bool,
+    paste_data: str | None,
+    competing_input: bool,
 ) -> None:
     events: list[tuple[Any, ...]] = []
     attach_payload: dict[str, Any] = {}
@@ -2335,6 +2352,7 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
             return FakeConnection()
 
     messages = [
+        {"type": "websocket.receive", "text": json.dumps({"kind": "control_claim"})},
         {
             "type": "websocket.receive",
             "text": json.dumps({"kind": "resize", "rows": 24, "cols": 80}),
@@ -2367,10 +2385,15 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
         },
         {
             "type": "websocket.receive",
-            "text": json.dumps({
-                "kind": "command", "data": "pwd", "rows": 38, "cols": 112,
-                **({"paste_data": paste_data} if paste_data is not None else {}),
-            }),
+            "text": json.dumps(
+                {
+                    "kind": "command",
+                    "data": "pwd",
+                    "rows": 38,
+                    "cols": 112,
+                    **({"paste_data": paste_data} if paste_data is not None else {}),
+                }
+            ),
         },
         {
             "type": "websocket.receive",
@@ -2387,7 +2410,9 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
             return message
 
         async def send_bytes(self, value: bytes) -> None:
-            browser_frames.append(("control", json.loads(value)))
+            frame = json.loads(value)
+            if frame["kind"] == "pane_mode":
+                browser_frames.append(("control", frame))
 
         async def send_text(self, value: str) -> None:
             browser_frames.append(("text", value))
@@ -2460,10 +2485,10 @@ async def test_node_terminal_binary_and_structured_input_take_over_before_send(
             {
                 "kind": "pane_mode",
                 "terminal_id": "terminal",
+                "controller_client_id": existing_owner,
+                "control_revision": 1,
                 "generation": next(
-                    message["generation"]
-                    for kind, message in browser_frames
-                    if kind == "control"
+                    message["generation"] for kind, message in browser_frames if kind == "control"
                 ),
                 "revision": 1,
                 "available": True,
@@ -2540,6 +2565,9 @@ async def test_node_fresh_terminal_bootstraps_grid_before_user_input() -> None:
 
         async def send_text(self, _value: str) -> None:
             return None
+
+        async def send_bytes(self, value: bytes) -> None:
+            assert json.loads(value)["kind"] == "terminal_control"
 
         async def close(self, *, code: int, reason: str) -> None:
             raise AssertionError((code, reason))
@@ -2625,6 +2653,7 @@ async def test_node_terminal_bridge_demotes_owner_that_changes_during_control() 
     class FakeWebSocket:
         def __init__(self) -> None:
             self.messages = [
+                {"type": "websocket.receive", "text": json.dumps({"kind": "control_claim"})},
                 {
                     "type": "websocket.receive",
                     "text": json.dumps(
@@ -2642,6 +2671,9 @@ async def test_node_terminal_bridge_demotes_owner_that_changes_during_control() 
 
         async def receive(self) -> dict[str, Any]:
             return self.messages.pop(0)
+
+        async def send_bytes(self, _value: bytes) -> None:
+            return None
 
         async def send_text(self, _value: str) -> None:
             return None

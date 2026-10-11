@@ -2,6 +2,30 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.5] - 2026-10-11
+
+### Changed
+
+- Automatically transfer exclusive terminal input control on user activation;
+  other browser connections remain view-only. Passive reconnects and viewport
+  changes do not take control.
+- Serialize terminal input and control transfer so an admitted paste finishes
+  before another connection takes control, across Local, SSH and Node terminals.
+
+### Fixed
+
+- Wait for PTY writability after nonblocking backpressure (`EAGAIN`) and retry
+  interrupted writes, preserving long-paste tails instead of closing the browser
+  connection after a partial write on the actual uvloop server path.
+- Preserve admitted terminal input when a competing viewport invalidates a
+  resize result instead of silently dropping the complete input frame.
+- Wait for queued xterm output to apply paste-mode changes before submitting
+  command-editor text; preserve connection identity and concurrent draft edits.
+
+Both nonblocking long-write interruption and the ownership race are reproduced
+and corrected independently. Exact traces for the original production paste and
+historical CPU100/504 causes remain unconfirmed.
+
 ## [0.4.4] - 2026-10-11
 
 ### Fixed

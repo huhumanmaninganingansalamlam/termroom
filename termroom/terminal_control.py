@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
 from dataclasses import dataclass
@@ -18,21 +19,19 @@ class TerminalResizePlan:
 
 
 class TerminalControl:
-    """Coordinates resize ownership across browser clients for one terminal.
+    """One activated browser controls input; other connections remain viewers.
 
-    Only the client that most recently sent real user input may resize the
-    shared tmux grid. Connections, focus changes, reloads, and passive viewport
-    resizes never claim ownership. A newly created tmux grid is the sole
-    exception: its first browser client may establish the default 80x24 pane's
-    initial size so a fresh Workspace does not render tmux padding until the
-    first keystroke. Successful apply and passive demotion consume that
-    bootstrap permission; only real input can establish a continuous owner.
-    If the input owner disconnects, the existing grid stays unchanged until
-    another client sends real user input.
+    A control claim represents an actual foreground/tab/terminal activation,
+    not input, reconnect, or viewport resizing. Bridges serialize claims with
+    complete input frames. Resize ownership still follows admitted real input,
+    with one initial bootstrap resize allowed for a newly created tmux grid.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._controllers: dict[str, str] = {}
+        self._control_revisions: dict[str, int] = {}
+        self._input_locks: dict[str, asyncio.Lock] = {}
         self._clients: dict[str, list[str]] = {}
         self._client_devices: dict[str, dict[str, str]] = {}
         self._input_owners: dict[str, str] = {}
@@ -50,6 +49,11 @@ class TerminalControl:
         safe_device_id = str(device_id).strip()
         with self._lock:
             clients = self._clients.setdefault(terminal_id, [])
+            if not clients:
+                self._controllers[terminal_id] = client_id
+                self._control_revisions[terminal_id] = (
+                    self._control_revisions.get(terminal_id, 0) + 1
+                )
             clients.append(client_id)
             if safe_device_id:
                 self._client_devices.setdefault(terminal_id, {})[client_id] = safe_device_id
@@ -61,6 +65,36 @@ class TerminalControl:
             ):
                 self._bootstrap_owners[terminal_id] = client_id
         return client_id
+
+    def input_lock(self, terminal_id: str) -> asyncio.Lock:
+        # Admission, complete frames, and control transfer share one terminal lock.
+        with self._lock:
+            return self._input_locks.setdefault(terminal_id, asyncio.Lock())
+
+    def can_input(self, terminal_id: str, client_id: str) -> bool:
+        with self._lock:
+            return self._controllers.get(terminal_id) == client_id
+
+    def claim_control(self, terminal_id: str, client_id: str) -> None:
+        with self._lock:
+            if client_id not in self._clients.get(terminal_id, []):
+                return
+            if self._controllers.get(terminal_id) != client_id:
+                self._controllers[terminal_id] = client_id
+                self._control_revisions[terminal_id] = (
+                    self._control_revisions.get(terminal_id, 0) + 1
+                )
+                self._input_owners.pop(terminal_id, None)
+
+    def control_state(self, terminal_id: str, client_id: str) -> dict[str, int | str]:
+        with self._lock:
+            return {
+                "kind": "terminal_control",
+                "terminal_id": terminal_id,
+                "generation": client_id,
+                "controller_client_id": self._controllers.get(terminal_id, ""),
+                "control_revision": self._control_revisions.get(terminal_id, 0),
+            }
 
     def mark_grid_fresh(self, terminal_id: str, *, client_id: str = "") -> None:
         """Let the first browser establish a newly created tmux grid before input."""
@@ -237,11 +271,19 @@ class TerminalControl:
                 clients.remove(client_id)
             except ValueError:
                 return
+            if self._controllers.get(terminal_id) == client_id:
+                self._controllers.pop(terminal_id, None)
+                self._control_revisions[terminal_id] = (
+                    self._control_revisions.get(terminal_id, 0) + 1
+                )
             client_devices = self._client_devices.get(terminal_id)
             if client_devices is not None:
                 client_devices.pop(client_id, None)
             if not clients:
                 self._clients.pop(terminal_id, None)
+                input_lock = self._input_locks.get(terminal_id)
+                if input_lock is not None and not input_lock.locked():
+                    self._input_locks.pop(terminal_id, None)
                 self._client_devices.pop(terminal_id, None)
                 self._input_owners.pop(terminal_id, None)
                 self._bootstrap_owners.pop(terminal_id, None)
@@ -276,4 +318,6 @@ class TerminalControl:
                 "count": len(known_devices) + anonymous_clients,
                 "input_revision": self._input_revisions.get(terminal_id, 0),
                 "last_input_device_id": self._last_input_devices.get(terminal_id, ""),
+                "controller_client_id": self._controllers.get(terminal_id, ""),
+                "control_revision": self._control_revisions.get(terminal_id, 0),
             }

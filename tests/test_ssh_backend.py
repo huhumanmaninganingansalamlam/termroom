@@ -97,6 +97,7 @@ async def test_ssh_bridge_sends_selected_pane_mode_and_cleans_up(
     controls: list[dict[str, object]] = []
     monkeypatch.setattr(backend, "ensure_workspace", lambda _workspace: [])
     monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, read_fd))
+
     def execute(_computer, _command):  # type: ignore[no-untyped-def]
         if query_fails:
             raise SSHBackendError("pane mode unavailable")
@@ -118,6 +119,9 @@ async def test_ssh_bridge_sends_selected_pane_mode_and_cleans_up(
 
     await backend.bridge(Browser(), workspace, terminal, device_id="device")  # type: ignore[arg-type]
 
+    assert controls[0]["kind"] == "terminal_control"
+    assert controls[0]["generation"] == controls[0]["controller_client_id"]
+    controls = [frame for frame in controls if frame["kind"] == "pane_mode"]
     assert len(controls) == 1
     assert controls[0]["kind"] == "pane_mode"
     assert controls[0]["terminal_id"] == "terminal"
@@ -232,6 +236,8 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
 
         async def send_bytes(self, data: bytes) -> None:
             control = json.loads(data)
+            if control["kind"] != "pane_mode":
+                return
             controls.append(control)
             if control["available"] and release.is_set():
                 recovered.set()
@@ -240,9 +246,13 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
             output.append(data)
             delivered.set()
 
-    bridge = asyncio.create_task(backend.bridge(
-        Browser(), workspace, terminal,  # type: ignore[arg-type]
-    ))
+    bridge = asyncio.create_task(
+        backend.bridge(
+            Browser(),
+            workspace,
+            terminal,  # type: ignore[arg-type]
+        )
+    )
     started = loop.time()
     try:
         os.write(write_fd, b"complete-benign-output")
@@ -1336,11 +1346,11 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
             f"printf ready > {shlex.quote(str(ready))}; "
             f"IFS= read -r -n 1 value; printf '%s' \"$value\" > {shlex.quote(str(effect))}"
         )
+        script += "; sleep 30"
         command = f"/bin/bash --noprofile --norc -c {shlex.quote(script)}"
         backend._exec(
             computer,
-            f"tmux send-keys -t {target} -l {shlex.quote(command)}; "
-            f"tmux send-keys -t {target} Enter",
+            f"tmux respawn-pane -k -t {target} {shlex.quote(command)}",
         )
 
         def grid() -> str:
@@ -1377,8 +1387,8 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
 
         def write(fd: int, data: bytes) -> int:
             if data == b"z":
-                assert grid() == "124x17"
-                assert input_applies == [(18, 124)]
+                assert grid() == ("124x22" if promotion_failure else "124x17")
+                assert input_applies == ([] if promotion_failure else [(18, 124)])
                 input_writes.append(data)
             return original_write(fd, data)
 
@@ -1452,7 +1462,11 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
                 if promotion_failure and step == 3:
                     await asyncio.sleep(0.1)
                     assert failed
-                    assert not effect.exists() and not input_writes and not input_applies
+                    deadline = time.monotonic() + 3
+                    while not effect.exists() and time.monotonic() < deadline:
+                        await asyncio.sleep(0.01)
+                    assert effect.read_text() == "z" and input_writes == [b"z"]
+                    assert not input_applies
                     assert grid() == "124x22"
                     client_id = backend.control._clients[terminal_id][0]
                     assert backend.control.can_resize(terminal_id, client_id)
@@ -1461,8 +1475,7 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
                         "type": "websocket.receive",
                         "text": json.dumps(
                             {
-                                "kind": "input",
-                                "data": "z",
+                                "kind": "resize",
                                 "rows": 18,
                                 "cols": 124,
                                 "user_input": True,
@@ -1475,9 +1488,7 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
                 assert effect.read_text() == "z"
                 assert grid() == "124x17"
                 assert input_writes == [b"z"] and input_applies == [(18, 124)]
-                assert backend.control.presence(terminal_id)["input_revision"] == (
-                    2 if promotion_failure else 1
-                )
+                assert backend.control.presence(terminal_id)["input_revision"] == 1
                 if step == (4 if promotion_failure else 3):
                     return {
                         "type": "websocket.receive",
@@ -1489,8 +1500,9 @@ async def test_ssh_bridge_one_shot_bootstrap_passive_input_and_reconnect(
                 return None
 
             async def send_bytes(self, data: bytes) -> None:
-                pane_modes.append(json.loads(data))
-
+                frame = json.loads(data)
+                if frame["kind"] == "pane_mode":
+                    pane_modes.append(frame)
 
         try:
             deadline = time.monotonic() + 3
@@ -1973,6 +1985,10 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             class InputWebSocket:
                 def __init__(self) -> None:
                     self.messages = [
+                        {
+                            "type": "websocket.receive",
+                            "text": json.dumps({"kind": "control_claim"}),
+                        },
                         {
                             "type": "websocket.receive",
                             "text": json.dumps(

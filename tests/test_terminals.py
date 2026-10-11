@@ -190,6 +190,9 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
         )
         assert helper_done.is_set()
         assert await ticker_task < 0.1
+        assert browser.controls[0]["kind"] == "terminal_control"
+        assert browser.controls[0]["generation"] == browser.controls[0]["controller_client_id"]
+        browser.controls = [frame for frame in browser.controls if frame["kind"] == "pane_mode"]
         assert browser.controls
         generation = browser.controls[0]["generation"]
         assert isinstance(generation, str) and generation

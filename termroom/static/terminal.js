@@ -307,6 +307,97 @@
   let mobileViewportBaseline = window.visualViewport?.height || window.innerHeight;
   let mobileViewportBaselineWidth = window.visualViewport?.width || window.innerWidth;
 
+  let controlGeneration = null;
+  let controlRevision = 0;
+  let controlsInput = false;
+  let controlClaimPending = false;
+  let controlClaimId = 0;
+  let activationPending = document.visibilityState === "visible" && document.hasFocus();
+  let programmaticTerminalFocus = false;
+  const pendingControlInput = [];
+  let pendingControlBytes = 0;
+  const MAX_PENDING_CONTROL_BYTES = 1024 * 1024;
+  Object.defineProperty(host, "termroomControlsInput", { get: () => controlsInput });
+  const updateInputControl = () => {
+    term.options.disableStdin = !controlsInput && !controlClaimPending;
+  };
+  const acceptInputControl = (value) => {
+    if (
+      value?.terminal_id !== host.dataset.terminalId ||
+      typeof value.generation !== "string" ||
+      typeof value.controller_client_id !== "string" ||
+      !Number.isSafeInteger(value.control_revision) ||
+      (controlGeneration !== null && value.generation !== controlGeneration)
+    ) return;
+    if (value.control_revision >= controlRevision) {
+      controlGeneration = value.generation;
+      controlRevision = value.control_revision;
+      controlsInput = value.controller_client_id === controlGeneration;
+    }
+    if (value.kind === "terminal_control" && value.claim_id === controlClaimId) {
+      controlClaimPending = false;
+      const queued = pendingControlInput.splice(0);
+      pendingControlBytes = 0;
+      if (controlsInput && socket?.readyState === WebSocket.OPEN) {
+        queued.forEach(({ frame, command }) => {
+          socket.send(frame);
+          if (typeof command === "string" && commandInput?.value === command) {
+            commandInput.value = "";
+            updateCommandComposer();
+            commandInput.blur();
+            setComposerOpen(false, { focus: false });
+          }
+        });
+      }
+    }
+    updateInputControl();
+  };
+  const resetInputControl = () => {
+    controlGeneration = null;
+    controlRevision = 0;
+    controlsInput = false;
+    controlClaimPending = false;
+    pendingControlInput.length = 0;
+    pendingControlBytes = 0;
+    updateInputControl();
+  };
+  const claimInputControl = () => {
+    if (programmaticTerminalFocus || document.visibilityState !== "visible" || !document.hasFocus()) return;
+    if (controlClaimPending) return;
+    activationPending = true;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    activationPending = false;
+    controlClaimPending = true;
+    updateInputControl();
+    socket.send(JSON.stringify({ kind: "control_claim", claim_id: ++controlClaimId }));
+  };
+  const sendInputFrame = (frame, command) => {
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    if (controlClaimPending) {
+      const bytes = typeof frame === "string" ? new TextEncoder().encode(frame).byteLength : frame.byteLength;
+      if (pendingControlBytes + bytes > MAX_PENDING_CONTROL_BYTES) {
+        socket.close(1009, "Terminal input is too large");
+        return false;
+      }
+      if (typeof command === "string" && pendingControlInput.some((entry) => entry.command === command)) return false;
+      pendingControlInput.push({ frame, command });
+      pendingControlBytes += bytes;
+      // The command editor clears a draft only after actual enqueue, never while waiting for control.
+      return typeof command !== "string";
+    }
+    if (!controlsInput) return false;
+    socket.send(frame);
+    return true;
+  };
+  updateInputControl();
+  window.addEventListener("focus", claimInputControl);
+  document.addEventListener("pointerdown", (event) => {
+    if (event.target.closest?.("#terminal, .terminal-composer, [data-terminal-switch]")) claimInputControl();
+  }, true);
+  document.addEventListener("focusin", (event) => {
+    if (event.target.closest?.("#terminal, .terminal-composer")) claimInputControl();
+  });
+
   const setStatusMessage = (message) => {
     statusLabel.textContent = message;
     status.setAttribute("aria-label", message);
@@ -347,6 +438,9 @@
         epoch !== connectionEpoch ||
         terminalId !== host.dataset.terminalId
       ) return;
+      if (controlGeneration !== null) {
+        acceptInputControl({ ...presence, generation: controlGeneration, terminal_id: terminalId });
+      }
       const count = Number(presence.count || 0);
       const revision = Number(presence.input_revision || 0);
       if (!presenceInitialized) {
@@ -388,7 +482,12 @@
 
   const send = (payload) => {
     if (socket?.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(payload));
+    const frame = JSON.stringify(payload);
+    if (payload.kind === "input" || payload.kind === "command") {
+      if (controlClaimPending && payload.kind === "input" && payload.user_input !== true) return false;
+      return sendInputFrame(frame, payload.kind === "command" ? payload.data : undefined);
+    }
+    socket.send(frame);
     return true;
   };
 
@@ -603,15 +702,21 @@
       reconnectDelay = 500;
       setStatus(tr("terminal.status.connected"), true);
       scheduleResize(true);
+      if (activationPending) claimInputControl();
       updatePresence();
-      if (!coarsePrimaryPointer.matches) term.focus();
+      if (!coarsePrimaryPointer.matches) {
+        programmaticTerminalFocus = true;
+        try { term.focus(); } finally { programmaticTerminalFocus = false; }
+      }
     });
     nextSocket.addEventListener("message", (event) => {
       if (epoch !== connectionEpoch || nextSocket !== socket) return;
       if (event.data instanceof ArrayBuffer) {
         try {
           const previousPaneMode = paneMode;
-          acceptPaneMode(JSON.parse(new TextDecoder().decode(event.data)));
+          const control = JSON.parse(new TextDecoder().decode(event.data));
+          if (control.kind === "terminal_control" || control.kind === "pane_mode") acceptInputControl(control);
+          acceptPaneMode(control);
           // A current successful pane query supersedes the page-load SSH failure.
           // Transport open, arbitrary output, and unrelated errors are not recovery.
           if (paneMode && paneMode !== previousPaneMode) {
@@ -643,6 +748,7 @@
     nextSocket.addEventListener("close", (event) => {
       if (epoch !== connectionEpoch || nextSocket !== socket) return;
       cancelPresenceRequest();
+      resetInputControl();
       const terminalCloseMessages = {
         4401: tr("terminal.status.auth_required"),
         4403: tr("terminal.status.rejected"),
@@ -670,6 +776,7 @@
   }
   let pastedCommand = null;
   let pastedCommandSent = false;
+  let commandPending = false;
   term.onData((data) => {
     const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;
     nextTerminalDataIsUserInput = false;
@@ -693,7 +800,7 @@
   });
   term.onBinary((data) => {
     if (socket?.readyState !== WebSocket.OPEN) return;
-    socket.send(Uint8Array.from(data, (character) => character.charCodeAt(0)));
+    sendInputFrame(Uint8Array.from(data, (character) => character.charCodeAt(0)));
   });
   term.onScroll(scheduleActivityAcknowledge);
   window.addEventListener(
@@ -712,6 +819,7 @@
       cancelPresenceRequest();
       return;
     }
+    if (document.hasFocus()) claimInputControl();
     if (reconnectAllowed && socket?.readyState === WebSocket.CLOSED) {
       connect();
       return;
@@ -866,22 +974,33 @@
   };
   commandForm?.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (composerComposing) return;
+    if (composerComposing || commandPending) return;
     if (!commandInput.value.trim()) return;
-    // Preserve xterm's negotiated paste protocol, while saving the plain
-    // command rather than terminal escape sequences in command history.
-    pastedCommand = commandInput.value;
-    pastedCommandSent = false;
-    try {
-      term.paste(pastedCommand);
-    } finally {
-      pastedCommand = null;
-    }
-    if (!pastedCommandSent) return;
-    commandInput.value = "";
-    updateCommandComposer();
-    commandInput.blur();
-    setComposerOpen(false, { focus: false });
+    const command = commandInput.value;
+    const epoch = connectionEpoch;
+    const commandSocket = socket;
+    commandPending = true;
+    // Parse already-received mode changes before negotiating native paste.
+    // A switch/reconnect must not redirect this explicitly submitted command.
+    term.write("", () => {
+      commandPending = false;
+      if (
+        epoch !== connectionEpoch || commandSocket !== socket ||
+        socket?.readyState !== WebSocket.OPEN
+      ) return;
+      pastedCommand = command;
+      pastedCommandSent = false;
+      try {
+        term.paste(command);
+      } finally {
+        pastedCommand = null;
+      }
+      if (!pastedCommandSent || commandInput.value !== command) return;
+      commandInput.value = "";
+      updateCommandComposer();
+      commandInput.blur();
+      setComposerOpen(false, { focus: false });
+    });
   });
   commandInput?.addEventListener("input", updateCommandComposer);
   commandInput?.addEventListener("keydown", (event) => {
@@ -938,6 +1057,7 @@
     const previousTerminalId = host.dataset.terminalId || "";
 
     connectionEpoch += 1;
+    resetInputControl();
     const epoch = connectionEpoch;
     pendingTerminalId = targetId;
     cancelPresenceRequest();

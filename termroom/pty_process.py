@@ -16,7 +16,14 @@ def write_all(fd: int, data: bytes) -> None:
     """Finish a PTY input frame before its caller accepts the next one."""
     remaining = memoryview(data)
     while remaining:
-        written = os.write(fd, remaining)
+        try:
+            written = os.write(fd, remaining)
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            # Output reads make the shared PTY nonblocking; wait for backpressure.
+            select.select([], [fd], [])
+            continue
         if written <= 0:
             raise OSError("PTY input write made no progress")
         remaining = remaining[written:]

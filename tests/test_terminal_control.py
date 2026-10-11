@@ -94,6 +94,8 @@ def test_presence_reports_client_count_and_input_device() -> None:
         "count": 2,
         "input_revision": 1,
         "last_input_device_id": "device-a",
+        "controller_client_id": first,
+        "control_revision": 1,
     }
 
 
@@ -109,6 +111,8 @@ def test_presence_deduplicates_clients_from_same_device() -> None:
         "count": 2,
         "input_revision": 1,
         "last_input_device_id": "device-a",
+        "controller_client_id": first,
+        "control_revision": 1,
     }
 
     control.unregister("term", first)
@@ -230,3 +234,32 @@ def test_node_existing_grid_reconciles_an_unacknowledged_bootstrap() -> None:
     assert control.can_resize("term", second)
     control.mark_grid_existing("term")
     assert not control.can_resize("term", second)
+
+
+def test_activation_transfers_control_without_input_or_background_reconnect_theft() -> None:
+    control = TerminalControl()
+    first = control.register("term")
+    second = control.register("term")
+    assert control.can_input("term", first)
+    assert not control.can_input("term", second)
+    control.mark_input("term", first)
+    control.claim_control("term", second)
+    assert control.can_input("term", second)
+    assert not control.can_input("term", first)
+    revision = control.control_state("term", second)["control_revision"]
+    control.register("term")
+    control.claim_control("term", "unknown")
+    assert control.control_state("term", second)["control_revision"] == revision
+    control.unregister("term", second)
+    assert not control.can_input("term", first)
+    control.claim_control("term", first)
+    assert control.can_input("term", first)
+
+
+def test_last_disconnect_releases_frame_lock_after_input_tasks_settle() -> None:
+    control = TerminalControl()
+    first = control.register("term")
+    lock = control.input_lock("term")
+    assert control.input_lock("term") is lock
+    control.unregister("term", first)
+    assert control.input_lock("term") is not lock

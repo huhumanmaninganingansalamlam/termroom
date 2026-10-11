@@ -1874,6 +1874,7 @@ class TerminalManager:
             await websocket.send_bytes(
                 json.dumps(
                     {
+                        **self.control.control_state(terminal_id, client_id),
                         "kind": "pane_mode",
                         "terminal_id": terminal_id,
                         "generation": client_id,
@@ -1955,68 +1956,101 @@ class TerminalManager:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
                     raise WebSocketDisconnect(message.get("code", 1000))
-                if message.get("bytes") is not None:
-                    payload_bytes = message["bytes"]
-                    if len(payload_bytes) > MAX_TERMINAL_MESSAGE_BYTES:
+                async with self.control.input_lock(terminal_id):
+                    if message.get("bytes") is not None:
+                        payload_bytes = message["bytes"]
+                        if len(payload_bytes) > MAX_TERMINAL_MESSAGE_BYTES:
+                            await websocket.close(code=1009, reason="Terminal input is too large")
+                            return
+                        if not self.control.can_input(terminal_id, client_id):
+                            await websocket.send_bytes(
+                                json.dumps(
+                                    self.control.control_state(terminal_id, client_id)
+                                ).encode()
+                            )
+                            continue
+                        if master_fd is None:
+                            return
+                        self.control.mark_input(terminal_id, client_id, device_id)
+                        if last_viewport is not None:
+                            await resize_browser_view(
+                                {"rows": last_viewport[0], "cols": last_viewport[1]}
+                            )
+                        await write_to_pty(payload_bytes)
+                        continue
+                    raw = message.get("text") or ""
+                    if len(raw.encode("utf-8")) > MAX_TERMINAL_MESSAGE_BYTES:
                         await websocket.close(code=1009, reason="Terminal input is too large")
                         return
-                    if master_fd is None:
-                        return
-                    self.control.mark_input(terminal_id, client_id, device_id)
-                    if last_viewport is not None and not await resize_browser_view(
-                        {"rows": last_viewport[0], "cols": last_viewport[1]}
-                    ):
-                        continue
-                    await write_to_pty(payload_bytes)
-                    continue
-                raw = message.get("text") or ""
-                if len(raw.encode("utf-8")) > MAX_TERMINAL_MESSAGE_BYTES:
-                    await websocket.close(code=1009, reason="Terminal input is too large")
-                    return
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
-                    if master_fd is None:
-                        return
-                    await write_to_pty(raw.encode())
-                    continue
-
-                if not isinstance(payload, dict):
-                    continue
-                kind = payload.get("kind")
-                if kind == "activity_ack":
-                    revision = payload.get("activity_at")
-                    if isinstance(revision, bool) or not isinstance(revision, int):
-                        continue
                     try:
-                        await asyncio.to_thread(
-                            self.store.acknowledge_terminal_activity,
-                            terminal_id,
-                            revision,
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        if not self.control.can_input(terminal_id, client_id):
+                            await websocket.send_bytes(
+                                json.dumps(
+                                    self.control.control_state(terminal_id, client_id)
+                                ).encode()
+                            )
+                            continue
+                        if master_fd is None:
+                            return
+                        await write_to_pty(raw.encode())
+                        continue
+
+                    if not isinstance(payload, dict):
+                        continue
+                    kind = payload.get("kind")
+                    if kind == "control_claim":
+                        self.control.claim_control(terminal_id, client_id)
+                        await websocket.send_bytes(
+                            json.dumps(
+                                {
+                                    **self.control.control_state(terminal_id, client_id),
+                                    "claim_id": payload.get("claim_id"),
+                                }
+                            ).encode()
                         )
-                    except (KeyError, ValueError):
                         continue
-                elif kind == "resize":
-                    await resize_browser_view(payload)
-                elif kind == "command":
-                    if master_fd is None:
-                        return
-                    self.control.mark_input(terminal_id, client_id, device_id)
-                    await resize_browser_view(payload)
-                    command = str(payload.get("data", ""))
-                    await asyncio.to_thread(
-                        self.store.add_command, workspace["id"], terminal["id"], command
-                    )
-                    paste = str(payload.get("paste_data", command))
-                    await write_to_pty(paste.encode() + b"\r")
-                elif kind == "input":
-                    if master_fd is None:
-                        return
-                    if terminal_input_claims_grid(payload):
+                    if kind in {"input", "command"} and not self.control.can_input(
+                        terminal_id, client_id
+                    ):
+                        await websocket.send_bytes(
+                            json.dumps(self.control.control_state(terminal_id, client_id)).encode()
+                        )
+                        continue
+                    if kind == "activity_ack":
+                        revision = payload.get("activity_at")
+                        if isinstance(revision, bool) or not isinstance(revision, int):
+                            continue
+                        try:
+                            await asyncio.to_thread(
+                                self.store.acknowledge_terminal_activity,
+                                terminal_id,
+                                revision,
+                            )
+                        except (KeyError, ValueError):
+                            continue
+                    elif kind == "resize":
+                        await resize_browser_view(payload)
+                    elif kind == "command":
+                        if master_fd is None:
+                            return
                         self.control.mark_input(terminal_id, client_id, device_id)
-                    if not await resize_browser_view(payload):
-                        continue
-                    await write_to_pty(str(payload.get("data", "")).encode())
+                        await resize_browser_view(payload)
+                        command = str(payload.get("data", ""))
+                        await asyncio.to_thread(
+                            self.store.add_command, workspace["id"], terminal["id"], command
+                        )
+                        paste = str(payload.get("paste_data", command))
+                        await write_to_pty(paste.encode() + b"\r")
+                    elif kind == "input":
+                        if master_fd is None:
+                            return
+                        if terminal_input_claims_grid(payload):
+                            self.control.mark_input(terminal_id, client_id, device_id)
+                        # A stale grid resize must not discard this terminal's input.
+                        await resize_browser_view(payload)
+                        await write_to_pty(str(payload.get("data", "")).encode())
 
         async def write_to_pty(data: bytes) -> None:
             if master_fd is None:
@@ -2026,6 +2060,9 @@ class TerminalManager:
         output_task: asyncio.Task[None] | None = None
         input_task: asyncio.Task[None] | None = None
         try:
+            await websocket.send_bytes(
+                json.dumps(self.control.control_state(terminal_id, client_id)).encode()
+            )
             setup_task = asyncio.create_task(
                 asyncio.to_thread(
                     self._setup_browser_terminal,
@@ -2049,9 +2086,6 @@ class TerminalManager:
                 with contextlib.suppress(WebSocketDisconnect, asyncio.CancelledError):
                     await task
         finally:
-            self.control.unregister(terminal_id, client_id)
-            if self.control.client_count(terminal_id) == 0:
-                self._terminal_resize_locks.pop(terminal_id, None)
             for task in (output_task, input_task):
                 if task is not None and not task.done():
                     task.cancel()
@@ -2065,6 +2099,9 @@ class TerminalManager:
             tasks = [task for task in (output_task, input_task) if task is not None]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            self.control.unregister(terminal_id, client_id)
+            if self.control.client_count(terminal_id) == 0:
+                self._terminal_resize_locks.pop(terminal_id, None)
             try:
                 await asyncio.to_thread(self._finish_browser_terminal, master_fd, view_session)
             except Exception as exc:
