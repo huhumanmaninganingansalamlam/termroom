@@ -2,6 +2,27 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.4] - 2026-10-11
+
+### Fixed
+
+- Complete partial PTY input writes on Local, SSH and Node terminals, preserving
+  long-paste tails, bracketed-paste terminators and subsequent input order.
+- Retain command-editor drafts when the browser cannot enqueue the command;
+  do not automatically replay commands after reconnecting.
+- Keep SSH pane queries and queued database bookkeeping from delaying already
+  received terminal output; retain the latest coalesced output timestamp.
+- Keep Local tmux page queries, terminal actions and file I/O off the Core event
+  loop, while preserving conflicting editor drafts during concurrent saves.
+- Preserve alternate-screen content when a hidden terminal viewport has zero size.
+
+Native paste negotiation and Codex defaults are unchanged. The command editor
+first used native paste in 0.4.3; an older single-write defect could discard its
+terminator and leave following input inside unfinished paste parsing. The complete
+write path is verified with isolated Local/SSH/Node PTYs and an actual offline
+Codex draft. Exact production byte-loss traces and the causes of historical
+CPU100/504 incidents remain unconfirmed.
+
 ## [0.4.3] - 2026-10-07
 
 ### Fixed
