@@ -2,6 +2,19 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.8] - 2026-10-12
+
+### Fixed
+
+- Keep the terminal connection indicator pending until the current backend
+  confirms its tmux pane. A WebSocket opening, presence count or arbitrary
+  output no longer reports a failed or still-preparing SSH terminal as connected.
+- Preserve the existing reconnect/failure indicators, verified recovery and
+  unsent command drafts; stale connections cannot mark a new terminal ready.
+
+This corrects the connection indicator, not the separate bin host/network outage.
+Terminal delivery acknowledgements and application responses remain separate.
+
 ## [0.4.7] - 2026-10-12
 
 ### Changed

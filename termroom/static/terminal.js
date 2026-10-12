@@ -699,10 +699,8 @@
         return;
       }
       reconnectDelay = 500;
-      setStatus(tr("terminal.status.connected"), true);
       scheduleResize(true);
       if (activationPending) claimInputControl();
-      updatePresence();
       if (!coarsePrimaryPointer.matches) {
         programmaticTerminalFocus = true;
         try { term.focus(); } finally { programmaticTerminalFocus = false; }
@@ -721,6 +719,10 @@
           // Transport open, arbitrary output, and unrelated errors are not recovery.
           if (paneMode && paneMode !== previousPaneMode) {
             document.querySelector("[data-terminal-connection-error]")?.remove();
+            if (!isConnected) {
+              setStatus(tr("terminal.status.connected"), true);
+              updatePresence();
+            }
           }
         } catch {
           // Invalid controls are never rendered or forwarded as terminal input.
