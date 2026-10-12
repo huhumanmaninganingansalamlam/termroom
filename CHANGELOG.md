@@ -2,6 +2,23 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.6] - 2026-10-12
+
+### Fixed
+
+- Wait for the current connection's initial PTY output to be parsed before
+  command-editor paste, so native paste modes are ready even when the WebSocket
+  opens before terminal initialization completes.
+- Preserve admitted command-editor delivery across page navigation and retain
+  unsent or unacknowledged drafts without automatically replaying them.
+- Record recent command execution only after the terminal acknowledges input.
+- Align the Python module version with the distribution version.
+
+The startup-mode race and navigation/acknowledgement path are independently
+verified. The original 10:02 command failure lacks a transport trace; separate
+intermittent rendering stalls and historical CPU100/504 causes are not attributed
+to these fixes. Codex defaults and running sessions are unchanged.
+
 ## [0.4.5] - 2026-10-11
 
 ### Changed
