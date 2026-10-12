@@ -594,6 +594,7 @@ const window = {clearTimeout(){},setTimeout(){},dispatchEvent(){}};
 const location = {protocol:'https:',host:'fixture.invalid'};
 let socket=null,connectionEpoch=0,reconnectTimer,reconnectDelay=500,reconnectAllowed=true;
 let paneMode=null,paneModeGeneration=null,paneModeRevision=0,isConnected=false,status;
+let initialOutputParsed=false;
 let activationPending=false,programmaticTerminalFocus=false;
 const claimInputControl=()=>{},resetInputControl=()=>{},acceptInputControl=()=>{};
 let outputRenderSequence=0,pendingActivityAt=0,acknowledgedActivityAt=0,renderedActivityAt=0;
@@ -667,6 +668,7 @@ term._core.textarea = {value:''}; // paste clears the native textarea after disp
 const sent = [];
 let connected = true;
 let connectionEpoch = 0, socket = {readyState:1};
+let initialOutputParsed = true;
 const WebSocket = {OPEN:1};
 const send = value => {if (!connected) return false; sent.push(value); return true;};
 let nextTerminalDataIsUserInput = false;
@@ -686,6 +688,20 @@ SUBMIT_HANDLER
 const text = '한글'.repeat(3300)+'\n끝!!';
 assert.equal(Buffer.byteLength(text),19806);
 (async () => {
+  // A socket/control ACK may precede the first tmux screen and its native modes.
+  initialOutputParsed = false;
+  commandInput.value = text;
+  submit({preventDefault(){}});
+  await new Promise(resolve => term.write('', resolve));
+  assert.equal(sent.length, 0, 'an uninitialized terminal cannot negotiate paste');
+  assert.equal(commandInput.value, text, 'retain input while initial output is pending');
+  term.write('\x1b[?2004h', () => {initialOutputParsed = true;});
+  await new Promise(resolve => term.write('', resolve));
+  await new Promise(resolve => term.write('', resolve));
+  assert.equal(sent.length, 1, 'send the explicit command once after initialization');
+  assert.equal(sent[0].paste_data, '\x1b[200~'+text.replaceAll('\n','\r')+'\x1b[201~');
+  acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent[0].command_id,accepted:true});
+  sent.length = 0;
   for (const bracketed of [true, false]) {
     term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l');
     commandInput.value = text;
@@ -796,6 +812,7 @@ const document = {body:{classList:{remove(){}}},querySelector(){return null;}};
 const CustomEvent = function(kind, options){this.type=kind;this.detail=options.detail;};
 const WebSocket = {OPEN:1,CLOSING:2};
 let connectionEpoch=0, pendingTerminalId='', socket={readyState:1,close(){this.readyState=3;}};
+let initialOutputParsed=false;
 let presenceAborted=false;
 let presenceRequest={controller:{abort(){presenceAborted=true;}}};
 let shellTerminal=true, reconnectTimer, otherInputTimer, reconnectAllowed=true, reconnectDelay=500;

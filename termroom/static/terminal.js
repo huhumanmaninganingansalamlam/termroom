@@ -285,6 +285,7 @@
     get: () => connectionEpoch,
   });
   let isConnected = false;
+  let initialOutputParsed = false;
   let lastInputRevision = 0;
   let presenceInitialized = false;
   let presenceRequest = null;
@@ -687,6 +688,7 @@
     paneModeRevision = 0;
     host.dispatchEvent(new Event("termroom:pane-mode"));
     socket = nextSocket;
+    initialOutputParsed = false;
     setStatus(tr("terminal.status.connecting"));
 
     nextSocket.addEventListener("open", () => {
@@ -726,6 +728,7 @@
       if (typeof event.data !== "string") return;
       term.write(event.data, () => {
         if (epoch !== connectionEpoch || nextSocket !== socket) return;
+        initialOutputParsed = true;
         outputRenderSequence += 1;
         if (pendingActivityAt > acknowledgedActivityAt) {
           renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
@@ -775,6 +778,15 @@
   let commandPending = false;
   let pendingCommand = null;
   let commandSequence = 0;
+  let pendingCommandPaste = null;
+  const pastePendingCommand = () => {
+    if (!initialOutputParsed || !pendingCommandPaste) return;
+    const paste = pendingCommandPaste;
+    pendingCommandPaste = null;
+    // Socket/control readiness does not initialize the application's paste mode.
+    term.write("", paste);
+  };
+  term.onWriteParsed(pastePendingCommand);
   term.onData((data) => {
     const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;
     nextTerminalDataIsUserInput = false;
@@ -984,6 +996,7 @@
   const resetCommandDelivery = () => {
     commandPending = false;
     pendingCommand = null;
+    pendingCommandPaste = null;
     updateCommandComposer();
   };
   const acceptCommandDelivery = (value) => {
@@ -1042,7 +1055,7 @@
     updateCommandComposer();
     // Parse already-received mode changes before negotiating native paste.
     // A switch/reconnect must not redirect this explicitly submitted command.
-    term.write("", () => {
+    pendingCommandPaste = () => {
       if (pendingCommand !== submission) return;
       if (
         epoch !== connectionEpoch || commandSocket !== socket ||
@@ -1059,7 +1072,8 @@
         pastedCommand = null;
       }
       if (!pastedCommandSent) resetCommandDelivery();
-    });
+    };
+    pastePendingCommand();
   });
   commandInput?.addEventListener("input", () => {
     commandUnconfirmed = pendingCommand?.command === commandInput.value;
