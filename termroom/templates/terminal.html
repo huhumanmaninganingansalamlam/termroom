@@ -37,6 +37,13 @@
       <span class="terminal-status-dot" aria-hidden="true"></span>
       <span class="terminal-status-label">{{ t('terminal.connecting') }}</span>
     </span>
+    <span id="command-delivery" class="terminal-status" role="status"
+          aria-label="{{ t('terminal.command_delivery') }}" aria-atomic="true"
+          aria-describedby="command-delivery-help" hidden>
+      <span aria-hidden="true">↗</span>
+      <span class="terminal-status-label"></span>
+    </span>
+    <span id="command-delivery-help" class="sr-only">{{ t('terminal.command_delivery_help') }}</span>
     <a class="terminal-tool-button terminal-output-action"
        href="/w/{{ workspace.id }}/terminal/{{ terminal.id }}/scrollback"
        data-terminal-output-link
@@ -170,8 +177,14 @@
 {% endif %}
 <div id="terminal"
      class="terminal-host"
+     role="region"
+     aria-label="{{ t('terminal.screen', name=terminal.name) }}"
+     aria-describedby="terminal-screen-reader-mode-help"
      data-terminal-id="{{ terminal.id }}"
      data-workspace-id="{{ workspace.id }}"
+     data-workspace-name="{{ workspace.display_name }}"
+     data-workspace-path="{{ workspace.canonical_path }}"
+     data-workspace-computer="{{ workspace.connection_label or t('home.this_computer') }}"
      data-device-id="{{ current_device_id }}"
      data-pane-mode-capable="true"
      data-terminal-role="{{ terminal.role | default('shell') }}"></div>
@@ -211,6 +224,10 @@
           <button type="button" data-terminal-key="_">_</button>
           <button type="button" data-terminal-key="|">|</button>
           <button type="button" data-terminal-key="~">~</button>
+          <button type="button" data-terminal-key="\u001b[5~" aria-label="PageUp">PgUp</button>
+          <button type="button" data-terminal-key="\u001b[6~" aria-label="PageDown">PgDn</button>
+          <button type="button" data-terminal-key="\u001b[1;5H">C-Home</button>
+          <button type="button" data-terminal-key="\u001b[1;5F">C-End</button>
         </div>
         <div class="terminal-secondary-actions">
           <button type="button" id="focus-terminal">{{ t('terminal.keyboard') }}</button>
@@ -218,12 +235,14 @@
         </div>
       </div>
     </div>
-    <button id="open-command-editor" class="terminal-command-trigger" type="button" aria-label="{{ t('terminal.command_edit') }}">
+    <button id="open-command-editor" class="terminal-command-trigger" type="button"
+            aria-label="{{ t('terminal.command_edit') }}" aria-expanded="false"
+            aria-controls="terminal-command-editor">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
       <span>{{ t('terminal.command_edit') }}</span>
     </button>
   </div>
-  <div class="terminal-compose-pane" hidden>
+  <div id="terminal-command-editor" class="terminal-compose-pane" hidden>
     <header class="terminal-compose-heading">
       <span>
         <strong>{{ t('terminal.command_edit') }}</strong>
@@ -238,6 +257,8 @@
       <div class="command-input-shell">
         <textarea id="command-input"
                   name="command"
+                  aria-label="{{ t('terminal.command_input') }}"
+                  aria-describedby="command-meta"
                   rows="1"
                   placeholder="{{ t('terminal.command_placeholder') }}"
                   autocomplete="off"

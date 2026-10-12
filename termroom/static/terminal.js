@@ -185,6 +185,7 @@
   term.options.screenReaderMode = false;
   screenReaderModeToggle?.addEventListener("change", () => {
     term.options.screenReaderMode = screenReaderModeToggle.checked;
+    host.querySelector(".xterm-accessibility-tree")?.setAttribute("aria-label", tr("terminal.visible_rows"));
   });
   const terminalStringCellWidth = (value) => {
     const service = term._core?.unicodeService;
@@ -627,6 +628,7 @@
 
   const setComposerOpen = (open, { focus = true } = {}) => {
     composerOpen = Boolean(open);
+    openCommandEditor?.setAttribute("aria-expanded", String(composerOpen));
     composerRoot?.classList.toggle("command-editor-open", composerOpen);
     if (composePane) composePane.hidden = !composerOpen;
     if (focus) {
@@ -963,6 +965,16 @@
   const commandInput = document.querySelector("#command-input");
   const commandMeta = document.querySelector("#command-meta");
   let commandUnconfirmed = false;
+  const commandDelivery = document.querySelector("#command-delivery");
+  const setCommandDelivery = (state) => {
+    if (!commandDelivery) return;
+    commandDelivery.dataset.state = state;
+    commandDelivery.hidden = state === "idle";
+    const label = commandDelivery.querySelector(".terminal-status-label");
+    const message = state === "idle" ? "" : tr(`terminal.command_delivery.${state}`);
+    label.textContent = message;
+    commandDelivery.title = message;
+  };
   const commandDraftKey = () => `termroom:command-draft:${host.dataset.workspaceId}:${host.dataset.terminalId}`;
   const persistCommandDraft = () => {
     if (!commandInput) return;
@@ -991,9 +1003,11 @@
     } catch {
       // A malformed or unavailable draft never becomes terminal input.
     }
+    setCommandDelivery(commandUnconfirmed ? "unconfirmed" : "idle");
     updateCommandComposer();
   };
   const resetCommandDelivery = () => {
+    if (commandPending) setCommandDelivery("unconfirmed");
     commandPending = false;
     pendingCommand = null;
     pendingCommandPaste = null;
@@ -1008,6 +1022,7 @@
     const command = pendingCommand.command;
     resetCommandDelivery();
     commandUnconfirmed = false;
+    setCommandDelivery(value.accepted ? "accepted" : "rejected");
     if (value.accepted && commandInput.value === command) {
       commandInput.value = "";
       commandInput.blur();
@@ -1048,6 +1063,7 @@
     const epoch = connectionEpoch;
     const commandSocket = socket;
     commandPending = true;
+    setCommandDelivery("pending");
     pendingCommand = { id: String(++commandSequence), command };
     const submission = pendingCommand;
     commandUnconfirmed = true;
@@ -1190,6 +1206,13 @@
         terminalNameInput.value = tab.dataset.terminalName || "shell";
       }
       if (terminalCommandClearTarget) terminalCommandClearTarget.value = targetId;
+      host.setAttribute("aria-label", tr("terminal.screen", { name: tab.dataset.terminalName }));
+      document.querySelector(".workspace-content")?.setAttribute("aria-label", tr("terminal.context", {
+        project: host.dataset.workspaceName,
+        path: host.dataset.workspacePath,
+        computer: host.dataset.workspaceComputer,
+        name: tab.dataset.terminalName,
+      }));
       document.querySelector(".terminal-error-banner")?.remove();
       window.dispatchEvent(
         new CustomEvent("termroom:terminal-switched", {

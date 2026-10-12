@@ -3093,6 +3093,10 @@ details:not([open]) > :not(summary) {
   gap: 6px;
 }
 
+.more-key-grid button {
+  min-height: 44px;
+}
+
 .terminal-secondary-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

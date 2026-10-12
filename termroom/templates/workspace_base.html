@@ -172,7 +172,7 @@
       <span aria-hidden="true">←</span>
     </a>
     <div class="workspace-title">
-      <strong title="{{ workspace.display_name }}">{{ workspace.display_name }}</strong>
+      <strong role="heading" aria-level="1" title="{{ workspace.display_name }}">{{ workspace.display_name }}</strong>
       <small title="{{ workspace.canonical_path }}">{{ workspace.connection_label or t('home.this_computer') }} · {{ t(workspace_kind_label) }}</small>
     </div>
     <span class="workspace-mobile-actions">
@@ -288,7 +288,8 @@
   </span>
 </aside>
 {% endif %}
-<main class="workspace-content {% block workspace_content_class %}{% endblock %}">
+<main class="workspace-content {% block workspace_content_class %}{% endblock %}"
+      aria-label="{{ workspace.display_name }} · {{ workspace.connection_label or t('home.this_computer') }} · {{ workspace.canonical_path }} · {{ t('common.' ~ active_tab) }}{% if active_tab == 'terminal' and terminal is defined %}: {{ terminal.name }}{% endif %}">
   {% block workspace_content %}{% endblock %}
 </main>
 <nav class="bottom-nav"

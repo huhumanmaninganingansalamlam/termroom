@@ -298,8 +298,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert terminal_script.count("new window.Terminal(") == 1
     assert re.search(
         r'screenReaderModeToggle\?\.addEventListener\("change", \(\) => \{\s*'
-        r"term\.options\.screenReaderMode = screenReaderModeToggle\.checked;\s*"
-        r"\}\);",
+        r"term\.options\.screenReaderMode = screenReaderModeToggle\.checked;",
         terminal_script,
     )
     screen_reader_query_at = terminal_script.index(
@@ -674,6 +673,9 @@ const send = value => {if (!connected) return false; sent.push(value); return tr
 let nextTerminalDataIsUserInput = false;
 const hasUserInputSignal = false;
 const commandInput = {value:'',blur(){}}, composerComposing = false;
+const receipt = {dataset:{},hidden:true,querySelector(){return this;},textContent:''};
+const document = {querySelector:()=>receipt};
+const tr = key => key;
 const host = {dataset:{workspaceId:'w',terminalId:'t'}};
 let controlGeneration = 'current';
 const drafts = new Map();
@@ -694,6 +696,7 @@ assert.equal(Buffer.byteLength(text),19806);
   submit({preventDefault(){}});
   await new Promise(resolve => term.write('', resolve));
   assert.equal(sent.length, 0, 'an uninitialized terminal cannot negotiate paste');
+  assert.equal(receipt.dataset.state, 'pending', 'connection is not a delivery ACK');
   assert.equal(commandInput.value, text, 'retain input while initial output is pending');
   term.write('\x1b[?2004h', () => {initialOutputParsed = true;});
   await new Promise(resolve => term.write('', resolve));
@@ -701,6 +704,8 @@ assert.equal(Buffer.byteLength(text),19806);
   assert.equal(sent.length, 1, 'send the explicit command once after initialization');
   assert.equal(sent[0].paste_data, '\x1b[200~'+text.replaceAll('\n','\r')+'\x1b[201~');
   acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent[0].command_id,accepted:true});
+  assert.equal(receipt.dataset.state, 'accepted');
+  assert.equal(receipt.hidden, false, 'ACK receipt survives the editor closing');
   sent.length = 0;
   for (const bracketed of [true, false]) {
     term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l');
@@ -719,6 +724,7 @@ assert.equal(Buffer.byteLength(text),19806);
     assert.equal(commandInput.value, text, 'wrong-terminal ACK cannot erase a draft');
     acceptCommandDelivery({terminal_id:'t',generation:'old',command_id:frame.command_id,accepted:true});
     assert.equal(commandInput.value, text, 'stale-generation ACK cannot erase a draft');
+    assert.equal(receipt.dataset.state, 'pending', 'a stale ACK cannot claim delivery');
     acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:frame.command_id,accepted:true});
     assert.equal(commandInput.value, '', 'only matching server acceptance clears a draft');
     assert.equal(drafts.size, 0);
@@ -756,6 +762,7 @@ assert.equal(Buffer.byteLength(text),19806);
   await new Promise(resolve => term.write('', resolve));
   acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent.at(-1).command_id,accepted:false});
   assert.equal(commandInput.value, 'rejected draft', 'rejection never erases the draft');
+  assert.equal(receipt.dataset.state, 'rejected');
   assert.equal(commandPending, false, 'explicit rejection must release the submit guard');
   commandInput.value = 'unconfirmed navigation draft';
   submit({preventDefault(){}});
@@ -766,6 +773,7 @@ assert.equal(Buffer.byteLength(text),19806);
   restoreCommandDraft();
   assert.equal(commandInput.value, 'unconfirmed navigation draft');
   assert.equal(commandUnconfirmed, true);
+  assert.equal(receipt.dataset.state, 'unconfirmed', 'navigation is not success or safe replay');
   assert.equal(sent.length, beforeNavigation, 'restore never replays a command');
   host.dataset.terminalId = 'other';
   restoreCommandDraft();
@@ -803,7 +811,8 @@ def test_terminal_switch_drains_old_writes_before_reassigning_identity() -> None
         r"""
 const assert = require('node:assert/strict');
 const events = [], connections = [], queue = [];
-const host = {dataset:{terminalId:'A',workspaceId:'w',terminalRole:'shell'}};
+const host = {dataset:{terminalId:'A',workspaceId:'w',terminalRole:'shell'},
+ setAttribute(key,value){this[key]=value;}};
 const tabs = ['A','B','C'].map(id => ({dataset:{terminalSwitch:id,terminalRole:'shell'},
   classList:{toggle(){}},setAttribute(){},removeAttribute(){},getAttribute(){return '/'+id;}}));
 const terminalTabs = tabs;

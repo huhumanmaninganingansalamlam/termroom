@@ -2,6 +2,23 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.7] - 2026-10-12
+
+### Changed
+
+- Give projects stable accessible names including their computer and path, and
+  keep the current workspace/terminal context accurate after terminal switching.
+- Name the command editor and retain a separate delivery acknowledgement after
+  it closes. Terminal delivery does not imply application admission or response;
+  unconfirmed/rejected input keeps its draft and is never automatically replayed.
+- Label xterm's opt-in displayed-row accessibility tree for small, current-screen
+  snapshots without collecting another transcript or changing default modes.
+- Add native PageUp, PageDown, Ctrl+Home and Ctrl+End keys to the existing helper
+  menu for application-owned history navigation, including Codex's past/latest view.
+
+Codex options and native mouse/paste handling are unchanged. An application which
+does not request mouse capture is not claimed to support wheel navigation.
+
 ## [0.4.6] - 2026-10-12
 
 ### Fixed

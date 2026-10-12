@@ -39,6 +39,7 @@
     {% for workspace in recent %}
     <a class="workspace-item"
        href="/w/{{ workspace.id }}"
+       aria-label="{{ workspace.display_name }} · {{ workspace.connection_label or t('home.this_computer') }} · {{ workspace.canonical_path }}"
        data-terminal-activity-workspace="{{ workspace.id }}"
        data-workspace-href="/w/{{ workspace.id }}"
        {% if workspace.backend_kind == 'remote' %}
