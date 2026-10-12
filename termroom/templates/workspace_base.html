@@ -289,7 +289,7 @@
 </aside>
 {% endif %}
 <main class="workspace-content {% block workspace_content_class %}{% endblock %}"
-      aria-label="{{ workspace.display_name }} · {{ workspace.connection_label or t('home.this_computer') }} · {{ workspace.canonical_path }} · {{ t('common.' ~ active_tab) }}{% if active_tab == 'terminal' and terminal is defined %}: {{ terminal.name }}{% endif %}">
+      aria-label="{{ workspace.display_name }} · {{ workspace.connection_label or t('home.this_computer') }} · {{ workspace.canonical_path }} · {{ t('common.terminal') if active_tab == 'terminal' else t('common.files') if active_tab == 'files' else t('common.recent') }}{% if active_tab == 'terminal' and terminal is defined %}: {{ terminal.name }}{% endif %}">
   {% block workspace_content %}{% endblock %}
 </main>
 <nav class="bottom-nav"

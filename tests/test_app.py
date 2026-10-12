@@ -1375,7 +1375,8 @@ async def test_terminal_display_screen_reader_mode_is_opt_in_and_localized(
             )
             assert "스크린 리더 모드" in korean.text
             assert (
-                "켜져 있는 동안 실시간 터미널 버퍼를 스크린 리더에 노출합니다. "
+                "현재 표시된 터미널 행을 스크린 리더에 노출합니다. "
+                "이전 출력은 터미널 안에서 탐색하세요. "
                 "페이지를 완전히 다시 불러오면 꺼집니다."
                 in korean.text
             )
@@ -1386,8 +1387,9 @@ async def test_terminal_display_screen_reader_mode_is_opt_in_and_localized(
             assert english.status_code == 200
             assert "Screen reader mode" in english.text
             assert (
-                "Expose the live terminal buffer to screen readers while this is on. "
-                "It turns off when the page is fully reloaded."
+                "Expose the displayed terminal rows to screen readers. "
+                "Use native terminal scrolling for earlier output. "
+                "Off after a full page reload."
                 in english.text
             )
     finally:
