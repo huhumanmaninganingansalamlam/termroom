@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +16,7 @@ permissions:
 jobs:
   test:
     name: Test release candidate
+    if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/ci.yml
 
   build:
@@ -185,3 +191,61 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+
+  github-release:
+    name: Publish GitHub Release notes
+    needs: container
+    if: always() && ((startsWith(github.ref, 'refs/tags/') && needs.container.result == 'success') || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare notes from the immutable release tag
+        shell: bash
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          tag="v${version}"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Release tag must match package version" >&2
+            exit 1
+          fi
+          git fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+          export RELEASE_TAG="$tag"
+          python - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          changelog = subprocess.check_output(["git", "show", f"{tag}:CHANGELOG.md"], text=True)
+          section = changelog.split(f"## [{tag[1:]}] - ", 1)[1].split("\n", 1)[1]
+          notes = section.split("\n## [", 1)[0].strip() + "\n"
+          Path(os.environ["RUNNER_TEMP"], "release-notes.md").write_text(notes)
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"RELEASE_TAG={tag}\nRELEASE_VERSION={tag[1:]}\n")
+          PY
+
+      - name: Publish and verify GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release create "$RELEASE_TAG" --verify-tag \
+            --title "Termroom ${RELEASE_VERSION}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md" \
+            >"${RUNNER_TEMP}/release-url.txt" 2>"${RUNNER_TEMP}/release-error.txt"; then
+            error=$(<"${RUNNER_TEMP}/release-error.txt")
+            error=${error//'%'/'%25'}
+            error=${error//$'\r'/'%0D'}
+            error=${error//$'\n'/'%0A'}
+            echo "::error title=GitHub Release publication::$error"
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" --json tagName,url,isDraft,publishedAt,body
