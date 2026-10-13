@@ -920,7 +920,7 @@ def test_password_ssh_attach_uses_encrypted_askpass_secret(
         assert "PATH=/login/bin:/usr/bin:/bin" in args[-1]
         assert "/opt/homebrew" not in args[-1]
         assert "/usr/local/bin" not in args[-1]
-        assert "tmux attach-session" in args[-1]
+        assert "tmux -u attach-session" in args[-1]
     finally:
         backend._wait_for_pid(process_pid, 1)
         os.close(master_fd)

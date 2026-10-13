@@ -406,11 +406,12 @@ async def _assert_bridge_barrier_keeps_loop_live(
             record("navigation_scheduled")
             record("second_terminal_progress_scheduled")
             loop.call_soon_threadsafe(scheduled.set)
-            deadline = time.monotonic() + 0.4
-            while time.monotonic() < deadline and not all(
-                event.is_set() for event in progress.values()
-            ):
-                time.sleep(0.005)
+            # The contract is progress while the barrier is held, not a 400ms
+            # tmux spawn/teardown benchmark. A bounded event wait still catches
+            # shared-loop starvation without depending on host scheduling speed.
+            deadline = time.monotonic() + 2
+            for event in progress.values():
+                event.wait(max(0, deadline - time.monotonic()))
             before_release.update({name: event.is_set() for name, event in progress.items()})
             before_release["bridge_done"] = bridge_done.is_set()
             record("progress_before_release")

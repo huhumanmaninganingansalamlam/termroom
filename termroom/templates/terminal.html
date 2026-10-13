@@ -37,6 +37,8 @@
       <span class="terminal-status-dot" aria-hidden="true"></span>
       <span class="terminal-status-label">{{ t('terminal.connecting') }}</span>
     </span>
+    <button id="terminal-reconnect" class="terminal-tool-button" type="button" hidden>{{ t('terminal.reconnect') }}</button>
+    <a id="terminal-sign-in" class="terminal-tool-button" href="/login" hidden>{{ t('login.submit') }}</a>
     <span id="command-delivery" class="terminal-status" role="status"
           aria-label="{{ t('terminal.command_delivery') }}" aria-atomic="true"
           aria-describedby="command-delivery-help" hidden>
@@ -128,6 +130,7 @@
   </div>
 </div>
 {% if error %}<p class="terminal-error-banner" role="alert" title="{{ error }}"{% if terminal_connection_error %} data-terminal-connection-error{% endif %}>{{ error }}</p>{% endif %}
+<p id="terminal-input-error" class="terminal-input-error" role="alert" hidden></p>
 {% if file_run %}
 <aside class="file-run-bar file-run-terminal-bar {{ file_run.display_state }}"
        data-file-run
@@ -224,10 +227,10 @@
           <button type="button" data-terminal-key="_">_</button>
           <button type="button" data-terminal-key="|">|</button>
           <button type="button" data-terminal-key="~">~</button>
-          <button type="button" data-terminal-key="\u001b[5~" aria-label="PageUp">PgUp</button>
-          <button type="button" data-terminal-key="\u001b[6~" aria-label="PageDown">PgDn</button>
-          <button type="button" data-terminal-key="\u001b[1;5H">C-Home</button>
-          <button type="button" data-terminal-key="\u001b[1;5F">C-End</button>
+          <button type="button" data-terminal-key="\u001b[5~" title="PageUp">{{ t('terminal.history.previous') }}</button>
+          <button type="button" data-terminal-key="\u001b[6~" title="PageDown">{{ t('terminal.history.next') }}</button>
+          <button type="button" data-terminal-key="\u001b[1;5H" title="Ctrl+Home">{{ t('terminal.history.first') }}</button>
+          <button type="button" data-terminal-key="\u001b[1;5F" title="Ctrl+End">{{ t('terminal.history.latest') }}</button>
         </div>
         <div class="terminal-secondary-actions">
           <button type="button" id="focus-terminal">{{ t('terminal.keyboard') }}</button>

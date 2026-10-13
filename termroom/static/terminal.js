@@ -120,6 +120,14 @@
 
   const status = document.querySelector("#terminal-status");
   const statusLabel = status.querySelector(".terminal-status-label");
+  const reconnectButton = document.querySelector("#terminal-reconnect");
+  const signInLink = document.querySelector("#terminal-sign-in");
+  const inputError = document.querySelector("#terminal-input-error");
+  const setInputError = (message = "") => {
+    if (!inputError) return;
+    inputError.textContent = message;
+    inputError.hidden = !message;
+  };
   const bundledTerminalFontLoad = beginBundledTerminalFontLoad();
   let bundledTerminalFontLoaded = await bundledTerminalFontLoad.initial;
   host.dataset.terminalFont = bundledTerminalFontLoaded ? "bundled" : "system-fallback";
@@ -413,6 +421,10 @@
     isConnected = connected;
     setStatusMessage(message);
     status.classList.toggle("connected", connected);
+    if (connected) {
+      if (reconnectButton) reconnectButton.hidden = true;
+      if (signInLink) signInLink.hidden = true;
+    }
   };
 
   const cancelPresenceRequest = () => {
@@ -687,6 +699,9 @@
 
   const connect = () => {
     window.clearTimeout(reconnectTimer);
+    cancelPresenceRequest();
+    resetInputControl();
+    const previousSocket = socket;
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const epoch = ++connectionEpoch;
     const terminalId = host.dataset.terminalId;
@@ -699,6 +714,11 @@
     paneModeRevision = 0;
     host.dispatchEvent(new Event("termroom:pane-mode"));
     socket = nextSocket;
+    if (previousSocket && previousSocket.readyState < WebSocket.CLOSING) {
+      previousSocket.close(1000, "reconnect");
+    }
+    if (reconnectButton) reconnectButton.disabled = true;
+    if (signInLink) signInLink.hidden = true;
     initialOutputParsed = false;
     setStatus(tr("terminal.status.connecting"));
 
@@ -770,6 +790,11 @@
       const terminalCloseMessage = terminalCloseMessages[event.code];
       reconnectAllowed = !terminalCloseMessage;
       setStatus(terminalCloseMessage || tr("terminal.status.reconnecting"));
+      if (reconnectButton) {
+        reconnectButton.hidden = !reconnectAllowed;
+        reconnectButton.disabled = false;
+      }
+      if (signInLink) signInLink.hidden = event.code !== 4401;
       if (reconnectAllowed && document.visibilityState !== "hidden") {
         reconnectTimer = window.setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 1.7, 5000);
@@ -777,6 +802,12 @@
     });
     nextSocket.addEventListener("error", () => nextSocket.close());
   };
+  reconnectButton?.addEventListener("click", () => {
+    if (reconnectAllowed) {
+      activationPending = true;
+      connect();
+    }
+  });
 
   let nextTerminalDataIsUserInput = false;
   const onUserInput = term._core?.coreService?.onUserInput;
@@ -955,8 +986,9 @@
   document.querySelector("#focus-terminal")?.addEventListener("click", () => closeMoreKeys());
   document.querySelector("#paste-terminal")?.addEventListener("click", async () => {
     closeMoreKeys({ focus: false });
+    setInputError();
     if (!window.isSecureContext || !navigator.clipboard?.readText) {
-      setStatus(tr("terminal.status.clipboard_insecure"));
+      setInputError(tr("terminal.status.clipboard_insecure"));
       term.focus();
       return;
     }
@@ -967,7 +999,7 @@
       term.paste(text);
       term.focus();
     } catch {
-      setStatus(tr("terminal.status.clipboard"));
+      setInputError(tr("terminal.status.clipboard"));
       term.focus();
     }
   });
@@ -1033,7 +1065,8 @@
     const command = pendingCommand.command;
     resetCommandDelivery();
     commandUnconfirmed = false;
-    setCommandDelivery(value.accepted ? "accepted" : "rejected");
+    setCommandDelivery(commandInput.value === command
+      ? value.accepted ? "accepted" : "rejected" : "idle");
     if (value.accepted && commandInput.value === command) {
       commandInput.value = "";
       commandInput.blur();
@@ -1054,6 +1087,12 @@
   commandInput?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
   const updateCommandComposer = () => {
     if (!commandInput) return;
+    commandForm?.setAttribute("aria-busy", String(commandPending));
+    const submitButton = commandForm?.querySelector('button[type="submit"]');
+    if (submitButton) {
+      submitButton.disabled = commandPending;
+      submitButton.textContent = tr(commandPending ? "terminal.command_sending_button" : "terminal.run");
+    }
     commandInput.style.height = "auto";
     commandInput.style.height = `${Math.min(commandInput.scrollHeight, 132)}px`;
     const lines = commandInput.value ? commandInput.value.split("\n").length : 0;
@@ -1104,6 +1143,8 @@
   });
   commandInput?.addEventListener("input", () => {
     commandUnconfirmed = pendingCommand?.command === commandInput.value;
+    if (!commandPending) setCommandDelivery("idle");
+    setInputError();
     persistCommandDraft();
     updateCommandComposer();
   });
@@ -1119,9 +1160,7 @@
     button.addEventListener("click", () => {
       setComposerOpen(true, { focus: false });
       commandInput.value = button.dataset.commandReuse || "";
-      commandUnconfirmed = false;
-      persistCommandDraft();
-      updateCommandComposer();
+      commandInput.dispatchEvent(new Event("input"));
       commandInput.focus();
       commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
     });

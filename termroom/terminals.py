@@ -2303,7 +2303,7 @@ class TerminalManager:
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TERMROOM_PASSWORD", None)
-        command = ["tmux"]
+        command = ["tmux", "-u"]
         test_socket = environment.get("PYTEST_TMUX_SOCKET", "")
         if test_socket:
             command.extend(("-S", test_socket))

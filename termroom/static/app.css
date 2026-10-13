@@ -3210,7 +3210,8 @@ details:not([open]) > :not(summary) {
   min-height: 44px;
 }
 
-.terminal-error-banner {
+.terminal-error-banner,
+.terminal-input-error {
   width: fit-content;
   max-width: calc(100% - 24px);
   flex: 0 0 auto;

@@ -2,6 +2,24 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.10] - 2026-10-13
+
+### Fixed
+
+- Keep connection state intact when clipboard access fails, and show the paste
+  error separately. Expose reconnect or sign-in actions for the relevant failure
+  without replaying unconfirmed input.
+- Show command submission as pending and prevent duplicate clicks; a new unsent
+  draft no longer inherits the previous command's delivery acknowledgement.
+- Force UTF-8 for browser tmux clients so Korean and other Unicode output remains
+  readable even when the computer's login locale is not UTF-8. Shell and Codex
+  options and environments are unchanged.
+
+### Changed
+
+- Give native history keys clear previous, next, first and latest screen labels.
+  They navigate the application's actual terminal view, not a separate transcript.
+
 ## [0.4.9] - 2026-10-13
 
 ### Fixed

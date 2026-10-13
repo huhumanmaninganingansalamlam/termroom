@@ -612,6 +612,9 @@ let socket=null,connectionEpoch=0,reconnectTimer,reconnectDelay=500,reconnectAll
 let paneMode=null,paneModeGeneration=null,paneModeRevision=0,isConnected=false,status;
 let initialOutputParsed=false;
 let activationPending=false,programmaticTerminalFocus=false;
+const reconnectButton = {hidden:true,disabled:false,
+ addEventListener(_,callback){this.retry=callback;}};
+const signInLink = {hidden:true};
 const claimInputControl=()=>{},resetInputControl=()=>{},acceptInputControl=()=>{};
 let outputRenderSequence=0,pendingActivityAt=0,acknowledgedActivityAt=0,renderedActivityAt=0;
 const term={write(_,callback){callback();},focus(){},
@@ -660,7 +663,9 @@ assert.equal(unrelatedError,true,'unrelated page errors must remain visible');
 current.emit('close',{code:1013});
 assert.equal(isConnected,false,'backend failure must retire connected state');
 assert.equal(status,'terminal.status.reconnecting');
-connect();const recovered=socket;recovered.emit('open');
+assert.equal(reconnectButton.hidden,false,'backend failure exposes a real reconnect action');
+reconnectButton.retry();const recovered=socket;recovered.emit('open');
+assert.equal(reconnectButton.disabled,true,'one reconnect is visibly in progress');
 assert.equal(isConnected,false,'reconnect must wait for this backend to become ready');
 current.emit('message',control(3));
 assert.equal(isConnected,false,'the prior connection cannot mark a reconnect ready');
@@ -669,6 +674,9 @@ assert.equal(isConnected,true);
 recovered.emit('close',{code:4403});
 assert.equal(isConnected,false);
 assert.equal(status,'terminal.status.rejected','a genuine current rejection must remain visible');
+assert.equal(reconnectButton.hidden,true,'an authorization rejection is not an automatic retry');
+recovered.emit('close',{code:4401});
+assert.equal(signInLink.hidden,false,'expired authentication offers sign in');
 """.replace("MODE_HANDLER", mode).replace("CONNECT_HANDLER", connect)
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -690,6 +698,16 @@ def test_command_editor_uses_native_paste_once_and_keeps_plain_history() -> None
             "  let composerComposing = false;"
         )
     ]
+    edit = script[
+        script.index('  commandInput?.addEventListener("input",') : script.index(
+            '  commandInput?.addEventListener("keydown",'
+        )
+    ]
+    reuse = script[
+        script.index('  document.querySelectorAll("[data-command-reuse]")') : script.index(
+            "  const terminalTabs ="
+        )
+    ]
     probe = r"""
 const assert = require('node:assert/strict');
 const window = globalThis;
@@ -705,9 +723,16 @@ const WebSocket = {OPEN:1};
 const send = value => {if (!connected) return false; sent.push(value); return true;};
 let nextTerminalDataIsUserInput = false;
 const hasUserInputSignal = false;
-const commandInput = {value:'',blur(){}}, composerComposing = false;
+let editDraft;
+const commandInput = {value:'',blur(){},focus(){},setSelectionRange(){},
+ addEventListener(_,callback){editDraft=callback;},
+ dispatchEvent(){editDraft();}};
+const composerComposing = false;
 const receipt = {dataset:{},hidden:true,querySelector(){return this;},textContent:''};
-const document = {querySelector:()=>receipt};
+let reuseDraft;
+const reuseButton = {dataset:{commandReuse:'history draft'},
+ addEventListener(_,callback){reuseDraft=callback;}};
+const document = {querySelector:()=>receipt,querySelectorAll:()=>[reuseButton]};
 const tr = key => key;
 const host = {dataset:{workspaceId:'w',terminalId:'t'}};
 let controlGeneration = 'current';
@@ -715,11 +740,14 @@ const drafts = new Map();
 const sessionStorage = {setItem:(key,value)=>drafts.set(key,value),
  getItem:key=>drafts.get(key) ?? null,removeItem:key=>drafts.delete(key)};
 const updateCommandComposer = () => {}, setComposerOpen = () => {};
+const setInputError = () => {};
 let submit;
 const commandForm = {addEventListener(_, callback){submit = callback;}};
 INPUT_HANDLER
 DELIVERY
 SUBMIT_HANDLER
+EDIT_HANDLER
+REUSE_HANDLER
 const text = '한글'.repeat(3300)+'\n끝!!';
 assert.equal(Buffer.byteLength(text),19806);
 (async () => {
@@ -739,6 +767,13 @@ assert.equal(Buffer.byteLength(text),19806);
   acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent[0].command_id,accepted:true});
   assert.equal(receipt.dataset.state, 'accepted');
   assert.equal(receipt.hidden, false, 'ACK receipt survives the editor closing');
+  reuseDraft();
+  assert.equal(commandInput.value, 'history draft', 'recent history opens as an unsent draft');
+  assert.equal(receipt.hidden, true, 'recalling history must not imply new delivery');
+  commandInput.value = 'new unsent draft';
+  editDraft();
+  assert.equal(receipt.hidden, true, 'a new draft must not inherit the previous delivery success');
+  assert.equal(sent.length, 1, 'editing a draft does not send it');
   sent.length = 0;
   for (const bracketed of [true, false]) {
     term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l');
@@ -790,6 +825,7 @@ assert.equal(Buffer.byteLength(text),19806);
   assert.equal(commandInput.value, 'new unsent draft', 'do not clear a newer edit');
   acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent.at(-1).command_id,accepted:true});
   assert.equal(commandInput.value, 'new unsent draft', 'ACK must also preserve newer edits');
+  assert.equal(receipt.hidden, true, 'an earlier ACK must not label a newer draft as sent');
   commandInput.value = 'rejected draft';
   submit({preventDefault(){}});
   await new Promise(resolve => term.write('', resolve));
@@ -818,6 +854,10 @@ assert.equal(Buffer.byteLength(text),19806);
 })().catch(error => {console.error(error);process.exitCode=1;});
 """.replace("INPUT_HANDLER", input_handler).replace("DELIVERY", delivery).replace(
         "SUBMIT_HANDLER", submit
+    ).replace(
+        "EDIT_HANDLER", edit
+    ).replace(
+        "REUSE_HANDLER", reuse
     )
     result = subprocess.run(["node", "-e", probe], cwd=root, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[-2000:]
