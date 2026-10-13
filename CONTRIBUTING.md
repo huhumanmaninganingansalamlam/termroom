@@ -55,13 +55,11 @@ truncated primary actions, touch targets below 44px on mobile, keyboard overlap,
 focus states, empty/error/loading states, and accidental divergence between Local,
 SSH, and Node screens.
 
-The 390px, 768px, and 1440px checks are responsive-layout evidence, not
-physical-device evidence. Exercise the actual-browser matrix on Safari running on a
-real macOS desktop, including Hangul/ASCII input, Esc/Tab/Ctrl/arrows, bracketed paste,
-focus, resize, reload/reconnect, tmux persistence, and selection/copy. Chrome on the
-same Mac is optional comparison evidence; Chrome/Firefox parity is not a release gate.
-Physical smartphone and installed-PWA validation is a separate, user-owned follow-up
-and does not block the current release.
+Exercise the affected flow in an available real browser/runtime: input, paste,
+focus, resize, reconnect, persistence or selection as relevant to the change.
+Reuse completed evidence for unchanged behavior. Responsive widths are layout
+checks, not physical-device evidence; real Mac Safari, native IME and physical
+phone/PWA checks are not prerequisites for every patch release.
 
 Top-level navigation is for changing workspace sections. Actions for the current
 view belong in that view's toolbar. Avoid duplicating the same action in several

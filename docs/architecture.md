@@ -215,13 +215,18 @@ canonical path, and managed ownership on the Node before acting.
 
 The Core removes `TERMROOM_PASSWORD` from tmux and spawned SSH environments.
 
-Viewport resize is bounded and only the view that most recently sent real user input controls
-terminal dimensions. Mobile IME composition stays on xterm's input path; Termroom does not
+User activation selects one input controller; other views remain observers. Admitted input
+finishes before control transfer, and only the controller's real input owns grid size.
+Passive resize/reconnect cannot steal control. Mobile IME composition stays on xterm's input path; Termroom does not
 rebuild Korean/Japanese/Chinese composition itself. Vim/Neovim and other TUIs use the
 same alternate-screen, cursor-mode, mouse, and bracketed-paste path. Reattach asks tmux
 to redraw the current screen rather than reconstructing application state in the browser.
 The baseline is `xterm-256color` with a bundled Nerd Font; true color is used only when
 the complete browser/tmux/terminfo path supports it.
+Canonical pane controls also identify a foreground shell outside tmux copy mode.
+In normal-screen shell state, xterm does not generate mouse reports left enabled by
+an exited TUI; keyboard and pasted text are not filtered. TUI and copy-mode mouse
+handling stays on the native path.
 
 ## File pipeline
 

@@ -188,9 +188,11 @@ terminal chrome, terminal 본문, composer, bottom navigation의 좌우 padding�
 
 ## 8. Browser validation matrix
 
-### 현재 release gate: macOS Safari
+### 변경 영향에 맞춘 browser 검증
 
-자동 QA 외에 실제 macOS desktop의 Safari에서 다음 Terminal 흐름을 확인한다.
+사용 가능한 실제 browser/runtime에서 변경에 영향을 받는 Terminal 흐름을 확인한다.
+완료된 미변경 흐름을 반복하거나 특정 Mac·Safari·native IME·실기기의 부재로
+모든 patch release를 막지 않는다.
 
 - shell과 Vim/Neovim에서 한글·ASCII 입력
 - Esc, Tab, Ctrl 조합과 normal/application cursor mode 방향키
@@ -200,9 +202,8 @@ terminal chrome, terminal 본문, composer, bottom navigation의 좌우 padding�
 - reload, WebSocket reconnect와 기존 tmux session 복귀
 - browser selection/copy와 tmux copy mode
 
-동일한 Mac의 Chrome은 비교 진단에 사용할 수 있지만 필수 gate가 아니며, Linux browser,
-user-agent 변경, responsive viewport 또는 WebKit emulation은 실제 macOS Safari 증거를
-대체하지 않는다.
+관측한 browser와 환경을 결과에 적는다. user-agent 변경이나 viewport/emulation을
+실제 macOS·물리 기기에서 실행한 결과로 기록하지 않는다.
 
 ### 사용자 후속 확인: 스마트폰과 installed PWA
 

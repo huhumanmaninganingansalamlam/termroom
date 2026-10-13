@@ -207,6 +207,7 @@ async def test_local_grid_client_lookup_does_not_block_event_loop(
             assert isinstance(control["pane_pid"], int) and control["pane_pid"] > 0
             assert isinstance(control["alternate"], bool)
             assert isinstance(control["mouse_tracking"], bool)
+            assert isinstance(control["shell_foreground"], bool)
             assert len(control["mouse_flags"]) == 5
             assert all(type(flag) is int and flag in (0, 1) for flag in control["mouse_flags"])
     finally:

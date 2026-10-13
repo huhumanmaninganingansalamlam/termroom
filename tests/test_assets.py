@@ -472,6 +472,10 @@ host.addEventListener('termroom:pane-mode', () => modeEvents++);
 let paneMode = null;
 let paneModeGeneration = null;
 let paneModeRevision = 0;
+const mouseReports = [];
+const term = {_core:{coreMouseService:{triggerMouseEvent(event) {
+ mouseReports.push(event); return true;
+}}}};
 """
         + handler
         + """
@@ -497,6 +501,19 @@ paneModeGeneration = null;
 paneModeRevision = 0;
 acceptPaneMode({...mode,generation:'b'});
 assert.equal(paneMode.generation, 'b');
+// Residual TUI modes at a foreground shell must not generate input, while
+// alternate/normal-screen apps, tmux copy mode and reconnect remain native.
+const mouse = term._core.coreMouseService;
+assert.equal(mouse.triggerMouseEvent('tui'), true);
+acceptPaneMode({...mode,generation:'b',revision:2,alternate:false,shell_foreground:true});
+assert.equal(mouse.triggerMouseEvent('shell'), false);
+acceptPaneMode({...mode,generation:'old',revision:99});
+assert.equal(mouse.triggerMouseEvent('stale'), false);
+acceptPaneMode({...mode,generation:'b',revision:3,alternate:false,shell_foreground:false});
+assert.equal(mouse.triggerMouseEvent('normal-app-or-copy-mode'), true);
+acceptPaneMode({...mode,generation:'b',revision:4,alternate:true,shell_foreground:true});
+assert.equal(mouse.triggerMouseEvent('alternate'), true);
+assert.deepEqual(mouseReports, ['tui','normal-app-or-copy-mode','alternate']);
 host.dataset.paneModeCapable = 'false';
 paneMode = null;
 paneModeGeneration = null;
@@ -597,7 +614,8 @@ let initialOutputParsed=false;
 let activationPending=false,programmaticTerminalFocus=false;
 const claimInputControl=()=>{},resetInputControl=()=>{},acceptInputControl=()=>{};
 let outputRenderSequence=0,pendingActivityAt=0,acknowledgedActivityAt=0,renderedActivityAt=0;
-const term={write(_,callback){callback();},focus(){}};
+const term={write(_,callback){callback();},focus(){},
+ _core:{coreMouseService:{triggerMouseEvent(){return true;}}}};
 const coarsePrimaryPointer={matches:true};
 const tr=x=>x, setStatus=(value,connected=false)=>{status=value;isConnected=connected;};
 const scheduleResize=()=>{},updatePresence=()=>{},cancelPresenceRequest=()=>{};

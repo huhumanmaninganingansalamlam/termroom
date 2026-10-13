@@ -115,6 +115,13 @@ WORKSPACE_COMMAND_READY_POLL_SECONDS = 0.01
 FILE_RUN_COMPLETION_GRACE_SECONDS = 2.0
 TERMINAL_TMUX_TIMEOUT_SECONDS = 5.0
 PANE_MODE_REFRESH_INTERVAL_SECONDS = 0.1
+TMUX_PANE_MODE_FORMAT = (
+    "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
+    "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
+    "#{mouse_all_flag}|#{mouse_sgr_flag}|"
+    "#{&&:#{==:#{pane_in_mode},0},"
+    "#{m/r:^(ash|bash|csh|dash|fish|ksh|mksh|sh|tcsh|yash|zsh)$,#{pane_current_command}}}"
+)
 _LOCAL_BRIDGE_TMUX_TIMEOUT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "local_bridge_tmux_timeout", default=None
 )
@@ -2155,13 +2162,11 @@ class TerminalManager:
             "-p",
             "-t",
             f"{workspace['tmux_session']}:{terminal['tmux_window']}",
-            "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
-            "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
-            "#{mouse_all_flag}|#{mouse_sgr_flag}",
+            TMUX_PANE_MODE_FORMAT,
         )
         fields = result.stdout.strip().split("|")
         if (
-            len(fields) != 10
+            len(fields) != 11
             or fields[0] != str(workspace["tmux_session"])
             or not fields[1].startswith("@")
             or not fields[2].startswith("%")
@@ -2176,7 +2181,8 @@ class TerminalManager:
             "pane_pid": int(fields[3]),
             "alternate": fields[4] == "1",
             "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
-            "mouse_flags": [int(flag) for flag in fields[5:]],
+            "mouse_flags": [int(flag) for flag in fields[5:10]],
+            "shell_foreground": fields[10] == "1",
         }
 
     def _setup_browser_terminal(

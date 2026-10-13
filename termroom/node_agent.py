@@ -104,6 +104,7 @@ from termroom.terminals import (
     TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
+    TMUX_PANE_MODE_FORMAT,
     TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
     TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
     TMUX_TERMINAL_RECORD_FORMAT,
@@ -2339,18 +2340,13 @@ class NodeRuntime:
             )
 
     def _current_pane_mode(self, session: str, window: str) -> dict[str, Any]:
-        format_string = (
-            "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
-            "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
-            "#{mouse_all_flag}|#{mouse_sgr_flag}"
-        )
         result = self._tmux(
-            "display-message", "-p", "-t", f"{session}:{window}", format_string
+            "display-message", "-p", "-t", f"{session}:{window}", TMUX_PANE_MODE_FORMAT
         )
         fields = result.stdout.strip().split("|")
         if (
             result.returncode
-            or len(fields) != 10
+            or len(fields) != 11
             or fields[0] != session
             or fields[1] != window
             or not fields[2].startswith("%")
@@ -2365,7 +2361,8 @@ class NodeRuntime:
             "pane_pid": int(fields[3]),
             "alternate": fields[4] == "1",
             "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
-            "mouse_flags": [int(flag) for flag in fields[5:]],
+            "mouse_flags": [int(flag) for flag in fields[5:10]],
+            "shell_foreground": fields[10] == "1",
         }
 
     async def _read_text_open(

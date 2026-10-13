@@ -182,6 +182,15 @@
     paneMode = value.available === false ? null : Object.freeze(value);
     host.dispatchEvent(new Event("termroom:pane-mode"));
   };
+  // A TUI can leave mouse modes enabled when it exits. tmux then forwards
+  // reports to readline, which inserts their numeric suffix into shell input.
+  // Gate xterm's mouse event source, not onData: pasted/user text stays intact.
+  const mouseService = term._core.coreMouseService;
+  const reportMouse = mouseService.triggerMouseEvent.bind(mouseService);
+  mouseService.triggerMouseEvent = (event) => {
+    if (paneMode?.shell_foreground === true && !paneMode.alternate) return false;
+    return reportMouse(event);
+  };
   term.options.screenReaderMode = false;
   screenReaderModeToggle?.addEventListener("change", () => {
     term.options.screenReaderMode = screenReaderModeToggle.checked;

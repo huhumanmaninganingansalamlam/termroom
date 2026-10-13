@@ -67,6 +67,7 @@ from termroom.terminals import (
     TMUX_BROWSER_SIZE_FORMAT,
     TMUX_BROWSER_VIEW_PREFIX,
     TMUX_MANAGED_RUN_OPTION,
+    TMUX_PANE_MODE_FORMAT,
     TMUX_TERMINAL_EDITOR_DIGEST_OPTION,
     TMUX_TERMINAL_EDITOR_RECORD_FORMAT,
     TMUX_TERMINAL_RECORD_FORMAT,
@@ -4076,18 +4077,13 @@ class SSHBackend:
         session = str(workspace.get("tmux_session") or "")
         window = str(terminal.get("tmux_window") or "")
         target = shlex.quote(f"{session}:{window}")
-        format_string = (
-            "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{alternate_on}|"
-            "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
-            "#{mouse_all_flag}|#{mouse_sgr_flag}"
-        )
         output = self._exec(
             self._computer(workspace),
-            f"tmux display-message -p -t {target} {shlex.quote(format_string)}",
+            f"tmux display-message -p -t {target} {shlex.quote(TMUX_PANE_MODE_FORMAT)}",
         )
         fields = output.strip().split("|")
         if (
-            len(fields) != 10
+            len(fields) != 11
             or fields[0] != session
             or fields[1] != window
             or not fields[2].startswith("%")
@@ -4102,7 +4098,8 @@ class SSHBackend:
             "pane_pid": int(fields[3]),
             "alternate": fields[4] == "1",
             "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
-            "mouse_flags": [int(flag) for flag in fields[5:]],
+            "mouse_flags": [int(flag) for flag in fields[5:10]],
+            "shell_foreground": fields[10] == "1",
         }
 
     async def bridge(

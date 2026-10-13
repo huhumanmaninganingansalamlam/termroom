@@ -600,8 +600,8 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
 
     def run_tmux(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
         output = ""
-        if args[0] == "display-message" and args[-1].endswith("#{mouse_sgr_flag}"):
-            output = f"{workspace['tmux_session']}|@1|%1|2147483647|0|0|0|0|0|0\n"
+        if args[0] == "display-message" and "#{mouse_sgr_flag}" in args[-1]:
+            output = f"{workspace['tmux_session']}|@1|%1|2147483647|0|0|0|0|0|0|1\n"
         return subprocess.CompletedProcess(args, 0, output, "")
 
     monkeypatch.setattr(
@@ -648,6 +648,7 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
             "alternate": False,
             "mouse_tracking": False,
             "mouse_flags": [0, 0, 0, 0, 0],
+            "shell_foreground": True,
         }
         assert control["alternate"] is False
         assert control["mouse_tracking"] is False

@@ -2,6 +2,17 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.9] - 2026-10-13
+
+### Fixed
+
+- Prevent residual TUI mouse modes from inserting numeric mouse reports into
+  shell commands after an application exits or a terminal view changes. Use
+  the current canonical foreground shell state across Local, SSH and Node;
+  native TUI/copy-mode mouse, keyboard, paste and drafts remain intact.
+- Align contribution and terminal validation guidance with affected-flow
+  runtime checks instead of obsolete mandatory Mac/Safari release gates.
+
 ## [0.4.8] - 2026-10-12
 
 ### Fixed
