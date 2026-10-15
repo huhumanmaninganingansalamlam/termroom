@@ -1686,7 +1686,9 @@ def test_terminal_input_survives_grid_promotion_retry(
                 assert effect.read_text() == "z" and writes == [b"z"]
                 assert manager.control.presence(terminal_id)["input_revision"] == 1
                 ws.send_json({"kind": "resize", "rows": 18, "cols": 124})
-                time.sleep(0.1)
+                deadline = time.monotonic() + 3
+                while grid() != "124x17" and time.monotonic() < deadline:
+                    time.sleep(0.01)
                 assert grid() == "124x17" and writes == [b"z"]
     finally:
         _cleanup(app, workspace)
