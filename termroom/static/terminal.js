@@ -599,6 +599,12 @@
     const changed = term.cols !== cols || term.rows !== rows;
     if (changed) {
       term.resize(cols, rows);
+      // xterm 6 skips shrinking an empty alternate buffer's capacity. If the
+      // editor opens before SSH output, that spare capacity becomes scrollback
+      // and later TUI redraws scroll the visible response away. An empty
+      // alternate buffer has no content to preserve and must fit this viewport.
+      const alternate = term._core._bufferService.buffers.alt;
+      if (alternate.lines.length === 0) alternate.lines.maxLength = rows;
     }
     if (changed || forceSend) send({ kind: "resize", rows, cols });
   };
@@ -807,6 +813,29 @@
       activationPending = true;
       connect();
     }
+  });
+  window.addEventListener("offline", () => {
+    if (!reconnectAllowed) return;
+    // TCP close can lag network loss. Retire this generation immediately so
+    // buffered frames cannot re-establish readiness or confirm an old command.
+    connectionEpoch += 1;
+    window.clearTimeout(reconnectTimer);
+    cancelPresenceRequest();
+    resetInputControl();
+    initialOutputParsed = false;
+    const previousSocket = socket;
+    socket = null;
+    setStatus(tr("terminal.status.offline"));
+    if (reconnectButton) {
+      reconnectButton.hidden = false;
+      reconnectButton.disabled = false;
+    }
+    if (previousSocket && previousSocket.readyState < WebSocket.CLOSING) {
+      previousSocket.close(1000, "offline");
+    }
+  });
+  window.addEventListener("online", () => {
+    if (reconnectAllowed && !socket && document.visibilityState !== "hidden") connect();
   });
 
   let nextTerminalDataIsUserInput = false;
@@ -1065,6 +1094,7 @@
     const command = pendingCommand.command;
     resetCommandDelivery();
     commandUnconfirmed = false;
+    if (value.accepted) rememberCommand(command);
     setCommandDelivery(commandInput.value === command
       ? value.accepted ? "accepted" : "rejected" : "idle");
     if (value.accepted && commandInput.value === command) {
@@ -1109,6 +1139,10 @@
     event.preventDefault();
     if (composerComposing || commandPending) return;
     if (!commandInput.value.trim()) return;
+    if (socket?.readyState !== WebSocket.OPEN) {
+      setCommandDelivery("rejected");
+      return;
+    }
     const command = commandInput.value;
     const epoch = connectionEpoch;
     const commandSocket = socket;
@@ -1156,7 +1190,7 @@
   });
   restoreCommandDraft();
 
-  document.querySelectorAll("[data-command-reuse]").forEach((button) => {
+  const bindCommandReuse = (button) => {
     button.addEventListener("click", () => {
       setComposerOpen(true, { focus: false });
       commandInput.value = button.dataset.commandReuse || "";
@@ -1164,7 +1198,24 @@
       commandInput.focus();
       commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
     });
-  });
+  };
+  document.querySelectorAll("[data-command-reuse]").forEach(bindCommandReuse);
+  const rememberCommand = (command) => {
+    const recent = document.querySelector("[data-recent-commands]");
+    if (!recent) return;
+    const previous = [...recent.querySelectorAll("[data-command-reuse]")]
+      .find((button) => button.dataset.commandReuse === command);
+    previous?.remove();
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.commandReuse = command;
+    button.textContent = command;
+    bindCommandReuse(button);
+    recent.querySelector(".recent-command-label").after(button);
+    [...recent.querySelectorAll("[data-command-reuse]")].slice(5).forEach((item) => item.remove());
+    recent.hidden = false;
+    document.querySelector("[data-command-empty]")?.setAttribute("hidden", "");
+  };
 
   const terminalTabs = [...document.querySelectorAll("[data-terminal-switch]")];
   const terminalOutputLink = document.querySelector("[data-terminal-output-link]");

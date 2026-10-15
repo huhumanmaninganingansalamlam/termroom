@@ -272,8 +272,8 @@
       </div>
       <button class="send-command" type="submit">{{ t('terminal.run') }}</button>
     </form>
-    {% if commands %}
-    <div class="recent-command-strip" aria-label="{{ t('terminal.recent_commands_aria') }}">
+    <div class="recent-command-strip" data-recent-commands
+         aria-label="{{ t('terminal.recent_commands_aria') }}"{% if not commands %} hidden{% endif %}>
       <span class="recent-command-label">{{ t('terminal.recent_commands') }}</span>
       {% for command in commands[:5] %}
       <button type="button" data-command-reuse="{{ command }}">{{ command }}</button>
@@ -287,9 +287,7 @@
         <button type="submit" class="recent-command-clear">{{ t('terminal.clear_recent') }}</button>
       </form>
     </div>
-    {% else %}
-    <p class="terminal-first-hint">{{ t('terminal.first_hint') }}</p>
-    {% endif %}
+    <p class="terminal-first-hint" data-command-empty{% if commands %} hidden{% endif %}>{{ t('terminal.first_hint') }}</p>
   </div>
 </div>
 {% endblock %}

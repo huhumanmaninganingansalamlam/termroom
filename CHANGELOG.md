@@ -2,6 +2,20 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.11] - 2026-10-15
+
+### Fixed
+
+- Preserve TUI output when opening the command editor before the first SSH
+  screen arrives. Keep the empty xterm alternate buffer at the actual viewport
+  capacity instead of allowing hidden scrollback to displace later redraws.
+- Mark browser network loss immediately, retain unsent or unconfirmed drafts,
+  and reconnect the same terminal when connectivity returns without replaying
+  commands or treating WebSocket open as backend readiness.
+- Make acknowledged commands immediately recoverable as unsent drafts in Recent,
+  including on desktop, without requiring a page reload. A terminal delivery
+  acknowledgement remains distinct from the application's actual response.
+
 ## [0.4.10] - 2026-10-13
 
 ### Fixed

@@ -305,7 +305,8 @@ const {Terminal} = require('./termroom/static/vendor/xterm.js');
   const real = new Terminal({cols:80,rows:24});
   const term = {get cols(){return real.cols;},get rows(){return real.rows;},
     resize:(c,r)=>real.resize(c,r),
-    _core:{_renderService:{dimensions:{css:{cell:{width:10,height:20}}}}}};
+    _core:{_bufferService:real._core._bufferService,
+      _renderService:{dimensions:{css:{cell:{width:10,height:20}}}}}};
   const host = {clientWidth:800,clientHeight:480};
   const sent = [], send = value => sent.push(value), publishTerminalMetrics = () => {};
   const window = {getComputedStyle(){return {
@@ -315,6 +316,17 @@ RESIZE_HANDLER
   const text = () => Array.from({length:real.buffer.active.length},(_,i) =>
     real.buffer.active.getLine(i).translateToString(true)).filter(Boolean);
   try {
+    // Open the editor before the first SSH frame: grow, then shrink an empty
+    // alternate buffer. Its capacity must not become hidden scrollback.
+    host.clientHeight=680;resizeTerminal();
+    host.clientHeight=620;resizeTerminal();
+    await new Promise(resolve => real.write('\x1b[?1049h'+
+      Array.from({length:40},(_,i)=>'line '+i+'\r\n').join('')+
+      '\x1b[H\x1b[2JOWNED RESUMED RESPONSE',resolve));
+    assert.equal(real.buffer.active.baseY,0,'alternate screen never owns scrollback');
+    assert.equal(real.buffer.active.getLine(0).translateToString(true),'OWNED RESUMED RESPONSE');
+    await new Promise(resolve=>real.write('\x1b[?1049l',resolve));
+    host.clientHeight=480;resizeTerminal();sent.length=0;
     await new Promise(resolve => real.write(
       '\x1b[?1049h\x1b[H\x1b[2JOWNED TOP FRAME\x1b[24;1H',resolve));
     for (const [width,height] of [[0,0],[0,480],[800,0]]) {
@@ -368,7 +380,9 @@ const document = {querySelector(selector) {
     return {remove(){unrelatedError=false;}};
   }
 }};
-const window = {clearTimeout(){},setTimeout(){},dispatchEvent(){}};
+const windowListeners = {};
+const window = {clearTimeout(){},setTimeout(){},dispatchEvent(){},
+ addEventListener(name,callback){windowListeners[name]=callback;}};
 const location = {protocol:'https:',host:'fixture.invalid'};
 let socket=null,connectionEpoch=0,reconnectTimer,reconnectDelay=500,reconnectAllowed=true;
 let paneMode=null,paneModeGeneration=null,paneModeRevision=0,isConnected=false,status;
@@ -387,10 +401,11 @@ const scheduleResize=()=>{},updatePresence=()=>{},cancelPresenceRequest=()=>{};
 const scheduleActivityAcknowledge=()=>{};
 const CustomEvent=class {};
 class WebSocket {
-  constructor(){this.listeners={};}
+  static CLOSING=2;
+  constructor(){this.listeners={};this.readyState=0;}
   addEventListener(name,callback){this.listeners[name]=callback;}
-  close(){this.listeners.close({code:1006});}
-  emit(name,event={}){this.listeners[name](event);}
+  close(){this.readyState=2;} // TCP close is deliberately withheld.
+  emit(name,event={}){if(name==='open')this.readyState=1;if(name==='close')this.readyState=3;this.listeners[name](event);}
 }
 MODE_HANDLER
 CONNECT_HANDLER
@@ -433,11 +448,26 @@ current.emit('message',control(3));
 assert.equal(isConnected,false,'the prior connection cannot mark a reconnect ready');
 recovered.emit('message',control(1));
 assert.equal(isConnected,true);
-recovered.emit('close',{code:4403});
+windowListeners.offline();
+assert.equal(isConnected,false,'offline must not wait for the TCP close event');
+assert.equal(status,'terminal.status.offline');
+assert.equal(socket,null);
+assert.equal(reconnectButton.hidden,false);
+assert.equal(reconnectButton.disabled,false);
+recovered.emit('message',control(2));
+assert.equal(isConnected,false,'late output cannot revive the offline generation');
+windowListeners.online();
+const online=socket;online.emit('open');
+assert.equal(isConnected,false,'network restoration still needs backend readiness');
+online.emit('message',control(1));
+assert.equal(isConnected,true);
+online.emit('close',{code:4403});
 assert.equal(isConnected,false);
 assert.equal(status,'terminal.status.rejected','a genuine current rejection must remain visible');
 assert.equal(reconnectButton.hidden,true,'an authorization rejection is not an automatic retry');
-recovered.emit('close',{code:4401});
+windowListeners.offline();
+assert.equal(status,'terminal.status.rejected','offline must preserve an actual rejection');
+online.emit('close',{code:4401});
 assert.equal(signInLink.hidden,false,'expired authentication offers sign in');
 """.replace("MODE_HANDLER", mode).replace("CONNECT_HANDLER", connect)
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
@@ -466,7 +496,7 @@ def test_command_editor_uses_native_paste_once_and_keeps_plain_history() -> None
         )
     ]
     reuse = script[
-        script.index('  document.querySelectorAll("[data-command-reuse]")') : script.index(
+        script.index('  const bindCommandReuse =') : script.index(
             "  const terminalTabs ="
         )
     ]
@@ -494,7 +524,13 @@ const receipt = {dataset:{},hidden:true,querySelector(){return this;},textConten
 let reuseDraft;
 const reuseButton = {dataset:{commandReuse:'history draft'},
  addEventListener(_,callback){reuseDraft=callback;}};
-const document = {querySelector:()=>receipt,querySelectorAll:()=>[reuseButton]};
+const recentButtons=[reuseButton];
+const recent={hidden:false,querySelectorAll:()=>recentButtons,
+ querySelector:()=>({after:button=>recentButtons.unshift(button)})};
+const document = {querySelector:selector=>selector==='#command-delivery'?receipt:
+ selector==='[data-recent-commands]'?recent:null,querySelectorAll:()=>[reuseButton],
+ createElement:()=>({dataset:{},addEventListener(_,callback){this.click=callback;},
+ remove(){recentButtons.splice(recentButtons.indexOf(this),1);}})};
 const tr = key => key;
 const host = {dataset:{workspaceId:'w',terminalId:'t'}};
 let controlGeneration = 'current';
@@ -529,6 +565,12 @@ assert.equal(Buffer.byteLength(text),19806);
   acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent[0].command_id,accepted:true});
   assert.equal(receipt.dataset.state, 'accepted');
   assert.equal(receipt.hidden, false, 'ACK receipt survives the editor closing');
+  assert.equal(recentButtons[0].dataset.commandReuse,text,
+    'ACK retains the exact text in live Recent');
+  recentButtons[0].click();
+  assert.equal(commandInput.value,text,
+    'recall needs no reload and keeps the original multiline text');
+  assert.equal(sent.length,1,'recall is an unsent draft, never an automatic replay');
   reuseDraft();
   assert.equal(commandInput.value, 'history draft', 'recent history opens as an unsent draft');
   assert.equal(receipt.hidden, true, 'recalling history must not imply new delivery');
@@ -594,6 +636,7 @@ assert.equal(Buffer.byteLength(text),19806);
   acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent.at(-1).command_id,accepted:false});
   assert.equal(commandInput.value, 'rejected draft', 'rejection never erases the draft');
   assert.equal(receipt.dataset.state, 'rejected');
+  assert.ok(!recentButtons.some(button=>button.dataset.commandReuse==='rejected draft'));
   assert.equal(commandPending, false, 'explicit rejection must release the submit guard');
   commandInput.value = 'unconfirmed navigation draft';
   submit({preventDefault(){}});

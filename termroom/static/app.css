@@ -5594,7 +5594,6 @@ details:not([open]) > :not(summary) {
 }
 
 @media (min-width: 1024px) {
-  .recent-command-strip,
   .terminal-first-hint {
     display: none;
   }

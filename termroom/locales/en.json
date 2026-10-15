@@ -684,6 +684,7 @@
   "terminal.status.other_input": "Input from another device",
   "terminal.status.other_input_many": "Other device input · {count} devices",
   "terminal.status.connecting": "Connecting…",
+  "terminal.status.offline": "Offline",
   "terminal.status.auth_required": "Authentication required",
   "terminal.status.rejected": "Terminal connection rejected",
   "terminal.status.not_found": "Terminal not found",
