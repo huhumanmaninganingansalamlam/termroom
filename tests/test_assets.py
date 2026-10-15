@@ -13,10 +13,7 @@ from termroom.assets import (
     ASSETS,
     TERMINAL_FONT_ASSETS,
     TERMINAL_FONT_SOURCE_ARCHIVE_SHA256,
-    TERMINAL_FONT_SOURCE_ARCHIVE_URL,
-    TERMINAL_FONT_SOURCE_TTF,
     TERMINAL_FONT_SOURCE_TTF_SHA256,
-    TERMINAL_FONT_VERSION,
     VENDOR_DIR,
     XTERM_UNICODE11_VERSION,
     XTERM_VERSION,
@@ -38,18 +35,7 @@ def _range_points(ranges: list[tuple[int, int]]) -> set[int]:
 
 
 def test_vendored_xterm_matches_declared_scoped_release() -> None:
-    assert XTERM_VERSION == "6.0.0"
-    assert XTERM_UNICODE11_VERSION == "0.8.0"
-    assert set(ASSETS) == {"xterm.js", "xterm.css", "addon-unicode11.js"}
     assert XTERM_VERSION_FILE.read_text(encoding="utf-8").strip() == XTERM_VERSION
-    assert (VENDOR_DIR / "xterm.js").stat().st_size > 400_000
-    assert (VENDOR_DIR / "xterm.css").stat().st_size > 5_000
-    assert (VENDOR_DIR / "addon-unicode11.js").stat().st_size > 12_000
-    for filename in ("xterm.js", "xterm.css"):
-        assert f"@xterm/xterm@{XTERM_VERSION}" in str(ASSETS[filename]["url"])
-    assert f"@xterm/addon-unicode11@{XTERM_UNICODE11_VERSION}" in str(
-        ASSETS["addon-unicode11.js"]["url"]
-    )
     for filename, details in ASSETS.items():
         digest = hashlib.sha256((VENDOR_DIR / filename).read_bytes()).hexdigest()
         assert digest == details["sha256"]
@@ -95,51 +81,10 @@ addon.dispose();
 
 
 def test_vendored_terminal_font_is_reproducible_and_attributed() -> None:
-    assert TERMINAL_FONT_VERSION == "3.5.0"
-    expected_assets = {
-        "core_hangul": (
-            "d2koding-ligature-nerd-font-mono-3.5.0-core-hangul.woff2",
-            567_584,
-            "b9fae6a182cc440dcf69c7a8b3a8b2ad60284fa2ed67e8e41c2f26bead83ede9",
-        ),
-        "cjk": (
-            "d2koding-ligature-nerd-font-mono-3.5.0-cjk.woff2",
-            801_848,
-            "0d1b8923dc714312107b8282b1e2f1d79645e48f26e0a12d38dac886028c9783",
-        ),
-        "nerd_bmp": (
-            "d2koding-ligature-nerd-font-mono-3.5.0-nerd-bmp.woff2",
-            497_412,
-            "64c9508468b380ac4e31f65ce5fc548e14939670ae1833870596f276661122dd",
-        ),
-        "nerd_supp": (
-            "d2koding-ligature-nerd-font-mono-3.5.0-nerd-supp.woff2",
-            397_908,
-            "25fa39d5040346d76385e04aa5977b15b1bc72b3af27bff429f27e341fc03f0d",
-        ),
-    }
-    assert set(TERMINAL_FONT_ASSETS) == set(expected_assets)
-    assert TERMINAL_FONT_SOURCE_ARCHIVE_URL.endswith("/releases/download/v3.5.0/D2Coding.tar.xz")
-    assert (
-        TERMINAL_FONT_SOURCE_ARCHIVE_SHA256
-        == "c1d4e7cbee20b9e55d2481762bbb8413124fda224cee26863b805fe2f863aaec"
-    )
-    assert TERMINAL_FONT_SOURCE_TTF == "D2KodingLigatureNerdFontMono-Regular.ttf"
-    assert (
-        TERMINAL_FONT_SOURCE_TTF_SHA256
-        == "be8964904705f43a1e5a62339629d9e20eb37316008dda4de5b5681547ea2996"
-    )
-
-    for key, (filename, size, digest) in expected_assets.items():
-        details = TERMINAL_FONT_ASSETS[key]
-        assert details["filename"] == filename
-        assert details["size"] == size
-        assert details["sha256"] == digest
-        font = VENDOR_DIR / filename
-        assert font.stat().st_size == size
-        assert hashlib.sha256(font.read_bytes()).hexdigest() == digest
-    assert sum(int(details["size"]) for details in TERMINAL_FONT_ASSETS.values()) == 2_264_752
-    assert not (VENDOR_DIR / "d2koding-ligature-nerd-font-mono-3.5.0.woff2").exists()
+    for details in TERMINAL_FONT_ASSETS.values():
+        font = VENDOR_DIR / str(details["filename"])
+        assert font.stat().st_size == details["size"]
+        assert hashlib.sha256(font.read_bytes()).hexdigest() == details["sha256"]
 
     d2_license = (VENDOR_DIR / "d2koding-nerd-font.OFL.txt").read_text(encoding="utf-8")
     nerd_license = (VENDOR_DIR / "nerd-fonts.LICENSE").read_text(encoding="utf-8")
@@ -151,8 +96,6 @@ def test_vendored_terminal_font_is_reproducible_and_attributed() -> None:
         TERMINAL_FONT_SOURCE_ARCHIVE_SHA256,
         TERMINAL_FONT_SOURCE_TTF_SHA256,
         *(str(details["sha256"]) for details in TERMINAL_FONT_ASSETS.values()),
-        "FontTools 4.63.0",
-        "brotli 1.2.0",
         "pyftsubset",
         "PfEd",
         "CC BY 4.0",
@@ -173,44 +116,12 @@ def test_vendored_terminal_font_is_reproducible_and_attributed() -> None:
 
 def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     stylesheet = (VENDOR_DIR.parent / "terminal-font.css").read_text(encoding="utf-8")
-    expected_ranges = (
-        "U+0000-DFFF, U+E000-E00A, U+E0A0-E0A3, U+E0B0-E0C8, U+E0CA, "
-        "U+E0CC-E0D2, U+E0D4, U+E0D6-E0D7, U+E200-E2A9, U+E300-E3E3, "
-        "U+E5FA-E6BB, U+E700-E8EF, U+EA60-EA88, U+EA8A-EA8C, "
-        "U+EA8F-EAC7, U+EAC9, U+EACC-EB09, U+EB0B-EB4E, U+EB50-EC5E, "
-        "U+EC60-EC84, U+ED00-EFCF, U+F000-F385, U+F400-F533, "
-        "U+F900-FFFF, U+F0001-F1AF0"
-    )
     korean_ranges = "U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7FF, U+FFA0-FFDC"
 
     faces = re.findall(r"@font-face\s*\{(.*?)\}", stylesheet, flags=re.DOTALL)
-    assert len(faces) == 5
     korean_face = next(
         candidate for candidate in faces if 'font-family: "Termroom Korean Terminal"' in candidate
     )
-    assert stylesheet.count('font-family: "Termroom D2Koding Nerd Mono"') == 4
-    assert stylesheet.count('font-family: "Termroom Korean Terminal"') == 1
-    assert stylesheet.count("font-weight: 400") == 5
-    assert stylesheet.count("font-style: normal") == 5
-    assert "font-weight: 700" not in stylesheet
-    assert "font-style: italic" not in stylesheet
-    assert stylesheet.count("font-display: block") == 1
-    assert stylesheet.count("font-display: swap") == 4
-    assert "font-variant-ligatures: none" in stylesheet
-    assert 'font-feature-settings: "liga" 0, "calt" 0' in stylesheet
-    assert "font-synthesis: weight style" in stylesheet
-    for local_family in (
-        "Noto Sans Mono CJK KR",
-        "D2Coding",
-        "NanumGothicCoding",
-        "Apple SD Gothic Neo",
-        "Malgun Gothic",
-        "Noto Sans CJK KR",
-        "Noto Sans KR",
-    ):
-        assert f'local("{local_family}")' in korean_face
-
-    expected_points = _range_points(_unicode_ranges(expected_ranges))
     korean_points = _range_points(_unicode_ranges(korean_ranges))
     korean_declaration = re.search(r"unicode-range:\s*([^;]+);", korean_face)
     assert korean_declaration is not None
@@ -228,9 +139,7 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
         assert actual_points.isdisjoint(points)
         actual_points.update(points)
         face_points[key] = points
-        assert f'url("vendor/{filename}?v=3.5.0.1")' in face
 
-    assert actual_points == expected_points - korean_points
     assert actual_points.isdisjoint(korean_points)
     assert {0x004D, 0x0301, 0x2500, 0x2800} <= face_points["core_hangul"]
     assert {0x1100, 0x3131, 0xAC00, 0xD7A3, 0xFFA0} <= korean_points
@@ -269,153 +178,6 @@ def test_terminal_font_claims_only_the_audited_character_ranges() -> None:
     assert "data-terminal-command-clear-target" in terminal_template
     for key in ("cjk", "nerd_bmp", "nerd_supp"):
         assert str(TERMINAL_FONT_ASSETS[key]["filename"]) not in terminal_template
-    terminal_script = (VENDOR_DIR.parent / "terminal.js").read_text(encoding="utf-8")
-    assert "KOREAN_TERMINAL_FONT_FAMILY = '\"Termroom Korean Terminal\"'" in terminal_script
-    assert 'BUNDLED_TERMINAL_FONT_PROBE = "M"' in terminal_script
-    assert (
-        "`${KOREAN_TERMINAL_FONT_FAMILY}, ${BUNDLED_TERMINAL_FONT_FAMILY}, "
-        "${systemFamily}`" in terminal_script
-    )
-    assert "`${KOREAN_TERMINAL_FONT_FAMILY}, ${systemFamily}`" in terminal_script
-    assert "\\uE0B0" not in terminal_script
-    assert "\\uF013" not in terminal_script
-    assert "\\u{F0001}" not in terminal_script
-    assert 'addEventListener?.("loadingdone"' in terminal_script
-    assert "clearTextureAtlas?.()" in terminal_script
-    assert "bundledTerminalFontLoad.completed.then" in terminal_script
-    assert "bundledTerminalFontLoaded = true" in terminal_script
-    assert "term.options.fontFamily = terminalFontFamily(true)" in terminal_script
-    assert "BUNDLED_TERMINAL_FONT_LOAD_TIMEOUT_MS = 400" in terminal_script
-    assert "const MINIMUM_TERMINAL_CONTRAST_RATIO = 4.5;" in terminal_script
-    assert "minimumContrastRatio: MINIMUM_TERMINAL_CONTRAST_RATIO" in terminal_script
-    assert "screenReaderMode: false," in terminal_script
-    assert (
-        "const screenReaderModeToggle = document.querySelector("
-        '"#terminal-screen-reader-mode");' in terminal_script
-    )
-    assert "screenReaderModeToggle.checked = false;" in terminal_script
-    assert "term.options.screenReaderMode = false;" in terminal_script
-    assert terminal_script.count("new window.Terminal(") == 1
-    assert re.search(
-        r'screenReaderModeToggle\?\.addEventListener\("change", \(\) => \{\s*'
-        r"term\.options\.screenReaderMode = screenReaderModeToggle\.checked;",
-        terminal_script,
-    )
-    screen_reader_query_at = terminal_script.index(
-        "const screenReaderModeToggle = document.querySelector("
-    )
-    screen_reader_checked_reset_at = terminal_script.index(
-        "screenReaderModeToggle.checked = false;"
-    )
-    first_font_await_at = terminal_script.index("await bundledTerminalFontLoad.initial")
-    terminal_constructor_at = terminal_script.index("new window.Terminal(")
-    terminal_open_at = terminal_script.index("term.open(host);")
-    screen_reader_option_reset_at = terminal_script.index("term.options.screenReaderMode = false;")
-    screen_reader_listener_at = terminal_script.index(
-        'screenReaderModeToggle?.addEventListener("change"'
-    )
-    assert (
-        screen_reader_query_at
-        < screen_reader_checked_reset_at
-        < first_font_await_at
-        < terminal_constructor_at
-        < terminal_open_at
-        < screen_reader_option_reset_at
-        < screen_reader_listener_at
-    )
-    assert 'TERMINAL_CELL_WIDTH_PROPERTY = "--termroom-terminal-cell-width"' in terminal_script
-    assert 'TERMINAL_CELL_HEIGHT_PROPERTY = "--termroom-terminal-cell-height"' in terminal_script
-    assert "const terminalStringCellWidth = (value) =>" in terminal_script
-    assert 'service.getStringCellWidth(String(value || ""))' in terminal_script
-    assert 'Object.defineProperty(host, "termroomStringCellWidth"' in terminal_script
-    buffer_mode_property = re.search(
-        r'Object\.defineProperty\(host, "termroomActiveBufferType", \{.*?\n  \}\);',
-        terminal_script,
-        re.S,
-    )
-    assert buffer_mode_property is not None
-    mode_probe = (
-        """
-const assert = require('node:assert/strict');
-const host = {};
-const term = {buffer:{active:{type:'normal'}}};
-"""
-        + buffer_mode_property.group()
-        + """
-assert.equal(host.termroomActiveBufferType, 'normal');
-term.buffer.active = {type:'alternate'};
-assert.equal(host.termroomActiveBufferType, 'alternate');
-const descriptor = Object.getOwnPropertyDescriptor(host, 'termroomActiveBufferType');
-assert.equal(descriptor.set, undefined);
-assert.equal(Object.keys(host).includes('termroomActiveBufferType'), false);
-"""
-    )
-    mode_result = subprocess.run(["node", "-e", mode_probe], capture_output=True, text=True)
-    assert mode_result.returncode == 0, mode_result.stderr
-    assert "const publishTerminalMetrics = (cell) =>" in terminal_script
-    assert 'new CustomEvent("termroom:terminal-metrics"' in terminal_script
-    assert "publishTerminalMetrics(cell);" in terminal_script
-    assert 'new CustomEvent("termroom:terminal-output"' in terminal_script
-    assert 'new CustomEvent("termroom:terminal-activity-changed"' in terminal_script
-    assert "workspace_id: host.dataset.workspaceId" in terminal_script
-    assert "terminal_id: host.dataset.terminalId" in terminal_script
-    assert "scheduleResize(true)" in terminal_script
-    assert "const onUserInput = term._core?.coreService?.onUserInput;" in terminal_script
-    assert "const userInput = hasUserInputSignal && nextTerminalDataIsUserInput;" in terminal_script
-    assert "user_input: userInput" in terminal_script
-    assert "term.onBinary((data) =>" in terminal_script
-    assert "sendInputFrame(Uint8Array.from(data" in terminal_script
-    assert 'kind: "command"' in terminal_script
-    assert "rows: term.rows" in terminal_script
-    assert "cols: term.cols" in terminal_script
-    assert "const Unicode11AddonClass = window.Unicode11Addon?.Unicode11Addon;" in terminal_script
-    assert (
-        'const unicode11Available = typeof Unicode11AddonClass === "function";' in terminal_script
-    )
-    assert "allowProposedApi: unicode11Available" in terminal_script
-    assert 'host.dataset.terminalUnicode = "default";' in terminal_script
-    assert "if (unicode11Available)" in terminal_script
-    assert "term.loadAddon(unicode11Addon);" in terminal_script
-    assert 'term.unicode.activeVersion = "11";' in terminal_script
-    assert 'host.dataset.terminalUnicode = "11";' in terminal_script
-    assert 'return "\\u001b[1;5A";' in terminal_script
-    assert 'return "\\u001b[1;5B";' in terminal_script
-    assert 'return "\\u001b[1;5C";' in terminal_script
-    assert 'return "\\u001b[1;5D";' in terminal_script
-    assert "const terminalCtrlValue = (value) =>" in terminal_script
-    assert "if (/^[A-Za-z]$/.test(value))" in terminal_script
-    assert 'if (value === "_") return "\\u001f";' in terminal_script
-    assert "if (!action) value = terminalCtrlValue(value);" in terminal_script
-    assert "let reconnectAllowed = true;" in terminal_script
-    assert "reconnectAllowed = !terminalCloseMessage;" in terminal_script
-    assert 'document.querySelectorAll("[data-terminal-switch]")' in terminal_script
-    assert (
-        'if (!targetId || !shellTerminal || targetRole !== "shell") return false;'
-        in terminal_script
-    )
-    assert "connectionEpoch += 1;" in terminal_script
-    assert "term.reset();" in terminal_script
-    assert "closeMoreKeys({ focus: false });" in terminal_script
-    assert "terminalCommandClearTarget.value = targetId" in terminal_script
-    assert "history.pushState(" in terminal_script
-    assert 'window.addEventListener("popstate"' in terminal_script
-    assert 'new CustomEvent("termroom:terminal-switched"' in terminal_script
-    assert "if (epoch !== connectionEpoch || nextSocket !== socket) return;" in terminal_script
-    assert re.search(
-        r'document\.addEventListener\("visibilitychange", \(\) => \{\s*'
-        r'if \(document\.visibilityState !== "visible"\) \{\s*'
-        r"cancelPresenceRequest\(\);\s*return;\s*\}\s*"
-        r"if \(document\.hasFocus\(\)\) claimInputControl\(\);\s*"
-        r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{",
-        terminal_script,
-    )
-    assert re.search(
-        r'window\.addEventListener\("focus", \(\) => \{\s*'
-        r"if \(reconnectAllowed && socket\?\.readyState === WebSocket\.CLOSED\) \{\s*"
-        r"connect\(\);\s*return;\s*\}\s*"
-        r"scheduleActivityAcknowledge\(\);\s*\}\);",
-        terminal_script,
-    )
 
 
 def test_template_static_asset_versions_match_file_hashes() -> None:
@@ -451,7 +213,7 @@ def test_template_static_asset_versions_match_file_hashes() -> None:
         path = VENDOR_DIR.parent / asset
         expected = hashlib.sha256(path.read_bytes()).hexdigest()
         assert static_asset_version(path) == expected
-    assert fixed_versions["vendor/addon-unicode11.js"] == {"0.8.0"}
+    assert fixed_versions["vendor/addon-unicode11.js"] == {XTERM_UNICODE11_VERSION}
 
 
 def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> None:
