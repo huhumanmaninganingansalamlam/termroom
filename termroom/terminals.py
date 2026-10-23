@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import WebSocket, WebSocketDisconnect
 
 from termroom.db import MAX_WORKSPACE_COMMANDS, StateStore, normalize_workspace_commands
-from termroom.pty_process import spawn_pty_process, write_all
+from termroom.pty_process import read_pty, spawn_pty_process, write_all
 from termroom.terminal_control import TerminalControl
 from termroom.workspace_usage import (
     RawWorkspaceUsage,
@@ -755,6 +755,35 @@ class TerminalOutputDecoder:
 
     def feed(self, chunk: bytes, *, final: bool = False) -> str:
         return self._decoder.decode(chunk, final=final)
+
+
+class TerminalModeRefresh:
+    """One owned metadata query; a slow query cannot hold back PTY output."""
+
+    def __init__(
+        self, query: Callable[[], Awaitable[None]], unavailable: Callable[[], Awaitable[None]]
+    ) -> None:
+        self.query = query
+        self.unavailable = unavailable
+        self.task: asyncio.Task[None] | None = None
+
+    async def refresh(self) -> None:
+        if self.task is not None:
+            if not self.task.done():
+                return
+            await self.task
+        self.task = asyncio.create_task(self.query())
+        done, _ = await asyncio.wait({self.task}, timeout=PANE_MODE_REFRESH_INTERVAL_SECONDS)
+        if done:
+            await self.task
+            self.task = None
+        else:
+            await self.unavailable()
+
+    async def close(self) -> None:
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
 
 async def _await_owned_task(task: asyncio.Task[Any]) -> tuple[Any, bool]:
@@ -1835,24 +1864,8 @@ class TerminalManager:
             chunks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
 
             async def read_output() -> None:
-                loop = asyncio.get_running_loop()
                 while master_fd is not None:
-                    readable = loop.create_future()
-
-                    def ready(waiter: asyncio.Future[None] = readable) -> None:
-                        if not waiter.done():
-                            waiter.set_result(None)
-
-                    try:
-                        # One reader owns this PTY: only read after readiness,
-                        # leaving shared executor capacity free while idle.
-                        loop.add_reader(master_fd, ready)
-                        await readable
-                        chunk = os.read(master_fd, 65536)
-                    except OSError:
-                        chunk = b""
-                    finally:
-                        loop.remove_reader(master_fd)
+                    chunk = await read_pty(master_fd)
                     await chunks.put(chunk)
                     if not chunk:
                         return
@@ -1874,7 +1887,7 @@ class TerminalManager:
                                 timer.cancel()
                         while not chunks.empty() and len(batch) < 16 and batch[-1]:
                             batch.append(chunks.get_nowait())
-                        await send_pane_mode()
+                        await mode_refresh.refresh()
                         last_refresh = loop.time()
                         decoded = decoder.feed(b"".join(batch), final=not batch[-1])
                         if decoded:
@@ -1890,14 +1903,24 @@ class TerminalManager:
         previous_mode: dict[str, Any] | None = None
 
         async def send_pane_mode() -> None:
-            nonlocal mode_revision, previous_mode
             query = asyncio.create_task(
                 asyncio.to_thread(self.current_pane_mode, workspace, terminal)
             )
-            mode, cancelled = await _await_owned_task(query)
+            try:
+                mode, cancelled = await _await_owned_task(query)
+            except (OSError, subprocess.SubprocessError, TerminalError, ValueError):
+                await mark_pane_mode_unavailable()
+                return
             if cancelled:
                 raise asyncio.CancelledError
-            if mode == previous_mode:
+            await publish_pane_mode(mode)
+
+        async def mark_pane_mode_unavailable() -> None:
+            await publish_pane_mode(None)
+
+        async def publish_pane_mode(mode: dict[str, Any] | None) -> None:
+            nonlocal mode_revision, previous_mode
+            if mode_revision and mode == previous_mode:
                 return
             previous_mode = mode
             mode_revision += 1
@@ -1911,10 +1934,13 @@ class TerminalManager:
                         "terminal_id": terminal_id,
                         "generation": client_id,
                         "revision": mode_revision,
-                        **mode,
+                        "available": mode is not None,
+                        **(mode or {}),
                     }
                 ).encode("utf-8")
             )
+
+        mode_refresh = TerminalModeRefresh(send_pane_mode, mark_pane_mode_unavailable)
 
         async def apply_browser_resize(payload: dict[str, Any]) -> bool:
             nonlocal last_viewport
@@ -2116,7 +2142,7 @@ class TerminalManager:
             (process_pid, master_fd), cancelled = await _await_owned_task(setup_task)
             if cancelled:
                 raise asyncio.CancelledError
-            await send_pane_mode()
+            await mode_refresh.refresh()
             output_task = asyncio.create_task(output_to_browser())
             input_task = asyncio.create_task(browser_to_input())
             done, pending = await asyncio.wait(
@@ -2134,6 +2160,7 @@ class TerminalManager:
             tasks = [task for task in (output_task, input_task) if task is not None]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            await mode_refresh.close()
             cleanup_error = await asyncio.to_thread(
                 self._release_browser_terminal,
                 terminal_id,

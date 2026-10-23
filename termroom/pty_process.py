@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import os
@@ -10,6 +11,25 @@ import struct
 import sys
 import termios
 from collections.abc import Mapping, Sequence
+
+
+async def read_pty(fd: int, size: int = 65536) -> bytes:
+    """Wait for this PTY without occupying a shared executor thread while idle."""
+    loop = asyncio.get_running_loop()
+    readable = loop.create_future()
+
+    def ready() -> None:
+        if not readable.done():
+            readable.set_result(None)
+
+    try:
+        loop.add_reader(fd, ready)
+        await readable
+        return os.read(fd, size)
+    except OSError:
+        return b""
+    finally:
+        loop.remove_reader(fd)
 
 
 def write_all(fd: int, data: bytes) -> None:

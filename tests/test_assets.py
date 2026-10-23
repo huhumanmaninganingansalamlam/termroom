@@ -448,6 +448,9 @@ assert.equal(isConnected,false,'reconnect must wait for this backend to become r
 current.emit('message',control(3));
 assert.equal(isConnected,false,'the prior connection cannot mark a reconnect ready');
 recovered.emit('message',control(1));
+assert.equal(isConnected,false,'pane metadata alone is not a displayed terminal');
+assert.equal(status,'terminal.status.waiting_output');
+recovered.emit('message',{data:'current screen'});
 assert.equal(isConnected,true);
 windowListeners.offline();
 assert.equal(isConnected,false,'offline must not wait for the TCP close event');
@@ -461,6 +464,8 @@ windowListeners.online();
 const online=socket;online.emit('open');
 assert.equal(isConnected,false,'network restoration still needs backend readiness');
 online.emit('message',control(1));
+assert.equal(isConnected,false);
+online.emit('message',{data:'restored screen'});
 assert.equal(isConnected,true);
 online.emit('close',{code:4403});
 assert.equal(isConnected,false);
@@ -749,6 +754,7 @@ const acceptPaneMode=()=>{},acceptInputControl=()=>{},resetInputControl=()=>{};
 CANCEL_HANDLER
 function attachMessage(nextSocket,epoch) {
   let receive;
+  const completeInitialScreen=()=>{};
   nextSocket.addEventListener=(_,listener)=>{receive=listener;};
 MESSAGE_HANDLER
   return receive;

@@ -55,7 +55,7 @@ from termroom.files import (
     parse_recent_ignore_patterns,
     recent_path_ignored,
 )
-from termroom.pty_process import spawn_pty_process
+from termroom.pty_process import read_pty, spawn_pty_process
 from termroom.secrets import SecretStore, SecretStoreError
 from termroom.security import file_digest
 from termroom.terminal_control import TerminalControl
@@ -81,6 +81,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER_ARGV,
+    TerminalModeRefresh,
     TerminalOutputDecoder,
     acknowledge_terminal_command,
     complete_terminal_command,
@@ -4126,7 +4127,6 @@ class SSHBackend:
         mode_revision = 0
         previous_mode: dict[str, Any] | None = None
         mode_available: bool | None = None
-        mode_query: asyncio.Task[None] | None = None
 
         async def mark_pane_mode_unavailable() -> None:
             nonlocal mode_revision, previous_mode, mode_available
@@ -4180,52 +4180,20 @@ class SSHBackend:
                 ).encode("utf-8")
             )
 
-        async def refresh_pane_mode() -> None:
-            nonlocal mode_query
-            if mode_query is not None and not mode_query.done() and mode_available is False:
-                return
-            if mode_query is not None and mode_query.done():
-                await mode_query
-                mode_query = None
-            if mode_query is None:
-                mode_query = asyncio.create_task(send_pane_mode())
-            # Metadata must not hold already-read PTY output behind a 20s SSH exec.
-            # Keep one owned query; its eventual result publishes even without new output.
-            done, _ = await asyncio.wait({mode_query}, timeout=PANE_MODE_REFRESH_INTERVAL_SECONDS)
-            if done:
-                await mode_query
-                mode_query = None
-            else:
-                # Do not advertise a stale selected-pane mode while the query is late.
-                await mark_pane_mode_unavailable()
+        mode_refresh = TerminalModeRefresh(send_pane_mode, mark_pane_mode_unavailable)
 
         async def output_to_browser() -> None:
             decoder = TerminalOutputDecoder()
             chunks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
 
-            async def read_pty() -> None:
-                loop = asyncio.get_running_loop()
+            async def read_output() -> None:
                 while True:
-                    readable = loop.create_future()
-
-                    def ready(waiter: asyncio.Future[None] = readable) -> None:
-                        if not waiter.done():
-                            waiter.set_result(None)
-
-                    try:
-                        # Idle SSH views must not occupy the executor used by pane queries and DB.
-                        loop.add_reader(master_fd, ready)
-                        await readable
-                        chunk = os.read(master_fd, 65536)
-                    except OSError:
-                        chunk = b""
-                    finally:
-                        loop.remove_reader(master_fd)
+                    chunk = await read_pty(master_fd)
                     await chunks.put(chunk)
                     if not chunk:
                         return
 
-            reader = asyncio.create_task(read_pty())
+            reader = asyncio.create_task(read_output())
             last_mode_refresh = asyncio.get_running_loop().time()
             try:
                 async with terminal_output_tracking(self.store, terminal_id) as record_output:
@@ -4237,7 +4205,7 @@ class SSHBackend:
                             await asyncio.sleep(delay)
                         while not chunks.empty() and len(batch) < 16 and batch[-1]:
                             batch.append(chunks.get_nowait())
-                        await refresh_pane_mode()
+                        await mode_refresh.refresh()
                         last_mode_refresh = loop.time()
                         decoded = decoder.feed(b"".join(batch), final=not batch[-1])
                         if decoded:
@@ -4440,7 +4408,7 @@ class SSHBackend:
             await websocket.send_bytes(
                 json.dumps(self.control.control_state(terminal_id, client_id)).encode()
             )
-            await refresh_pane_mode()
+            await mode_refresh.refresh()
             output_task = asyncio.create_task(output_to_browser())
             input_task = asyncio.create_task(browser_to_input())
             done, pending = await asyncio.wait(
@@ -4452,14 +4420,15 @@ class SSHBackend:
                 with contextlib.suppress(WebSocketDisconnect, asyncio.CancelledError):
                     await task
         finally:
-            for task in (output_task, input_task, mode_query):
+            for task in (output_task, input_task):
                 if task is not None and not task.done():
                     task.cancel()
-            if output_task is not None or input_task is not None or mode_query is not None:
+            if output_task is not None or input_task is not None:
                 await asyncio.gather(
-                    *(task for task in (output_task, input_task, mode_query) if task is not None),
+                    *(task for task in (output_task, input_task) if task is not None),
                     return_exceptions=True,
                 )
+            await mode_refresh.close()
             self._forget_ssh_browser_grid_owner(
                 terminal_id, client_id, workspace=workspace, window=str(terminal["tmux_window"])
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -71,6 +72,130 @@ class _BridgeWebSocket:
 
     async def close(self, *, code: int, reason: str) -> None:
         raise AssertionError((code, reason))
+
+
+def test_idle_node_output_keeps_executor_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr("termroom.node_agent.os.killpg", lambda *_: None)
+    monkeypatch.setattr("termroom.node_agent._wait_for_pid", lambda *_: True)
+
+    async def observe() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        output: list[bytes] = []
+        delivered = asyncio.Event()
+
+        async def send(value):  # type: ignore[no-untyped-def]
+            if value["type"] == "stream.data":
+                output.append(base64.b64decode(value["data"]))
+                delivered.set()
+
+        stream = TerminalAgentStream("e" * 32, 999999, read_fd, send, {})
+        task = asyncio.create_task(stream.start())
+        try:
+            # Settle scheduled stream/reader coroutines, without a timed sleep.
+            for _ in range(4):
+                await asyncio.sleep(0)
+            started = loop.time()
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: "available"), 0.5)
+            print(f"idle_node_executor_probe_ms={(loop.time() - started) * 1000:.3f}")
+            os.write(write_fd, b"next visible output")
+            await asyncio.wait_for(delivered.wait(), 1)
+            assert output == [b"next visible output"]
+        finally:
+            os.close(write_fd)
+            await asyncio.wait_for(task, 2)
+
+    asyncio.run(observe())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_kind", ["local", "node"])
+async def test_output_progresses_while_pane_metadata_is_delayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str
+) -> None:
+    read_fd, write_fd = os.pipe()
+    release = threading.Event()
+    entered, delivered, recovered, disconnected = (asyncio.Event() for _ in range(4))
+    loop = asyncio.get_running_loop()
+    controls: list[dict] = []
+    output: list[str] = []
+    queries = 0
+
+    def mode(*_args):  # type: ignore[no-untyped-def]
+        nonlocal queries
+        queries += 1
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(3)
+        return {"pane": "%1", "alternate": False, "mouse_tracking": False}
+
+    def control(value):  # type: ignore[no-untyped-def]
+        if value.get("kind") == "pane_mode":
+            controls.append(value)
+            if value.get("available", True) and release.is_set():
+                recovered.set()
+
+    class Browser(_BridgeWebSocket):
+        async def receive(self):  # type: ignore[no-untyped-def]
+            await disconnected.wait()
+            return _terminal_disconnect()
+
+        async def send_bytes(self, value: bytes) -> None:
+            control(json.loads(value))
+
+        async def send_text(self, value: str) -> None:
+            output.append(value)
+            delivered.set()
+
+    browser = Browser()
+    if backend_kind == "local":
+        store = StateStore(tmp_path / "state.sqlite3")
+        store.initialize()
+        root = store.ensure_root(tmp_path)
+        workspace = store.create_workspace(root["id"], ".", "fixture", "session")
+        terminal = store.create_terminal(workspace["id"], "shell", "@1")
+        manager = TerminalManager(store)
+        monkeypatch.setattr(manager, "current_pane_mode", mode)
+        monkeypatch.setattr(manager, "_setup_browser_terminal", lambda *_: (999999, read_fd))
+        monkeypatch.setattr(manager, "_release_browser_terminal", lambda *_: None)
+        monkeypatch.setattr(manager, "_finish_browser_terminal", lambda *_: None)
+        work = manager.bridge(browser, workspace, terminal)
+    else:
+        async def send(value):  # type: ignore[no-untyped-def]
+            if value["type"] == "stream.data":
+                await browser.send_text(base64.b64decode(value["data"]).decode())
+            else:
+                control(value)
+
+        monkeypatch.setattr("termroom.node_agent.os.killpg", lambda *_: None)
+        monkeypatch.setattr("termroom.node_agent._wait_for_pid", lambda *_: True)
+        stream = TerminalAgentStream(
+            "d" * 32, 999999, read_fd, send, {},
+            current_pane_mode=mode, pane_mode_control=True,
+        )
+        work = stream.start()
+    task = asyncio.create_task(work)
+    started = loop.time()
+    try:
+        os.write(write_fd, b"first visible result")
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(delivered.wait(), 0.6)
+        assert not release.is_set() and output == ["first visible result"]
+        assert controls[-1]["available"] is False
+        print(f"{backend_kind} delayed_mode_output_ms={(loop.time()-started)*1000:.1f}")
+        delivered.clear()
+        os.write(write_fd, b"; second result")
+        await asyncio.wait_for(delivered.wait(), 0.6)
+        assert "".join(output) == "first visible result; second result" and queries == 1
+        release.set()
+        await asyncio.wait_for(recovered.wait(), 1)
+    finally:
+        release.set()
+        disconnected.set()
+        os.close(write_fd)
+        await asyncio.wait_for(task, 3)
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
 
 
 @pytest.mark.asyncio
@@ -1211,7 +1336,10 @@ def test_terminal_websocket_requires_authentication_and_same_origin(tmp_path: Pa
         _cleanup(app, workspace)
 
 
-def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(tmp_path: Path) -> None:
+def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.termroom")
     app, workspace, terminal = _app(tmp_path)
     marker = "TERMROOM_INPUT_한글"
     try:
@@ -1242,6 +1370,13 @@ def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(tmp_path
                     time.sleep(0.05)
 
                 assert marker in scrollback
+        records = [json.loads(record.message.removeprefix("terminal "))
+                   for record in caplog.records if record.name == "uvicorn.error.termroom"]
+        assert {r["event"] for r in records} >= {
+            "open", "pane_state", "first_output", "disconnect",
+        }
+        assert records[-1]["output_bytes"] > 0
+        assert marker not in caplog.text and "correct-password" not in caplog.text
     finally:
         _cleanup(app, workspace)
 

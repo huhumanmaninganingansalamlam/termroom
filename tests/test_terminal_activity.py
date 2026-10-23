@@ -641,6 +641,7 @@ async def test_local_attach_redraw_is_plain_text_and_does_not_change_activity(
             "controller_client_id": generation,
             "control_revision": 1,
             "revision": revision,
+            "available": True,
             "session": workspace["tmux_session"],
             "window": "@1",
             "pane": "%1",

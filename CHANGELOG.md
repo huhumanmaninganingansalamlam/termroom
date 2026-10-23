@@ -2,6 +2,25 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.13] - 2026-10-23
+
+### Fixed
+
+- Keep Local and Node PTY output moving while a tmux pane-state query is slow.
+  Share the existing bounded refresh behavior with SSH, with one outstanding
+  query and eventual state recovery even when no further output arrives.
+- Wait for idle Node PTYs through the event loop instead of occupying the
+  shared executor needed by input and other requests.
+- Show the initial screen as pending, with a reconnect action, until both
+  current pane state and parsed PTY output are available. Preserve unsent
+  drafts and do not equate connection or PTY acknowledgement with app progress.
+
+### Changed
+
+- Add content-free connection, first-output, pane-availability and command-ACK
+  diagnostics to normal server logs, with current-connection received/parsed
+  frame counters in the terminal DOM. No terminal text or credentials are logged.
+
 ## [0.4.12] - 2026-10-23
 
 ### Fixed

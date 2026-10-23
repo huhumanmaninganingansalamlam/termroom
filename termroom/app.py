@@ -8,6 +8,7 @@ import hashlib
 import io
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -5087,7 +5088,51 @@ def create_app(settings: Settings) -> FastAPI:
         except (KeyError, HTTPException):
             await reject(4404, "Workspace not found")
             return
+        # Observe the real browser bridge, without recording input, output,
+        # authentication, or application-specific prompt/completion guesses.
+        logger = logging.getLogger("uvicorn.error.termroom")
+        connection_id = uuid.uuid4().hex
+        started = asyncio.get_running_loop().time()
+        output_frames = output_bytes = 0
+        pane_available: bool | None = None
+        transport = websocket
+
+        def trace(event: str, **values: Any) -> None:
+            logger.info("terminal %s", json.dumps({
+                "event": event, "connection": connection_id,
+                "terminal": terminal_id, "workspace": workspace["id"],
+                "elapsed_ms": round((asyncio.get_running_loop().time() - started) * 1000),
+                **values,
+            }))
+
+        async def observed_send(message: Message) -> None:
+            nonlocal output_frames, output_bytes, pane_available
+            await transport.send(message)
+            if message["type"] != "websocket.send":
+                return
+            if message.get("text") is not None:
+                output_frames += 1
+                output_bytes += len(message["text"].encode("utf-8"))
+                if output_frames == 1:
+                    trace("first_output", bytes=output_bytes)
+            elif message.get("bytes"):
+                try:
+                    control = json.loads(message["bytes"])
+                except (ValueError, UnicodeError):
+                    return
+                if not isinstance(control, dict):
+                    return
+                if control.get("kind") == "pane_mode":
+                    available = control.get("available", True) is True
+                    if available != pane_available:
+                        pane_available = available
+                        trace("pane_state", available=available)
+                elif control.get("kind") == "command_ack":
+                    trace("command_ack", accepted=control.get("accepted") is True)
+
+        websocket = WebSocket(websocket.scope, transport.receive, observed_send)
         await websocket.accept()
+        trace("open")
         active_websockets.setdefault(device_id, []).append(websocket)
         active_terminal_websockets.setdefault(terminal_id, []).append(websocket)
         bridge_task: asyncio.Task[None] | None = None
@@ -5114,7 +5159,8 @@ def create_app(settings: Settings) -> FastAPI:
                 bridge_task.cancel()
             try:
                 await bridge_task
-            except (SSHBackendError, RemoteAccessError, TerminalError, OSError):
+            except (SSHBackendError, RemoteAccessError, TerminalError, OSError) as exc:
+                trace("backend_error", error_type=type(exc).__name__)
                 await _close_websocket(
                     websocket,
                     code=1013,
@@ -5123,6 +5169,7 @@ def create_app(settings: Settings) -> FastAPI:
             except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError):
                 pass
         finally:
+            trace("disconnect", output_frames=output_frames, output_bytes=output_bytes)
             tasks = tuple(
                 task for task in (bridge_task, expiry_task) if task is not None
             )

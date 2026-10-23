@@ -686,6 +686,7 @@
   "terminal.status.other_input": "다른 기기에서 입력됨",
   "terminal.status.other_input_many": "다른 기기 입력 · {count}기기",
   "terminal.status.connecting": "연결 중…",
+  "terminal.status.waiting_output": "터미널 화면 기다리는 중…",
   "terminal.status.offline": "오프라인",
   "terminal.status.auth_required": "인증 필요",
   "terminal.status.rejected": "터미널 연결이 거부되었습니다",

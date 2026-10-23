@@ -419,6 +419,7 @@
 
   const setStatus = (message, connected = false) => {
     isConnected = connected;
+    host.dataset.terminalReady = String(connected && initialOutputParsed);
     setStatusMessage(message);
     status.classList.toggle("connected", connected);
     updateCommandComposer();
@@ -727,7 +728,17 @@
     if (reconnectButton) reconnectButton.disabled = true;
     if (signInLink) signInLink.hidden = true;
     initialOutputParsed = false;
+    host.dataset.terminalReady = "false";
+    host.dataset.outputFrames = "0";
+    host.dataset.parsedFrames = "0";
     setStatus(tr("terminal.status.connecting"));
+
+    const completeInitialScreen = () => {
+      if (!paneMode || !initialOutputParsed || isConnected) return;
+      host.dataset.terminalReady = "true";
+      setStatus(tr("terminal.status.connected"), true);
+      updatePresence();
+    };
 
     nextSocket.addEventListener("open", () => {
       if (epoch !== connectionEpoch || nextSocket !== socket) {
@@ -755,10 +766,14 @@
           // Transport open, arbitrary output, and unrelated errors are not recovery.
           if (paneMode && paneMode !== previousPaneMode) {
             document.querySelector("[data-terminal-connection-error]")?.remove();
-            if (!isConnected) {
-              setStatus(tr("terminal.status.connected"), true);
-              updatePresence();
+            if (!initialOutputParsed) {
+              setStatus(tr("terminal.status.waiting_output"));
+              if (reconnectButton) {
+                reconnectButton.hidden = false;
+                reconnectButton.disabled = false;
+              }
             }
+            completeInitialScreen();
           }
         } catch {
           // Invalid controls are never rendered or forwarded as terminal input.
@@ -766,12 +781,15 @@
         return;
       }
       if (typeof event.data !== "string") return;
+      host.dataset.outputFrames = String(Number(host.dataset.outputFrames) + 1);
       term.write(event.data, () => {
         if (epoch !== connectionEpoch || nextSocket !== socket) return;
+        host.dataset.parsedFrames = String(Number(host.dataset.parsedFrames) + 1);
         if (!initialOutputParsed) {
           initialOutputParsed = true;
           updateCommandComposer();
         }
+        completeInitialScreen();
         outputRenderSequence += 1;
         if (pendingActivityAt > acknowledgedActivityAt) {
           renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);

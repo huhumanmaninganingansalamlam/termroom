@@ -354,7 +354,8 @@ def _wait_terminal_run(
     latest: dict[str, object] = {}
     while time.monotonic() < deadline:
         latest = manager.reconcile(run_id)
-        if bool(latest.get("state") in FILE_RUN_TERMINAL_STATES) == terminal:
+        expected = FILE_RUN_TERMINAL_STATES if terminal else {"running"}
+        if latest.get("state") in expected:
             return latest
         time.sleep(0.05)
     raise AssertionError(f"File Run did not reach expected state: {latest}")
@@ -1007,6 +1008,7 @@ def test_local_file_run_stop_and_force_stop_target_only_managed_pane(
     manager, workspace, project = _local_manager(tmp_path)
     (project / "wait.py").write_text(
         "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "print('interrupt-handler-ready', flush=True)\n"
         "while True: time.sleep(0.1)\n",
         encoding="utf-8",
     )
@@ -1020,6 +1022,14 @@ def test_local_file_run_stop_and_force_stop_target_only_managed_pane(
             idempotency_key=str(uuid.uuid4()),
         )
         _wait_terminal_run(manager, str(run["id"]), terminal=False)
+        terminal = manager.store.get_managed_terminal(str(workspace["id"]), "file_run")
+        assert terminal is not None
+        deadline = time.monotonic() + 5
+        while "interrupt-handler-ready" not in manager.terminals.capture_scrollback(
+            workspace, terminal
+        ):
+            assert time.monotonic() < deadline, "The child did not install its signal handler"
+            time.sleep(0.05)
         stopped = manager.stop(str(run["id"]))
         assert stopped["needs_force"] is True
         killed = manager.kill(str(run["id"]))
