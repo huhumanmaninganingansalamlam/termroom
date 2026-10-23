@@ -2,6 +2,21 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.12] - 2026-10-23
+
+### Fixed
+
+- Keep command execution disabled until the current terminal backend is ready
+  and its initial PTY screen has been parsed. Show that the draft is unsent;
+  becoming ready does not automatically submit it. Reconnect retains drafts
+  and uncertain-delivery state without replaying input.
+
+### Changed
+
+- Label a successful PTY acknowledgement as terminal receipt, not application
+  acceptance. Label the home output indicator as terminal activity: pane
+  redraws can advance it even when an application has no new response.
+
 ## [0.4.11] - 2026-10-15
 
 ### Fixed

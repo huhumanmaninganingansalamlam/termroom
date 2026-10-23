@@ -421,6 +421,7 @@
     isConnected = connected;
     setStatusMessage(message);
     status.classList.toggle("connected", connected);
+    updateCommandComposer();
     if (connected) {
       if (reconnectButton) reconnectButton.hidden = true;
       if (signInLink) signInLink.hidden = true;
@@ -767,7 +768,10 @@
       if (typeof event.data !== "string") return;
       term.write(event.data, () => {
         if (epoch !== connectionEpoch || nextSocket !== socket) return;
-        initialOutputParsed = true;
+        if (!initialOutputParsed) {
+          initialOutputParsed = true;
+          updateCommandComposer();
+        }
         outputRenderSequence += 1;
         if (pendingActivityAt > acknowledgedActivityAt) {
           renderedActivityAt = Math.max(renderedActivityAt, pendingActivityAt);
@@ -1115,12 +1119,14 @@
   });
   commandInput?.addEventListener("focus", updateMobileKeyboardState);
   commandInput?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
+  const commandReady = () => isConnected && initialOutputParsed && socket?.readyState === WebSocket.OPEN;
   const updateCommandComposer = () => {
     if (!commandInput) return;
+    const ready = commandReady();
     commandForm?.setAttribute("aria-busy", String(commandPending));
     const submitButton = commandForm?.querySelector('button[type="submit"]');
     if (submitButton) {
-      submitButton.disabled = commandPending;
+      submitButton.disabled = commandPending || !ready;
       submitButton.textContent = tr(commandPending ? "terminal.command_sending_button" : "terminal.run");
     }
     commandInput.style.height = "auto";
@@ -1130,6 +1136,7 @@
       commandMeta.textContent =
         commandPending ? tr("terminal.command_sending")
         : commandUnconfirmed ? tr("terminal.command_unconfirmed")
+        : !ready ? tr("terminal.command_waiting")
         : lines > 1
           ? tr("terminal.command_multiline", { lines })
           : tr("terminal.command_hint");
@@ -1139,8 +1146,8 @@
     event.preventDefault();
     if (composerComposing || commandPending) return;
     if (!commandInput.value.trim()) return;
-    if (socket?.readyState !== WebSocket.OPEN) {
-      setCommandDelivery("rejected");
+    if (!commandReady()) {
+      setCommandDelivery("not_sent");
       return;
     }
     const command = commandInput.value;

@@ -397,6 +397,7 @@ const term={write(_,callback){callback();},focus(){},
  _core:{coreMouseService:{triggerMouseEvent(){return true;}}}};
 const coarsePrimaryPointer={matches:true};
 const tr=x=>x, setStatus=(value,connected=false)=>{status=value;isConnected=connected;};
+const updateCommandComposer=()=>{};
 const scheduleResize=()=>{},updatePresence=()=>{},cancelPresenceRequest=()=>{};
 const scheduleActivityAcknowledge=()=>{};
 const CustomEvent=class {};
@@ -509,6 +510,7 @@ const term = new Terminal();
 term._core.textarea = {value:''}; // paste clears the native textarea after dispatch
 const sent = [];
 let connected = true;
+let isConnected = true;
 let connectionEpoch = 0, socket = {readyState:1};
 let initialOutputParsed = true;
 const WebSocket = {OPEN:1};
@@ -537,28 +539,48 @@ let controlGeneration = 'current';
 const drafts = new Map();
 const sessionStorage = {setItem:(key,value)=>drafts.set(key,value),
  getItem:key=>drafts.get(key) ?? null,removeItem:key=>drafts.delete(key)};
-const updateCommandComposer = () => {}, setComposerOpen = () => {};
+const setComposerOpen = () => {};
 const setInputError = () => {};
 let submit;
-const commandForm = {addEventListener(_, callback){submit = callback;}};
+const submitButton = {};
+const commandForm = {addEventListener(_, callback){submit = callback;},
+ setAttribute(){},querySelector(){return submitButton;}};
+commandInput.style = {};
+const commandMeta = {};
 INPUT_HANDLER
 DELIVERY
+COMPOSER
 SUBMIT_HANDLER
 EDIT_HANDLER
 REUSE_HANDLER
 const text = '한글'.repeat(3300)+'\n끝!!';
 assert.equal(Buffer.byteLength(text),19806);
 (async () => {
-  // A socket/control ACK may precede the first tmux screen and its native modes.
-  initialOutputParsed = false;
+  // Transport open and backend readiness each precede the parsed native modes.
+  isConnected = false;
   commandInput.value = text;
+  updateCommandComposer();
+  assert.equal(submitButton.disabled, true);
+  submit({preventDefault(){}});
+  assert.equal(receipt.dataset.state, 'not_sent');
+  assert.equal(commandUnconfirmed, false, 'known unsent is not uncertain delivery');
+  isConnected = true;
+  initialOutputParsed = false;
+  updateCommandComposer();
+  assert.equal(submitButton.disabled, true, 'wait for parsed PTY modes, not socket open');
+  assert.equal(commandMeta.textContent, 'terminal.command_waiting');
   submit({preventDefault(){}});
   await new Promise(resolve => term.write('', resolve));
   assert.equal(sent.length, 0, 'an uninitialized terminal cannot negotiate paste');
-  assert.equal(receipt.dataset.state, 'pending', 'connection is not a delivery ACK');
+  assert.equal(receipt.dataset.state, 'not_sent', 'connection is not a delivery ACK');
   assert.equal(commandInput.value, text, 'retain input while initial output is pending');
   term.write('\x1b[?2004h', () => {initialOutputParsed = true;});
   await new Promise(resolve => term.write('', resolve));
+  await new Promise(resolve => term.write('', resolve));
+  updateCommandComposer();
+  assert.equal(submitButton.disabled, false, 'ready terminal permits explicit submission');
+  assert.equal(sent.length, 0, 'becoming ready never replays an unsubmitted draft');
+  submit({preventDefault(){}});
   await new Promise(resolve => term.write('', resolve));
   assert.equal(sent.length, 1, 'send the explicit command once after initialization');
   assert.equal(sent[0].paste_data, '\x1b[200~'+text.replaceAll('\n','\r')+'\x1b[201~');
@@ -660,6 +682,11 @@ assert.equal(Buffer.byteLength(text),19806);
 """.replace("INPUT_HANDLER", input_handler).replace("DELIVERY", delivery).replace(
         "SUBMIT_HANDLER", submit
     ).replace(
+        "COMPOSER", script[
+            script.index("  const commandReady ="):
+            script.index('  commandForm?.addEventListener("submit",')
+        ]
+    ).replace(
         "EDIT_HANDLER", edit
     ).replace(
         "REUSE_HANDLER", reuse
@@ -715,7 +742,7 @@ const term={buffer:[],write(data,callback){
  reset(){this.buffer=[];},clearSelection(){}};
 const connect=()=>{connections.push(host.dataset.terminalId);connectionEpoch++;
   socket={readyState:1,close(){this.readyState=3;}};};
-const persistCommandDraft=()=>{},restoreCommandDraft=()=>{};
+const persistCommandDraft=()=>{},restoreCommandDraft=()=>{},updateCommandComposer=()=>{};
 const scheduleActivityAcknowledge=()=>events.push({type:'ack-scheduled',
  terminalId:host.dataset.terminalId});
 const acceptPaneMode=()=>{},acceptInputControl=()=>{},resetInputControl=()=>{};
