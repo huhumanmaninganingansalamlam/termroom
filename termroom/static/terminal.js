@@ -188,7 +188,10 @@
     paneModeGeneration = value.generation;
     paneModeRevision = value.revision;
     paneMode = value.available === false ? null : Object.freeze(value);
+    host.dataset.inputTargetPane = paneMode?.pane || "";
+    host.dataset.inputTargetState = !paneMode ? "unknown" : paneMode.dead ? "ended" : "available";
     host.dispatchEvent(new Event("termroom:pane-mode"));
+    updateCommandComposer();
   };
   // A TUI can leave mouse modes enabled when it exits. tmux then forwards
   // reports to readline, which inserts their numeric suffix into shell input.
@@ -720,6 +723,8 @@
     paneMode = null;
     paneModeGeneration = null;
     paneModeRevision = 0;
+    host.dataset.inputTargetPane = "";
+    host.dataset.inputTargetState = "unknown";
     host.dispatchEvent(new Event("termroom:pane-mode"));
     socket = nextSocket;
     if (previousSocket && previousSocket.readyState < WebSocket.CLOSING) {
@@ -889,6 +894,7 @@
       pastedCommandSent = send({
         kind: "command",
         command_id: pendingCommand?.id,
+        pane: pendingCommand?.pane,
         data: pastedCommand,
         paste_data: data,
         rows: term.rows,
@@ -1118,7 +1124,10 @@
     commandUnconfirmed = false;
     if (value.accepted) rememberCommand(command);
     setCommandDelivery(commandInput.value === command
-      ? value.accepted ? "accepted" : "rejected" : "idle");
+      ? value.accepted ? "accepted"
+        : ["pane_ended", "pane_changed", "pane_unavailable"].includes(value.reason)
+          ? value.reason : "rejected"
+      : "idle");
     if (value.accepted && commandInput.value === command) {
       commandInput.value = "";
       commandInput.blur();
@@ -1137,7 +1146,9 @@
   });
   commandInput?.addEventListener("focus", updateMobileKeyboardState);
   commandInput?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
-  const commandReady = () => isConnected && initialOutputParsed && socket?.readyState === WebSocket.OPEN;
+  const commandReady = () => isConnected && initialOutputParsed
+    && (host.dataset.paneModeCapable !== "true" || paneMode !== null)
+    && paneMode?.dead !== true && socket?.readyState === WebSocket.OPEN;
   const updateCommandComposer = () => {
     if (!commandInput) return;
     const ready = commandReady();
@@ -1154,10 +1165,14 @@
       commandMeta.textContent =
         commandPending ? tr("terminal.command_sending")
         : commandUnconfirmed ? tr("terminal.command_unconfirmed")
+        : paneMode?.dead ? tr("terminal.command_pane_ended", { pane: paneMode.pane })
         : !ready ? tr("terminal.command_waiting")
         : lines > 1
           ? tr("terminal.command_multiline", { lines })
           : tr("terminal.command_hint");
+      if (ready && paneMode?.pane) {
+        commandMeta.textContent = `${tr("terminal.command_target", { pane: paneMode.pane })} · ${commandMeta.textContent}`;
+      }
     }
   };
   commandForm?.addEventListener("submit", (event) => {
@@ -1165,7 +1180,7 @@
     if (composerComposing || commandPending) return;
     if (!commandInput.value.trim()) return;
     if (!commandReady()) {
-      setCommandDelivery("not_sent");
+      setCommandDelivery(paneMode?.dead ? "pane_ended" : "not_sent");
       return;
     }
     const command = commandInput.value;
@@ -1173,7 +1188,7 @@
     const commandSocket = socket;
     commandPending = true;
     setCommandDelivery("pending");
-    pendingCommand = { id: String(++commandSequence), command };
+    pendingCommand = { id: String(++commandSequence), command, pane: paneMode?.pane };
     const submission = pendingCommand;
     commandUnconfirmed = true;
     persistCommandDraft();

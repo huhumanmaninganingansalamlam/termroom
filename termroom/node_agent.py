@@ -2347,7 +2347,7 @@ class NodeRuntime:
         fields = result.stdout.strip().split("|")
         if (
             result.returncode
-            or len(fields) != 11
+            or len(fields) != 12
             or fields[0] != session
             or fields[1] != window
             or not fields[2].startswith("%")
@@ -2364,6 +2364,7 @@ class NodeRuntime:
             "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
             "mouse_flags": [int(flag) for flag in fields[5:10]],
             "shell_foreground": fields[10] == "1",
+            "dead": fields[11] == "1",
         }
 
     async def _read_text_open(

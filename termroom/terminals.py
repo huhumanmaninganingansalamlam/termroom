@@ -120,7 +120,7 @@ TMUX_PANE_MODE_FORMAT = (
     "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
     "#{mouse_all_flag}|#{mouse_sgr_flag}|"
     "#{&&:#{==:#{pane_in_mode},0},"
-    "#{m/r:^(ash|bash|csh|dash|fish|ksh|mksh|sh|tcsh|yash|zsh)$,#{pane_current_command}}}"
+    "#{m/r:^(ash|bash|csh|dash|fish|ksh|mksh|sh|tcsh|yash|zsh)$,#{pane_current_command}}}|#{pane_dead}"
 )
 _LOCAL_BRIDGE_TMUX_TIMEOUT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "local_bridge_tmux_timeout", default=None
@@ -807,7 +807,7 @@ async def write_terminal_input(fd: int, data: bytes) -> None:
 
 async def acknowledge_terminal_command(
     websocket: WebSocket, payload: dict[str, Any], terminal_id: str, client_id: str,
-    *, accepted: bool,
+    *, accepted: bool, reason: str | None = None,
 ) -> None:
     command_id = payload.get("command_id")
     if (
@@ -819,7 +819,16 @@ async def acknowledge_terminal_command(
     await websocket.send_bytes(json.dumps({
         "kind": "command_ack", "terminal_id": terminal_id, "generation": client_id,
         "command_id": command_id, "accepted": accepted,
+        **({"reason": reason} if reason else {}),
     }).encode())
+
+
+def terminal_command_target_error(payload: dict[str, Any], mode: dict[str, Any]) -> str | None:
+    if mode.get("dead") is True:
+        return "pane_ended"
+    if payload.get("pane") is not None and payload["pane"] != mode.get("pane"):
+        return "pane_changed"
+    return None
 
 
 async def complete_terminal_command(operation: Awaitable[None]) -> None:
@@ -2098,8 +2107,23 @@ class TerminalManager:
                             return
                         self.control.mark_input(terminal_id, client_id, device_id)
 
+                        rejection: str | None = None
+
                         async def deliver_command(command_payload: dict[str, Any]) -> None:
+                            nonlocal rejection
                             await resize_browser_view(command_payload)
+                            # A live tmux client PTY can silently discard input to a dead split.
+                            # Check the selected canonical pane, not cached browser metadata.
+                            try:
+                                mode = await asyncio.to_thread(
+                                    self.current_pane_mode, workspace, terminal
+                                )
+                            except (OSError, subprocess.SubprocessError, TerminalError, ValueError):
+                                rejection = "pane_unavailable"
+                            else:
+                                rejection = terminal_command_target_error(command_payload, mode)
+                            if rejection:
+                                return
                             command = str(command_payload.get("data", ""))
                             paste = str(command_payload.get("paste_data", command))
                             await write_to_pty(paste.encode() + b"\r")
@@ -2109,7 +2133,8 @@ class TerminalManager:
 
                         await complete_terminal_command(deliver_command(payload))
                         await acknowledge_terminal_command(
-                            websocket, payload, terminal_id, client_id, accepted=True
+                            websocket, payload, terminal_id, client_id,
+                            accepted=rejection is None, reason=rejection,
                         )
                     elif kind == "input":
                         if master_fd is None:
@@ -2193,7 +2218,7 @@ class TerminalManager:
         )
         fields = result.stdout.strip().split("|")
         if (
-            len(fields) != 11
+            len(fields) != 12
             or fields[0] != str(workspace["tmux_session"])
             or not fields[1].startswith("@")
             or not fields[2].startswith("%")
@@ -2210,6 +2235,7 @@ class TerminalManager:
             "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
             "mouse_flags": [int(flag) for flag in fields[5:10]],
             "shell_foreground": fields[10] == "1",
+            "dead": fields[11] == "1",
         }
 
     def _setup_browser_terminal(

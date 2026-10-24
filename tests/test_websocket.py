@@ -1855,3 +1855,89 @@ def test_terminal_websocket_closes_when_signed_session_expires(
                 assert closed
     finally:
         _cleanup(app, workspace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_kind", ["local", "ssh"])
+async def test_command_rejects_dead_changed_or_unavailable_pane_before_live_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str,
+) -> None:
+    app, workspace, terminal = _app(tmp_path)
+    manager = app.state.terminals
+    window = str(terminal["tmux_window"])
+    live = manager.current_pane_mode(workspace, terminal)["pane"]
+    manager._run_tmux("set-window-option", "-t", window, "remain-on-exit", "on")
+    dead = manager._run_tmux(
+        "split-window", "-h", "-t", live, "-P", "-F", "#{pane_id}", "exit 0"
+    ).stdout.strip()
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    os.set_blocking(slave, False)
+    acks: list[dict[str, object]] = []
+    received = bytearray()
+    command = "owned draft 한글"
+    phase = 0
+
+    def mode(*_args):  # type: ignore[no-untyped-def]
+        if phase == 2:
+            raise OSError("owned metadata failure")
+        return manager.current_pane_mode(workspace, terminal)
+
+    class Browser(_BridgeWebSocket):
+        async def receive(self) -> dict[str, object]:
+            nonlocal phase
+            phase = len(acks)
+            if phase == 4:
+                return _terminal_disconnect()
+            if phase == 1:
+                manager._run_tmux("select-pane", "-t", live)
+            if phase == 0:
+                # Wait for this owned process to exit, not for a UI footer timer.
+                deadline = time.monotonic() + 2
+                while not manager.current_pane_mode(workspace, terminal)["dead"]:
+                    assert time.monotonic() < deadline
+                    await asyncio.sleep(0.01)
+            return {"type": "websocket.receive", "text": json.dumps({
+                "kind": "command", "command_id": str(phase), "data": command,
+                "pane": dead if phase < 2 else live,
+            })}
+
+        async def send_bytes(self, data: bytes) -> None:
+            frame = json.loads(data)
+            if frame["kind"] == "command_ack":
+                acks.append(frame)
+                if not frame["accepted"]:
+                    assert manager.store.list_commands(workspace["id"]) == []
+                    with pytest.raises(BlockingIOError):
+                        os.read(slave, 65536)
+                else:
+                    ready, _, _ = await asyncio.to_thread(select.select, [slave], [], [], 1)
+                    assert ready
+                    received.extend(os.read(slave, 65536))
+
+    monkeypatch.setattr(os, "killpg", lambda *_args: None)
+    if backend_kind == "local":
+        backend = TerminalManager(manager.store)
+        monkeypatch.setattr(backend, "_setup_browser_terminal", lambda *_: (999999, master))
+        monkeypatch.setattr(backend, "_release_browser_terminal", lambda *_: None)
+        monkeypatch.setattr(backend, "_finish_browser_terminal", lambda *_: None)
+    else:
+        backend = SSHBackend(manager.store, tmp_path)
+        monkeypatch.setattr(backend, "ensure_workspace", lambda *_: [])
+        monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_: (999999, master))
+        monkeypatch.setattr(backend, "_wait_for_pid", lambda *_: True)
+    monkeypatch.setattr(backend, "current_pane_mode", mode)
+    try:
+        await asyncio.wait_for(backend.bridge(Browser(), workspace, terminal), 5)
+        assert [ack["accepted"] for ack in acks] == [False, False, False, True]
+        assert [ack.get("reason") for ack in acks] == [
+            "pane_ended", "pane_changed", "pane_unavailable", None,
+        ]
+        assert bytes(received) == (command + "\r").encode()
+        assert manager.store.list_commands(workspace["id"]) == [command]
+        assert manager.current_pane_mode(workspace, terminal)["pane"] == live
+    finally:
+        for fd in (master, slave):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        _cleanup(app, workspace)

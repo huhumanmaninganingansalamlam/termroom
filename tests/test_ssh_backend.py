@@ -93,7 +93,7 @@ async def test_ssh_bridge_sends_selected_pane_mode_and_cleans_up(
     terminal = {"id": "terminal", "tmux_window": "@7"}
     read_fd, write_fd = os.pipe()
     os.close(write_fd)
-    mode = "session|@7|%1|4321|1|0|0|0|0|0|0"
+    mode = "session|@7|%1|4321|1|0|0|0|0|0|0|0"
     controls: list[dict[str, object]] = []
     monkeypatch.setattr(backend, "ensure_workspace", lambda _workspace: [])
     monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, read_fd))

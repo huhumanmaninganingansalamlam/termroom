@@ -94,6 +94,7 @@ from termroom.terminals import (
     parse_tmux_terminal_editor_records,
     parse_tmux_terminal_records,
     parse_tmux_workspace_command_records,
+    terminal_command_target_error,
     terminal_editor_digest,
     terminal_input_claims_grid,
     terminal_output_tracking,
@@ -4084,7 +4085,7 @@ class SSHBackend:
         )
         fields = output.strip().split("|")
         if (
-            len(fields) != 11
+            len(fields) != 12
             or fields[0] != session
             or fields[1] != window
             or not fields[2].startswith("%")
@@ -4101,6 +4102,7 @@ class SSHBackend:
             "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
             "mouse_flags": [int(flag) for flag in fields[5:10]],
             "shell_foreground": fields[10] == "1",
+            "dead": fields[11] == "1",
         }
 
     async def bridge(
@@ -4381,8 +4383,26 @@ class SSHBackend:
                     elif kind == "command":
                         self.control.mark_input(terminal_id, client_id, device_id)
 
+                        rejection: str | None = None
+
                         async def deliver_command(command_payload: dict[str, Any]) -> None:
+                            nonlocal rejection
                             await resize_browser_view(command_payload)
+                            # A live tmux client PTY can silently discard input to a dead split.
+                            # Check the selected canonical pane, not cached browser metadata.
+                            try:
+                                mode = await asyncio.to_thread(
+                                    self.current_pane_mode, workspace, terminal
+                                )
+                            except (
+                                OSError, subprocess.SubprocessError, SSHBackendError,
+                                paramiko.SSHException, ValueError,
+                            ):
+                                rejection = "pane_unavailable"
+                            else:
+                                rejection = terminal_command_target_error(command_payload, mode)
+                            if rejection:
+                                return
                             command = str(command_payload.get("data", ""))
                             paste = str(command_payload.get("paste_data", command))
                             await write_terminal_input(master_fd, paste.encode() + b"\r")
@@ -4393,7 +4413,8 @@ class SSHBackend:
 
                         await complete_terminal_command(deliver_command(payload))
                         await acknowledge_terminal_command(
-                            websocket, payload, terminal_id, client_id, accepted=True
+                            websocket, payload, terminal_id, client_id,
+                            accepted=rejection is None, reason=rejection,
                         )
                     elif kind == "input":
                         if terminal_input_claims_grid(payload):
