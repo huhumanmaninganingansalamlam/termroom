@@ -2,6 +2,18 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.15] - 2026-10-24
+
+### Fixed
+
+- Keep command-editor drafts and show the selected split pane when that pane
+  has ended. A connected tmux client is not proof that the selected pane can
+  receive input; disable Run for a known ended pane without closing the editor.
+- Bind SSH and Local command submissions to the displayed pane and check its
+  current state before writing to the PTY. Reject ended, changed or unavailable
+  targets without a success acknowledgement or recent-command entry. Keep the
+  draft for explicit retry; never automatically resend after pane selection.
+
 ## [0.4.14] - 2026-10-24
 
 ### Fixed
