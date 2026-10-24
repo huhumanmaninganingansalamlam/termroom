@@ -2,6 +2,21 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.14] - 2026-10-24
+
+### Fixed
+
+- Restore the terminal's reading position after switching terminals or returning
+  from another page in the same browser tab. Keep LIVE and new user input in
+  control of returning to the latest screen; store coordinates, not output logs.
+
+### Added
+
+- Read and copy the changed portion of terminal output from the existing Output
+  view, comparing with that page's previous capture. Keep full history available,
+  distinguish unchanged captures and removed lines, and preserve the last capture
+  and comparison baseline when a refresh fails.
+
 ## [0.4.13] - 2026-10-23
 
 ### Fixed
