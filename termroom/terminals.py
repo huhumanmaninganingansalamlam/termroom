@@ -120,7 +120,7 @@ TMUX_PANE_MODE_FORMAT = (
     "#{mouse_any_flag}|#{mouse_standard_flag}|#{mouse_button_flag}|"
     "#{mouse_all_flag}|#{mouse_sgr_flag}|"
     "#{&&:#{==:#{pane_in_mode},0},"
-    "#{m/r:^(ash|bash|csh|dash|fish|ksh|mksh|sh|tcsh|yash|zsh)$,#{pane_current_command}}}|#{pane_dead}"
+    "#{m/r:^(ash|bash|csh|dash|fish|ksh|mksh|sh|tcsh|yash|zsh)$,#{pane_current_command}}}|#{pane_dead}|#{pane_in_mode}"
 )
 _LOCAL_BRIDGE_TMUX_TIMEOUT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "local_bridge_tmux_timeout", default=None
@@ -828,6 +828,8 @@ def terminal_command_target_error(payload: dict[str, Any], mode: dict[str, Any])
         return "pane_ended"
     if payload.get("pane") is not None and payload["pane"] != mode.get("pane"):
         return "pane_changed"
+    if mode.get("in_mode") is True:
+        return "pane_in_mode"
     return None
 
 
@@ -2218,7 +2220,7 @@ class TerminalManager:
         )
         fields = result.stdout.strip().split("|")
         if (
-            len(fields) != 12
+            len(fields) != 13
             or fields[0] != str(workspace["tmux_session"])
             or not fields[1].startswith("@")
             or not fields[2].startswith("%")
@@ -2236,6 +2238,7 @@ class TerminalManager:
             "mouse_flags": [int(flag) for flag in fields[5:10]],
             "shell_foreground": fields[10] == "1",
             "dead": fields[11] == "1",
+            "in_mode": fields[12] == "1",
         }
 
     def _setup_browser_terminal(

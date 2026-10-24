@@ -1199,8 +1199,10 @@ class RemoteAccess:
                                             )
                                         }
                                     )
-                                if available and type(mode.get("dead")) is bool:
-                                    control["dead"] = mode["dead"]
+                                if available:
+                                    for key in ("dead", "in_mode"):
+                                        if type(mode.get(key)) is bool:
+                                            control[key] = mode[key]
                                 await websocket.send_bytes(json.dumps(control).encode("utf-8"))
                             continue
                         chunk = event

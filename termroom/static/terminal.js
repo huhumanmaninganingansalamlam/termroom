@@ -179,6 +179,7 @@
       || !Number.isSafeInteger(value.revision)
       || value.revision < 1
       || (value.available !== undefined && typeof value.available !== "boolean")
+      || (value.in_mode !== undefined && typeof value.in_mode !== "boolean")
       || (value.available !== false
         && (typeof value.alternate !== "boolean"
           || typeof value.mouse_tracking !== "boolean"))
@@ -189,7 +190,8 @@
     paneModeRevision = value.revision;
     paneMode = value.available === false ? null : Object.freeze(value);
     host.dataset.inputTargetPane = paneMode?.pane || "";
-    host.dataset.inputTargetState = !paneMode ? "unknown" : paneMode.dead ? "ended" : "available";
+    host.dataset.inputTargetState = !paneMode ? "unknown" : paneMode.dead ? "ended"
+      : paneMode.in_mode ? "tmux_mode" : "available";
     host.dispatchEvent(new Event("termroom:pane-mode"));
     updateCommandComposer();
   };
@@ -1125,7 +1127,7 @@
     if (value.accepted) rememberCommand(command);
     setCommandDelivery(commandInput.value === command
       ? value.accepted ? "accepted"
-        : ["pane_ended", "pane_changed", "pane_unavailable"].includes(value.reason)
+        : ["pane_ended", "pane_changed", "pane_unavailable", "pane_in_mode"].includes(value.reason)
           ? value.reason : "rejected"
       : "idle");
     if (value.accepted && commandInput.value === command) {
@@ -1148,7 +1150,8 @@
   commandInput?.addEventListener("blur", () => window.setTimeout(updateMobileKeyboardState, 0));
   const commandReady = () => isConnected && initialOutputParsed
     && (host.dataset.paneModeCapable !== "true" || paneMode !== null)
-    && paneMode?.dead !== true && socket?.readyState === WebSocket.OPEN;
+    && paneMode?.dead !== true && paneMode?.in_mode !== true
+    && socket?.readyState === WebSocket.OPEN;
   const updateCommandComposer = () => {
     if (!commandInput) return;
     const ready = commandReady();
@@ -1166,6 +1169,7 @@
         commandPending ? tr("terminal.command_sending")
         : commandUnconfirmed ? tr("terminal.command_unconfirmed")
         : paneMode?.dead ? tr("terminal.command_pane_ended", { pane: paneMode.pane })
+        : paneMode?.in_mode ? tr("terminal.command_pane_in_mode", { pane: paneMode.pane })
         : !ready ? tr("terminal.command_waiting")
         : lines > 1
           ? tr("terminal.command_multiline", { lines })
@@ -1180,7 +1184,8 @@
     if (composerComposing || commandPending) return;
     if (!commandInput.value.trim()) return;
     if (!commandReady()) {
-      setCommandDelivery(paneMode?.dead ? "pane_ended" : "not_sent");
+      setCommandDelivery(paneMode?.dead ? "pane_ended"
+        : paneMode?.in_mode ? "pane_in_mode" : "not_sent");
       return;
     }
     const command = commandInput.value;

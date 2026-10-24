@@ -1859,7 +1859,7 @@ def test_terminal_websocket_closes_when_signed_session_expires(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend_kind", ["local", "ssh"])
-async def test_command_rejects_dead_changed_or_unavailable_pane_before_live_retry(
+async def test_command_rejects_unavailable_or_mode_pane_before_live_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str,
 ) -> None:
     app, workspace, terminal = _app(tmp_path)
@@ -1887,10 +1887,15 @@ async def test_command_rejects_dead_changed_or_unavailable_pane_before_live_retr
         async def receive(self) -> dict[str, object]:
             nonlocal phase
             phase = len(acks)
-            if phase == 4:
+            if phase == 5:
                 return _terminal_disconnect()
             if phase == 1:
                 manager._run_tmux("select-pane", "-t", live)
+            elif phase == 3:
+                manager._run_tmux("copy-mode", "-t", live)
+            elif phase == 4:
+                assert manager.current_pane_mode(workspace, terminal)["in_mode"] is True
+                manager._run_tmux("send-keys", "-t", live, "-X", "cancel")
             if phase == 0:
                 # Wait for this owned process to exit, not for a UI footer timer.
                 deadline = time.monotonic() + 2
@@ -1929,9 +1934,9 @@ async def test_command_rejects_dead_changed_or_unavailable_pane_before_live_retr
     monkeypatch.setattr(backend, "current_pane_mode", mode)
     try:
         await asyncio.wait_for(backend.bridge(Browser(), workspace, terminal), 5)
-        assert [ack["accepted"] for ack in acks] == [False, False, False, True]
+        assert [ack["accepted"] for ack in acks] == [False, False, False, False, True]
         assert [ack.get("reason") for ack in acks] == [
-            "pane_ended", "pane_changed", "pane_unavailable", None,
+            "pane_ended", "pane_changed", "pane_unavailable", "pane_in_mode", None,
         ]
         assert bytes(received) == (command + "\r").encode()
         assert manager.store.list_commands(workspace["id"]) == [command]

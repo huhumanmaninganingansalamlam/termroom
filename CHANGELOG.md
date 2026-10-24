@@ -2,6 +2,18 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.16] - 2026-10-24
+
+### Fixed
+
+- Keep command-editor drafts unsent while the selected pane is in tmux copy
+  or clock mode. Show why Run is unavailable and preserve the draft across
+  reloads; leaving the mode never automatically sends the draft.
+- Reject SSH and Local command submissions if the pane enters a tmux mode
+  before the server writes input. Return an explicit not-sent acknowledgement
+  without adding command history or consuming the draft. Native mode keys
+  remain available; Termroom does not cancel the mode on the user's behalf.
+
 ## [0.4.15] - 2026-10-24
 
 ### Fixed

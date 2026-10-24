@@ -677,6 +677,8 @@
   "terminal.command_delivery.pane_ended": "미전송 · 선택된 pane 종료됨 · 초안 보존",
   "terminal.command_delivery.pane_changed": "미전송 · 선택된 pane 변경됨 · 대상 확인 후 다시 실행",
   "terminal.command_delivery.pane_unavailable": "미전송 · 선택된 pane 확인 불가 · 초안 보존",
+  "terminal.command_pane_in_mode": "pane {pane} · tmux 모드 활성 · 기록 읽기/시계 모드 종료 필요 · 초안 미전송",
+  "terminal.command_delivery.pane_in_mode": "미전송 · tmux 기록 읽기/시계 모드 종료 후 다시 실행 · 초안 보존",
   "terminal.command_hint": "Enter는 줄바꿈 · Ctrl/⌘+Enter 실행",
   "terminal.command_waiting": "터미널 준비 전 · 미전송 초안 보존",
   "terminal.command_sending": "서버 확인을 기다리는 중…",

@@ -679,7 +679,18 @@ assert.equal(Buffer.byteLength(text),19806);
   paneMode = {pane:'%1',dead:false};
   updateCommandComposer();
   assert.equal(submitButton.disabled, false);
-  for (const reason of ['pane_ended','pane_changed','pane_unavailable']) {
+  paneMode = {pane:'%1',dead:false,in_mode:true};
+  updateCommandComposer();
+  assert.equal(submitButton.disabled, true, 'copy mode must not consume a command');
+  const beforeMode = sent.length;
+  submit({preventDefault(){}});
+  assert.equal(receipt.dataset.state, 'pane_in_mode');
+  assert.equal(commandInput.value, 'dead pane draft');
+  assert.equal(sent.length, beforeMode);
+  paneMode = {pane:'%1',dead:false,in_mode:false};
+  updateCommandComposer();
+  assert.equal(submitButton.disabled, false, 'exit permits explicit retry, never replay');
+  for (const reason of ['pane_ended','pane_changed','pane_unavailable','pane_in_mode']) {
     submit({preventDefault(){}});
     paneMode = {pane:'%9',dead:false};
     await new Promise(resolve => term.write('', resolve));
