@@ -92,6 +92,28 @@
     ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
     : null;
 
+  const readingPositionKey = () =>
+    `termroom.reading.${terminalHost.dataset.workspaceId}.${terminalHost.dataset.terminalId}`;
+  const savedReadingTop = () => {
+    try {
+      const value = sessionStorage.getItem(readingPositionKey());
+      const top = value === null ? NaN : Number(value);
+      return Number.isFinite(top) && top >= 0 ? top : null;
+    } catch {
+      return null;
+    }
+  };
+  let pendingReadingTop = savedReadingTop();
+  const rememberReadingPosition = () => {
+    if (pendingReadingTop !== null) return;
+    try {
+      if (liveFollowing) sessionStorage.removeItem(readingPositionKey());
+      else sessionStorage.setItem(readingPositionKey(), String(surface.scrollTop));
+    } catch {
+      // Reading stays usable when browser storage is unavailable.
+    }
+  };
+
   const normalizeText = (value) =>
     String(value || "")
       .replace(/\r\n?/g, "\n")
@@ -838,7 +860,10 @@
   };
 
   const scrollToLive = ({ userInitiated = false } = {}) => {
-    if (userInitiated) userScrollRevision += 1;
+    if (userInitiated) {
+      userScrollRevision += 1;
+      pendingReadingTop = null;
+    }
     const interactionRevision = userScrollRevision;
     liveFollowing = true;
 
@@ -946,7 +971,11 @@
             || interactionRevision !== userScrollRevision
           ) return;
           syncLiveHeight();
-          if (keepBottom && liveFollowing) {
+          if (pendingReadingTop !== null) {
+            userScrollIntentPending = true;
+            surface.scrollTop = Math.min(pendingReadingTop, maxScrollTop());
+            pendingReadingTop = null;
+          } else if (keepBottom && liveFollowing) {
             surface.scrollTop = maxScrollTop();
           } else if (!liveFollowing) {
             surface.scrollTop = Math.min(previousTop, maxScrollTop());
@@ -1094,6 +1123,7 @@
   };
 
   const noteUserScrollIntent = ({ revealHistory = false } = {}) => {
+    pendingReadingTop = null;
     userScrollRevision += 1;
     if (revealHistory) userScrollIntentPending = true;
     if (revealHistory && historyDirty && liveFollowing) {
@@ -1201,6 +1231,7 @@
       return;
     }
     const returnToLive = () => {
+      pendingReadingTop = null;
       userScrollIntentPending = false;
       applySelectionOwnership({
         type: "terminal-input",
@@ -1222,6 +1253,7 @@
   document.querySelector("#command-form")?.addEventListener(
     "submit",
     () => {
+      pendingReadingTop = null;
       applySelectionOwnership({
         type: "terminal-input",
         mouseTracking: mouseTrackingActive(),
@@ -1238,6 +1270,7 @@
         '[data-terminal-key], [data-terminal-action], #paste-terminal, #focus-terminal',
       );
       if (!terminalInputTarget) return;
+      pendingReadingTop = null;
       // Helper keys and paste enter xterm through their direct handlers, so
       // they may not produce a textarea keydown. Clear an older history
       // gesture before a later layout callback can interpret it as reading.
@@ -1356,7 +1389,10 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) scheduleHistoryRefresh({ urgent: true });
   });
+  window.addEventListener("pagehide", rememberReadingPosition);
+  window.addEventListener("termroom:terminal-switching", rememberReadingPosition);
   window.addEventListener("termroom:terminal-switched", () => {
+    pendingReadingTop = savedReadingTop();
     applySelectionOwnership({ type: "reset" }, { refreshHistory: false });
     terminalRevision += 1;
     switchGeneration += 1;

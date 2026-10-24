@@ -13,6 +13,80 @@ from termroom.config import Settings
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_output_refresh_reads_changes_and_preserves_capture_on_failure() -> None:
+    script = (ROOT / "termroom/static/app.js").read_text()
+    handlers = script[
+        script.index('  const scrollbackSearch = document.querySelector("#scrollback-search");'):
+        script.index("  const selectTextOffsets =")
+    ]
+    probe = r"""
+const assert = require('node:assert/strict');
+const nodes = new Map();
+const document = {querySelector(selector) {
+  if (!nodes.has(selector)) nodes.set(selector, {
+    textContent: '', dataset: {}, disabled: false, hidden: false,
+    addEventListener(type, callback) { this[type] = callback; },
+    setAttribute() {}, removeAttribute() {}
+  });
+  return nodes.get(selector);
+}};
+const tr = (key, values = {}) => key + JSON.stringify(values);
+const location = {href: '/w/owned/terminal/one/scrollback'};
+document.querySelector('#scrollback-output').textContent = 'alpha\nbeta\nomega\n';
+""" + handlers + r"""
+(async () => {
+  assert.deepEqual(scrollbackChanges('a\nb\n', 'a\nx\nb\n'),
+    {text: 'x', added: 1, removed: 0});
+  assert.deepEqual(scrollbackChanges('a\nb\n', 'a\n'),
+    {text: '', added: 0, removed: 1});
+  assert.deepEqual(scrollbackChanges('│  \n\n', '│  \n\n'),
+    {text: '', added: 0, removed: 0});
+  assert.deepEqual(scrollbackChanges('alpha\nold\nomega\n', 'alpha\n새 결과\nomega\n'),
+    {text: '새 결과', added: 1, removed: 1});
+  let requests = 0, resolve;
+  globalThis.fetch = async (url, options) => {
+    requests++;
+    assert.equal(url, location.href);
+    assert.equal(options.headers.Accept, 'text/plain');
+    return new Promise(done => {resolve = done;});
+  };
+  const response = text => ({ok: true, headers: {get: () => 'text/plain'}, text: async () => text});
+  const first = scrollbackRefresh.click();
+  await scrollbackRefresh.click();
+  assert.equal(requests, 1, 'a pending capture must not be duplicated');
+  resolve(response('alpha\nbeta\nnew result\nomega\n'));
+  await first;
+  assert.equal(scrollbackOutput.textContent, 'new result');
+  assert.equal(scrollbackOutput.dataset.view, 'changes');
+  assert.match(scrollbackCopy.textContent, /copy_changes/);
+  scrollbackFull.click();
+  assert.match(scrollbackCopy.textContent, /copy_all/);
+  assert.equal(scrollbackOutput.textContent, 'alpha\nbeta\nnew result\nomega\n');
+  globalThis.fetch = async () => ({ok: false, headers: {get: () => 'text/plain'}});
+  await scrollbackRefresh.click();
+  assert.equal(scrollbackOutput.textContent, 'alpha\nbeta\nnew result\nomega\n');
+  assert.equal(scrollbackRefresh.disabled, false);
+  assert.match(scrollbackRefreshStatus.textContent, /refresh_failed/);
+  globalThis.fetch = async () => response('alpha\nbeta\nnew result\nretry result\nomega\n');
+  await scrollbackRefresh.click();
+  assert.equal(scrollbackOutput.textContent, 'retry result', 'failure must retain the baseline');
+  globalThis.fetch = async () => response('alpha\nbeta\nnew result\nretry result\nomega\n');
+  await scrollbackRefresh.click();
+  assert.equal(scrollbackOutput.textContent, '');
+  assert.match(scrollbackRefreshStatus.textContent, /unchanged/);
+  globalThis.fetch = async () => ({
+    ok: true, headers: {get: () => 'text/html'}, text: async () => 'login'
+  });
+  await scrollbackRefresh.click();
+  assert.match(scrollbackRefreshStatus.textContent, /refresh_failed/);
+  scrollbackFull.click();
+  assert.equal(scrollbackOutput.textContent, 'alpha\nbeta\nnew result\nretry result\nomega\n');
+})().catch(error => {console.error(error); process.exitCode = 1;});
+"""
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def _asset_hash(filename: str) -> str:
     return hashlib.sha256((ROOT / "termroom/static" / filename).read_bytes()).hexdigest()
 
@@ -113,12 +187,15 @@ let refreshQueued = false, urgentRefreshQueued = false, forceNextHistoryRefresh 
 let loading = false, historyChangeRevision = 0, historyEtag = '', historyDirty = true;
 let historyDirtySince = 0, lastHistoryChangeAt = 0, nativeCopySelectionActive = false;
 let liveFollowing = true, userScrollRevision = 0, historyRenderRevision = 0;
-let commits = 0;
+let pendingReadingTop = null;
+let commits = 0, userScrollIntentPending = false;
 const history = {dataset: {}, replaceChildren(fragment) { commits++; this.fragment = fragment; }};
 const syncHistoryMetrics = () => {};
 const surface = {dataset: {}, scrollTop: 0};
-const atLiveBottom = () => true, maxScrollTop = () => 0;
-const afterLayout = () => {}, syncLiveHeight = () => {}, updateScrollState = () => {};
+const atLiveBottom = () => true, maxScrollTop = () => 100;
+const layouts = [];
+const afterLayout = callback => layouts.push(callback);
+const syncLiveHeight = () => {}, updateScrollState = () => {};
 const clearHistoryDirty = () => { historyDirty = false; };
 const scheduleHistoryRefresh = () => {};
 const historyOnlyUrl = () => '/history';
@@ -148,6 +225,18 @@ const historyOnlyUrl = () => '/history';
   await loadHistory();
   assert.equal(history.fragment.textContent, 'alpha 한글界e\u0301\nmarker');
   assert.equal(commits, 2);
+  pendingReadingTop = 31;
+  await loadHistory({stickToBottom: true, force: true});
+  layouts.at(-1)();
+  assert.equal(surface.scrollTop, 31);
+  assert.equal(pendingReadingTop, null);
+  assert.equal(userScrollIntentPending, true);
+  pendingReadingTop = 55;
+  await loadHistory({stickToBottom: true, force: true});
+  userScrollRevision++;
+  layouts.at(-1)();
+  assert.equal(surface.scrollTop, 31, 'late restoration must not override a newer gesture');
+  pendingReadingTop = null;
   globalThis.fetch = async () => {
     terminalRevision++;
     return {status: 200, ok: true, headers: {get: () => 'new'}, text: async () => 'wrong'};
@@ -451,6 +540,7 @@ let atBottom = false;
 let returnedToLive = 0;
 let blurred = 0;
 let enteredReading = 0;
+let pendingReadingTop = null;
 const atLiveBottom = () => atBottom;
 const scrollToLive = () => {{
   returnedToLive += 1;
@@ -517,8 +607,10 @@ assert.equal(liveButton.hidden, true);
 atBottom = true;
 liveFollowing = true;
 userScrollIntentPending = true;
+pendingReadingTop = 80;
 {return_to_live}
 returnToLive();
+assert.equal(pendingReadingTop, null, 'input cancels pending reading restoration');
 assert.equal(userScrollIntentPending, false);
 atBottom = false;
 updateScrollState();

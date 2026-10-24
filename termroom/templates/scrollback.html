@@ -18,8 +18,11 @@
 </section>
 <div class="scrollback-tools">
   <input id="scrollback-search" type="search" placeholder="{{ t('scrollback.search') }}" aria-label="{{ t('scrollback.search') }}">
+  <button id="scrollback-refresh" class="secondary-button" type="button">{{ t('scrollback.read_changes') }}</button>
+  <button id="scrollback-full" class="secondary-button" type="button" hidden>{{ t('scrollback.full') }}</button>
   <button class="secondary-button" type="button" data-copy-target="#scrollback-output">{{ t('scrollback.copy_all') }}</button>
   <span id="scrollback-search-status" class="scrollback-search-status" role="status"></span>
 </div>
+<p id="scrollback-refresh-status" role="status" aria-live="polite"></p>
 <pre id="scrollback-output" class="scrollback-output">{{ output }}</pre>
 {% endblock %}

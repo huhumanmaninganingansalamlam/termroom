@@ -2310,6 +2310,69 @@
   const scrollbackOutput = document.querySelector("#scrollback-output");
   const scrollbackSearchStatus = document.querySelector("#scrollback-search-status");
   let scrollbackNextOffset = 0;
+  const scrollbackChanges = (previous, current) => {
+    const before = previous.split("\n");
+    const after = current.split("\n");
+    let start = 0;
+    while (start < before.length && start < after.length && before[start] === after[start]) start++;
+    let beforeEnd = before.length;
+    let afterEnd = after.length;
+    while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+      beforeEnd--;
+      afterEnd--;
+    }
+    return {
+      text: after.slice(start, afterEnd).join("\n"),
+      added: afterEnd - start,
+      removed: beforeEnd - start,
+    };
+  };
+  const scrollbackRefresh = document.querySelector("#scrollback-refresh");
+  const scrollbackFull = document.querySelector("#scrollback-full");
+  const scrollbackCopy = document.querySelector('[data-copy-target="#scrollback-output"]');
+  const scrollbackRefreshStatus = document.querySelector("#scrollback-refresh-status");
+  let scrollbackCapture = scrollbackOutput?.textContent || "";
+  scrollbackRefresh?.addEventListener("click", async () => {
+    if (scrollbackRefresh.disabled) return;
+    scrollbackRefresh.disabled = true;
+    scrollbackRefreshStatus.textContent = tr("scrollback.refreshing");
+    scrollbackOutput.setAttribute("aria-busy", "true");
+    try {
+      const response = await fetch(location.href, {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "text/plain" },
+      });
+      if (!response.ok || !response.headers.get("content-type")?.includes("text/plain")) {
+        throw new Error("Terminal capture unavailable");
+      }
+      const current = await response.text();
+      const changes = scrollbackChanges(scrollbackCapture, current);
+      scrollbackCapture = current;
+      scrollbackOutput.textContent = changes.text;
+      scrollbackOutput.dataset.view = "changes";
+      scrollbackFull.hidden = false;
+      scrollbackCopy.textContent = tr("scrollback.copy_changes");
+      scrollbackNextOffset = 0;
+      scrollbackSearchStatus.textContent = "";
+      scrollbackRefreshStatus.textContent = changes.added || changes.removed
+        ? tr("scrollback.changed", changes) : tr("scrollback.unchanged");
+    } catch {
+      scrollbackRefreshStatus.textContent = tr("scrollback.refresh_failed");
+    } finally {
+      scrollbackRefresh.disabled = false;
+      scrollbackOutput.removeAttribute("aria-busy");
+    }
+  });
+  scrollbackFull?.addEventListener("click", () => {
+    scrollbackOutput.textContent = scrollbackCapture;
+    scrollbackOutput.dataset.view = "full";
+    scrollbackFull.hidden = true;
+    scrollbackCopy.textContent = tr("scrollback.copy_all");
+    scrollbackNextOffset = 0;
+    scrollbackSearchStatus.textContent = "";
+    scrollbackRefreshStatus.textContent = "";
+  });
   const selectTextOffsets = (root, start, end) => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let position = 0;

@@ -1277,6 +1277,7 @@
     if (targetId === (pendingTerminalId || host.dataset.terminalId)) return true;
     const previousTerminalId = host.dataset.terminalId || "";
 
+    window.dispatchEvent(new Event("termroom:terminal-switching"));
     persistCommandDraft();
     connectionEpoch += 1;
     resetInputControl();
