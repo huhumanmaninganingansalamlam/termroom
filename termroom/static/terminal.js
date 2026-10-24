@@ -201,7 +201,8 @@
   const mouseService = term._core.coreMouseService;
   const reportMouse = mouseService.triggerMouseEvent.bind(mouseService);
   mouseService.triggerMouseEvent = (event) => {
-    if (paneMode?.shell_foreground === true && !paneMode.alternate) return false;
+    // An ended shell cannot consume reports; tmux still needs pane-selection clicks.
+    if (paneMode?.shell_foreground === true && !paneMode.alternate && !paneMode.dead) return false;
     return reportMouse(event);
   };
   term.options.screenReaderMode = false;

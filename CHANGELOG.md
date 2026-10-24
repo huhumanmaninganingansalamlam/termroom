@@ -2,6 +2,15 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.17] - 2026-10-24
+
+### Fixed
+
+- Allow tmux mouse clicks to select a living neighbour when the selected shell
+  pane has ended. Keep command submission to the ended pane blocked and retain
+  unsent drafts for explicit retry after selecting a live pane. Residual mouse
+  protection for living shells remains enabled.
+
 ## [0.4.16] - 2026-10-24
 
 ### Fixed

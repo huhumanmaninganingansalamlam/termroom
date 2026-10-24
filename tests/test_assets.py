@@ -276,7 +276,13 @@ acceptPaneMode({...mode,generation:'b',revision:3,alternate:false,shell_foregrou
 assert.equal(mouse.triggerMouseEvent('normal-app-or-copy-mode'), true);
 acceptPaneMode({...mode,generation:'b',revision:4,alternate:true,shell_foreground:true});
 assert.equal(mouse.triggerMouseEvent('alternate'), true);
-assert.deepEqual(mouseReports, ['tui','normal-app-or-copy-mode','alternate']);
+acceptPaneMode({...mode,generation:'b',revision:5,alternate:false,shell_foreground:true,dead:true});
+assert.equal(mouse.triggerMouseEvent('leave-ended-shell'), true,
+  'tmux must receive clicks to select a live neighbour even if the ended command was a shell');
+acceptPaneMode({...mode,generation:'b',revision:6,alternate:false,shell_foreground:true,dead:false});
+assert.equal(mouse.triggerMouseEvent('live-shell'), false,
+  'selecting an ended pane must not disable residual mouse protection for living shells');
+assert.deepEqual(mouseReports, ['tui','normal-app-or-copy-mode','alternate','leave-ended-shell']);
 host.dataset.paneModeCapable = 'false';
 paneMode = null;
 paneModeGeneration = null;
