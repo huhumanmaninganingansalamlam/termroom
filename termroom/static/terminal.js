@@ -206,9 +206,18 @@
     return reportMouse(event);
   };
   term.options.screenReaderMode = false;
+  const syncAccessibleTerminalRows = () => {
+    // Expose the rendered viewport without copying text or enabling spoken output.
+    const rows = host.querySelector(".xterm-rows");
+    rows?.setAttribute("role", "group");
+    rows?.setAttribute("aria-label", tr("terminal.visible_rows"));
+    rows?.setAttribute("aria-hidden", String(term.options.screenReaderMode));
+    host.querySelector(".xterm-accessibility-tree")?.setAttribute("aria-label", tr("terminal.visible_rows"));
+  };
+  syncAccessibleTerminalRows();
   screenReaderModeToggle?.addEventListener("change", () => {
     term.options.screenReaderMode = screenReaderModeToggle.checked;
-    host.querySelector(".xterm-accessibility-tree")?.setAttribute("aria-label", tr("terminal.visible_rows"));
+    syncAccessibleTerminalRows();
   });
   const terminalStringCellWidth = (value) => {
     const service = term._core?.unicodeService;

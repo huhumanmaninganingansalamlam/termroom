@@ -2,6 +2,16 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.18] - 2026-10-25
+
+### Fixed
+
+- Include the currently rendered terminal rows in browser accessibility
+  snapshots when spoken screen-reader output is off. Current TUI output stays
+  visible alongside scrollback instead of exposing only older history. Use
+  xterm's native accessibility rows when screen-reader output is enabled to
+  avoid duplicate screen content.
+
 ## [0.4.17] - 2026-10-24
 
 ### Fixed

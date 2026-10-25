@@ -216,6 +216,41 @@ def test_template_static_asset_versions_match_file_hashes() -> None:
     assert fixed_versions["vendor/addon-unicode11.js"] == {XTERM_UNICODE11_VERSION}
 
 
+def test_visible_terminal_rows_have_one_accessible_source() -> None:
+    script = (VENDOR_DIR.parent / "terminal.js").read_text()
+    handler = script[
+        script.index("  term.options.screenReaderMode = false;"):
+        script.index("  const terminalStringCellWidth =")
+    ]
+    probe = r"""
+const assert = require('node:assert/strict');
+const rows = new Map([['aria-hidden', 'true']]);
+const native = new Map();
+const element = attributes => ({setAttribute:(name,value)=>attributes.set(name,value)});
+const term = {options:{screenReaderMode:false}};
+const host = {querySelector:selector=>selector==='.xterm-rows'
+  ? element(rows) : term.options.screenReaderMode ? element(native) : null};
+const tr = key => key;
+let change;
+const screenReaderModeToggle = {checked:false,addEventListener:(_,callback)=>change=callback};
+HANDLER
+assert.equal(rows.get('aria-hidden'),'false','default snapshots must include the rendered screen');
+assert.equal(rows.get('aria-label'),'terminal.visible_rows');
+screenReaderModeToggle.checked = true;
+change();
+assert.equal(term.options.screenReaderMode,true);
+assert.equal(rows.get('aria-hidden'),'true','native screen-reader rows must not be duplicated');
+assert.equal(native.get('aria-label'),'terminal.visible_rows');
+screenReaderModeToggle.checked = false;
+change();
+assert.equal(term.options.screenReaderMode,false);
+assert.equal(rows.get('aria-hidden'),'false',
+  'turning spoken output off must keep snapshots current');
+""".replace("HANDLER", handler)
+    result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_pane_controls_reject_stale_state_and_never_parse_terminal_text() -> None:
     ROOT = Path(__file__).resolve().parents[1]
     script = (ROOT / "termroom/static/terminal.js").read_text()
