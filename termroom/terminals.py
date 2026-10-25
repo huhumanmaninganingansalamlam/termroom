@@ -766,13 +766,22 @@ class TerminalModeRefresh:
         self.query = query
         self.unavailable = unavailable
         self.task: asyncio.Task[None] | None = None
+        self.pending = False
+
+    async def _run(self) -> None:
+        while True:
+            self.pending = False
+            await self.query()
+            if not self.pending:
+                return
 
     async def refresh(self) -> None:
         if self.task is not None:
             if not self.task.done():
+                self.pending = True
                 return
             await self.task
-        self.task = asyncio.create_task(self.query())
+        self.task = asyncio.create_task(self._run())
         done, _ = await asyncio.wait({self.task}, timeout=PANE_MODE_REFRESH_INTERVAL_SECONDS)
         if done:
             await self.task

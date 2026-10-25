@@ -2,6 +2,16 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.19] - 2026-10-26
+
+### Fixed
+
+- Refresh the selected input pane after native tmux navigation even when an
+  earlier pane lookup is still running. Local, SSH and Node connections retain
+  the pending refresh instead of leaving the command editor stuck on an ended
+  pane until another output or reload. PTY output stays nonblocking, ended-pane
+  commands remain rejected, and unsent drafts wait for explicit retry.
+
 ## [0.4.18] - 2026-10-25
 
 ### Fixed

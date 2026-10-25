@@ -212,17 +212,19 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
     executor = ThreadPoolExecutor(max_workers=1)
     loop.set_default_executor(executor)
     queries = 0
+    selected = {"pane": "%1", "dead": True}
     output: list[str] = []
     controls: list[dict[str, object]] = []
 
     def pane_mode(*_args):  # type: ignore[no-untyped-def]
         nonlocal queries
         queries += 1
+        captured = dict(selected)
         if queries >= slow_query:
             loop.call_soon_threadsafe(querying.set)
             if not release.wait(3):
                 raise SSHBackendError("bounded fixture pane timeout")
-        return {"pane": "%1", "alternate": True, "mouse_tracking": True}
+        return {**captured, "alternate": True, "mouse_tracking": True}
 
     monkeypatch.setattr(backend, "ensure_workspace", lambda *_args: [])
     monkeypatch.setattr(backend, "_spawn_ssh_tmux_client", lambda *_args: (999999, read_fd))
@@ -240,7 +242,7 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
             if control["kind"] != "pane_mode":
                 return
             controls.append(control)
-            if control["available"] and release.is_set():
+            if control.get("pane") == "%2":
                 recovered.set()
 
         async def send_text(self, data: str) -> None:
@@ -262,6 +264,7 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
         assert not release.is_set() and output == ["complete-benign-output"]
         assert controls[-1]["available"] is False
         print(f"slow_pane_output_ms={(loop.time() - started) * 1000:.3f}")
+        selected.update(pane="%2", dead=False)
         delivered.clear()
         os.write(write_fd, b"-next-output")
         await asyncio.wait_for(delivered.wait(), 0.5)
@@ -270,6 +273,8 @@ async def test_ssh_output_continues_during_a_slow_pane_query(
         release.set()
         await asyncio.wait_for(recovered.wait(), 1)
         assert controls[-1]["available"] is True
+        assert controls[-1]["pane"] == "%2" and controls[-1]["dead"] is False
+        assert queries == slow_query + 1
         assert [c["revision"] for c in controls] == list(range(1, len(controls) + 1))
     finally:
         release.set()

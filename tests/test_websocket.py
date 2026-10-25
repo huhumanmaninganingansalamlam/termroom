@@ -121,18 +121,20 @@ async def test_output_progresses_while_pane_metadata_is_delayed(
     controls: list[dict] = []
     output: list[str] = []
     queries = 0
+    selected = {"pane": "%1", "dead": True}
 
     def mode(*_args):  # type: ignore[no-untyped-def]
         nonlocal queries
         queries += 1
+        captured = dict(selected)
         loop.call_soon_threadsafe(entered.set)
         release.wait(3)
-        return {"pane": "%1", "alternate": False, "mouse_tracking": False}
+        return {**captured, "alternate": False, "mouse_tracking": False}
 
     def control(value):  # type: ignore[no-untyped-def]
         if value.get("kind") == "pane_mode":
             controls.append(value)
-            if value.get("available", True) and release.is_set():
+            if value.get("pane", value.get("mode", {}).get("pane")) == "%2":
                 recovered.set()
 
     class Browser(_BridgeWebSocket):
@@ -183,12 +185,14 @@ async def test_output_progresses_while_pane_metadata_is_delayed(
         assert not release.is_set() and output == ["first visible result"]
         assert controls[-1]["available"] is False
         print(f"{backend_kind} delayed_mode_output_ms={(loop.time()-started)*1000:.1f}")
+        selected.update(pane="%2", dead=False)
         delivered.clear()
         os.write(write_fd, b"; second result")
         await asyncio.wait_for(delivered.wait(), 0.6)
         assert "".join(output) == "first visible result; second result" and queries == 1
         release.set()
         await asyncio.wait_for(recovered.wait(), 1)
+        assert queries == 2  # No more output is needed to publish the new selection.
     finally:
         release.set()
         disconnected.set()
