@@ -2,6 +2,15 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.20] - 2026-10-28
+
+### Fixed
+
+- Offer an Open workspace link when a terminal connection reports that its
+  Terminal no longer exists. Reopen the current terminal list on an explicit
+  click, preserving unsent drafts under their original Terminal and reusing
+  surviving tmux windows without replaying commands.
+
 ## [0.4.19] - 2026-10-26
 
 ### Fixed

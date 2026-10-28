@@ -422,8 +422,8 @@ const document = {querySelector(selector) {
     return {remove(){unrelatedError=false;}};
   }
 }};
-const windowListeners = {};
-const window = {clearTimeout(){},setTimeout(){},dispatchEvent(){},
+const windowListeners = {}, reconnects = [];
+const window = {clearTimeout(){},setTimeout(callback){reconnects.push(callback);},dispatchEvent(){},
  addEventListener(name,callback){windowListeners[name]=callback;}};
 const location = {protocol:'https:',host:'fixture.invalid'};
 let socket=null,connectionEpoch=0,reconnectTimer,reconnectDelay=500,reconnectAllowed=true;
@@ -433,6 +433,7 @@ let activationPending=false,programmaticTerminalFocus=false;
 const reconnectButton = {hidden:true,disabled:false,
  addEventListener(_,callback){this.retry=callback;}};
 const signInLink = {hidden:true};
+const openWorkspaceLink = {hidden:true};
 const claimInputControl=()=>{},resetInputControl=()=>{},acceptInputControl=()=>{};
 let outputRenderSequence=0,pendingActivityAt=0,acknowledgedActivityAt=0,renderedActivityAt=0;
 const term={write(_,callback){callback();},focus(){},
@@ -463,10 +464,11 @@ assert.equal(isConnected,false,'transport open is not backend readiness');
 assert.equal(status,'terminal.status.connecting');
 connect();const current=socket;current.emit('open');
 const liveStatus=status;
-old.emit('close',{code:4403});
+old.emit('close',{code:4404});
 old.emit('error');
 old.emit('message',control(1));
 assert.equal(status,liveStatus,'old errors/close cannot replace current connection status');
+assert.equal(openWorkspaceLink.hidden,true,'a stale close cannot offer recovery');
 assert.equal(connectionError,true,'an old connection cannot prove recovery');
 current.emit('message',control(1,{available:false}));
 current.emit('message',{data:'ssh: connection timed out'});
@@ -517,6 +519,18 @@ windowListeners.offline();
 assert.equal(status,'terminal.status.rejected','offline must preserve an actual rejection');
 online.emit('close',{code:4401});
 assert.equal(signInLink.hidden,false,'expired authentication offers sign in');
+assert.equal(openWorkspaceLink.hidden,true,'authentication failure keeps its sign-in action');
+const pendingReconnects = reconnects.length;
+online.emit('close',{code:4404});
+assert.equal(status,'terminal.status.not_found');
+assert.equal(openWorkspaceLink.hidden,false,'a missing terminal offers the workspace route');
+assert.equal(reconnectButton.hidden,true,'a missing terminal must not reconnect its stale id');
+assert.equal(signInLink.hidden,true);
+assert.equal(reconnects.length,pendingReconnects,'recovery waits for an explicit user action');
+windowListeners.offline();
+assert.equal(openWorkspaceLink.hidden,false,'offline preserves the recovery action');
+connect();
+assert.equal(openWorkspaceLink.hidden,true,'opening another terminal retires the recovery action');
 """.replace("MODE_HANDLER", mode).replace("CONNECT_HANDLER", connect)
     result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

@@ -1281,6 +1281,12 @@ async def test_terminal_page_canonicalizes_stale_terminal_query(tmp_path: Path) 
         )
         assert initial.status_code == 200
         terminal = app.state.store.list_terminals(str(workspace["id"]))[0]
+        recovery_link = re.search(
+            r'<a id="terminal-open-workspace"[^>]+>', initial.text
+        )
+        assert recovery_link is not None
+        assert f'href="/w/{workspace["id"]}/terminal"' in recovery_link[0]
+        assert "hidden" in recovery_link[0]
 
         stale = await client.get(
             f"/w/{workspace['id']}/terminal?terminal=missing-terminal",

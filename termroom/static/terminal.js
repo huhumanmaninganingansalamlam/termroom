@@ -122,6 +122,7 @@
   const statusLabel = status.querySelector(".terminal-status-label");
   const reconnectButton = document.querySelector("#terminal-reconnect");
   const signInLink = document.querySelector("#terminal-sign-in");
+  const openWorkspaceLink = document.querySelector("#terminal-open-workspace");
   const inputError = document.querySelector("#terminal-input-error");
   const setInputError = (message = "") => {
     if (!inputError) return;
@@ -744,6 +745,7 @@
     }
     if (reconnectButton) reconnectButton.disabled = true;
     if (signInLink) signInLink.hidden = true;
+    if (openWorkspaceLink) openWorkspaceLink.hidden = true;
     initialOutputParsed = false;
     host.dataset.terminalReady = "false";
     host.dataset.outputFrames = "0";
@@ -840,6 +842,7 @@
         reconnectButton.disabled = false;
       }
       if (signInLink) signInLink.hidden = event.code !== 4401;
+      if (openWorkspaceLink) openWorkspaceLink.hidden = event.code !== 4404;
       if (reconnectAllowed && document.visibilityState !== "hidden") {
         reconnectTimer = window.setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 1.7, 5000);

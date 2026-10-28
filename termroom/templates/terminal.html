@@ -39,6 +39,7 @@
     </span>
     <button id="terminal-reconnect" class="terminal-tool-button" type="button" hidden>{{ t('terminal.reconnect') }}</button>
     <a id="terminal-sign-in" class="terminal-tool-button" href="/login" hidden>{{ t('login.submit') }}</a>
+    <a id="terminal-open-workspace" class="terminal-tool-button" href="/w/{{ workspace.id }}/terminal" hidden>{{ t('home.open_workspace') }}</a>
     <span id="command-delivery" class="terminal-status" role="status"
           aria-label="{{ t('terminal.command_delivery') }}" aria-atomic="true"
           aria-describedby="command-delivery-help" hidden>
