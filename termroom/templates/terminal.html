@@ -40,13 +40,6 @@
     <button id="terminal-reconnect" class="terminal-tool-button" type="button" hidden>{{ t('terminal.reconnect') }}</button>
     <a id="terminal-sign-in" class="terminal-tool-button" href="/login" hidden>{{ t('login.submit') }}</a>
     <a id="terminal-open-workspace" class="terminal-tool-button" href="/w/{{ workspace.id }}/terminal" hidden>{{ t('home.open_workspace') }}</a>
-    <span id="command-delivery" class="terminal-status" role="status"
-          aria-label="{{ t('terminal.command_delivery') }}" aria-atomic="true"
-          aria-describedby="command-delivery-help" hidden>
-      <span aria-hidden="true">↗</span>
-      <span class="terminal-status-label"></span>
-    </span>
-    <span id="command-delivery-help" class="sr-only">{{ t('terminal.command_delivery_help') }}</span>
     <a class="terminal-tool-button terminal-output-action"
        href="/w/{{ workspace.id }}/terminal/{{ terminal.id }}/scrollback"
        data-terminal-output-link
@@ -131,6 +124,13 @@
   </div>
 </div>
 {% if error %}<p class="terminal-error-banner" role="alert" title="{{ error }}"{% if terminal_connection_error %} data-terminal-connection-error{% endif %}>{{ error }}</p>{% endif %}
+<p id="command-delivery" class="terminal-command-delivery" role="status"
+   aria-label="{{ t('terminal.command_delivery') }}" aria-atomic="true"
+   aria-describedby="command-delivery-help" hidden>
+  <span aria-hidden="true">↗</span>
+  <span class="terminal-status-label"></span>
+</p>
+<span id="command-delivery-help" class="sr-only">{{ t('terminal.command_delivery_help') }}</span>
 <p id="terminal-input-error" class="terminal-input-error" role="alert" hidden></p>
 {% if file_run %}
 <aside class="file-run-bar file-run-terminal-bar {{ file_run.display_state }}"

@@ -598,6 +598,7 @@ const document = {querySelector:selector=>selector==='#command-delivery'?receipt
 const tr = key => key;
 const host = {dataset:{workspaceId:'w',terminalId:'t'}};
 let controlGeneration = 'current';
+let controlsInput = true, controlClaimPending = false;
 const drafts = new Map();
 const sessionStorage = {setItem:(key,value)=>drafts.set(key,value),
  getItem:key=>drafts.get(key) ?? null,removeItem:key=>drafts.delete(key)};
@@ -662,6 +663,30 @@ assert.equal(Buffer.byteLength(text),19806);
   editDraft();
   assert.equal(receipt.hidden, true, 'a new draft must not inherit the previous delivery success');
   assert.equal(sent.length, 1, 'editing a draft does not send it');
+  sent.length = 0;
+  controlsInput = false;
+  term.options.disableStdin = true;
+  commandInput.value = 'known unsent draft';
+  submit({preventDefault(){}});
+  await new Promise(resolve => term.write('', resolve));
+  assert.equal(sent.length, 0, 'a view without control cannot send or claim control');
+  assert.equal(receipt.dataset.state, 'not_in_control', 'local refusal is known unsent');
+  assert.equal(commandUnconfirmed, false);
+  assert.equal(commandPending, false);
+  assert.equal(commandInput.value, 'known unsent draft');
+  assert.equal(JSON.parse([...drafts.values()][0]).unconfirmed, false);
+  controlsInput = true;
+  term.options.disableStdin = false;
+  updateCommandComposer();
+  assert.equal(sent.length, 0, 'regaining control never replays the preserved draft');
+  controlsInput = false;
+  controlClaimPending = true;
+  submit({preventDefault(){}});
+  await new Promise(resolve => term.write('', resolve));
+  assert.equal(sent.length, 1, 'an existing explicit control claim still permits queuing');
+  acceptCommandDelivery({terminal_id:'t',generation:'current',command_id:sent[0].command_id,accepted:true});
+  controlsInput = true;
+  controlClaimPending = false;
   sent.length = 0;
   for (const bracketed of [true, false]) {
     term.write(bracketed ? '\x1b[?2004h' : '\x1b[?2004l');

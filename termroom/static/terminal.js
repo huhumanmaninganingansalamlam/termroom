@@ -1222,6 +1222,14 @@
         resetCommandDelivery();
         return;
       }
+      if (!controlsInput && !controlClaimPending) {
+        resetCommandDelivery();
+        commandUnconfirmed = false;
+        setCommandDelivery(commandInput.value === command ? "not_in_control" : "idle");
+        persistCommandDraft();
+        updateCommandComposer();
+        return;
+      }
       pastedCommand = command;
       pastedCommandSent = false;
       try {

@@ -3076,6 +3076,18 @@ details:not([open]) > :not(summary) {
   background: var(--green);
 }
 
+.terminal-command-delivery {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+#command-delivery .terminal-status-label {
+  display: inline;
+}
+
 .terminal-screen:has(.terminal-error-banner) .terminal-status.connected {
   display: none;
 }

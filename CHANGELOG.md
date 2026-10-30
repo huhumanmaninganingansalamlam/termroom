@@ -2,6 +2,17 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.21] - 2026-10-30
+
+### Fixed
+
+- Identify command-editor submissions blocked by missing input control as not
+  sent, with guidance to activate the tab or terminal and the draft preserved.
+  Regaining control never resends the draft. Successful delivery now explicitly
+  asks the user to check application receipt; terminal delivery alone does not
+  confirm application acceptance or execution. Keep delivery feedback readable
+  below the toolbar on mobile as well as desktop.
+
 ## [0.4.20] - 2026-10-28
 
 ### Fixed
