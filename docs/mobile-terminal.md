@@ -74,22 +74,6 @@ Termroom은 `compositionstart/update/end`를 관찰할 수 있지만 **compositi
 직접 WebSocket으로 보내면 안 된다.** 최종 commit은 xterm의 `onData`만 source of
 truth로 사용한다.
 
-자동 browser QA에서는 한국어 composition을 첫 자모부터 다음처럼 재현한다.
-
-```text
-ㅎ → 하 → 한 → 한ㄱ → 한그 → 한글 → … → 한글테스트
-```
-
-합격 조건:
-
-- intermediate jamo WebSocket input: 0건
-- final input: `한글테스트` 1건
-- tmux 화면에서도 완성 음절이 유지됨
-
-synthetic browser event는 실제 Gboard/Samsung Keyboard/iOS IME의 완전한 대체물이
-아니다. 실제 macOS Safari 검증과 추후 사용자가 수행하는 스마트폰 실기기 확인은 아래처럼
-구분하며, 확인하지 않은 기기 조합을 검증된 것처럼 표현하지 않는다.
-
 ## 4. Paste
 
 terminal의 붙여넣기는 clipboard text를 WebSocket에 직접 write하지 않는다.
@@ -186,49 +170,14 @@ terminal chrome, terminal 본문, composer, bottom navigation의 좌우 padding�
 `safe-area-inset-left/right`를 고려한다. notch가 있는 iPhone landscape에서도 핵심
 터치 컨트롤과 terminal 문자가 safe area 밖에 걸리지 않게 한다.
 
-## 8. Browser validation matrix
+## 8. Terminal에서 파일 빠른 탐색
 
-### 변경 영향에 맞춘 browser 검증
-
-사용 가능한 실제 browser/runtime에서 변경에 영향을 받는 Terminal 흐름을 확인한다.
-완료된 미변경 흐름을 반복하거나 특정 Mac·Safari·native IME·실기기의 부재로
-모든 patch release를 막지 않는다.
-
-- shell과 Vim/Neovim에서 한글·ASCII 입력
-- Esc, Tab, Ctrl 조합과 normal/application cursor mode 방향키
-- 여러 줄 bracketed paste
-- terminal focus와 command editor 전환
-- viewport resize와 alternate-screen redraw
-- reload, WebSocket reconnect와 기존 tmux session 복귀
-- browser selection/copy와 tmux copy mode
-
-관측한 browser와 환경을 결과에 적는다. user-agent 변경이나 viewport/emulation을
-실제 macOS·물리 기기에서 실행한 결과로 기록하지 않는다.
-
-### 사용자 후속 확인: 스마트폰과 installed PWA
-
-Android와 iOS 실기기 및 installed PWA 검증은 사용자가 추후 수행하는 비차단 후속 항목이다.
-기기가 없거나 아직 실행하지 않았다는 이유로 현재 delivery 또는 `PRODUCT_COMPLETE`를
-차단하지 않는다. 모든 keyboard vendor, tablet 크기와 browser version 조합을 매 release
-gate로 만들지도 않는다.
-
-| 환경 | 사용자 후속 확인 |
-|---|---|
-| Android Chrome + installed PWA | 대표 한국어 keyboard의 composition, focus, keyboard open-close, rotation |
-| iPhone Safari + installed PWA | composition, punctuation, copy/paste, safe area |
-| 물리 또는 Bluetooth keyboard | Esc/Tab/Ctrl/arrows, terminal focus와 resize |
-
-실기기에서 확인할 때는 최소 다음 시나리오를 실행한다.
-
-1. shell prompt에 `한글테스트` 입력
-2. interactive CLI/REPL에서 `echo 한글`
-3. `vim`/`nvim` insert mode 한글 입력, Esc와 command line visibility
-4. alternate screen 상태의 resize, disconnect와 reconnect redraw
-5. normal/application cursor mode의 방향키
-6. Ctrl+C / Ctrl+D / Tab
-7. 여러 줄 bracketed paste
-8. command editor에서 한글·여러 줄 편집 후 Run
-9. keyboard open/close와 portrait/landscape rotation
-10. browser selection/copy와 tmux copy mode
-
-실기기에서 확인하지 않은 항목을 문서나 release note에서 "완벽 지원"으로 표현하지 않는다.
+- Terminal의 `파일 / Files` 탐색은 현재 Terminal DOM과 tmux 입력 경로를 유지한 채
+  native dialog 서랍에서 기존 인증된 파일 목록 응답을 읽는다. 별도 파일 엔진이나
+  수정 요청을 복제하지 않는다.
+- 서랍에서는 폴더 이동·검색·페이지 이동만 하고, 파일 보기는 새 탭으로 연다.
+  업로드·브라우저 편집·이름 변경·삭제는 기존 전체 Files 화면에서 수행한다.
+- 서랍은 Esc 또는 닫기 버튼으로 닫으며, 보이는 Files 트리거로 포커스를 되돌린다.
+  keyboard-open처럼 하단 탐색이 숨은 상태에서는 보이지 않는 트리거에 포커스를 강제하지 않는다.
+- 좁은 모바일 화면에서는 서랍을 화면 전체로 펼치며, 실제 기기·소프트웨어 키보드 검수는
+  별도 acceptance에서 수행한다.

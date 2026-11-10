@@ -1797,6 +1797,7 @@ const term={options:{}};
 const windowListeners={},documentListeners={};
 let focused=true,visible='visible',clears=0,blurs=0,closed=false;
 const document={get visibilityState(){return visible},hasFocus:()=>focused,
+ querySelector:()=>null,
  addEventListener:(name,callback)=>{documentListeners[name]=callback}};
 const window={addEventListener:(name,callback)=>{windowListeners[name]=callback}};
 const WebSocket={OPEN:1};
@@ -1805,6 +1806,7 @@ let socket={readyState:1,send:frame=>frames.push(frame),close:()=>{closed=true}}
 const commandInput={value:'',blur:()=>blurs++};
 const updateCommandComposer=()=>clears++,setComposerOpen=()=>{};
 const resetCommandDelivery=()=>{};
+const setInputError=()=>{};
 CONTROLS
 SEND
 const state=(revision,owner,generation='current',extra={})=>({kind:'terminal_control',

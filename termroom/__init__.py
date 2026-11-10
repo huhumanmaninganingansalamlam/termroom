@@ -1,3 +1,3 @@
 """Termroom implementation package."""
 
-__version__ = "0.4.21"
+__version__ = "0.4.22"

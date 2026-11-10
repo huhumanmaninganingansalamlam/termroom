@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import os
 import pty
 import select
@@ -346,6 +347,7 @@ async def test_long_paste_short_pty_writes_preserve_tail_and_next_input(
     confirmation = "\x1b[200~confirm\x1b[201~"
     expected = (paste + "\r" + confirmation + "\r\tlegacy").encode() + b"binary"
     received = bytearray()
+    all_bytes = asyncio.Event()
     original_write = os.write
 
     def short_write(fd: int, data: bytes) -> int:
@@ -362,6 +364,8 @@ async def test_long_paste_short_pty_writes_preserve_tail_and_next_input(
                 loop.remove_reader(slave_fd)
                 return
             received.extend(chunk)
+            if len(received) >= len(expected):
+                all_bytes.set()
 
     monkeypatch.setattr(os, "write", short_write)
     loop = asyncio.get_running_loop()
@@ -403,6 +407,8 @@ async def test_long_paste_short_pty_writes_preserve_tail_and_next_input(
             await asyncio.wait_for(backend.bridge(browser, workspace, terminal), 3)
             assert sorted(store.list_commands(str(workspace["id"]))) == sorted([text, "confirm"])
         drain()
+        # PTY write completion precedes asynchronous slave-side readability.
+        await asyncio.wait_for(all_bytes.wait(), 2)
         print(f"{backend_kind}: expected={len(expected)} received={len(received)}")
         assert bytes(received) == expected, "PTY lost paste tail/terminator or joined next input"
     finally:
@@ -1345,6 +1351,9 @@ def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(
 ) -> None:
     caplog.set_level("INFO", logger="uvicorn.error.termroom")
     app, workspace, terminal = _app(tmp_path)
+    # An earlier in-process Uvicorn server can stop propagation to pytest's root handler.
+    terminal_logger = logging.getLogger("uvicorn.error.termroom")
+    terminal_logger.addHandler(caplog.handler)
     marker = "TERMROOM_INPUT_한글"
     try:
         with TestClient(app, base_url="http://testserver") as client:
@@ -1382,6 +1391,7 @@ def test_terminal_websocket_writes_ascii_and_unicode_input_to_real_tmux(
         assert records[-1]["output_bytes"] > 0
         assert marker not in caplog.text and "correct-password" not in caplog.text
     finally:
+        terminal_logger.removeHandler(caplog.handler)
         _cleanup(app, workspace)
 
 

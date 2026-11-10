@@ -1562,6 +1562,82 @@ def test_node_workspace_reconnect_reuses_tmux_and_terminal_identity(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_node_terminal_input_targets_exact_pane_with_one_enter(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    runtime = NodeRuntime([tmp_path])
+    payload = _payload(workspace)
+    session = str(payload["tmux_session"])
+    receiver = tmp_path / "node_t39_receiver.py"
+    output = tmp_path / "node_t39_bytes.bin"
+    receiver.write_text(
+        "import os, sys, termios, tty\n"
+        "fd = sys.stdin.fileno()\n"
+        "before = termios.tcgetattr(fd)\n"
+        "tty.setraw(fd)\n"
+        "try:\n"
+        "    sys.stdout.write('\\x1b[?2004hNODE_T39_READY\\r\\n')\n"
+        "    sys.stdout.flush()\n"
+        "    data = bytearray()\n"
+        "    while b'\\r' not in data and len(data) < 16384:\n"
+        "        data.extend(os.read(fd, 4096))\n"
+        "    open(sys.argv[1], 'wb').write(data)\n"
+        "finally:\n"
+        "    termios.tcsetattr(fd, termios.TCSANOW, before)\n",
+        encoding="utf-8",
+    )
+    try:
+        terminal = runtime._handle_sync("workspace.ensure", payload)["terminals"][0]
+        window = terminal["tmux_window"]
+        target = {**payload, "tmux_window": window}
+        observed = runtime._handle_sync("terminal.mode", target)["mode"]
+        assert observed["window"] == window
+        assert observed["pane"].startswith("%")
+        runtime._tmux(
+            "send-keys", "-l", "-t", window,
+            f"python3 -u {shlex.quote(str(receiver))} {shlex.quote(str(output))}",
+        )
+        runtime._tmux("send-keys", "-t", window, "Enter")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "NODE_T39_READY" in runtime._tmux(
+                "capture-pane", "-p", "-t", window,
+            ).stdout:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("Node synthetic PTY receiver was not ready")
+        stale = {**target, "pane": "%9999999", "value": "blocked", "append_enter": True}
+        with pytest.raises(NodeAgentError) as exc:
+            runtime._handle_sync("terminal.input", stale)
+        assert exc.value.code == "pane_changed"
+        assert not output.exists()
+
+        data = "Node-한글-명령"
+        delivered = runtime._handle_sync(
+            "terminal.input",
+            {**target, "pane": observed["pane"], "value": data, "append_enter": True},
+        )["delivery"]
+        assert delivered == {
+            "pane": observed["pane"],
+            "delivered_bytes": len(data.encode("utf-8")),
+            "enter_sent": True,
+        }
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not output.exists():
+            time.sleep(0.05)
+        assert output.exists()
+        raw = output.read_bytes()
+        assert raw.count(b"\r") == 1
+        assert raw.endswith(b"\r")
+        assert data.encode("utf-8") in raw
+    finally:
+        runtime._tmux("kill-session", "-t", session, check=False)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 def test_node_scrollback_can_exclude_the_live_tmux_viewport(tmp_path: Path) -> None:
     old_marker = "NODE_HISTORY_OLD"
     live_marker = "NODE_HISTORY_LIVE"

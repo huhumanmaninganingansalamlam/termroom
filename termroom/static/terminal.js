@@ -349,12 +349,15 @@
   let controlClaimId = 0;
   let activationPending = document.visibilityState === "visible" && document.hasFocus();
   let programmaticTerminalFocus = false;
+  let handoffPaused = false;
+  const releaseControlButton = document.querySelector("#terminal-release-control");
   const pendingControlInput = [];
   let pendingControlBytes = 0;
   const MAX_PENDING_CONTROL_BYTES = 1024 * 1024;
   Object.defineProperty(host, "termroomControlsInput", { get: () => controlsInput });
   const updateInputControl = () => {
     term.options.disableStdin = !controlsInput && !controlClaimPending;
+    if (releaseControlButton) releaseControlButton.disabled = !controlsInput;
   };
   const acceptInputControl = (value) => {
     if (
@@ -379,6 +382,10 @@
         resetCommandDelivery();
       }
     }
+    if (value.kind === "terminal_control" && typeof value.released === "boolean") {
+      handoffPaused = value.released;
+      setInputError(tr(value.released ? "terminal.control_released" : "terminal.control_release_refused"));
+    }
     updateInputControl();
   };
   const resetInputControl = () => {
@@ -392,7 +399,7 @@
     updateInputControl();
   };
   const claimInputControl = () => {
-    if (programmaticTerminalFocus || document.visibilityState !== "visible" || !document.hasFocus()) return;
+    if (handoffPaused || programmaticTerminalFocus || document.visibilityState !== "visible" || !document.hasFocus()) return;
     if (controlClaimPending) return;
     activationPending = true;
     if (socket?.readyState !== WebSocket.OPEN) return;
@@ -422,10 +429,24 @@
   updateInputControl();
   window.addEventListener("focus", claimInputControl);
   document.addEventListener("pointerdown", (event) => {
-    if (event.target.closest?.("#terminal, .terminal-composer, [data-terminal-switch]")) claimInputControl();
+    if (event.target.closest?.("#terminal, .terminal-composer, [data-terminal-switch]")) {
+      handoffPaused = false;
+      setInputError();
+      claimInputControl();
+    }
   }, true);
   document.addEventListener("focusin", (event) => {
-    if (event.target.closest?.("#terminal, .terminal-composer")) claimInputControl();
+    if (event.target.closest?.("#terminal, .terminal-composer")) {
+      handoffPaused = false;
+      claimInputControl();
+    }
+  });
+  releaseControlButton?.addEventListener("click", () => {
+    if (!controlsInput || socket?.readyState !== WebSocket.OPEN) return;
+    if (!window.confirm(tr("terminal.control_release_confirm"))) return;
+    // Dialog focus restoration is not a Terminal activation.
+    handoffPaused = true;
+    socket.send(JSON.stringify({ kind: "control_release" }));
   });
 
   const setStatusMessage = (message) => {
@@ -767,7 +788,14 @@
       reconnectDelay = 500;
       scheduleResize(true);
       if (activationPending) claimInputControl();
-      if (!coarsePrimaryPointer.matches) {
+      // A reconnect must not steal focus from another active UI control.
+      const focusedElement = document.activeElement;
+      if (
+        !coarsePrimaryPointer.matches &&
+        !composerOpen &&
+        (!focusedElement || focusedElement === document.body ||
+          host.contains(focusedElement))
+      ) {
         programmaticTerminalFocus = true;
         try { term.focus(); } finally { programmaticTerminalFocus = false; }
       }

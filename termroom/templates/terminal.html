@@ -13,6 +13,10 @@
 {% block workspace_content %}
 <div class="terminal-chrome">
   <div class="terminal-chrome-leading">
+    <div class="terminal-workspace-identity" title="{{ workspace.canonical_path }}">
+      <strong role="heading" aria-level="1">{{ workspace.display_name }}</strong>
+      <small>{{ workspace.connection_label or t('home.this_computer') }} · {{ t(workspace_kind_label) }}</small>
+    </div>
     <span class="terminal-session-name"
           data-terminal-session-name
           aria-label="{{ t('terminal.tmux_session', session=workspace.tmux_session) }}"
@@ -88,6 +92,7 @@
           </div>
         </section>
         {% if (terminal.role | default('shell')) == 'shell' %}
+          <button type="button" id="terminal-release-control">{{ t('terminal.control_release') }}</button>
           <label>
             <span>{{ t('terminal.name') }}</span>
             <input name="name" value="{{ terminal.name }}" maxlength="32" required aria-label="{{ t('terminal.rename') }}" data-terminal-name-input>

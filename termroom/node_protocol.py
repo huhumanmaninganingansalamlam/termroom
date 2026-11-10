@@ -34,6 +34,7 @@ NODE_OPTIONAL_CAPABILITIES = frozenset(
         NODE_WORKSPACE_COMMAND_CAPABILITY,
         "workspace_usage",
         "terminal_editor",
+        "terminal_input_v1",
     }
 )
 NODE_CAPABILITIES = NODE_REQUIRED_CAPABILITIES | NODE_OPTIONAL_CAPABILITIES
@@ -50,6 +51,8 @@ NODE_REQUEST_OPERATIONS = frozenset(
         "terminal.editor.open",
         "terminal.rename",
         "terminal.close",
+        "terminal.mode",
+        "terminal.input",
         "terminal.activity",
         "terminal.scrollback",
         "terminal.attach",

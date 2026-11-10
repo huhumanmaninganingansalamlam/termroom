@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Current Workspace CSS fixture — Termroom</title>
+  <link rel="stylesheet" href="../../../termroom/static/app.css">
+  <style>
+    :root { --app-height: 100dvh; }
+    .terminal-reference { margin: 0; padding: 14px 17px; font: 14px/18px "DejaVu Sans Mono", ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--terminal-text); }
+    .terminal-reference b { color: var(--terminal-green); font-weight: 550; }
+    .terminal-reference em { color: var(--terminal-blue); font-style: normal; }
+    .terminal-reference strong { color: var(--terminal-yellow); font-weight: 550; }
+    .baseline-note { position: absolute; right: 12px; bottom: 12px; color: var(--text-tertiary); opacity: .6; font-size: 10px; pointer-events: none; }
+  </style>
+</head>
+<body class="workspace-page terminal-page">
+  <header class="workspace-header">
+    <div class="workspace-brand-row">
+      <a class="workspace-brand" href="#" aria-label="홈"><span class="brand-mark">›_</span><span>Termroom</span></a>
+      <span class="workspace-brand-actions"><span class="workspace-mode">로컬 · 작업 공간</span><button type="button" class="terminal-tool-button" aria-label="활동">◌</button><button type="button" class="terminal-tool-button" aria-label="설정">⚙</button></span>
+    </div>
+    <div class="workspace-project-row">
+      <a class="workspace-home-button" href="#" aria-label="홈">←</a>
+      <div class="workspace-title"><strong role="heading" aria-level="1">payments-service</strong><small>/home/dev/projects/payments-service</small></div>
+      <span class="workspace-mobile-actions"><span class="workspace-mobile-mode"><strong>Local laptop</strong><small>로컬</small></span><button class="terminal-tool-button" aria-label="활동">◌</button><button class="terminal-tool-button" aria-label="설정">⚙</button></span>
+    </div>
+  </header>
+  <main class="workspace-content terminal-screen" aria-label="payments-service · Terminal">
+    <div class="terminal-chrome">
+      <div class="terminal-chrome-leading"><span class="terminal-session-name"><span>tmux</span><code>payments</code></span>
+        <nav class="terminal-tabs" aria-label="터미널 전환">
+          <a class="active" href="#" aria-current="page">shell</a><a href="#">api</a><a href="#">logs</a>
+        </nav>
+      </div>
+      <div class="terminal-top-actions">
+        <span class="terminal-status connected" role="status"><span class="terminal-status-dot"></span><span class="terminal-status-label">연결됨</span></span>
+        <a class="terminal-tool-button terminal-output-action" href="#" aria-label="출력">☰<span class="terminal-tool-label">출력</span></a>
+        <button class="terminal-tool-button" aria-label="터미널 관리">•••</button>
+        <button class="terminal-tool-button terminal-new-button" aria-label="새 터미널">＋</button>
+      </div>
+    </div>
+    <div id="terminal" class="terminal-host" role="region" aria-label="터미널 화면: shell">
+      <pre class="terminal-reference"><em>dev@laptop</em> <b>~/projects/payments-service</b> $ git status --short
+ M app/services/invoice.py
+ M tests/test_invoice.py
+<em>dev@laptop</em> <b>~/projects/payments-service</b> $ pytest tests/test_invoice.py -q
+...........                                                    [100%]
+<strong>11 passed</strong> in 0.84s
+<em>dev@laptop</em> <b>~/projects/payments-service</b> $ <span aria-hidden="true">▌</span></pre>
+    </div>
+    <div class="terminal-composer">
+      <div class="quick-keys" aria-label="터미널 보조 키">
+        <div class="terminal-key-rail">
+          <button type="button" class="terminal-keycap">Esc</button><button type="button" class="terminal-keycap">Tab</button>
+          <button type="button" class="terminal-keycap">Ctrl</button><button type="button" class="terminal-keycap">↑</button>
+          <button type="button" class="terminal-keycap">↓</button><button type="button" class="terminal-keycap">C-c</button>
+        </div>
+        <div class="more-keys"><button type="button" class="terminal-keycap" aria-label="더 많은 키">•••</button></div>
+        <button id="open-command-editor" class="terminal-command-trigger" aria-label="명령 편집" aria-expanded="false">✎ <span>명령 편집</span></button>
+      </div>
+    </div>
+  </main>
+  <nav class="bottom-nav" aria-label="Workspace">
+    <span class="workspace-nav-label">Workspace</span>
+    <a class="active" href="#" aria-current="page"><svg viewBox="0 0 24 24"><path d="M5 7l4 5-4 5M11 17h8"/></svg><span>터미널</span></a>
+    <a href="#"><svg viewBox="0 0 24 24"><path d="M4 6h6l2 2h8v10H4z"/></svg><span>파일</span></a>
+    <a href="#"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg><span>최근</span></a>
+    <a href="#"><svg viewBox="0 0 24 24"><path d="m8 5 10 7-10 7Z"/></svg><span>실행</span></a>
+  </nav>
+  <footer class="workspace-sidebar-footer"><span class="status-dot is-active"></span><span class="workspace-sidebar-copy"><strong>연결됨</strong><small>터미널 3</small></span></footer>
+<script>
+  if (new URLSearchParams(location.search).get('keyboard') === '1') document.body.classList.add('terminal-keyboard-open');
+</script>
+</body>
+</html>

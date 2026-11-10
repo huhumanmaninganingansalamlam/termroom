@@ -123,6 +123,9 @@ termroom .
 ### Files
 
 - Browse and search project folders.
+- From the Terminal, Files opens a read-only quick browser without leaving the
+  Terminal; file previews open in a new tab. Use the full Files page to upload,
+  edit, rename, or delete.
 - Create a new project folder from the Open Workspace browser and open it immediately.
 - Select several files or folders and download them as a ZIP.
 - Upload multiple files with overwrite confirmation.
@@ -576,12 +579,6 @@ node --check termroom/static/remote_run.js
 node --check termroom/static/terminal.js
 docker compose config
 ```
-
-User-facing changes should be checked at mobile, tablet, and desktop responsive widths.
-Those viewport checks are useful layout evidence, but they are not physical-device evidence.
-The current real-browser release gate is Safari on an actual macOS desktop. Physical smartphone
-Safari/Chrome and installed-PWA checks are a separate, user-owned follow-up and do not block the
-current release; Chrome on the same Mac is optional comparison evidence.
 
 ## Documentation
 

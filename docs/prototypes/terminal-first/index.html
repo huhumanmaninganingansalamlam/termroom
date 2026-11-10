@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Terminal-first Workspace — Review fixture</title>
+  <script>
+    document.documentElement.dataset.layout = new URLSearchParams(location.search).get("layout") === "strip" ? "strip" : "dock";
+  </script>
+  <link rel="stylesheet" href="prototype.css">
+  <script src="prototype.js" defer></script>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="app-header">
+    <a href="#home" class="back-link" aria-label="홈으로">←</a>
+    <div class="brand"><strong>Termroom</strong><span class="brand-separator" aria-hidden="true">/</span><span class="project-name">payments-service</span><small class="project-location">Local laptop · ~/projects/payments-service</small></div>
+    <div class="header-status"><span class="status-light"></span><span id="header-status-text">연결됨</span></div>
+    <button type="button" class="header-icon" data-view="activity" aria-label="활동" title="활동">◌<span class="unread" aria-label="새 활동 2개"></span></button>
+    <button type="button" class="header-icon" data-view="settings" aria-label="설정" title="설정">⚙</button>
+  </header>
+
+  <nav class="view-nav" aria-label="Workspace 화면">
+    <button type="button" data-view="terminal" aria-current="page" title="터미널 · Alt+1"><span class="nav-symbol">›_</span><span class="nav-name">터미널</span></button>
+    <button type="button" data-view="files" title="파일 · Alt+2"><span class="nav-symbol">▤</span><span class="nav-name">파일</span></button>
+    <button type="button" data-view="recent" title="최근 · Alt+3"><span class="nav-symbol">◷</span><span class="nav-name">최근</span></button>
+    <button type="button" data-view="run" title="실행 · Alt+4"><span class="nav-symbol">▷</span><span class="nav-name">실행</span></button>
+    <div class="nav-spacer" aria-hidden="true"></div>
+    <button type="button" class="rail-utility" data-view="activity" aria-label="활동" title="활동">◌</button>
+    <button type="button" class="rail-utility" data-view="settings" aria-label="설정" title="설정">⚙</button>
+    <span class="nav-bottom">작업 공간 · tmux 3</span>
+  </nav>
+
+  <main id="main" class="workspace">
+    <section class="terminal-surface" aria-label="터미널 화면">
+      <div class="terminal-toolbar">
+        <div class="workspace-inline"><strong>payments-service</strong><small>Local laptop</small></div>
+        <div class="tmux-label" title="tmux session: payments">tmux <code>payments</code></div>
+        <div class="terminal-tabs" id="terminal-tabs" role="group" aria-label="터미널 전환">
+          <button type="button" data-terminal="shell" aria-pressed="true">shell</button>
+          <button type="button" data-terminal="api" aria-pressed="false">api <i class="tab-dot" aria-label="새 출력"></i></button>
+          <button type="button" data-terminal="logs" aria-pressed="false">logs</button>
+        </div>
+        <div class="terminal-tools">
+          <button type="button" class="tool-status" data-status-button aria-label="연결 상태: 연결됨"><span class="status-light"></span><span class="status-word">연결됨</span></button>
+          <button type="button" class="tool-button output-button" data-action="output" title="출력·스크롤백" aria-label="출력·스크롤백">☰<span>출력</span></button>
+          <button type="button" class="tool-button" data-menu-toggle="terminal" aria-expanded="false" aria-controls="terminal-menu" aria-label="터미널 관리" title="터미널 관리">•••</button>
+          <button type="button" class="tool-button highlighted" data-action="new-terminal" title="새 터미널" aria-label="새 터미널">＋</button>
+        </div>
+      </div>
+      <div class="terminal-menu menu" id="terminal-menu" hidden role="group" aria-label="터미널 관리">
+        <div class="menu-title"><strong>터미널 관리</strong><button class="close-button" type="button" data-close-menu aria-label="닫기">×</button></div>
+        <label for="rename-input">현재 터미널 이름</label>
+        <div class="rename-row"><input id="rename-input" maxlength="32" value="shell"><button type="button" data-action="rename">이름 변경</button></div>
+        <div class="menu-controls"><button type="button" data-action="smaller">글자 −</button><span id="font-display">14px</span><button type="button" data-action="larger">글자 +</button></div>
+        <label class="check-line"><input id="screen-reader" type="checkbox"> 스크린 리더 모드</label>
+        <button type="button" class="danger-text" data-action="close-terminal">현재 터미널 닫기…</button>
+      </div>
+      <p class="notice" id="notice" role="alert" hidden></p>
+      <div class="delivery-message" id="delivery" role="status" hidden></div>
+      <div class="terminal-viewport" data-terminal-viewport role="region" tabindex="-1" aria-label="현재 터미널 출력">
+        <div class="terminal-content" data-output="shell"><pre><span class="dim"># Terminal · payments-service / shell</span>
+<span class="blue">dev@laptop</span> <span class="green">~/projects/payments-service</span> $ git status --short
+ M app/services/invoice.py
+ M tests/test_invoice.py
+<span class="blue">dev@laptop</span> <span class="green">~/projects/payments-service</span> $ pytest tests/test_invoice.py -q
+...........                                                    [100%]
+<span class="yellow">11 passed</span> in 0.84s
+<span class="blue">dev@laptop</span> <span class="green">~/projects/payments-service</span> $ <span class="cursor"> </span></pre></div>
+        <div class="terminal-content" data-output="api" hidden><pre><span class="dim"># Terminal · payments-service / api</span>
+<span class="blue">dev@laptop</span> <span class="green">~/projects/payments-service</span> $ uvicorn app.main:app --reload
+INFO:     Watching for changes in ['/home/dev/projects/payments-service']
+INFO:     Uvicorn running on http://127.0.0.1:8000
+INFO:     Application startup complete.
+<span class="green">INFO</span>:     127.0.0.1:52180 - "GET /health HTTP/1.1" 200 OK
+<span class="green">INFO</span>:     127.0.0.1:52192 - "GET /api/invoices HTTP/1.1" 200 OK</pre></div>
+        <div class="terminal-content" data-output="logs" hidden><pre><span class="dim"># Terminal · payments-service / logs</span>
+<span class="blue">dev@laptop</span> <span class="green">~/projects/payments-service</span> $ journalctl --user -fu payments-worker
+Nov 09 11:06:20 INFO queue connected
+Nov 09 11:06:23 INFO invoice_1082 processed · 84ms
+Nov 09 11:06:26 INFO invoice_1083 processed · 91ms
+Nov 09 11:06:29 WARN retrying downstream request after 429</pre></div>
+      </div>
+      <div class="terminal-bottom">
+        <div class="helper-keys" aria-label="터미널 보조 키">
+          <button type="button" data-key="Esc">Esc</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Ctrl">Ctrl</button>
+          <button type="button" data-key="↑">↑</button><button type="button" data-key="↓">↓</button><button type="button" data-key="C-c">C-c</button>
+          <button type="button" class="more-key-button" data-menu-toggle="keys" aria-expanded="false" aria-controls="keys-menu" aria-label="더 많은 보조 키">•••</button>
+        </div>
+        <button type="button" class="compose-toggle" data-action="compose" aria-expanded="false" aria-controls="compose-panel"><span>✎</span><span class="compose-label">명령 편집</span></button>
+      </div>
+      <div class="menu keys-menu" id="keys-menu" hidden role="group" aria-label="더 많은 보조 키">
+        <div class="menu-title"><strong>더 많은 키</strong><button class="close-button" type="button" data-close-menu aria-label="닫기">×</button></div>
+        <div class="key-grid"><button data-key="←">←</button><button data-key="→">→</button><button data-key="C-d">C-d</button><button data-key="/">/</button><button data-key="-">-</button><button data-key="|">|</button><button data-key="~">~</button><button data-key="PgUp">PgUp</button></div>
+        <button type="button" data-action="focus-terminal">터미널로 돌아가기</button>
+      </div>
+      <form class="compose-panel" id="compose-panel" hidden>
+        <div class="compose-head"><div><strong>명령 편집</strong><small>긴 명령을 검토한 뒤 전송 · 데모에서는 실행하지 않습니다</small></div><button type="button" class="close-button" data-action="close-compose" aria-label="명령 편집 닫기">×</button></div>
+        <div class="compose-row"><label class="sr-only" for="command-draft">명령 입력</label><textarea id="command-draft" rows="2" placeholder="예: pytest tests/test_invoice.py -q" spellcheck="false"></textarea><button class="submit" type="submit">전송</button></div>
+        <small class="draft-help">Enter는 줄바꿈입니다. 전송 버튼에서만 PTY로 전달하는 실제 제품 계약을 검토합니다.</small>
+      </form>
+    </section>
+
+    <aside class="aux-surface" id="aux-surface" aria-labelledby="aux-title" hidden>
+      <header class="aux-header"><div><small id="aux-kicker">작업 공간</small><h1 id="aux-title" tabindex="-1">파일</h1></div><button type="button" id="close-aux" class="close-button" aria-label="패널 닫고 터미널로 복귀">×</button></header>
+      <div class="aux-content" id="aux-content">
+        <p class="panel-alert" id="panel-alert" role="alert" hidden></p>
+        <section data-panel="files">
+          <nav class="crumbs" aria-label="파일 경로"><button type="button">payments-service</button><span>/</span><strong>app</strong><span>/</span><strong>services</strong></nav>
+          <p class="panel-help">현재 위치 · ~/projects/payments-service/app/services</p>
+          <div class="panel-actions"><button type="button" data-action="upload">업로드</button><button type="button" data-action="create">＋ 새 파일/폴더</button></div>
+          <label class="search-label">파일 검색<input type="search" id="file-search" placeholder="현재 폴더에서 검색"></label>
+          <div class="file-list" id="file-list">
+            <button type="button" data-file="invoice.py"><span class="file-icon">py</span><span><strong>invoice.py</strong><small>수정됨 · 6.2 KB</small></span><span class="file-open">열기</span></button>
+            <button type="button" data-file="payment.py"><span class="file-icon">py</span><span><strong>payment.py</strong><small>12.4 KB</small></span><span class="file-open">열기</span></button>
+            <button type="button" data-file="__init__.py"><span class="file-icon">py</span><span><strong>__init__.py</strong><small>0 B</small></span><span class="file-open">열기</span></button>
+          </div>
+          <div class="file-actions" id="file-actions" hidden><strong id="selected-file">invoice.py</strong><p>선택한 파일은 실제 서버에서 열리지 않습니다.</p><button type="button" data-action="browser-edit">브라우저 편집</button><button type="button" data-action="vim-open">Vim에서 열기</button><button type="button" data-action="file-run">파일 실행</button><button type="button" data-action="remote-run">다른 컴퓨터에서 실행</button></div>
+        </section>
+        <section data-panel="recent" hidden><p class="panel-help">이 작업 공간의 최근 접근 항목</p>
+          <div class="file-list"><button type="button" data-action="recent-file"><span>▤</span><span><strong>app/services/invoice.py</strong><small>어제 · 브라우저 편집</small></span></button><button type="button" data-action="recent-shell"><span>›_</span><span><strong>shell</strong><small>현재 tmux 세션</small></span></button><button type="button" data-action="recent-file"><span>▤</span><span><strong>tests/test_invoice.py</strong><small>2시간 전 · Vim</small></span></button></div>
+        </section>
+        <section data-panel="run" hidden>
+          <p class="panel-help">저장된 명령은 최대 3개입니다. 저장 전 실행되지 않습니다.</p>
+          <p class="panel-help" id="empty-run" hidden>저장된 명령이 없습니다. 아래에서 이름과 명령을 작성해 저장하세요.</p>
+          <div class="saved-command"><div><strong>Tests</strong><code>pytest tests/test_invoice.py -q</code></div><button type="button" data-action="saved-run">실행</button></div>
+          <div class="saved-command"><div><strong>Server</strong><code>uvicorn app.main:app --reload</code></div><button type="button" data-action="saved-run">실행</button></div>
+          <details class="command-editor"><summary>＋ 명령 추가</summary><label>이름<input type="text" id="saved-name" maxlength="160" placeholder="예: 린트"></label><label>명령<input type="text" id="saved-command" maxlength="4096" placeholder="ruff check ."></label><button type="button" data-action="save-command">저장</button></details>
+          <hr><h2>파일 실행</h2><p class="panel-help" id="run-status">app/services/invoice.py · 실행 이력 없음</p>
+          <button type="button" data-action="file-run">파일 실행 시안 보기</button>
+          <div class="run-simulation-actions" id="file-run-actions" hidden><button type="button" data-action="stop-run">중지 요청</button><button type="button" data-action="force-stop">강제 중지…</button><small>데모 상태로만 표시됨 · 실제 프로세스 없음</small></div>
+          <h2>원격 실행</h2><p class="panel-help">소스: Local laptop · 대상: build-node-02</p><button type="button" data-action="remote-run">실행 설정/결과 검토</button>
+          <div class="remote-result" id="remote-result" hidden><strong>build-node-02 · 실행 완료</strong><p>종료 코드 0 · 2분 11초 · 결과 보존 중</p><button type="button" data-action="download-result">결과 ZIP 다운로드</button><button type="button" data-action="collect-result">소스 위치에서 결과 검토</button><small>실제 다운로드·수집은 하지 않습니다.</small></div>
+        </section>
+        <section data-panel="activity" hidden><p class="panel-help">실제 작업 기록과 알림을 확인하는 보조 화면</p><ol class="activity-list"><li><strong>파일 실행 완료</strong><small>invoice.py · 종료 코드 0 · 오전 11:06</small></li><li><strong>원격 실행 결과 수집 가능</strong><small>build-node-02 · 결과 ZIP · 어제 오후 9:41</small></li><li><strong>터미널 새 출력</strong><small>api · 오전 11:02</small></li></ol></section>
+        <section data-panel="settings" hidden><p class="panel-help">작업 공간 설정 · 실제 계정/작업 공간 변경 없음</p><label class="setting-row">표시 이름<input type="text" value="payments-service"></label><label class="setting-row">언어<select><option>한국어</option><option>English</option></select></label><label class="check-line"><input type="checkbox"> 라이트 테마 사용</label><p class="panel-help">PWA 설치 및 세션 삭제는 실제 제품에서 설정 메뉴를 통해 제공됩니다.</p></section>
+      </div>
+    </aside>
+    <button class="surface-scrim" id="surface-scrim" type="button" tabindex="-1" aria-hidden="true" aria-label="패널 닫기" hidden></button>
+  </main>
+  <aside class="review-controls" aria-label="시안 검토 설정">
+    <button type="button" data-review-layout="dock">A · 닫히는 도구 서랍</button><button type="button" data-review-layout="strip">B · 작업 화면 전환</button>
+    <select id="scenario" aria-label="검토 상태">
+      <option value="ready">정상 연결</option><option value="offline">연결 끊김</option><option value="refused">입력 거부</option><option value="conflict">파일 충돌</option><option value="unknown">결과 확인 불가</option><option value="empty">빈 작업 공간</option><option value="host-key">SSH 호스트 키 변경</option><option value="pairing">Node 페어링 만료</option><option value="file-run">파일 실행</option><option value="remote-run">원격 결과</option>
+    </select>
+    <label class="keyboard-review"><input type="checkbox" id="keyboard-open">모바일 키보드</label>
+    <span class="review-mark">가상 데이터 · 전송 없음</span>
+  </aside>
+  <div class="live-announcer sr-only" role="status" aria-live="polite" id="announcer"></div>
+</div>
+</body>
+</html>

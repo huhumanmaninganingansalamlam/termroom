@@ -46,10 +46,15 @@
                data-workspace-run-command-persisted="{{ 'true' if item else 'false' }}"
                {% if not item and index > 0 %}hidden{% endif %}>
         <details class="workspace-run-command-editor">
-          <summary aria-label="{{ t('workspace.run.configure') }} · {{ t('workspace.run.slot', number=index + 1) }}"
+          <summary aria-label="{{ t('workspace.run.configure') }} · {{ t('workspace.run.slot', number=index + 1) }}{% if item %} · {{ item.name }}{% endif %}"
                    title="{{ t('workspace.run.configure') }}">
-            <code data-workspace-command-summary
-                  data-empty-label="{{ t('workspace.run.slot', number=index + 1) }}">{{ item.command if item else t('workspace.run.slot', number=index + 1) }}</code>
+            <span class="workspace-run-command-overview">
+              <strong data-workspace-command-summary
+                      data-empty-label="{{ t('workspace.run.slot', number=index + 1) }}">{{ item.name if item else t('workspace.run.slot', number=index + 1) }}</strong>
+              {% if item %}
+              <code title="{{ item.command }}">{{ item.command }}</code>
+              {% endif %}
+            </span>
             <span class="workspace-run-command-edit-action">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5 5 19zM13.8 7.4l2.8 2.8"/></svg>
               <span>{{ t('workspace.run.configure') }}</span>
@@ -62,12 +67,26 @@
             <input type="hidden" name="_csrf" value="{{ csrf_token }}">
             {% if item %}
             <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
+            <input type="hidden" name="command_id" value="{{ item.id }}">
+            <input type="hidden" name="command_revision" value="{{ item.revision }}">
+            {% else %}
+            <input type="hidden" name="commands_revision" value="{{ workspace_commands_revision }}">
             {% endif %}
             <label>
-              <span>{{ t('workspace.run.slot', number=index + 1) }}</span>
+              <span>{{ t('workspace.run.name') }}</span>
+              <input name="name"
+                     value="{{ item.name if item else '' }}"
+                     maxlength="160"
+                     autocomplete="off"
+                     required
+                     placeholder="{{ t('workspace.run.name_placeholder') }}">
+            </label>
+            <label>
+              <span>{{ t('workspace.run.command_value') }}</span>
               <input name="command"
                      value="{{ item.command if item else '' }}"
                      maxlength="4096"
+                     required
                      autocomplete="off"
                      spellcheck="false"
                      placeholder="{{ t('workspace.run.placeholder') }}">
@@ -111,8 +130,11 @@
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <input type="hidden" name="launch_id" value="{{ item.launch_id }}">
           <input type="hidden" name="command_digest" value="{{ item.command_digest }}">
+          <input type="hidden" name="command_id" value="{{ item.id }}">
+          <input type="hidden" name="command_revision" value="{{ item.revision }}">
           <button type="submit"
                   title="{{ item.command }}"
+                  aria-label="{{ t('workspace.run.command') }} · {{ t('workspace.run.slot', number=index + 1) }} · {{ item.name }}"
                   data-workspace-command-run-button
                   data-save-first-title="{{ t('workspace.run.save_before_run') }}">
             <span data-workspace-command-label>{{ t('workspace.run.command') }}</span>
@@ -292,6 +314,45 @@
       aria-label="{{ workspace.display_name }} · {{ workspace.connection_label or t('home.this_computer') }} · {{ workspace.canonical_path }} · {{ t('common.terminal') if active_tab == 'terminal' else t('common.files') if active_tab == 'files' else t('common.recent') }}{% if active_tab == 'terminal' and terminal is defined %}: {{ terminal.name }}{% endif %}">
   {% block workspace_content %}{% endblock %}
 </main>
+{% if active_tab == 'terminal' and not server_terminal %}
+<dialog class="terminal-files-drawer"
+        data-terminal-files-drawer
+        data-workspace-id="{{ workspace.id }}"
+        data-root-label="{{ workspace.display_name }}"
+        data-loading-label="{{ t('files.drawer.loading') }}"
+        data-error-label="{{ t('files.drawer.error') }}"
+        data-new-tab-label="{{ t('files.drawer.new_tab') }}"
+        data-loaded-label="{{ t('files.drawer.loaded') }}"
+        data-pagination-label="{{ t('files.pagination') }}"
+        aria-labelledby="terminal-files-drawer-title">
+  <div class="terminal-files-drawer-inner">
+    <header class="terminal-files-drawer-header">
+      <span>
+        <small>{{ workspace.display_name }}</small>
+        <strong id="terminal-files-drawer-title">{{ t('files.drawer.heading') }}</strong>
+      </span>
+      <button type="button" data-terminal-files-close
+              aria-label="{{ t('common.close') }}" title="{{ t('common.close') }}">×</button>
+    </header>
+    <form class="terminal-files-drawer-search" data-terminal-files-search role="search">
+      <label class="sr-only" for="terminal-files-drawer-query">{{ t('files.search') }}</label>
+      <input id="terminal-files-drawer-query" type="search" maxlength="120"
+             placeholder="{{ t('files.search_placeholder') }}" autocomplete="off">
+      <button type="submit">{{ t('files.search') }}</button>
+    </form>
+    <p class="terminal-files-drawer-location" data-terminal-files-location></p>
+    <p class="terminal-files-drawer-state" data-terminal-files-state role="status" aria-live="polite"></p>
+    <ul class="terminal-files-drawer-list" data-terminal-files-list
+        aria-label="{{ t('common.files') }}"></ul>
+    <nav class="terminal-files-drawer-pagination" data-terminal-files-pagination
+         aria-label="{{ t('files.pagination') }}"></nav>
+    <footer class="terminal-files-drawer-footer">
+      <button type="button" data-terminal-files-retry hidden>{{ t('files.drawer.retry') }}</button>
+      <a href="/w/{{ workspace.id }}/files">{{ t('files.drawer.full') }}</a>
+    </footer>
+  </div>
+</dialog>
+{% endif %}
 <nav class="bottom-nav"
      aria-label="{% if server_terminal %}{{ t('server_terminal.title') }}{% else %}{{ t('common.workspace') }}{% endif %}"
      data-workspace-terminal-activity
@@ -315,7 +376,7 @@
     <span>{{ t('server_terminal.settings') }}</span>
   </a>
   {% else %}
-  <a class="{% if active_tab == 'files' %}active{% endif %}" href="/w/{{ workspace.id }}/files">
+  <a class="{% if active_tab == 'files' %}active{% endif %}" href="/w/{{ workspace.id }}/files"{% if active_tab == 'terminal' and not server_terminal %} data-terminal-files-trigger{% endif %}>
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4z"/></svg>
     <span>{{ t('common.files') }}</span>
   </a>
@@ -327,6 +388,22 @@
   {% endif %}
   {% endif %}
   {{ workspace_run_menu('navigation') }}
+  {% if active_tab == 'terminal' %}
+  <div class="terminal-rail-utilities" role="group" aria-label="{{ t('common.workspace') }}">
+    <a class="workspace-activity-link"
+       href="/activity"
+       data-activity-link
+       data-summary-url="/api/activity/summary"
+       data-claim-url="/api/activity/notifications/claim"
+       data-csrf="{{ csrf_token }}"
+       aria-label="{{ t('activity.heading') }}"
+       title="{{ t('activity.heading') }}">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 7H3s3 0 3-7M9.5 19h5"/></svg>
+      <strong class="activity-unread-badge" data-activity-unread hidden></strong>
+    </a>
+    {{ user_settings_menu('terminal-rail', workspace) }}
+  </div>
+  {% endif %}
 </nav>
 {% if workspace.transient %}
 <footer class="workspace-sidebar-footer"

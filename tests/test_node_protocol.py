@@ -115,6 +115,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "remote_run",
         "remote_run_source",
         "terminal_editor",
+        "terminal_input_v1",
         NODE_WORKSPACE_COMMAND_CAPABILITY,
         "workspace_usage",
     } == NODE_OPTIONAL_CAPABILITIES
@@ -127,6 +128,7 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "remote_run",
         "remote_run_source",
         "terminal_editor",
+        "terminal_input_v1",
         NODE_WORKSPACE_COMMAND_CAPABILITY,
         "workspace_usage",
     } == NODE_CAPABILITIES
@@ -151,6 +153,8 @@ def test_managed_runs_are_optional_and_expose_only_fixed_operations() -> None:
         "terminal.close",
         "terminal.create",
         "terminal.editor.open",
+        "terminal.input",
+        "terminal.mode",
         "terminal.rename",
         "terminal.resize",
         "terminal.scrollback",

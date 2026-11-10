@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -562,8 +563,722 @@ def test_real_node_pairing_and_control_connection_use_custom_ca(tmp_path: Path) 
             handle.close()
 
 
+@contextlib.contextmanager
+def _isolated_chrome_terminal(
+    profile: Path, base_url: str, cookie: str, workspace_id: str, terminal_id: str,
+) -> Iterator[Callable[[str], Any]]:
+    """Drive only a test-owned Chrome profile during remote backend work."""
+    profile.mkdir()
+    chrome = subprocess.Popen(
+        [
+            "google-chrome", "--headless=new", "--disable-gpu",
+            "--no-first-run", "--no-default-browser-check",
+            "--remote-debugging-port=0",
+            "--remote-allow-origins=http://127.0.0.1",
+            f"--user-data-dir={profile}", "about:blank",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        port_file = profile / "DevToolsActivePort"
+        _wait_until(lambda: port_file.exists(), description="isolated Chrome debugger")
+        debug_port = int(port_file.read_text(encoding="utf-8").splitlines()[0])
+        page = httpx.put(
+            f"http://127.0.0.1:{debug_port}/json/new?about:blank", timeout=5,
+        ).json()
+        with websocket_connect(
+            page["webSocketDebuggerUrl"],
+            origin="http://127.0.0.1",
+            open_timeout=5,
+        ) as devtools:
+            next_id = 0
+
+            def cdp(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+                nonlocal next_id
+                next_id += 1
+                request_id = next_id
+                devtools.send(json.dumps({
+                    "id": request_id, "method": method, "params": params or {},
+                }))
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    message = json.loads(devtools.recv(timeout=10))
+                    if message.get("id") != request_id:
+                        continue
+                    if "error" in message:
+                        raise AssertionError(f"Chrome CDP {method}: {message['error']}")
+                    return message.get("result", {})
+                raise AssertionError(f"Chrome CDP {method} timed out")
+
+            def evaluate(expression: str) -> Any:
+                result = cdp("Runtime.evaluate", {
+                    "expression": expression, "returnByValue": True,
+                })
+                if "exceptionDetails" in result:
+                    raise AssertionError(str(result["exceptionDetails"]))
+                return result.get("result", {}).get("value")
+
+            cdp("Page.enable")
+            # A separate initial about:blank tab exists in this test profile.
+            # Keep the observed Chrome page foreground for real focus checks.
+            cdp("Page.bringToFront")
+            cdp("Runtime.enable")
+            cdp("Network.enable")
+            assert cdp("Network.setCookie", {
+                "name": "termroom_session", "value": cookie,
+                "url": f"{base_url}/", "httpOnly": True,
+            })["success"]
+            cdp("Page.navigate", {
+                "url": f"{base_url}/w/{workspace_id}/terminal?terminal={terminal_id}",
+            })
+            _wait_until(
+                lambda: evaluate(
+                    "document.readyState === 'complete' && "
+                    "!!document.querySelector('#terminal .xterm-helper-textarea') && "
+                    "document.querySelector('.terminal-tabs a.active')"
+                    f"?.dataset.terminalActivityTab === '{terminal_id}'"
+                ),
+                description="real Chrome Terminal A",
+            )
+            yield evaluate
+    finally:
+        _stop_process(chrome)
+
+
+@pytest.mark.skipif(
+    not all(shutil.which(command) for command in ("tmux", "google-chrome")),
+    reason="Real Chrome and a private tmux server are required",
+)
+def test_real_chrome_reconnect_preserves_open_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Core restart must not steal focus or replay an unsent browser draft."""
+    from termroom.workspaces import RootManager, WorkspaceManager
+
+    root = tmp_path / "root"
+    (root / "qa").mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    tmux_dir = tmp_path / "tmux"
+    tmux_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_dir))
+    environment = os.environ.copy()
+    environment["TERMROOM_PASSWORD"] = "isolated-chrome-reconnect-password"
+    environment["TERMROOM_LOCALE"] = "en"
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    core: subprocess.Popen[bytes] | None = None
+    client: httpx.Client | None = None
+    handles: list[Any] = []
+    try:
+        core, handle = _start_process(
+            _core_command(root, state_dir, port), environment, tmp_path / "core.log",
+        )
+        handles.append(handle)
+        _wait_until(
+            lambda: httpx.get(f"{base_url}/health", timeout=1).status_code == 200,
+            description="isolated Chrome Core",
+        )
+        client, _ = _login(base_url, "isolated-chrome-reconnect-password")
+        store = StateStore(state_dir / "termroom.sqlite3")
+        workspace = WorkspaceManager(RootManager(root), store).open("qa")
+        page = client.get(f"/w/{workspace['id']}/terminal")
+        assert page.status_code == 200
+        match = re.search(r'data-terminal-id="([a-f0-9]{32})"', page.text)
+        assert match is not None
+        terminal_id = match.group(1)
+        terminal = store.get_terminal(terminal_id)
+        assert terminal is not None
+        target = f"{workspace['tmux_session']}:{terminal['tmux_window']}"
+        cookie = client.cookies.get("termroom_session")
+        assert cookie
+
+        with _isolated_chrome_terminal(
+            tmp_path / "chrome-profile", base_url, cookie,
+            workspace["id"], terminal_id,
+        ) as evaluate:
+            _wait_until(
+                lambda: evaluate(
+                    "document.querySelector('#terminal')?.termroomControlsInput === true"
+                ),
+                description="Chrome initially controls Terminal",
+            )
+            draft = "echo qa-browser-unsent-no-replay"
+            assert evaluate("""(() => {
+              document.querySelector('#open-command-editor').click();
+              const input = document.querySelector('#command-input');
+              input.value = 'echo qa-browser-unsent-no-replay';
+              input.dispatchEvent(new Event('input', {bubbles: true}));
+              input.focus();
+              input.setSelectionRange(6, 15);
+              return input.value;
+            })()""") == draft
+            state_expr = """(() => {
+              const input = document.querySelector('#command-input');
+              const host = document.querySelector('#terminal');
+              return {
+                terminalId: host.dataset.terminalId,
+                selected: document.querySelector(
+                  '.terminal-tabs a.active'
+                )?.dataset.terminalActivityTab,
+                composerOpen: !document.querySelector(
+                  '#terminal-command-editor'
+                ).hidden,
+                focusId: document.activeElement?.id,
+                hasFocus: document.hasFocus(),
+                draft: input.value,
+                start: input.selectionStart,
+                end: input.selectionEnd,
+                epoch: host.termroomConnectionEpoch,
+                controls: host.termroomControlsInput,
+                ready: host.dataset.terminalReady,
+                delivery: document.querySelector('#command-delivery')
+                  ?.dataset.state || 'idle'
+              };
+            })()"""
+            before = evaluate(state_expr)
+            assert before["composerOpen"] and before["focusId"] == "command-input"
+            assert before["selected"] == before["terminalId"] == terminal_id
+            assert before["hasFocus"] and before["controls"] is True
+
+            _stop_process(core)
+            _wait_until(
+                lambda: evaluate(
+                    "document.querySelector('#terminal')?.dataset.terminalReady"
+                ) == "false",
+                description="Chrome observes Core disconnect",
+            )
+            during = evaluate(state_expr)
+            assert during["draft"] == draft
+            assert during["composerOpen"] and during["focusId"] == "command-input"
+
+            core, handle = _start_process(
+                _core_command(root, state_dir, port), environment,
+                tmp_path / "core-restarted.log",
+            )
+            handles.append(handle)
+            _wait_until(
+                lambda: httpx.get(f"{base_url}/health", timeout=1).status_code == 200,
+                description="restarted isolated Core",
+            )
+            _wait_until(
+                lambda: evaluate(
+                    "document.querySelector('#terminal')?.dataset.terminalReady"
+                    " === 'true' && document.querySelector('#terminal')"
+                    "?.termroomControlsInput === true"
+                ),
+                timeout=20,
+                description="Chrome reconnects and regains input control",
+            )
+            after = evaluate(state_expr)
+            assert after["terminalId"] == after["selected"] == terminal_id
+            assert after["epoch"] > before["epoch"]
+            assert after["draft"] == draft
+            assert (after["start"], after["end"]) == (6, 15)
+            assert after["composerOpen"] and after["focusId"] == "command-input"
+            assert after["hasFocus"] and after["controls"] is True
+            assert after["delivery"] == "idle"
+            captured = subprocess.check_output(
+                ["tmux", "capture-pane", "-p", "-t", target, "-S", "-80"],
+                env=environment, text=True, timeout=5,
+            )
+            assert "qa-browser-unsent-no-replay" not in captured
+    finally:
+        if client is not None:
+            client.close()
+        _stop_process(core)
+        for handle in handles:
+            handle.close()
+        # Only this test's TMUX_TMPDIR is used; never touch the user's tmux.
+        subprocess.run(
+            ["tmux", "kill-server"], env=environment, check=False,
+            capture_output=True,
+        )
+
+
+
+@pytest.mark.skipif(
+    not all(shutil.which(command) for command in (
+        "tmux", "google-chrome", "ssh", "ssh-keygen",
+    )) or not Path("/usr/sbin/sshd").is_file(),
+    reason="Real Chrome, tmux and isolated OpenSSH server are required",
+)
+def test_real_chrome_a_stays_unchanged_while_ssh_b_operates(tmp_path: Path) -> None:
+    """Concurrent Chrome A and scoped SSH B use the same temporary Core."""
+    from termroom.workspaces import RootManager, WorkspaceManager
+
+    root = tmp_path / "core-root"
+    remote_root = tmp_path / "ssh-project"
+    state_dir = tmp_path / "core-state"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "a.txt").write_text("browser-a\n", encoding="utf-8")
+    remote_root.mkdir()
+    (remote_root / "qa.txt").write_text("ssh-before\n", encoding="utf-8")
+    (remote_root / "qa.py").write_text(
+        "print('T43_SSH_CHROME_REAL_OUTPUT')\n", encoding="utf-8",
+    )
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    environment = os.environ.copy()
+    environment["TERMROOM_PASSWORD"] = "isolated-ssh-chrome-password"
+    environment["TERMROOM_LOCALE"] = "en"
+    core: subprocess.Popen[bytes] | None = None
+    client: httpx.Client | None = None
+    backend: SSHBackend | None = None
+    computer: dict[str, Any] | None = None
+    a_session = ""
+    b_session = ""
+    handles: list[Any] = []
+    chrome_stack = contextlib.ExitStack()
+
+    with _test_sshd(tmp_path) as server:
+        try:
+            core, handle = _start_process(
+                _core_command(root, state_dir, port),
+                environment,
+                tmp_path / "core.log",
+            )
+            handles.append(handle)
+            _wait_until(
+                lambda: httpx.get(f"{base_url}/health", timeout=1).status_code == 200,
+                description="isolated SSH+Chrome Core",
+            )
+            client, csrf = _login(base_url, "isolated-ssh-chrome-password")
+            store = StateStore(state_dir / "termroom.sqlite3")
+            manager = WorkspaceManager(RootManager(root), store)
+            a_workspace = manager.open("a")
+            a_session = str(a_workspace["tmux_session"])
+
+            backend = SSHBackend(store, state_dir)
+            host_key = backend.probe_host_key("127.0.0.1", int(server["port"]))
+            computer = store.create_computer(
+                name="Isolated SSH B",
+                ssh_alias="",
+                host="127.0.0.1",
+                port=int(server["port"]),
+                username=str(server["username"]),
+                identity_file=str(server["client_key"]),
+                host_key_type=host_key["host_key_type"],
+                host_key_data=host_key["host_key_data"],
+                host_fingerprint=host_key["host_fingerprint"],
+            )
+            backend.remember_host_key(computer)
+            assert backend.test_connection(computer)["tmux"].startswith("tmux ")
+            canonical = backend.validate_workspace_path(computer, str(remote_root))
+            b_workspace = manager.open_remote(
+                computer["id"], canonical, "SSH B",
+            )
+            b_session = str(b_workspace["tmux_session"])
+            backend.ensure_workspace(b_workspace)
+
+            a_page = client.get(f"/w/{a_workspace['id']}/terminal")
+            assert a_page.status_code == 200
+            match = re.search(r'data-terminal-id="([a-f0-9]{32})"', a_page.text)
+            assert match is not None
+            a_terminal_id = match.group(1)
+            a_terminal = store.get_terminal(a_terminal_id)
+            assert a_terminal is not None
+            a_target = f"{a_session}:{a_terminal['tmux_window']}"
+            cookie = client.cookies.get("termroom_session")
+            assert cookie
+            evaluate = chrome_stack.enter_context(_isolated_chrome_terminal(
+                tmp_path / "chrome-a-profile", base_url, cookie,
+                a_workspace["id"], a_terminal_id,
+            ))
+            assert evaluate("""(() => {
+              document.querySelector('#open-command-editor').click();
+              const input = document.querySelector('#command-input');
+              if (document.querySelector('#terminal-command-editor').hidden) {
+                throw new Error('Composer stayed closed');
+              }
+              input.value = 'unsent SSH A 한글 draft';
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.focus();
+              input.setSelectionRange(7, 12);
+              return input.value;
+            })()""") == "unsent SSH A 한글 draft"
+            state_expression = """(() => {
+              const input = document.querySelector('#command-input');
+              return {
+                url: location.href,
+                selectedTerminal: document.querySelector(
+                  '.terminal-tabs a.active'
+                )?.dataset.terminalActivityTab,
+                composerOpen: !document.querySelector(
+                  '#terminal-command-editor'
+                ).hidden,
+                focusId: document.activeElement?.id,
+                draft: input.value,
+                selectionStart: input.selectionStart,
+                selectionEnd: input.selectionEnd,
+                pageScroll: window.scrollY
+              };
+            })()"""
+
+            def a_geometry() -> str:
+                return subprocess.check_output(
+                    ["tmux", "display-message", "-p", "-t", a_target,
+                     "#{pane_width}x#{pane_height}|#{pane_id}"],
+                    text=True,
+                ).strip()
+
+            geometry = a_geometry()
+            stable_at = time.monotonic()
+            deadline = stable_at + 8
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                current = a_geometry()
+                if current != geometry:
+                    geometry = current
+                    stable_at = time.monotonic()
+                if time.monotonic() - stable_at >= 0.8:
+                    break
+            else:
+                raise AssertionError("Chrome A initial geometry did not stabilize")
+            before_a = evaluate(state_expression)
+            assert before_a["selectedTerminal"] == a_terminal_id
+            assert before_a["focusId"] == "command-input"
+
+            credential = client.post(
+                "/api/client-credentials",
+                json={
+                    "name": "ssh-b-operator",
+                    "capabilities": ["read", "operate"],
+                    "workspace_ids": [b_workspace["id"]],
+                },
+                headers={"X-Termroom-CSRF": csrf},
+            )
+            assert credential.status_code == 201, credential.text
+            headers = {
+                "Authorization": f"Bearer {credential.json()['client']['token']}",
+            }
+            files_url = f"/api/control/v1/workspaces/{b_workspace['id']}/files/text"
+            runs_url = f"/api/control/v1/workspaces/{b_workspace['id']}/file-runs"
+            with httpx.Client(base_url=base_url, timeout=25) as b_client:
+                assert b_client.get(
+                    f"/api/control/v1/workspaces/{a_workspace['id']}/files",
+                    headers=headers,
+                ).status_code == 404
+                observed = b_client.get(
+                    files_url, params={"path": "qa.txt"}, headers=headers,
+                )
+                assert observed.status_code == 200, observed.text
+                saved = b_client.put(files_url, headers=headers, json={
+                    "action_id": "ssh-chrome-b-save-0001",
+                    "relative_path": "qa.txt",
+                    "content": "ssh-b-saved\n",
+                    "expected_digest": observed.json()["digest"],
+                    "expected_mtime_ns": observed.json()["mtime_ns"],
+                })
+                assert saved.status_code == 200, saved.text
+                assert saved.json()["phase"] == "result_verified"
+                assert (remote_root / "qa.txt").read_text(
+                    encoding="utf-8",
+                ) == "ssh-b-saved\n"
+                run_payload = {
+                    "action_id": "ssh-chrome-b-run-0001",
+                    "relative_path": "qa.py",
+                    "expected_digest": hashlib.sha256(
+                        (remote_root / "qa.py").read_bytes(),
+                    ).hexdigest(),
+                    "idempotency_key": str(uuid.uuid4()),
+                }
+                started = b_client.post(
+                    runs_url, headers=headers, json=run_payload,
+                )
+                assert started.status_code in (200, 202), started.text
+                run_id = started.json()["run"]["id"]
+                terminal_id = started.json()["run"]["terminal_id"]
+                terminal_ids = {
+                    row["id"] for row in store.list_terminals(b_workspace["id"])
+                }
+                replayed = b_client.post(
+                    runs_url, headers=headers, json=run_payload,
+                )
+                assert replayed.status_code in (200, 202), replayed.text
+                assert replayed.json()["result_resource_id"] == run_id
+                assert {
+                    row["id"] for row in store.list_terminals(b_workspace["id"])
+                } == terminal_ids
+            finished = _wait_until(
+                lambda: _file_run_status_is(client, run_id, "finished"),
+                description="actual SSH B managed Run",
+            )
+            assert finished["exit_code"] == 0
+            managed = store.get_terminal(terminal_id)
+            assert managed is not None
+            _wait_until(
+                lambda: "T43_SSH_CHROME_REAL_OUTPUT" in backend.capture_scrollback(
+                    b_workspace, managed,
+                ),
+                description="real SSH B tmux output",
+            )
+            browser_view = client.get(
+                f"/w/{b_workspace['id']}/view/qa.txt",
+            )
+            assert browser_view.status_code == 200
+            assert "ssh-b-saved" in browser_view.text
+            assert evaluate(state_expression) == before_a
+            assert a_geometry() == geometry
+
+            # The same real Chrome now performs a human file save in SSH B.
+            # Its HTML editor submits the normal browser form, so a previously
+            # captured non-UI CAS cannot erase the user's saved bytes.
+            with httpx.Client(base_url=base_url, timeout=15) as stale_client:
+                stale_version = stale_client.get(
+                    files_url, params={"path": "qa.txt"}, headers=headers,
+                )
+                assert stale_version.status_code == 200, stale_version.text
+                editor_path = f"/w/{b_workspace['id']}/edit/qa.txt"
+                evaluate(f"location.assign({json.dumps(base_url + editor_path)})")
+
+                def editor_ready() -> bool:
+                    try:
+                        return bool(evaluate(
+                            "document.readyState === 'complete' && "
+                            f"location.pathname === {json.dumps(editor_path)} && "
+                            "!!document.querySelector('#editor-content')"
+                        ))
+                    except AssertionError:
+                        return False
+
+                _wait_until(editor_ready, description="Chrome SSH B file editor")
+                assert evaluate("""(() => {
+                  const form = document.querySelector('#editor-form');
+                  const content = form.querySelector('#editor-content');
+                  if (content.value !== 'ssh-b-saved\\n') {
+                    throw new Error('Browser opened a different file version');
+                  }
+                  content.value = 'ssh-b-human-browser-wins\\n';
+                  content.dispatchEvent(new Event('input', { bubbles: true }));
+                  form.querySelector('button[name=intent][value=save]').click();
+                  return true;
+                })()""") is True
+
+                def browser_saved() -> bool:
+                    try:
+                        return bool(evaluate(
+                            "document.readyState === 'complete' && "
+                            "!!document.querySelector('.editor-saved-notice')"
+                        ))
+                    except AssertionError:
+                        return False
+
+                _wait_until(browser_saved, description="Chrome SSH B file save")
+                assert (remote_root / "qa.txt").read_text(
+                    encoding="utf-8",
+                ) == "ssh-b-human-browser-wins\n"
+                stale = stale_client.put(files_url, headers=headers, json={
+                    "action_id": "ssh-chrome-b-stale-file-save-0001",
+                    "relative_path": "qa.txt",
+                    "content": "ssh-b-stale-must-not-win\n",
+                    "expected_digest": stale_version.json()["digest"],
+                    "expected_mtime_ns": stale_version.json()["mtime_ns"],
+                })
+                assert stale.status_code == 409, stale.text
+                assert stale.json()["code"] == "file_conflict"
+                assert stale.json()["current_version"]["digest"] == hashlib.sha256(
+                    b"ssh-b-human-browser-wins\n",
+                ).hexdigest()
+                receipt = stale_client.get(
+                    "/api/control/v1/actions/ssh-chrome-b-stale-file-save-0001",
+                    headers=headers,
+                )
+                assert receipt.status_code == 200
+                assert receipt.json()["status"] == "refused"
+                assert (remote_root / "qa.txt").read_text(
+                    encoding="utf-8",
+                ) == "ssh-b-human-browser-wins\n"
+            # Browser A performs the real approval page action only after the
+            # unrelated SSH B work is observed. The closing Terminal is test-owned.
+            reviewer = client.post(
+                "/api/client-credentials",
+                json={
+                    "name": "a-close-reviewer",
+                    "capabilities": ["read", "operate"],
+                    "workspace_ids": [a_workspace["id"]],
+                },
+                headers={"X-Termroom-CSRF": csrf},
+            )
+            assert reviewer.status_code == 201, reviewer.text
+            review_headers = {
+                "Authorization": f"Bearer {reviewer.json()['client']['token']}",
+            }
+            close_base = (
+                f"/api/control/v1/workspaces/{a_workspace['id']}"
+                f"/terminals/{a_terminal_id}"
+            )
+            action_id = "ssh-chrome-human-approved-close-0001"
+            with httpx.Client(base_url=base_url, timeout=15) as operator:
+                intent = operator.post(
+                    close_base + "/close-intents",
+                    headers=review_headers,
+                    json={
+                        "action_id": action_id,
+                        "expected_tmux_window": a_terminal["tmux_window"],
+                    },
+                )
+                assert intent.status_code == 201, intent.text
+                approval_id = intent.json()["approval_id"]
+                close_payload = {
+                    "action_id": action_id,
+                    "approval_id": approval_id,
+                    "expected_tmux_window": a_terminal["tmux_window"],
+                }
+                premature = operator.post(
+                    close_base + "/close",
+                    headers=review_headers,
+                    json=close_payload,
+                )
+                assert premature.status_code == 409
+                assert store.get_terminal(a_terminal_id) is not None
+
+                review_path = intent.json()["human_review_url"]
+                evaluate(f"location.assign({json.dumps(base_url + review_path)})")
+
+                def review_ready() -> bool:
+                    try:
+                        return bool(evaluate(
+                            "document.readyState === 'complete' && "
+                            f"location.pathname === {json.dumps(review_path)} && "
+                            "!!document.querySelector('button[name=decision][value=approve]')"
+                        ))
+                    except AssertionError:
+                        return False
+
+                _wait_until(review_ready, description="Chrome A exact close review")
+                # A synthetic confirmation substitutes only the native dialog;
+                # the visible review button still submits the real browser form.
+                assert evaluate("""(() => {
+                  window.confirm = () => true;
+                  const approve = document.querySelector(
+                    'button[name=decision][value=approve]'
+                  );
+                  approve.click();
+                  return true;
+                })()""") is True
+
+                def approved_page() -> bool:
+                    try:
+                        return bool(evaluate(
+                            "document.readyState === 'complete' && "
+                            "!!document.querySelector('.notice[role=status]')"
+                        ))
+                    except AssertionError:
+                        return False
+
+                _wait_until(approved_page, description="Chrome approval notice")
+                status = operator.get(
+                    close_base + f"/close-intents/{approval_id}",
+                    headers=review_headers,
+                )
+                assert status.status_code == 200
+                assert status.json()["state"] == "approved"
+                closed = operator.post(
+                    close_base + "/close",
+                    headers=review_headers,
+                    json=close_payload,
+                )
+                assert closed.status_code == 200, closed.text
+                assert closed.json()["closed"] is True
+                assert store.get_terminal(a_terminal_id) is None
+                assert store.get_terminal(terminal_id) is not None
+                # Reverse the same-file race: SSH B now saves after a human
+                # opens the editor. The real browser must show the conflict and
+                # retain its unsaved content without overwriting agent bytes.
+                evaluate(f"location.assign({json.dumps(base_url + editor_path)})")
+                _wait_until(editor_ready, description="Chrome stale SSH editor")
+                assert evaluate(
+                    "document.querySelector('#editor-content').value"
+                ) == "ssh-b-human-browser-wins\n"
+
+                with httpx.Client(base_url=base_url, timeout=15) as b_operator:
+                    current_version = b_operator.get(
+                        files_url, params={"path": "qa.txt"}, headers=headers,
+                    )
+                    assert current_version.status_code == 200
+                    remote_saved = b_operator.put(
+                        files_url, headers=headers, json={
+                            "action_id": "ssh-chrome-b-agent-wins-0001",
+                            "relative_path": "qa.txt",
+                            "content": "ssh-b-agent-wins\n",
+                            "expected_digest": current_version.json()["digest"],
+                            "expected_mtime_ns": current_version.json()["mtime_ns"],
+                        },
+                    )
+                    assert remote_saved.status_code == 200, remote_saved.text
+                assert evaluate("""(() => {
+                  const form = document.querySelector('#editor-form');
+                  const content = form.querySelector('#editor-content');
+                  content.value = 'ssh-b-human-stale-draft\\n';
+                  content.dispatchEvent(new Event('input', { bubbles: true }));
+                  form.querySelector('button[name=intent][value=save]').click();
+                  return true;
+                })()""") is True
+
+                def human_conflict_visible() -> bool:
+                    try:
+                        return bool(evaluate(
+                            "document.readyState === 'complete' && "
+                            "!!document.querySelector('.conflict-notice') && "
+                            "document.querySelector('#editor-content')?.dataset.unsaved === '1'"
+                        ))
+                    except AssertionError:
+                        return False
+
+                _wait_until(
+                    human_conflict_visible,
+                    description="real Chrome stale human save conflict",
+                )
+                assert evaluate(
+                    "document.querySelector('.conflict-notice')?.getAttribute('role')"
+                ) == "alert"
+                assert evaluate(
+                    "document.querySelector('#editor-content').value"
+                ) == "ssh-b-human-stale-draft\n"
+                assert (remote_root / "qa.txt").read_text(
+                    encoding="utf-8",
+                ) == "ssh-b-agent-wins\n"
+                assert store.get_terminal(terminal_id) is not None
+        finally:
+            chrome_stack.close()
+            if client is not None:
+                client.close()
+            _stop_process(core)
+            if a_session:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", a_session],
+                    capture_output=True, check=False,
+                )
+            if backend is not None and computer is not None and b_session:
+                with contextlib.suppress(Exception):
+                    backend._exec(
+                        computer,
+                        f"tmux kill-session -t {shlex.quote(b_session)}",
+                    )
+            for handle in handles:
+                handle.close()
+
+
+@pytest.mark.parametrize(
+    "with_chrome",
+    [
+        pytest.param(False, id="node-only"),
+        pytest.param(
+            True,
+            id="chrome-a-with-node-b",
+            marks=pytest.mark.skipif(
+                shutil.which("google-chrome") is None,
+                reason="Google Chrome is required for live browser A",
+            ),
+        ),
+    ],
+)
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: Path) -> None:
+def test_real_node_process_pair_workspace_terminal_files_and_recovery(
+    tmp_path: Path, with_chrome: bool,
+) -> None:
     core_root = tmp_path / "core-root"
     node_root = tmp_path / "node-root"
     core_state = tmp_path / "core-state"
@@ -607,6 +1322,10 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
     (node_root / "fail.py").write_text(
         "raise SystemExit(7)\n", encoding="utf-8"
     )
+
+    (node_root / "qa-control.py").write_text(
+        "print('T43_NODE_API_RUN_OK')\n", encoding="utf-8",
+    )
     (node_root / "stubborn.py").write_text(
         "import signal, time\n"
         "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
@@ -625,6 +1344,8 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
     handles: list[Any] = []
     client: httpx.Client | None = None
     session_name = ""
+    source_a_session = ""
+    chrome_stack = contextlib.ExitStack()
 
     try:
         core, handle = _start_process(
@@ -817,6 +1538,227 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         terminal_match = re.search(r'data-terminal-id="([a-f0-9]{32})"', terminal_page.text)
         assert terminal_match is not None
         terminal_id = terminal_match.group(1)
+        # A separate bearer-only client observes the real Node without opening a
+        # browser route or becoming the tmux input controller.
+        read_client = client.post(
+            "/api/client-credentials",
+            json={
+                "name": "e2e-observer", "capabilities": ["read"],
+                "workspace_ids": [workspace_id],
+            },
+            headers={"X-Termroom-CSRF": csrf},
+        )
+        assert read_client.status_code == 201, read_client.text
+        read_headers = {
+            "Authorization": f"Bearer {read_client.json()['client']['token']}"
+        }
+        with httpx.Client(base_url=base_url, timeout=10) as observer:
+            observed_workspace = observer.get(
+                "/api/control/v1/workspaces", headers=read_headers,
+            )
+            assert observed_workspace.status_code == 200, observed_workspace.text
+            assert [row["id"] for row in observed_workspace.json()["workspaces"]] == [
+                workspace_id
+            ]
+            registered = observer.get(
+                f"/api/control/v1/workspaces/{workspace_id}/terminals",
+                headers=read_headers,
+            )
+            assert registered.status_code == 200, registered.text
+            assert terminal_id in [row["id"] for row in registered.json()["terminals"]]
+            capture = observer.get(
+                f"/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/snapshot",
+                params={"lines": 5}, headers=read_headers,
+            )
+            assert capture.status_code == 200, capture.text
+            assert capture.json()["pane_identity_verified"] is False
+            assert capture.json()["pane_state"] == "unknown"
+            listing = observer.get(
+                f"/api/control/v1/workspaces/{workspace_id}/files",
+                headers=read_headers,
+            )
+            assert listing.status_code == 200, listing.text
+            assert "hello.txt" in [entry["name"] for entry in listing.json()["entries"]]
+            stat = observer.get(
+                f"/api/control/v1/workspaces/{workspace_id}/files/stat",
+                params={"path": "hello.txt"}, headers=read_headers,
+            )
+            assert stat.status_code == 200, stat.text
+            assert stat.json()["entry"]["size"] == len("before\n")
+            text_read = observer.get(
+                f"/api/control/v1/workspaces/{workspace_id}/files/text",
+                params={"path": "hello.txt"}, headers=read_headers,
+            )
+            assert text_read.status_code == 200, text_read.text
+            assert text_read.json()["content"] == "before\n"
+            private = observer.get(
+                f"/api/control/v1/workspaces/{workspace_id}/files/text",
+                params={"path": "container/.local/state/termroom/node/node-key.pem"},
+                headers=read_headers,
+            )
+            assert private.status_code == 404
+
+        # Hold an actual local Chrome Terminal A while a separately paired Node B
+        # accepts scoped client writes and managed runs. Both roots are temporary.
+        chrome_state: Callable[[str], Any] | None = None
+        if with_chrome:
+            a_page = client.get(f"/w/{source_workspace_id}/terminal")
+            assert a_page.status_code == 200
+            a_match = re.search(r'data-terminal-id="([a-f0-9]{32})"', a_page.text)
+            assert a_match is not None
+            a_terminal_id = a_match.group(1)
+            a_workspace = store.get_workspace(source_workspace_id)
+            a_terminal = store.get_terminal(a_terminal_id)
+            assert a_workspace is not None and a_terminal is not None
+            source_a_session = str(a_workspace["tmux_session"])
+            a_target = f"{source_a_session}:{a_terminal['tmux_window']}"
+            session_cookie = client.cookies.get("termroom_session")
+            assert session_cookie
+            chrome_state = chrome_stack.enter_context(_isolated_chrome_terminal(
+                tmp_path / "chrome-a-profile", base_url, session_cookie,
+                source_workspace_id, a_terminal_id,
+            ))
+            assert chrome_state("""(() => {
+              document.querySelector('#open-command-editor').click();
+              const input = document.querySelector('#command-input');
+              if (document.querySelector('#terminal-command-editor').hidden) {
+                throw new Error('Composer stayed closed');
+              }
+              input.value = 'unsent Chrome A 한글 draft';
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.focus();
+              input.setSelectionRange(7, 13);
+              return input.value;
+            })()""") == "unsent Chrome A 한글 draft"
+            a_state_expression = """(() => {
+              const input = document.querySelector('#command-input');
+              return {
+                url: location.href,
+                selectedTerminal: document.querySelector(
+                  '.terminal-tabs a.active'
+                )?.dataset.terminalActivityTab,
+                composerOpen: !document.querySelector(
+                  '#terminal-command-editor'
+                ).hidden,
+                focusId: document.activeElement?.id,
+                draft: input.value,
+                selectionStart: input.selectionStart,
+                selectionEnd: input.selectionEnd,
+                pageScroll: window.scrollY
+              };
+            })()"""
+            def a_geometry() -> str:
+                return subprocess.check_output(
+                    ["tmux", "display-message", "-p", "-t", a_target,
+                     "#{pane_width}x#{pane_height}|#{pane_id}"],
+                    text=True,
+                ).strip()
+
+            # Browser attach/resizing is asynchronous. Establish a settled A
+            # before attributing a later geometry change to Node B.
+            before_geometry = a_geometry()
+            stable_at = time.monotonic()
+            deadline = stable_at + 8
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                current_geometry = a_geometry()
+                if current_geometry != before_geometry:
+                    before_geometry = current_geometry
+                    stable_at = time.monotonic()
+                if time.monotonic() - stable_at >= 0.8:
+                    break
+            else:
+                raise AssertionError("Chrome A initial geometry did not stabilize")
+            before_a = chrome_state(a_state_expression)
+            assert before_a["selectedTerminal"] == a_terminal_id
+            assert before_a["focusId"] == "command-input"
+
+        # T43: the same real Node is writable by an independent scoped client.
+        operator = client.post(
+            "/api/client-credentials",
+            json={
+                "name": "e2e-node-operator", "capabilities": ["read", "operate"],
+                "workspace_ids": [workspace_id],
+            },
+            headers={"X-Termroom-CSRF": csrf},
+        )
+        assert operator.status_code == 201, operator.text
+        operate_headers = {"Authorization": f"Bearer {operator.json()['client']['token']}"}
+        qa_files_url = f"/api/control/v1/workspaces/{workspace_id}/files/text"
+        qa_run_url = f"/api/control/v1/workspaces/{workspace_id}/file-runs"
+        qa_run_payload = {
+            "action_id": "t43-node-file-run-0001",
+            "relative_path": "qa-control.py",
+            "expected_digest": hashlib.sha256(
+                (node_root / "qa-control.py").read_bytes()
+            ).hexdigest(),
+            "idempotency_key": str(uuid.uuid4()),
+        }
+        with httpx.Client(base_url=base_url, timeout=20) as agent:
+            observed = agent.get(
+                qa_files_url, params={"path": "hello.txt"}, headers=operate_headers,
+            )
+            assert observed.status_code == 200, observed.text
+            denied = agent.put(
+                qa_files_url, headers=read_headers,
+                json={
+                    "action_id": "t43-node-read-only-save",
+                    "relative_path": "hello.txt", "content": "denied\n",
+                    "expected_digest": observed.json()["digest"],
+                    "expected_mtime_ns": observed.json()["mtime_ns"],
+                },
+            )
+            assert denied.status_code == 404
+            saved = agent.put(
+                qa_files_url, headers=operate_headers,
+                json={
+                    "action_id": "t43-node-file-save-0001",
+                    "relative_path": "hello.txt", "content": "node-client-saved\n",
+                    "expected_digest": observed.json()["digest"],
+                    "expected_mtime_ns": observed.json()["mtime_ns"],
+                },
+            )
+            assert saved.status_code == 200, saved.text
+            assert saved.json()["phase"] == "result_verified"
+            assert (node_root / "hello.txt").read_text(
+                encoding="utf-8"
+            ) == "node-client-saved\n"
+            browser_view = client.get(f"/w/{workspace_id}/view/hello.txt")
+            assert browser_view.status_code == 200
+            assert "node-client-saved" in browser_view.text
+
+            started = agent.post(
+                qa_run_url, headers=operate_headers, json=qa_run_payload,
+            )
+            assert started.status_code in (200, 202), started.text
+            qa_run_id = started.json()["run"]["id"]
+            qa_run_terminal_id = started.json()["run"]["terminal_id"]
+            repeated = agent.post(
+                qa_run_url, headers=operate_headers, json=qa_run_payload,
+            )
+            assert repeated.status_code in (200, 202), repeated.text
+            assert repeated.json()["result_resource_id"] == qa_run_id
+            qa_action_before_restart = agent.get(
+                "/api/control/v1/actions/t43-node-file-run-0001",
+                headers=operate_headers,
+            ).json()
+            assert qa_action_before_restart["result_resource_id"] == qa_run_id
+        completed_qa_run = _wait_until(
+            lambda: _file_run_status_is(client, qa_run_id, "finished"),
+            description="non-UI Node File Run completion",
+        )
+        assert completed_qa_run["exit_code"] == 0
+        _wait_until(
+            lambda: "T43_NODE_API_RUN_OK" in client.get(
+                f"/w/{workspace_id}/terminal/{qa_run_terminal_id}/scrollback"
+            ).text,
+            description="non-UI Node Run actual tmux output",
+        )
+
+        if chrome_state is not None:
+            assert chrome_state(a_state_expression) == before_a
+            assert a_geometry() == before_geometry
+            chrome_stack.close()
 
         files_page = client.get(f"/w/{workspace_id}/files")
         assert files_page.status_code == 200
@@ -1064,6 +2006,32 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         )
         assert restored_remote_run["workspace_id"] == recovery_run["workspace_id"]
         assert execution_record.read_text(encoding="utf-8") == "once\n"
+
+        # A new Core process must not invent a completed action receipt or rerun it.
+        with httpx.Client(base_url=base_url, timeout=10) as restarted_agent:
+            receipt = restarted_agent.get(
+                "/api/control/v1/actions/t43-node-file-run-0001",
+                headers=operate_headers,
+            )
+            assert receipt.status_code == 200, receipt.text
+            expected_status = (
+                "observed" if qa_action_before_restart["status"] == "observed"
+                else "unknown"
+            )
+            assert receipt.json()["status"] == expected_status
+            assert receipt.json()["phase"] == qa_action_before_restart["phase"]
+            assert receipt.json()["result_resource_id"] == qa_run_id
+            replay = restarted_agent.post(
+                qa_run_url, headers=operate_headers, json=qa_run_payload,
+            )
+            assert replay.json()["status"] == expected_status
+            assert replay.json()["result_resource_id"] == qa_run_id
+            run_detail = restarted_agent.get(
+                f"{qa_run_url}/{qa_run_id}", headers=operate_headers,
+            )
+            assert run_detail.status_code == 200, run_detail.text
+            assert run_detail.json()["run"]["state"] == "finished"
+            assert run_detail.json()["run"]["exit_code"] == 0
         run_scrollback = client.get(
             f"/w/{workspace_id}/terminal/{run_terminal_id}/scrollback"
         )
@@ -1273,11 +2241,17 @@ def test_real_node_process_pair_workspace_terminal_files_and_recovery(tmp_path: 
         token = (core_state / "access-token").read_text(encoding="utf-8").strip()
         assert hashlib.sha256(f"termroom-csrf:{token}".encode()).hexdigest() == csrf
     finally:
+        chrome_stack.close()
         if client is not None:
             client.close()
         _stop_process(pair)
         _stop_process(node)
         _stop_process(core)
+        if source_a_session:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", source_a_session],
+                capture_output=True, check=False,
+            )
         if session_name:
             subprocess.run(
                 ["tmux", "kill-session", "-t", session_name],

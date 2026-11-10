@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import os
@@ -41,6 +42,128 @@ def _free_port() -> int:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
 
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_ssh_terminal_input_shell_quotes_real_tmux_paste_and_single_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, tmp_path)
+    session = "termroom-ssh-t39-" + uuid.uuid4().hex[:12]
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, "-n", "shell"],
+        check=True, capture_output=True,
+    )
+    result_file = tmp_path / "ssh_t39_bytes.bin"
+    receiver = tmp_path / "ssh_t39_receiver.py"
+    receiver.write_text(
+        "import os, sys, termios, tty\n"
+        "fd = sys.stdin.fileno()\n"
+        "before = termios.tcgetattr(fd)\n"
+        "tty.setraw(fd)\n"
+        "try:\n"
+        "    sys.stdout.write('\\x1b[?2004hSSH_T39_READY\\r\\n')\n"
+        "    sys.stdout.flush()\n"
+        "    data = bytearray()\n"
+        "    while b'\\r' not in data and len(data) < 16384:\n"
+        "        data.extend(os.read(fd, 4096))\n"
+        "    open(sys.argv[1], 'wb').write(data)\n"
+        "finally:\n"
+        "    termios.tcsetattr(fd, termios.TCSANOW, before)\n",
+        encoding="utf-8",
+    )
+    def tmux(*args):
+        result = subprocess.run(["tmux", *args], check=True, capture_output=True, text=True)
+        return result.stdout.strip()
+
+    try:
+        window = tmux("display-message", "-p", "-t", session, "#{window_id}")
+        pane = tmux("display-message", "-p", "-t", session, "#{pane_id}")
+        target = f"{session}:{window}"
+        tmux("send-keys", "-l", "-t", target,
+             f"python3 -u {shlex.quote(str(receiver))} {shlex.quote(str(result_file))}")
+        tmux("send-keys", "-t", target, "Enter")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "SSH_T39_READY" in tmux("capture-pane", "-p", "-t", target):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("SSH synthetic PTY receiver was not ready")
+
+        monkeypatch.setattr(backend, "_computer", lambda *_args: {"id": "synthetic"})
+        monkeypatch.setattr(backend, "current_pane_mode", lambda *_args: {
+            "window": window, "pane": pane, "dead": False, "in_mode": False,
+        })
+
+        def local_ssh_shell(_computer, command):
+            result = subprocess.run(
+                ["/bin/sh", "-c", command], capture_output=True, text=True,
+            )
+            if result.returncode:
+                raise SSHBackendError(result.stderr or "SSH command failed")
+            return result.stdout
+
+        monkeypatch.setattr(backend, "_exec", local_ssh_shell)
+        unexpected = tmp_path / "UNEXPECTED_EXECUTION"
+        text = f"한글 ' $(touch {unexpected})"
+        delivered = backend.paste_terminal_input(
+            {"tmux_session": session}, {"tmux_window": window},
+            pane, text, append_enter=True,
+        )
+        assert delivered["pane"] == pane
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not result_file.exists():
+            time.sleep(0.05)
+        assert result_file.exists()
+        raw = result_file.read_bytes()
+        assert text.encode("utf-8") in raw
+        assert raw.count(b"\r") == 1 and raw.endswith(b"\r")
+        assert not unexpected.exists(), "Payload escaped shell quoting"
+        assert "termroom-input-" not in tmux("list-buffers", "-F", "#{buffer_name}")
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session], check=False, capture_output=True,
+        )
+
+
+def test_ssh_observe_scrollback_is_read_only_and_detects_pane_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    backend = SSHBackend(store, tmp_path)
+    workspace = {"tmux_session": "synthetic-session"}
+    terminal = {"tmux_window": "@7"}
+    calls: list[str] = []
+    modes = [
+        "synthetic-session|@7|%23|123|0|0|0|0|0|0|1|0|0\n",
+        "synthetic-session|@7|%23|123|0|0|0|0|0|0|1|0|0\n",
+    ]
+    monkeypatch.setattr(
+        backend, "ensure_workspace",
+        lambda *_args: pytest.fail("Read-only observer called ensure_workspace"),
+    )
+    monkeypatch.setattr(backend, "_computer", lambda *_args: {"id": "synthetic"})
+
+    def execute(_computer, command):
+        calls.append(command)
+        return modes.pop(0) if "display-message" in command else "ssh-history\n"
+
+    monkeypatch.setattr(backend, "_exec", execute)
+    output, mode = backend.observe_scrollback(workspace, terminal, lines=7)
+    assert output == "ssh-history\n" and mode["pane"] == "%23"
+    assert len(calls) == 3
+    assert "capture-pane -p -J -S -7 -t synthetic-session:@7" in calls[1]
+    assert all("attach" not in call and "resize" not in call for call in calls)
+
+    modes.extend((
+        "synthetic-session|@7|%23|123|0|0|0|0|0|0|1|0|0\n",
+        "synthetic-session|@7|%99|123|0|0|0|0|0|0|1|0|0\n",
+    ))
+    with pytest.raises(SSHBackendError, match="changed"):
+        backend.observe_scrollback(workspace, terminal)
 
 def test_ssh_scrollback_ansi_capture_keeps_a_plain_fallback(
     tmp_path: Path,
@@ -1632,6 +1755,63 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
             extra_terminal = backend.create_terminal(workspace, "logs")
             remaining_terminals = backend.close_terminal(workspace, extra_terminal)
             assert [item["id"] for item in remaining_terminals] == [terminal["id"]]
+            # The bearer read surface uses the same real SSH/SFTP/tmux owners
+            # without attaching to or resizing this terminal.
+            control_settings = Settings.create(
+                local_root, state_dir=state_dir,
+                login_password="test-only-ssh-password",
+                access_token="test-only-ssh-access",
+            )
+            control_app = create_app(control_settings)
+            credential = control_app.state.control_credentials.issue(
+                name="ssh-observer", capabilities=["read"],
+                workspace_ids=[workspace["id"]],
+            )
+            headers = {"Authorization": f"Bearer {credential['token']}"}
+            target = shlex.quote(
+                f"{workspace['tmux_session']}:{terminal['tmux_window']}"
+            )
+            dimensions = (
+                f"tmux display-message -p -t {target} "
+                "'#{pane_width}|#{pane_height}'"
+            )
+            before_geometry = backend._exec(computer, dimensions).strip()
+            before_opened = store.get_workspace(workspace["id"])["last_opened_at"]
+            before_terminals = store.list_terminals(workspace["id"])
+            transport = httpx.ASGITransport(app=control_app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="https://testserver",
+            ) as observer:
+                base = f"/api/control/v1/workspaces/{workspace['id']}"
+                listed = await observer.get(f"{base}/files", headers=headers)
+                assert listed.status_code == 200, listed.text
+                assert "readme.txt" in [
+                    entry["name"] for entry in listed.json()["entries"]
+                ]
+                read = await observer.get(
+                    f"{base}/files/text", params={"path": "readme.txt"},
+                    headers=headers,
+                )
+                assert read.status_code == 200, read.text
+                assert read.json()["content"] == "hello remote\n"
+                found = await observer.get(
+                    f"{base}/files/search", params={"q": "needle"},
+                    headers=headers,
+                )
+                assert found.status_code == 200, found.text
+                assert [row["relative_path"] for row in found.json()["entries"]] == [
+                    "src/deep/ssh-needle.txt"
+                ]
+                capture = await observer.get(
+                    f"{base}/terminals/{terminal['id']}/snapshot",
+                    params={"lines": 10}, headers=headers,
+                )
+                assert capture.status_code == 200, capture.text
+                assert capture.json()["pane_identity_verified"] is True
+                assert capture.json()["continuity"] == "snapshot_only_no_event_cursor"
+            assert backend._exec(computer, dimensions).strip() == before_geometry
+            assert store.get_workspace(workspace["id"])["last_opened_at"] == before_opened
+            assert store.list_terminals(workspace["id"]) == before_terminals
 
             backend._exec(
                 computer,
@@ -2073,6 +2253,77 @@ async def test_ssh_backend_remote_tmux_sftp_and_resize(tmp_path: Path) -> None:
                 home = await client.get("/")
                 assert home.status_code == 200
                 assert "Loopback QA" in home.text
+
+
+                # T43: a bearer-only operator mutates a real isolated SSH Workspace.
+                (project / "qa-ssh-control.txt").write_text("ssh-before\n", encoding="utf-8")
+                (project / "qa-ssh-control.py").write_text(
+                    "print('T43_SSH_API_RUN_OK')\n", encoding="utf-8",
+                )
+                operator = app.state.control_credentials.issue(
+                    name="ssh-operator", capabilities=["read", "operate"],
+                    workspace_ids=[workspace["id"]],
+                )
+                headers = {"Authorization": f"Bearer {operator['token']}"}
+                files_url = f"/api/control/v1/workspaces/{workspace['id']}/files/text"
+                runs_url = f"/api/control/v1/workspaces/{workspace['id']}/file-runs"
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="https://testserver", timeout=20,
+                ) as agent:
+                    observed = await agent.get(
+                        files_url, params={"path": "qa-ssh-control.txt"}, headers=headers,
+                    )
+                    assert observed.status_code == 200, observed.text
+                    saved = await agent.put(files_url, headers=headers, json={
+                        "action_id": "t43-ssh-file-save-0001",
+                        "relative_path": "qa-ssh-control.txt",
+                        "content": "ssh-client-saved\n",
+                        "expected_digest": observed.json()["digest"],
+                        "expected_mtime_ns": observed.json()["mtime_ns"],
+                    })
+                    assert saved.status_code == 200, saved.text
+                    assert saved.json()["phase"] == "result_verified"
+                    assert (project / "qa-ssh-control.txt").read_text(
+                        encoding="utf-8"
+                    ) == "ssh-client-saved\n"
+                    browser_view = await client.get(
+                        f"/w/{workspace['id']}/view/qa-ssh-control.txt",
+                    )
+                    assert browser_view.status_code == 200
+                    assert "ssh-client-saved" in browser_view.text
+                    run_payload = {
+                        "action_id": "t43-ssh-file-run-0001",
+                        "relative_path": "qa-ssh-control.py",
+                        "expected_digest": hashlib.sha256(
+                            (project / "qa-ssh-control.py").read_bytes()
+                        ).hexdigest(),
+                        "idempotency_key": str(uuid.uuid4()),
+                    }
+                    started = await agent.post(
+                        runs_url, headers=headers, json=run_payload,
+                    )
+                    assert started.status_code in (200, 202), started.text
+                    run_id = started.json()["run"]["id"]
+                    repeated = await agent.post(
+                        runs_url, headers=headers, json=run_payload,
+                    )
+                    assert repeated.status_code in (200, 202), repeated.text
+                    assert repeated.json()["result_resource_id"] == run_id
+                    status = None
+                    for _ in range(120):
+                        result = await client.get(f"/api/file-runs/{run_id}/status")
+                        if result.status_code == 200:
+                            status = result.json()
+                            if status.get("state") == "finished":
+                                break
+                        await asyncio.sleep(0.1)
+                    assert status is not None and status["state"] == "finished", status
+                    assert status["exit_code"] == 0
+                    managed = store.get_terminal(started.json()["run"]["terminal_id"])
+                    assert managed is not None
+                    assert "T43_SSH_API_RUN_OK" in backend.capture_scrollback(
+                        workspace, managed,
+                    )
 
                 files_page = await client.get(f"/w/{workspace['id']}/files")
                 assert files_page.status_code == 200
@@ -2627,6 +2878,16 @@ async def test_remote_run_end_to_end_uses_real_ssh_sftp_tmux_and_workspace(
             assert backend.read_text(workspace, "result.txt", 1024).content == (
                 "continued-after-false\n"
             )
+            managed = store.get_managed_terminal(workspace["id"], "remote_run")
+            assert managed is not None and managed["managed_run_id"] == run_id
+            before_workspace = store.get_workspace(workspace["id"])
+            before_terminal = store.get_terminal(managed["id"])
+            scrollback, pane = backend.observe_scrollback(
+                workspace, managed, lines=20,
+            )
+            assert isinstance(scrollback, str) and pane["pane"].startswith("%")
+            assert store.get_workspace(workspace["id"]) == before_workspace
+            assert store.get_terminal(managed["id"]) == before_terminal
             assert [row["id"] for row in store.list_recent_workspaces()] == [source["id"]]
 
             deleted = manager.request_delete(run_id)

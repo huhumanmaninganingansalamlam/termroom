@@ -40,6 +40,43 @@ def test_terminal_names_preserve_unicode_and_sanitize_shell_unsafe_characters() 
     assert normalize_terminal_name("***") == "shell"
 
 
+def test_local_observe_scrollback_is_read_only_and_pane_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    manager = TerminalManager(store)
+    workspace = {"tmux_session": "synthetic-session"}
+    terminal = {"tmux_window": "@7"}
+    calls: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        manager, "ensure_workspace",
+        lambda *_args: pytest.fail("Read-only observer called ensure_workspace"),
+    )
+
+    def tmux_runner(_timeout):
+        def run(*args):
+            calls.append(args)
+            output = (
+                "synthetic-session|@7|%23|123|0|0|0|0|0|0|1|0|0\n"
+                if args[0] == "display-message" else "safe-history\n"
+            )
+            return subprocess.CompletedProcess(args, 0, stdout=output)
+        return run
+
+    monkeypatch.setattr(manager, "_tmux_runner", tmux_runner)
+    output, mode = manager.observe_scrollback(workspace, terminal, lines=300)
+    assert output == "safe-history\n"
+    assert mode["pane"] == "%23"
+    assert [args[0] for args in calls] == [
+        "display-message", "capture-pane", "display-message",
+    ]
+    assert calls[1] == (
+        "capture-pane", "-p", "-J", "-S", "-200", "-t",
+        "synthetic-session:@7",
+    )
+
 def test_terminal_editor_paths_and_tmux_records_are_bounded() -> None:
     assert normalize_terminal_editor_path("src/한글 file.py") == "src/한글 file.py"
     digest = terminal_editor_digest("src/한글 file.py")

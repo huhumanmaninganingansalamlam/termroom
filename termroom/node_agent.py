@@ -113,6 +113,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER_ARGV,
+    TerminalError,
     TerminalModeRefresh,
     clear_tmux_workspace_command_identity,
     file_run_completion_grace_active,
@@ -126,8 +127,10 @@ from termroom.terminals import (
     parse_tmux_terminal_records,
     parse_tmux_workspace_command_records,
     set_tmux_browser_view_grid_resize,
+    terminal_command_target_error,
     terminal_editor_digest,
     tmux_browser_view_session,
+    tmux_paste_exact,
     validate_workspace_command_launch,
     validate_workspace_command_slot,
     wait_tmux_browser_grid_size,
@@ -1030,6 +1033,10 @@ class NodeRuntime:
             return {"terminal": self._rename_terminal(payload)}
         if operation == "terminal.close":
             return {"terminals": self._close_terminal(payload)}
+        if operation == "terminal.mode":
+            return {"mode": self._terminal_mode(payload)}
+        if operation == "terminal.input":
+            return {"delivery": self._paste_terminal_input(payload)}
         if operation == "terminal.activity":
             return {"workspaces": self._terminal_activity(payload)}
         if operation == "terminal.scrollback":
@@ -2154,6 +2161,61 @@ class NodeRuntime:
             raise NodeAgentError("The last Terminal cannot be closed", code="terminal_last")
         self._tmux("kill-window", "-t", window)
         return self._list_terminals(session)
+
+    def _terminal_mode(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._workspace_path(payload)
+        session = self._session(payload)
+        window = self._window(payload, session)
+        result = self._tmux(
+            "display-message", "-p", "-t", f"{session}:{window}",
+            TMUX_PANE_MODE_FORMAT, check=False,
+        )
+        fields = result.stdout.strip().split("|")
+        if (
+            result.returncode or len(fields) != 13
+            or fields[0] != session or fields[1] != window
+            or not fields[2].startswith("%") or not fields[3].isdigit()
+            or any(flag not in {"0", "1"} for flag in fields[4:])
+        ):
+            raise NodeAgentError("Terminal pane is unavailable", code="pane_unavailable")
+        return {
+            "session": fields[0], "window": fields[1], "pane": fields[2],
+            "pane_pid": int(fields[3]), "alternate": fields[4] == "1",
+            "mouse_tracking": any(flag == "1" for flag in fields[5:9]),
+            "mouse_flags": [int(flag) for flag in fields[5:10]],
+            "shell_foreground": fields[10] == "1",
+            "dead": fields[11] == "1", "in_mode": fields[12] == "1",
+        }
+
+    def _paste_terminal_input(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        mode = self._terminal_mode(payload)
+        session = mode["session"]
+        window = mode["window"]
+        record = next(
+            (item for item in self._list_terminals(session) if item["tmux_window"] == window),
+            None,
+        )
+        if record is None or record.get("role") != "shell":
+            raise NodeAgentError("Terminal is not a shell", code="terminal_managed")
+        pane = payload.get("pane")
+        value = payload.get("value")
+        enter = payload.get("append_enter")
+        if (
+            not isinstance(pane, str) or not re.fullmatch(r"%[0-9]+", pane)
+            or not isinstance(value, str) or not 1 <= len(value.encode("utf-8")) <= 4096
+            or "\x00" in value or "\x1b" in value
+            or type(enter) is not bool
+        ):
+            raise NodeAgentError("Invalid Terminal input", code="request_invalid")
+        if reason := terminal_command_target_error({"pane": pane}, mode):
+            raise NodeAgentError("Terminal pane changed or is unavailable", code=reason)
+        try:
+            tmux_paste_exact(pane, value, append_enter=enter)
+        except TerminalError as exc:
+            raise NodeAgentError(
+                "Terminal delivery status unknown", code="input_status_unknown"
+            ) from exc
+        return {"pane": pane, "delivered_bytes": len(value.encode("utf-8")), "enter_sent": enter}
 
     def _capture_scrollback(self, payload: Mapping[str, Any]) -> str:
         self._workspace_path(payload)

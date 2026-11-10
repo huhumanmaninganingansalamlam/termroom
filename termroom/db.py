@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -77,6 +78,115 @@ def normalize_workspace_commands(values: Iterable[object]) -> tuple[str, ...]:
     if len(commands) > MAX_WORKSPACE_COMMANDS:
         raise ValueError("A Workspace can store at most three commands")
     return tuple(commands)
+
+
+
+MAX_QUICK_COMMAND_NAME_CHARS = 160
+MAX_QUICK_COMMAND_NAME_BYTES = 512
+
+
+def normalize_quick_command_name(value: object) -> str:
+    """Validate an explicit display name, never a command to execute."""
+
+    if not isinstance(value, str):
+        raise ValueError("Quick Command name must be text")
+    name = value.strip()
+    if (
+        not 1 <= len(name) <= MAX_QUICK_COMMAND_NAME_CHARS
+        or len(name.encode("utf-8")) > MAX_QUICK_COMMAND_NAME_BYTES
+        or any(
+            unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
+            for character in name
+        )
+    ):
+        raise ValueError("Quick Command name must be one line of up to 160 characters")
+    return name
+
+
+def _new_quick_command(command: str, *, name: str | None = None) -> dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex,
+        "name": command if name is None else name,
+        "command": command,
+        "revision": 1,
+    }
+
+
+def _quick_commands_decode(raw: object) -> tuple[dict[str, Any], ...]:
+    """Validate stored metadata independently from the legacy command projection."""
+
+    try:
+        value = json.loads(str(raw or "[]"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Stored Quick Commands are invalid") from exc
+    if not isinstance(value, list) or len(value) > MAX_WORKSPACE_COMMANDS:
+        raise RuntimeError("Stored Quick Commands are invalid")
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "name", "command", "revision"
+        }:
+            raise RuntimeError("Stored Quick Commands are invalid")
+        identity, name, command, revision = (
+            item["id"], item["name"], item["command"], item["revision"]
+        )
+        if (
+            not isinstance(identity, str)
+            or len(identity) != 32
+            or any(char not in "0123456789abcdef" for char in identity)
+            or identity in seen
+            or not isinstance(name, str)
+            or not isinstance(command, str)
+            or type(revision) is not int
+            or not 1 <= revision < SQLITE_MAX_INTEGER
+        ):
+            raise RuntimeError("Stored Quick Commands are invalid")
+        try:
+            parsed = uuid.UUID(hex=identity)
+            normalized = normalize_workspace_commands([command])
+            if (
+                parsed.version != 4
+                or normalized != (command,)
+                or not name
+                or name.strip() != name
+                or (
+                    name != command
+                    and normalize_quick_command_name(name) != name
+                )
+            ):
+                raise ValueError("Invalid Quick Command metadata")
+        except ValueError as exc:
+            raise RuntimeError("Stored Quick Commands are invalid") from exc
+        seen.add(identity)
+        records.append({
+            "id": identity, "name": name,
+            "command": command, "revision": revision,
+        })
+    return tuple(records)
+
+
+def _quick_commands_encode(records: Iterable[Mapping[str, Any]]) -> str:
+    return json.dumps(list(records), ensure_ascii=False, separators=(",", ":"))
+
+
+def quick_commands_revision(records: Iterable[Mapping[str, Any]]) -> str:
+    return hashlib.sha256(_quick_commands_encode(records).encode("utf-8")).hexdigest()
+
+
+def _rebase_quick_commands(
+    prior: tuple[dict[str, Any], ...], commands: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    """A legacy slot-count change cannot safely identify shifted duplicates."""
+
+    if len(prior) != len(commands):
+        return tuple(_new_quick_command(command) for command in commands)
+    return tuple(
+        dict(prior[index])
+        if index < len(prior) and prior[index]["command"] == command
+        else _new_quick_command(command)
+        for index, command in enumerate(commands)
+    )
 
 
 def _computers_table_sql(
@@ -349,6 +459,39 @@ class StateStore:
                     PRIMARY KEY(event_id, device_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS client_credentials (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    capabilities_json TEXT NOT NULL,
+                    workspace_ids_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    revoked_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS client_action_receipts (
+                    client_id TEXT NOT NULL
+                        REFERENCES client_credentials(id) ON DELETE CASCADE,
+                    action_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    resource_kind TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'accepted'
+                        CHECK(status IN ('accepted', 'refused', 'observed', 'unknown')),
+                    phase TEXT NOT NULL DEFAULT 'accepted',
+                    instance_id TEXT NOT NULL,
+                    result_resource_id TEXT,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY(client_id, action_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_client_actions_time
+                    ON client_action_receipts(client_id, created_at DESC);
+
                 CREATE INDEX IF NOT EXISTS idx_workspaces_recent
                     ON workspaces(last_opened_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_history_recent
@@ -404,6 +547,11 @@ class StateStore:
                 "workspace_commands_json",
                 "TEXT NOT NULL DEFAULT '[]'",
             )
+            self._ensure_column(
+                db, "workspaces", "workspace_quick_commands_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._migrate_workspace_quick_commands(db)
             self._ensure_column(
                 db, "computers", "auth_kind", "TEXT NOT NULL DEFAULT 'key'"
             )
@@ -937,6 +1085,24 @@ class StateStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def _migrate_workspace_quick_commands(self, db: sqlite3.Connection) -> None:
+        """Preserve the legacy projection so older releases can still execute commands."""
+
+        rows = db.execute(
+            "SELECT * FROM workspaces WHERE workspace_kind = 'workspace'"
+        ).fetchall()
+        for stored in rows:
+            workspace = dict(stored)
+            commands = self.workspace_commands_from(workspace)
+            prior = _quick_commands_decode(workspace["workspace_quick_commands_json"])
+            current = _rebase_quick_commands(prior, commands)
+            encoded = _quick_commands_encode(current)
+            if encoded != workspace["workspace_quick_commands_json"]:
+                db.execute(
+                    "UPDATE workspaces SET workspace_quick_commands_json = ? WHERE id = ?",
+                    (encoded, workspace["id"]),
+                )
+
     @staticmethod
     def workspace_commands_from(workspace: Mapping[str, Any]) -> tuple[str, ...]:
         raw = workspace.get("workspace_commands_json") or "[]"
@@ -954,29 +1120,73 @@ class StateStore:
             raise RuntimeError("Stored Workspace commands are invalid")
         return commands
 
+    @staticmethod
+    def workspace_quick_commands_from(
+        workspace: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        commands = StateStore.workspace_commands_from(workspace)
+        records = _quick_commands_decode(workspace.get("workspace_quick_commands_json"))
+        if tuple(item["command"] for item in records) != commands:
+            raise RuntimeError("Quick Command metadata differs from stored commands")
+        return records
+
     def list_workspace_commands(self, workspace_id: str) -> tuple[str, ...]:
         workspace = self.get_workspace(workspace_id)
         if workspace is None:
             raise KeyError(f"Unknown Workspace: {workspace_id}")
         return self.workspace_commands_from(workspace)
 
+    def list_workspace_quick_commands(
+        self, workspace_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None or workspace["workspace_kind"] != "workspace":
+            raise KeyError(f"Unknown persistent Workspace: {workspace_id}")
+        return self.workspace_quick_commands_from(workspace)
+
+    @staticmethod
+    def _quick_workspace_for_write(
+        db: sqlite3.Connection, workspace_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        row = db.execute(
+            "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown Workspace: {workspace_id}")
+        if row["workspace_kind"] != "workspace":
+            raise ValueError("Commands are available only for persistent Workspaces")
+        return StateStore.workspace_quick_commands_from(dict(row))
+
+    @staticmethod
+    def _write_quick_projection(
+        db: sqlite3.Connection, workspace_id: str,
+        records: Iterable[Mapping[str, Any]],
+    ) -> None:
+        values = list(records)
+        commands = normalize_workspace_commands(item["command"] for item in values)
+        db.execute(
+            """
+            UPDATE workspaces
+            SET workspace_commands_json = ?, workspace_quick_commands_json = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(commands, ensure_ascii=False, separators=(",", ":")),
+                _quick_commands_encode(values), workspace_id,
+            ),
+        )
+
     def replace_workspace_commands(
         self, workspace_id: str, values: Iterable[object]
     ) -> tuple[str, ...]:
+        """Compatibility writer: rebase metadata conservatively on old-style edits."""
+
         commands = normalize_workspace_commands(values)
-        encoded = json.dumps(commands, ensure_ascii=False, separators=(",", ":"))
         with self.connect() as db:
-            row = db.execute(
-                "SELECT workspace_kind FROM workspaces WHERE id = ?", (workspace_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Unknown Workspace: {workspace_id}")
-            if row["workspace_kind"] != "workspace":
-                raise ValueError("Commands are available only for persistent Workspaces")
-            db.execute(
-                "UPDATE workspaces SET workspace_commands_json = ? WHERE id = ?",
-                (encoded, workspace_id),
-            )
+            db.execute("BEGIN IMMEDIATE")
+            previous = self._quick_workspace_for_write(db, workspace_id)
+            records = _rebase_quick_commands(previous, commands)
+            self._write_quick_projection(db, workspace_id, records)
         return commands
 
     def replace_workspace_commands_if_current(
@@ -985,33 +1195,96 @@ class StateStore:
         expected_values: Iterable[object],
         values: Iterable[object],
     ) -> tuple[str, ...] | None:
-        """Atomically replace one Workspace command list when it is still current."""
+        """Preserve the old optimistic comparison and synchronize Quick metadata."""
 
         expected = normalize_workspace_commands(expected_values)
         commands = normalize_workspace_commands(values)
         expected_encoded = json.dumps(
             expected, ensure_ascii=False, separators=(",", ":")
         )
-        encoded = json.dumps(commands, ensure_ascii=False, separators=(",", ":"))
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT workspace_kind FROM workspaces WHERE id = ?", (workspace_id,)
+                "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
             ).fetchone()
             if row is None:
                 raise KeyError(f"Unknown Workspace: {workspace_id}")
             if row["workspace_kind"] != "workspace":
                 raise ValueError("Commands are available only for persistent Workspaces")
-            changed = db.execute(
-                """
-                UPDATE workspaces
-                SET workspace_commands_json = ?
-                WHERE id = ? AND workspace_commands_json = ?
-                """,
-                (encoded, workspace_id, expected_encoded),
-            )
-            if changed.rowcount != 1:
+            if row["workspace_commands_json"] != expected_encoded:
                 return None
+            previous = self.workspace_quick_commands_from(dict(row))
+            records = _rebase_quick_commands(previous, commands)
+            self._write_quick_projection(db, workspace_id, records)
         return commands
+
+    def create_workspace_quick_command(
+        self, workspace_id: str, *, name: str, command: str,
+        expected_list_revision: str,
+    ) -> dict[str, Any] | None:
+        safe_name = normalize_quick_command_name(name)
+        normalized = normalize_workspace_commands([command])
+        if len(normalized) != 1:
+            raise ValueError("Quick Command must be a non-empty command")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            records = self._quick_workspace_for_write(db, workspace_id)
+            if quick_commands_revision(records) != expected_list_revision:
+                return None
+            if len(records) >= MAX_WORKSPACE_COMMANDS:
+                raise ValueError("Workspace command limit reached")
+            created = _new_quick_command(normalized[0], name=safe_name)
+            self._write_quick_projection(db, workspace_id, (*records, created))
+        return created
+
+    def update_workspace_quick_command(
+        self, workspace_id: str, command_id: str, *, expected_revision: int,
+        name: str, command: str,
+    ) -> dict[str, Any] | None:
+        safe_name = normalize_quick_command_name(name)
+        normalized = normalize_workspace_commands([command])
+        if len(normalized) != 1:
+            raise ValueError("Quick Command must be a non-empty command")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            records = list(self._quick_workspace_for_write(db, workspace_id))
+            index = next(
+                (index for index, row in enumerate(records) if row["id"] == command_id),
+                None,
+            )
+            if index is None:
+                raise KeyError(f"Unknown Quick Command: {command_id}")
+            prior = records[index]
+            if prior["revision"] != expected_revision:
+                return None
+            if prior["name"] == safe_name and prior["command"] == normalized[0]:
+                return dict(prior)
+            changed = {
+                **prior, "name": safe_name, "command": normalized[0],
+                "revision": prior["revision"] + 1,
+            }
+            records[index] = changed
+            self._write_quick_projection(db, workspace_id, records)
+        return changed
+
+    def delete_workspace_quick_command(
+        self, workspace_id: str, command_id: str, *, expected_revision: int,
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            records = list(self._quick_workspace_for_write(db, workspace_id))
+            index = next(
+                (index for index, row in enumerate(records) if row["id"] == command_id),
+                None,
+            )
+            if index is None:
+                raise KeyError(f"Unknown Quick Command: {command_id}")
+            prior = records[index]
+            if prior["revision"] != expected_revision:
+                return None
+            records.pop(index)
+            self._write_quick_projection(db, workspace_id, records)
+        return dict(prior)
 
     def find_remote_workspace(
         self,
@@ -1248,11 +1521,20 @@ class StateStore:
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown Workspace: {workspace_id}")
 
-    def list_terminals(self, workspace_id: str) -> list[dict[str, Any]]:
+    def list_terminals(
+        self, workspace_id: str, *, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 1000):
+            raise ValueError("Terminal list limit is invalid")
+        clause = " LIMIT ?" if limit is not None else ""
+        params: tuple[Any, ...] = (
+            (workspace_id, limit) if limit is not None else (workspace_id,)
+        )
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM terminals WHERE workspace_id = ? ORDER BY created_at",
-                (workspace_id,),
+                "SELECT * FROM terminals WHERE workspace_id = ? "
+                f"ORDER BY created_at, id{clause}",
+                params,
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1874,11 +2156,14 @@ class StateStore:
             db.execute("DELETE FROM command_history WHERE workspace_id = ?", (workspace_id,))
 
     def claim_workspace_command(
-        self, workspace_id: str, launch_id: str, slot: int, command_digest: str
+        self, workspace_id: str, launch_id: str, slot: int, command_digest: str,
+        *, command_id: str | None = None, expected_revision: int | None = None,
     ) -> str:
-        """Consume a Workspace command launch identity before dispatch."""
+        """Consume a launch once; validate the named command in the same transaction."""
         if not launch_id:
             raise ValueError("Workspace command launch identity is required")
+        if (command_id is None) != (expected_revision is None):
+            raise ValueError("Both Quick Command identity and revision are required")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
@@ -1895,6 +2180,19 @@ class StateStore:
                         "Workspace command launch identity was reused with a different command"
                     )
                 return "replayed"
+            if command_id is not None:
+                commands = self._quick_workspace_for_write(db, workspace_id)
+                if not 0 <= slot < len(commands):
+                    return "changed"
+                record = commands[slot]
+                if (
+                    record["id"] != command_id
+                    or record["revision"] != expected_revision
+                    or hashlib.sha256(
+                        str(record["command"]).encode("utf-8")
+                    ).hexdigest() != command_digest
+                ):
+                    return "changed"
             db.execute(
                 "INSERT INTO workspace_command_claims("
                 "workspace_id, launch_id, slot, command_digest, created_at) "
@@ -1902,6 +2200,41 @@ class StateStore:
                 (workspace_id, launch_id, slot, command_digest, utc_now()),
             )
             return "created"
+
+    def list_workspace_run_claims(
+        self, workspace_id: str, *, limit: int = 26,
+        before: tuple[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Bounded admission receipts, not execution-lifecycle records."""
+
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Workspace Run page limit is invalid")
+        where = "WHERE workspace_id = ?"
+        params: list[Any] = [workspace_id]
+        if before is not None:
+            where += " AND (created_at, launch_id) < (?, ?)"
+            params.extend(before)
+        params.append(limit)
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT launch_id, slot, command_digest, created_at "
+                f"FROM workspace_command_claims {where} "
+                "ORDER BY created_at DESC, launch_id DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_workspace_run_claim(
+        self, workspace_id: str, launch_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT launch_id, slot, command_digest, created_at "
+                "FROM workspace_command_claims "
+                "WHERE workspace_id = ? AND launch_id = ?",
+                (workspace_id, launch_id),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def claim_file_run(
         self, payload: Mapping[str, Any]
@@ -2069,6 +2402,28 @@ class StateStore:
                 f"{self._file_run_select()} "
                 "WHERE file_runs.state IN ('preparing', 'running') "
                 "ORDER BY file_runs.created_at"
+            ).fetchall()
+            return [self._decode_file_run(row) or {} for row in rows]
+
+    def list_file_runs_for_workspace(
+        self, workspace_id: str, *, limit: int = 26,
+        before: tuple[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Bounded, id-keyset page of stored Run observations; no reconciliation."""
+
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("File Run page limit is invalid")
+        where = "WHERE file_runs.workspace_id = ?"
+        params: list[Any] = [workspace_id]
+        if before is not None:
+            where += " AND (file_runs.created_at, file_runs.id) < (?, ?)"
+            params.extend(before)
+        params.append(limit)
+        with self.connect() as db:
+            rows = db.execute(
+                f"{self._file_run_select()} {where} "
+                "ORDER BY file_runs.created_at DESC, file_runs.id DESC LIMIT ?",
+                params,
             ).fetchall()
             return [self._decode_file_run(row) or {} for row in rows]
 
@@ -2254,6 +2609,46 @@ class StateStore:
                 "SELECT * FROM remote_runs WHERE id = ?", (run_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def list_scoped_remote_runs(
+        self, source_workspace_id: str, allowed_target_computers: Iterable[str],
+        *, limit: int = 26, before: tuple[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Only runs with both Source Workspace and Target Computer granted."""
+
+        target_ids = list(dict.fromkeys(str(v) for v in allowed_target_computers))
+        if not target_ids:
+            return []
+        if type(limit) is not int or not 1 <= limit <= 100 or len(target_ids) > 32:
+            raise ValueError("Remote Run page scope is invalid")
+        placeholders = ",".join("?" for _ in target_ids)
+        where = (
+            "WHERE source_kind = 'workspace' AND source_workspace_id = ? "
+            f"AND target_computer_id IN ({placeholders})"
+        )
+        params: list[Any] = [source_workspace_id, *target_ids]
+        if before is not None:
+            where += " AND (created_at, id) < (?, ?)"
+            params.extend(before)
+        params.append(limit)
+        with self.connect() as db:
+            rows = db.execute(
+                f"SELECT * FROM remote_runs {where} "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def remote_run_report_metadata(self, run_id: str) -> dict[str, Any] | None:
+        """Metadata only; an old report is not a current approval."""
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT report_id, plan_revision, created_at "
+                "FROM remote_run_collection_reports WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def save_remote_run_collection_report(
         self, run_id: str, report: Mapping[str, Any]
@@ -3379,3 +3774,260 @@ class StateStore:
             db.execute("DELETE FROM roots WHERE path = ?", (f"node://{computer_id}",))
             db.execute("DELETE FROM computers WHERE id = ?", (computer_id,))
             return workspace_ids
+
+    @staticmethod
+    def _client_credential_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["capabilities"] = json.loads(str(row["capabilities_json"]))
+        result["workspace_ids"] = json.loads(str(row["workspace_ids_json"]))
+        del result["capabilities_json"]
+        del result["workspace_ids_json"]
+        return result
+
+    def create_client_credential(
+        self,
+        *,
+        client_id: str,
+        name: str,
+        token_hash: str,
+        capabilities: list[str],
+        workspace_ids: list[str],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM client_credentials WHERE revoked_at IS NULL"
+            ).fetchone()[0]
+            if count >= 32:
+                raise ValueError("Revoke an unused client before adding another")
+            db.execute(
+                """
+                INSERT INTO client_credentials (
+                    id, name, token_hash, capabilities_json, workspace_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_id,
+                    name,
+                    token_hash,
+                    json.dumps(capabilities, separators=(",", ":")),
+                    json.dumps(workspace_ids, separators=(",", ":")),
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM client_credentials WHERE id = ?", (client_id,)
+            ).fetchone()
+            return self._client_credential_row(row)
+
+    def get_client_credential(self, client_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM client_credentials WHERE id = ?", (client_id,)
+            ).fetchone()
+            return self._client_credential_row(row) if row else None
+
+    def list_client_credentials(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM client_credentials ORDER BY created_at DESC, id DESC LIMIT 200"
+            ).fetchall()
+            return [self._client_credential_row(row) for row in rows]
+
+    def touch_client_credential(self, client_id: str) -> None:
+        now = datetime.now(UTC)
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE client_credentials SET last_used_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                  AND (last_used_at IS NULL OR last_used_at < ?)
+                """,
+                (
+                    now.isoformat(timespec="seconds"),
+                    client_id,
+                    (now - timedelta(minutes=1)).isoformat(timespec="seconds"),
+                ),
+            )
+
+    def revoke_client_credential(self, client_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE client_credentials SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
+                (utc_now(), client_id),
+            )
+            row = db.execute(
+                "SELECT * FROM client_credentials WHERE id = ?", (client_id,)
+            ).fetchone()
+            return self._client_credential_row(row) if row else None
+
+    def claim_client_action(
+        self,
+        *,
+        client_id: str,
+        action_id: str,
+        action: str,
+        resource_kind: str,
+        resource_id: str,
+        payload_sha256: str,
+        instance_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically reserve one mutation identity; never replay a reused key."""
+
+        if (
+            not 8 <= len(action_id) <= 128
+            or not 1 <= len(action) <= 80
+            or not 1 <= len(resource_kind) <= 40
+            or not 1 <= len(resource_id) <= 128
+            or len(payload_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in payload_sha256)
+        ):
+            raise ValueError("Invalid action identity")
+        now = datetime.now(UTC)
+        created_at = now.isoformat(timespec="seconds")
+        expires_at = (now + timedelta(days=30)).isoformat(timespec="seconds")
+        with self.connect() as db:
+            prior = db.execute(
+                "SELECT 1 FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                (client_id, action_id),
+            ).fetchone()
+            if prior is None:
+                count = db.execute(
+                    "SELECT COUNT(*) FROM client_action_receipts WHERE client_id = ?",
+                    (client_id,),
+                ).fetchone()[0]
+                if count >= 10000:
+                    raise RuntimeError("Action receipt capacity reached; do not reuse old IDs")
+            cursor = db.execute(
+                """
+                INSERT OR IGNORE INTO client_action_receipts (
+                    client_id, action_id, action, resource_kind, resource_id,
+                    payload_sha256, instance_id, created_at, updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_id, action_id, action, resource_kind, resource_id,
+                    payload_sha256, instance_id, created_at, created_at, expires_at,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = db.execute(
+                "SELECT * FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                (client_id, action_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Action receipt was not persisted")
+            if (
+                row["action"] != action
+                or row["resource_kind"] != resource_kind
+                or row["resource_id"] != resource_id
+                or row["payload_sha256"] != payload_sha256
+            ):
+                raise ValueError("idempotency_conflict")
+            if not created and (
+                (row["instance_id"] != instance_id or row["expires_at"] <= created_at)
+                and row["status"] == "accepted"
+            ):
+                db.execute(
+                    """
+                    UPDATE client_action_receipts SET status = 'unknown', updated_at = ?
+                    WHERE client_id = ? AND action_id = ? AND status = 'accepted'
+                    """,
+                    (created_at, client_id, action_id),
+                )
+                row = db.execute(
+                    "SELECT * FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                    (client_id, action_id),
+                ).fetchone()
+            return dict(row), created
+
+    def get_client_action(
+        self, client_id: str, action_id: str, *, instance_id: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                (client_id, action_id),
+            ).fetchone()
+            if row is None:
+                return None
+            now = utc_now()
+            if row["status"] == "accepted" and (
+                row["instance_id"] != instance_id or row["expires_at"] <= now
+            ):
+                db.execute(
+                    """
+                    UPDATE client_action_receipts SET status = 'unknown', updated_at = ?
+                    WHERE client_id = ? AND action_id = ? AND status = 'accepted'
+                    """,
+                    (now, client_id, action_id),
+                )
+                row = db.execute(
+                    "SELECT * FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                    (client_id, action_id),
+                ).fetchone()
+            return dict(row)
+
+    def update_client_action(
+        self,
+        *,
+        client_id: str,
+        action_id: str,
+        instance_id: str,
+        status: str,
+        phase: str,
+        result_resource_id: str | None = None,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"accepted", "refused", "observed", "unknown"}:
+            raise ValueError("Invalid action status")
+        if phase not in {
+            "accepted", "dispatched", "pty_delivered",
+            "process_started", "process_finished", "result_verified",
+        }:
+            raise ValueError("Invalid observation phase")
+        if result_resource_id is not None and len(result_resource_id) > 128:
+            raise ValueError("Result identity too long")
+        if error_code is not None and len(error_code) > 80:
+            raise ValueError("Error code too long")
+        with self.connect() as db:
+            previous = db.execute(
+                "SELECT * FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                (client_id, action_id),
+            ).fetchone()
+            if (
+                previous is None
+                or previous["instance_id"] != instance_id
+                or previous["status"] not in {"accepted", "observed"}
+            ):
+                raise RuntimeError("Action is no longer owned or already unknown/refused")
+            phases = (
+                "accepted", "dispatched", "pty_delivered",
+                "process_started", "process_finished", "result_verified",
+            )
+            if phases.index(phase) < phases.index(previous["phase"]):
+                raise ValueError("Cannot move action evidence backwards")
+            if status == "observed" and phase not in {"process_finished", "result_verified"}:
+                raise ValueError("A transport receipt cannot establish process completion")
+            if previous["status"] == "observed" and status != "observed":
+                raise ValueError("Cannot erase observed completion")
+            updated = db.execute(
+                """
+                UPDATE client_action_receipts
+                SET status = ?, phase = ?, result_resource_id = ?, error_code = ?,
+                    updated_at = ?
+                WHERE client_id = ? AND action_id = ? AND instance_id = ?
+                  AND status IN ('accepted', 'observed')
+                """,
+                (
+                    status, phase, result_resource_id, error_code, utc_now(),
+                    client_id, action_id, instance_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("Action is no longer owned or already unknown/refused")
+            row = db.execute(
+                "SELECT * FROM client_action_receipts WHERE client_id = ? AND action_id = ?",
+                (client_id, action_id),
+            ).fetchone()
+            return dict(row)

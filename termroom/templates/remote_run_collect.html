@@ -16,6 +16,7 @@
   </header>
 
   {% if action_error %}<p class="notice error" role="alert">{{ action_error }}</p>{% endif %}
+  {% if agent_approved %}<p class="notice" role="status">{{ t('remote_run.collect.agent_approval_success') }}</p>{% endif %}
   {% if plan %}
   <section class="panel remote-run-collect-summary" aria-label="{{ t('remote_run.collect.summary') }}">
     <span><strong>{{ plan['summary']['ready'] }}</strong><small>{{ t('remote_run.collect.status.ready') }}</small></span>
@@ -46,6 +47,33 @@
     <p class="notice" role="status">{{ t('remote_run.collect.truncated_plan', count=plan['omitted_items']) }}</p>
     {% endif %}
   </section>
+
+  {% if pending_control_approvals and plan.get('apply_allowed', true) %}
+  <section class="panel remote-run-collect-panel" aria-label="{{ t('remote_run.collect.agent_approval_heading') }}">
+    <header class="open-section-heading">
+      <div>
+        <h2>{{ t('remote_run.collect.agent_approval_heading') }}</h2>
+        <p>{{ t('remote_run.collect.agent_approval_copy') }}</p>
+      </div>
+    </header>
+    <div class="remote-run-collect-list">
+      {% for intent in pending_control_approvals %}
+      <article class="remote-run-collect-row">
+        <div>
+          <strong>{{ intent.client_name }}</strong>
+          <code>{{ intent.action_id }}</code>
+        </div>
+        <form method="post" action="/remote-runs/{{ run.id }}/approve-control-apply/{{ intent.id }}">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <input type="hidden" name="revision" value="{{ plan['revision'] }}">
+          <input type="hidden" name="plan_hash" value="{{ approval_plan_hash }}">
+          <button class="secondary-button" type="submit">{{ t('remote_run.collect.agent_approval_button') }}</button>
+        </form>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
 
   <footer class="remote-run-collect-actions">
     <a class="secondary-button" href="/remote-runs/{{ run.id }}">{{ t('remote_run.collect.cancel') }}</a>

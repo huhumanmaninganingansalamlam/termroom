@@ -433,6 +433,60 @@ class RemoteAccess:
         )
         return self._reconcile_terminals(workspace, result.get("terminals"))
 
+    async def current_pane_mode(
+        self, workspace: dict[str, Any], terminal: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self.is_node(workspace):
+            return await asyncio.to_thread(self.ssh.current_pane_mode, workspace, terminal)
+        if not self.supports_capability(workspace, "terminal_input_v1"):
+            raise RemoteAccessError(
+                "Node Terminal input is unavailable", code="capability_unsupported"
+            )
+        response = await self._workspace_request(
+            workspace, "terminal.mode", {"tmux_window": terminal["tmux_window"]},
+        )
+        mode = response.get("mode")
+        if (
+            not isinstance(mode, dict)
+            or mode.get("window") != terminal["tmux_window"]
+            or not isinstance(mode.get("pane"), str)
+            or not mode["pane"].startswith("%")
+            or type(mode.get("dead")) is not bool
+            or type(mode.get("in_mode")) is not bool
+        ):
+            raise RemoteAccessError(
+                "Node returned invalid pane identity", code="node_response_invalid"
+            )
+        return mode
+
+    async def paste_terminal_input(
+        self, workspace: dict[str, Any], terminal: dict[str, Any],
+        pane: str, value: str, *, append_enter: bool,
+    ) -> dict[str, Any]:
+        if not self.is_node(workspace):
+            return await asyncio.to_thread(
+                self.ssh.paste_terminal_input, workspace, terminal,
+                pane, value, append_enter=append_enter,
+            )
+        if not self.supports_capability(workspace, "terminal_input_v1"):
+            raise RemoteAccessError(
+                "Node Terminal input is unavailable", code="capability_unsupported"
+            )
+        response = await self._workspace_request(
+            workspace, "terminal.input", {
+                "tmux_window": terminal["tmux_window"],
+                "pane": pane, "value": value, "append_enter": append_enter,
+            },
+        )
+        delivery = response.get("delivery")
+        if (
+            not isinstance(delivery, dict) or delivery.get("pane") != pane
+            or delivery.get("delivered_bytes") != len(value.encode("utf-8"))
+            or delivery.get("enter_sent") is not append_enter
+        ):
+            raise RemoteAccessError("Node input receipt is ambiguous", code="input_status_unknown")
+        return delivery
+
     async def capture_scrollback(
         self,
         workspace: dict[str, Any],
@@ -465,6 +519,19 @@ class RemoteAccess:
         if not isinstance(output, str):
             raise RemoteAccessError("Node returned invalid Terminal scrollback")
         return output
+
+    async def observe_scrollback(
+        self, workspace: dict[str, Any], terminal: dict[str, Any], *, lines: int = 100
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Read only: SSH checks pane generation, Node validates session/window."""
+
+        if not self.is_node(workspace):
+            return await asyncio.to_thread(
+                self.ssh.observe_scrollback, workspace, terminal, lines=lines,
+            )
+        output = await self.capture_scrollback(workspace, terminal, lines)
+        # Legacy Node scrollback has no pane-generation field; never invent one.
+        return output, None
 
     async def list_dir(
         self,
@@ -1357,6 +1424,7 @@ class RemoteAccess:
                                     ).encode()
                                 )
                                 continue
+                            self.control.mark_input(terminal_id, client_id, device_id)
                             await stream.send(raw.encode())
                             continue
                         if not isinstance(payload, dict):
@@ -1371,6 +1439,15 @@ class RemoteAccess:
                                         "claim_id": payload.get("claim_id"),
                                     }
                                 ).encode()
+                            )
+                            continue
+                        if kind == "control_release":
+                            released = self.control.release_browser_control(terminal_id, client_id)
+                            await websocket.send_bytes(
+                                json.dumps({
+                                    **self.control.control_state(terminal_id, client_id),
+                                    "released": released,
+                                }).encode()
                             )
                             continue
                         if kind in {"input", "command"} and not self.control.can_input(

@@ -2,6 +2,34 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.22] - 2026-11-10
+
+### Added
+
+- Put Terminal first with a 56px desktop navigation rail, a real Files
+  quick-browse panel and the existing Run actions. Preserve the selected
+  Terminal, input draft and focus while moving between these surfaces.
+- Add authenticated, Workspace-scoped non-UI control and read endpoints with
+  independently revocable credentials, action receipts, stable named-command
+  identities, explicit Terminal handoff and managed Run idempotency. Reuse
+  existing Local, SSH and Node execution and file-version boundaries.
+- Support browser review of exact non-UI Terminal-close and Remote Run
+  result-apply requests without silently treating a pending approval as consent.
+
+### Fixed
+
+- Refuse mutations and Terminal input/control after Credential revocation,
+  including queued operations and delayed request bodies. Prevent approved
+  result-apply requests from dispatching after revocation.
+- Reject queued Terminal/Files/Run reads after their Credential is revoked,
+  and withhold the result of a read revoked while its backend was running.
+- Preserve composer and saved-command editor focus and unsent selections
+  across Terminal reconnection. Give file-editor back navigation an accessible
+  name and announce file-edit conflicts as alerts.
+- Preserve human and non-UI file contents across both directions of a
+  concurrent version-conflict save; keep duplicate Run requests bound to
+  their original operation instead of starting another process.
+
 ## [0.4.21] - 2026-10-30
 
 ### Fixed

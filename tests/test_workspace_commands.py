@@ -20,7 +20,12 @@ import pytest
 import termroom.node_agent as node_agent
 from termroom.app import _workspace_context, create_app
 from termroom.config import Settings
-from termroom.db import StateStore, normalize_workspace_commands
+from termroom.db import (
+    StateStore,
+    normalize_quick_command_name,
+    normalize_workspace_commands,
+    quick_commands_revision,
+)
 from termroom.node_agent import NodeAgentError, NodeRuntime
 from termroom.node_protocol import (
     NODE_REQUEST_OPERATIONS,
@@ -120,6 +125,152 @@ def test_workspace_command_storage_migrates_and_replaces_atomically(tmp_path: Pa
         "uv run pytest -q",
         "npm run build",
     )
+
+
+def test_quick_command_migration_identity_version_and_legacy_rollback(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _local_workspace(tmp_path)
+    workspace_id = str(workspace["id"])
+    # Simulate an older database whose command column predates name metadata.
+    with store.connect() as db:
+        db.execute(
+            "UPDATE workspaces SET workspace_commands_json = ?, "
+            "workspace_quick_commands_json = '[]' WHERE id = ?",
+            ('["uv run pytest","ruff check ."]', workspace_id),
+        )
+    store.initialize()
+    records = store.list_workspace_quick_commands(workspace_id)
+    assert [item["name"] for item in records] == ["uv run pytest", "ruff check ."]
+    assert len({item["id"] for item in records}) == 2
+    first_id, second_id = records[0]["id"], records[1]["id"]
+
+    # Repeated upgrade and restart must preserve identity.
+    store.initialize()
+    assert store.list_workspace_quick_commands(workspace_id) == records
+    opened = StateStore(store.path)
+    opened.initialize()
+    assert opened.list_workspace_quick_commands(workspace_id) == records
+
+    added = store.create_workspace_quick_command(
+        workspace_id, name="Build", command="python -m build",
+        expected_list_revision=quick_commands_revision(records),
+    )
+    assert added is not None and added["revision"] == 1
+    assert store.create_workspace_quick_command(
+        workspace_id, name="Duplicate", command="echo noop",
+        expected_list_revision=quick_commands_revision(records),
+    ) is None
+    renamed = store.update_workspace_quick_command(
+        workspace_id, second_id, expected_revision=1,
+        name="검사 실행", command="ruff check .",
+    )
+    assert renamed is not None
+    assert renamed["id"] == second_id and renamed["revision"] == 2
+    assert renamed["name"] == "검사 실행"
+    assert store.update_workspace_quick_command(
+        workspace_id, second_id, expected_revision=1,
+        name="stale", command="ruff check --fix .",
+    ) is None
+    assert store.list_workspace_commands(workspace_id) == (
+        "uv run pytest", "ruff check .", "python -m build",
+    )
+    deleted = store.delete_workspace_quick_command(
+        workspace_id, first_id, expected_revision=1,
+    )
+    assert deleted is not None and deleted["id"] == first_id
+    assert [item["id"] for item in store.list_workspace_quick_commands(
+        workspace_id,
+    )] == [second_id, added["id"]]
+    with pytest.raises(KeyError):
+        store.update_workspace_quick_command(
+            workspace_id, first_id, expected_revision=1,
+            name="reused", command="echo wrong",
+        )
+
+    # A rollback release can still read the legacy string list. If that older
+    # release edits it, a subsequent upgrade invalidates the changed ID.
+    with store.connect() as db:
+        db.execute(
+            "UPDATE workspaces SET workspace_commands_json = ? WHERE id = ?",
+            ('["different","python -m build"]', workspace_id),
+        )
+    opened.initialize()
+    rebased = opened.list_workspace_quick_commands(workspace_id)
+    assert rebased[0]["id"] != second_id
+    assert rebased[1]["id"] == added["id"]
+    assert [item["command"] for item in rebased] == [
+        "different", "python -m build",
+    ]
+
+
+def test_legacy_slot_shift_cannot_resolve_a_deleted_duplicate_identity(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _local_workspace(tmp_path)
+    workspace_id = str(workspace["id"])
+    store.replace_workspace_commands(workspace_id, ["printf same", "printf same"])
+    previous = store.list_workspace_quick_commands(workspace_id)
+    assert previous[0]["id"] != previous[1]["id"]
+
+    # An older release knows only the command strings. A deletion of one
+    # duplicate is ambiguous, so no previous identity may be reused.
+    with store.connect() as db:
+        db.execute(
+            "UPDATE workspaces SET workspace_commands_json = ? WHERE id = ?",
+            ('["printf same"]', workspace_id),
+        )
+    store.initialize()
+    remaining = store.list_workspace_quick_commands(workspace_id)
+    assert len(remaining) == 1
+    assert remaining[0]["id"] not in {row["id"] for row in previous}
+    store.initialize()
+    assert store.list_workspace_quick_commands(workspace_id) == remaining
+
+
+def test_quick_command_names_reject_control_and_overlong_text() -> None:
+    with pytest.raises(ValueError, match="Quick Command name"):
+        normalize_quick_command_name("bad\u202ename")
+    with pytest.raises(ValueError, match="Quick Command name"):
+        normalize_quick_command_name("x" * 161)
+
+
+def test_quick_command_launch_admission_is_atomic_with_revision_check(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _local_workspace(tmp_path)
+    workspace_id = str(workspace["id"])
+    created = store.create_workspace_quick_command(
+        workspace_id, name="Run", command="printf safe",
+        expected_list_revision=quick_commands_revision(()),
+    )
+    assert created is not None
+    digest = workspace_command_digest("printf safe")
+    renamed = store.update_workspace_quick_command(
+        workspace_id, created["id"], expected_revision=1,
+        name="Run checks", command="printf safe",
+    )
+    assert renamed is not None and renamed["revision"] == 2
+    launch_id = uuid.uuid4().hex
+    assert store.claim_workspace_command(
+        workspace_id, launch_id, 0, digest,
+        command_id=created["id"], expected_revision=1,
+    ) == "changed"
+    assert store.list_workspace_run_claims(workspace_id) == []
+    assert store.claim_workspace_command(
+        workspace_id, launch_id, 0, digest,
+        command_id=created["id"], expected_revision=2,
+    ) == "created"
+    # Replayed launch identity is never dispatched again, even after a rename.
+    store.update_workspace_quick_command(
+        workspace_id, created["id"], expected_revision=2,
+        name="Renamed again", command="printf safe",
+    )
+    assert store.claim_workspace_command(
+        workspace_id, launch_id, 0, digest,
+        command_id=created["id"], expected_revision=2,
+    ) == "replayed"
+    assert len(store.list_workspace_run_claims(workspace_id)) == 1
 
 
 def test_workspace_command_claim_survives_store_reopen_and_rejects_conflicts(
@@ -1324,14 +1475,29 @@ async def test_workspace_command_http_uses_only_server_saved_command(
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
+
+        def add_fields(command: str) -> dict[str, str]:
+            return {
+                "_csrf": settings.csrf_token,
+                "name": normalize_workspace_commands([command])[0],
+                "command": command,
+                "commands_revision": quick_commands_revision(
+                    app.state.store.list_workspace_quick_commands(workspace_id)
+                ),
+            }
+
+        def identity(slot: int) -> dict[str, Any]:
+            row = app.state.store.list_workspace_quick_commands(workspace_id)[slot]
+            return {"command_id": row["id"], "command_revision": row["revision"]}
+
         first_saved = await client.post(
             f"/w/{workspace_id}/run-commands/add",
-            data={"_csrf": settings.csrf_token, "command": "  uv run pytest  "},
+            data=add_fields("  uv run pytest  "),
             follow_redirects=False,
         )
         second_saved = await client.post(
             f"/w/{workspace_id}/run-commands/add",
-            data={"_csrf": settings.csrf_token, "command": "ruff check ."},
+            data=add_fields("ruff check ."),
             follow_redirects=False,
         )
         assert first_saved.status_code == second_saved.status_code == 303
@@ -1379,7 +1545,7 @@ async def test_workspace_command_http_uses_only_server_saved_command(
 
         added = await client.post(
             f"/w/{workspace_id}/run-commands/add",
-            data={"_csrf": settings.csrf_token, "command": "python -m build"},
+            data=add_fields("python -m build"),
             follow_redirects=False,
         )
         assert added.status_code == 303
@@ -1390,7 +1556,7 @@ async def test_workspace_command_http_uses_only_server_saved_command(
         )
         over_limit = await client.post(
             f"/w/{workspace_id}/run-commands/add",
-            data={"_csrf": settings.csrf_token, "command": "echo fourth"},
+            data=add_fields("echo fourth"),
             follow_redirects=False,
         )
         assert over_limit.status_code == 303
@@ -1416,11 +1582,13 @@ async def test_workspace_command_http_uses_only_server_saved_command(
             "ruff check .",
         )
 
+        second_before_change = identity(1)
         saved_one = await client.post(
             f"/w/{workspace_id}/run-commands/1/save",
             data={
                 "_csrf": settings.csrf_token,
                 "command_digest": workspace_command_digest("ruff check ."),
+                **second_before_change,
                 "command": "ruff check --fix .",
             },
             follow_redirects=False,
@@ -1435,6 +1603,7 @@ async def test_workspace_command_http_uses_only_server_saved_command(
             data={
                 "_csrf": settings.csrf_token,
                 "command_digest": workspace_command_digest("ruff check ."),
+                **second_before_change,
                 "command": "ruff check --unsafe-fixes .",
             },
             follow_redirects=False,
@@ -1449,6 +1618,7 @@ async def test_workspace_command_http_uses_only_server_saved_command(
                 "_csrf": settings.csrf_token,
                 "launch_id": uuid.uuid4().hex,
                 "command_digest": workspace_command_digest("ruff check ."),
+                **second_before_change,
                 "command": "printf attacker-controlled",
             },
             follow_redirects=False,
@@ -1471,6 +1641,7 @@ async def test_workspace_command_http_uses_only_server_saved_command(
                 "_csrf": settings.csrf_token,
                 "launch_id": launch_id,
                 "command_digest": workspace_command_digest("ruff check --fix ."),
+                **identity(1),
                 "command": "printf attacker-controlled",
             },
             follow_redirects=False,
@@ -1488,6 +1659,7 @@ async def test_workspace_command_http_uses_only_server_saved_command(
                 "_csrf": settings.csrf_token,
                 "launch_id": launch_id,
                 "command_digest": workspace_command_digest("ruff check --fix ."),
+                **identity(1),
             },
             follow_redirects=False,
         )
@@ -1566,6 +1738,138 @@ async def test_workspace_command_http_uses_only_server_saved_command(
 
 
 @pytest.mark.asyncio
+async def test_named_quick_command_browser_forms_bind_stable_identity_and_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    (root / "project").mkdir(parents=True)
+    settings = Settings.create(
+        root, state_dir=tmp_path / "state", access_token="test-token",
+    )
+    app = create_app(settings)
+    workspace_id = str(app.state.workspaces.open("project")["id"])
+    store = app.state.store
+    store.replace_workspace_commands(workspace_id, ["printf same", "printf same"])
+    first, second = store.list_workspace_quick_commands(workspace_id)
+    assert first["id"] != second["id"]
+    launched: list[tuple[int, str, str]] = []
+
+    def run_command(
+        workspace: dict[str, Any], *, slot: int, command: str, launch_id: str,
+    ) -> dict[str, Any]:
+        launched.append((slot, command, launch_id))
+        return {"id": "quick-managed-terminal"}
+
+    monkeypatch.setattr(app.state.terminals, "run_workspace_command", run_command)
+    digest = workspace_command_digest("printf same")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await _login(client)
+        page = await client.get(f"/w/{workspace_id}/files")
+        assert page.status_code == 200
+        assert page.text.count('name="command_id"') == 4
+        assert page.text.count('name="command_revision"') == 4
+        assert page.text.count('placeholder="Name this command"') == 3
+        assert page.text.count("<code title=\"printf same\">printf same</code>") == 2
+        assert 'aria-label="Run · Command 1 · printf same"' in page.text
+        assert 'aria-label="Run · Command 2 · printf same"' in page.text
+
+        edited = await client.post(
+            f"/w/{workspace_id}/run-commands/0/save",
+            data={
+                "_csrf": settings.csrf_token, "command_digest": digest,
+                "command_id": first["id"], "command_revision": first["revision"],
+                "name": "<script>Run safe</script>", "command": "printf same",
+            },
+            follow_redirects=False,
+        )
+        assert edited.status_code == 303
+        renamed, untouched = store.list_workspace_quick_commands(workspace_id)
+        assert renamed["id"] == first["id"] and renamed["revision"] == 2
+        assert renamed["name"] == "<script>Run safe</script>"
+        assert untouched == second
+        escaped_page = await client.get(f"/w/{workspace_id}/files")
+        assert "&lt;script&gt;Run safe&lt;/script&gt;" in escaped_page.text
+        assert "<script>Run safe</script>" not in escaped_page.text
+
+        stale = await client.post(
+            f"/w/{workspace_id}/run-commands/0/save",
+            data={
+                "_csrf": settings.csrf_token, "command_digest": digest,
+                "command_id": first["id"], "command_revision": 1,
+                "name": "Overwrite", "command": "printf changed",
+            },
+            follow_redirects=False,
+        )
+        assert stale.status_code == 303 and "error=" in stale.headers["location"]
+        assert store.list_workspace_commands(workspace_id) == ("printf same", "printf same")
+
+        deleted = await client.post(
+            f"/w/{workspace_id}/run-commands/0/delete",
+            data={
+                "_csrf": settings.csrf_token, "command_digest": digest,
+                "command_id": first["id"], "command_revision": 2,
+            },
+            follow_redirects=False,
+        )
+        assert deleted.status_code == 303
+        assert store.list_workspace_quick_commands(workspace_id) == (second,)
+        stale_launch = await client.post(
+            f"/w/{workspace_id}/run-commands/0",
+            data={
+                "_csrf": settings.csrf_token, "launch_id": uuid.uuid4().hex,
+                "command_digest": digest, "command_id": first["id"],
+                "command_revision": 2,
+            },
+            follow_redirects=False,
+        )
+        assert stale_launch.status_code == 303
+        assert "error=" in stale_launch.headers["location"]
+        assert launched == []
+
+        launch_id = uuid.uuid4().hex
+        launch = await client.post(
+            f"/w/{workspace_id}/run-commands/0",
+            data={
+                "_csrf": settings.csrf_token, "launch_id": launch_id,
+                "command_digest": digest, "command_id": second["id"],
+                "command_revision": 1,
+            },
+            follow_redirects=False,
+        )
+        assert launch.status_code == 303
+        assert "terminal=quick-managed-terminal" in launch.headers["location"]
+        assert launched == [(0, "printf same", launch_id)]
+        replay = await client.post(
+            f"/w/{workspace_id}/run-commands/0",
+            data={
+                "_csrf": settings.csrf_token, "launch_id": launch_id,
+                "command_digest": digest, "command_id": second["id"],
+                "command_revision": 1,
+            },
+            follow_redirects=False,
+        )
+        assert replay.status_code == 303 and "error=" in replay.headers["location"]
+        assert len(launched) == 1
+
+        revision = quick_commands_revision(store.list_workspace_quick_commands(workspace_id))
+        added = await client.post(
+            f"/w/{workspace_id}/run-commands/add",
+            data={
+                "_csrf": settings.csrf_token, "commands_revision": revision,
+                "name": "<script>Run safe</script>", "command": "printf second",
+            },
+            follow_redirects=False,
+        )
+        assert added.status_code == 303
+        rows = store.list_workspace_quick_commands(workspace_id)
+        assert len(rows) == 2 and rows[0] == second
+        assert rows[1]["name"] == "<script>Run safe</script>"
+        assert rows[1]["command"] == "printf second"
+        assert rows[1]["id"] not in {first["id"], second["id"]}
+
+
+@pytest.mark.asyncio
 async def test_workspace_command_delete_uses_only_the_saved_digest(tmp_path: Path) -> None:
     root = tmp_path / "root"
     (root / "project").mkdir(parents=True)
@@ -1585,11 +1889,23 @@ async def test_workspace_command_delete_uses_only_the_saved_digest(tmp_path: Pat
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         await _login(client)
+        first = app.state.store.list_workspace_quick_commands(workspace_id)[0]
+        no_identity = await client.post(
+            f"/w/{workspace_id}/run-commands/0/delete",
+            data={
+                "_csrf": settings.csrf_token,
+                "command_digest": workspace_command_digest("uv run pytest"),
+            },
+            follow_redirects=False,
+        )
+        assert no_identity.status_code == 303
+        assert "error=" in no_identity.headers["location"]
         stale = await client.post(
             f"/w/{workspace_id}/run-commands/0/delete",
             data={
                 "_csrf": settings.csrf_token,
                 "command_digest": workspace_command_digest("changed elsewhere"),
+                "command_id": first["id"], "command_revision": first["revision"],
             },
             follow_redirects=False,
         )
@@ -1605,6 +1921,7 @@ async def test_workspace_command_delete_uses_only_the_saved_digest(tmp_path: Pat
             data={
                 "_csrf": settings.csrf_token,
                 "command_digest": workspace_command_digest("uv run pytest"),
+                "command_id": first["id"], "command_revision": first["revision"],
             },
             follow_redirects=False,
         )

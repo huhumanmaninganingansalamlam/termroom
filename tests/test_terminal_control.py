@@ -256,10 +256,69 @@ def test_activation_transfers_control_without_input_or_background_reconnect_thef
     assert control.can_input("term", first)
 
 
-def test_last_disconnect_releases_frame_lock_after_input_tasks_settle() -> None:
+def test_last_disconnect_preserves_lock_identity_for_external_claims() -> None:
     control = TerminalControl()
     first = control.register("term")
     lock = control.input_lock("term")
     assert control.input_lock("term") is lock
     control.unregister("term", first)
-    assert control.input_lock("term") is not lock
+    # An in-flight non-UI claimant may already hold this exact lock reference.
+    assert control.input_lock("term") is lock
+
+
+def test_partial_browser_input_blocks_external_claim_even_after_disconnect() -> None:
+    control = TerminalControl()
+    person = control.register("term")
+    control.mark_input("term", person)
+    control.unregister("term", person)
+    revision = control.external_state("term")["control_revision"]
+
+    generation, reason = control.claim_external("term", "credential-A", revision)
+    assert generation is None
+    assert reason == "control_conflict"
+    assert control.external_state("term")["handoff_required"]
+
+
+def test_explicit_browser_handoff_and_genuine_activation_invalidate_generation() -> None:
+    control = TerminalControl()
+    person = control.register("term")
+    control.mark_input("term", person)
+    assert control.release_browser_control("term", person)
+    assert not control.can_input("term", person)
+    state = control.external_state("term")
+    assert state["controller_kind"] == "none"
+    generation, reason = control.claim_external(
+        "term", "credential-A", state["control_revision"],
+    )
+    assert reason == ""
+    assert generation
+    revision = control.external_state("term")["control_revision"]
+    assert control.can_external_input("term", "credential-A", generation, revision)
+    assert not control.can_external_input("term", "credential-B", generation, revision)
+    assert control.external_state("term", "credential-B")["generation"] == ""
+    assert control.external_state("term", "credential-A")["generation"] == generation
+    viewer = control.register("term")
+    assert not control.can_input("term", viewer)
+    assert not control.can_resize("term", viewer)
+    control.claim_control("term", viewer)
+    assert control.can_input("term", viewer)
+    assert not control.can_external_input("term", "credential-A", generation, revision)
+
+
+def test_external_claim_requires_fresh_revision_and_releases_once() -> None:
+    control = TerminalControl()
+    viewer = control.register("term")
+    assert control.release_browser_control("term", viewer)
+    revision = control.external_state("term")["control_revision"]
+    token, reason = control.claim_external("term", "credential-A", revision - 1)
+    assert token is None and reason == "control_revision_changed"
+    token, reason = control.claim_external("term", "credential-A", revision)
+    assert reason == "" and token
+    next_revision = revision + 1
+    assert control.claim_external(
+        "term", "credential-B", next_revision
+    ) == (None, "control_conflict")
+    assert not control.release_external("term", "credential-B", token, next_revision)
+    assert control.release_external("term", "credential-A", token, next_revision)
+    assert not control.release_external("term", "credential-A", token, next_revision)
+    assert control.external_state("term")["controller_kind"] == "none"

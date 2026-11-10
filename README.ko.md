@@ -121,6 +121,8 @@ termroom .
 ### 파일
 
 - 프로젝트 폴더 탐색과 검색
+- 터미널의 `파일`은 현재 터미널을 유지한 채 읽기 전용 서랍에서 탐색·검색합니다.
+  파일 보기는 새 탭에서 열리고, 업로드·편집·이름 변경·삭제는 전체 파일 화면에서 처리합니다.
 - Workspace 열기의 폴더 탐색 화면에서 새 프로젝트 폴더를 만들고 바로 열기
 - 여러 파일·폴더를 선택해서 ZIP으로 다운로드
 - 여러 파일 업로드와 덮어쓰기 확인
@@ -541,12 +543,6 @@ node --check termroom/static/remote_run.js
 node --check termroom/static/terminal.js
 docker compose config
 ```
-
-사용자 화면을 바꾸는 경우 모바일·태블릿·데스크톱 responsive 폭에서 전체 흐름을 확인합니다.
-이 viewport 검증은 유용한 layout 증거지만 실기기 증거를 대신하지 않습니다. 현재 실제
-브라우저 release gate는 실제 macOS desktop의 Safari입니다. 스마트폰 Safari/Chrome과
-installed PWA 실기기 검증은 사용자가 추후 수행하는 별도 후속 항목이며 현재 release를
-차단하지 않습니다. 같은 Mac의 Chrome 비교 검증은 선택 사항입니다.
 
 ## 문서
 

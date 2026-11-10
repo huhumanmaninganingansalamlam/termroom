@@ -1,0 +1,897 @@
+{
+  "fixture": "Synthetic HTML/CSS. Baseline mirrors current DOM with production app.css unmodified.",
+  "browser": "Isolated Chrome headless CDP; exact device metric overrides",
+  "measuredAt": "2026-11-09T03:39:54.283Z",
+  "rowsCols": "Estimates only, based on specimen monospace font/line-height; NOT xterm FitAddon/tmux grid",
+  "results": [
+    {
+      "variant": "baseline",
+      "size": "desktop",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "terminal": {
+        "x": 248,
+        "y": 52,
+        "width": 1192,
+        "height": 795
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 248,
+        "height": 158
+      },
+      "nav": {
+        "x": 0,
+        "y": 158,
+        "width": 248,
+        "height": 666
+      },
+      "chrome": {
+        "x": 248,
+        "y": 0,
+        "width": 1192,
+        "height": 52
+      },
+      "helper": {
+        "x": 248,
+        "y": 847,
+        "width": 1192,
+        "height": 53
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 44,
+      "estimatedCols": 138,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal"
+    },
+    {
+      "variant": "baseline",
+      "size": "narrow",
+      "viewport": {
+        "width": 1024,
+        "height": 768
+      },
+      "terminal": {
+        "x": 248,
+        "y": 52,
+        "width": 776,
+        "height": 663
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 248,
+        "height": 158
+      },
+      "nav": {
+        "x": 0,
+        "y": 158,
+        "width": 248,
+        "height": 534
+      },
+      "chrome": {
+        "x": 248,
+        "y": 0,
+        "width": 776,
+        "height": 52
+      },
+      "helper": {
+        "x": 248,
+        "y": 715,
+        "width": 776,
+        "height": 53
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 36,
+      "estimatedCols": 89,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal"
+    },
+    {
+      "variant": "baseline",
+      "size": "mobile",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "terminal": {
+        "x": 0,
+        "y": 113,
+        "width": 390,
+        "height": 614
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 390,
+        "height": 56
+      },
+      "nav": {
+        "x": 0,
+        "y": 784,
+        "width": 390,
+        "height": 60
+      },
+      "chrome": {
+        "x": 0,
+        "y": 56,
+        "width": 390,
+        "height": 57
+      },
+      "helper": {
+        "x": 0,
+        "y": 727,
+        "width": 390,
+        "height": 57
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 34,
+      "estimatedCols": 43,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal"
+    },
+    {
+      "variant": "baseline",
+      "size": "keyboard-390x500",
+      "viewport": {
+        "width": 390,
+        "height": 500
+      },
+      "terminal": {
+        "x": 0,
+        "y": 57,
+        "width": 390,
+        "height": 386
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "nav": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "chrome": {
+        "x": 0,
+        "y": 0,
+        "width": 390,
+        "height": 57
+      },
+      "helper": {
+        "x": 0,
+        "y": 443,
+        "width": 390,
+        "height": 57
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 21,
+      "estimatedCols": 43,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal"
+    },
+    {
+      "variant": "A",
+      "size": "desktop",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "terminal": {
+        "x": 56,
+        "y": 52,
+        "width": 1384,
+        "height": 794
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 56,
+        "height": 54
+      },
+      "nav": {
+        "x": 0,
+        "y": 54,
+        "width": 56,
+        "height": 846
+      },
+      "chrome": {
+        "x": 56,
+        "y": 0,
+        "width": 1384,
+        "height": 52
+      },
+      "helper": {
+        "x": 56,
+        "y": 846,
+        "width": 1384,
+        "height": 54
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 44,
+      "estimatedCols": 161,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal",
+      "interaction": {
+        "panelOpen": true,
+        "focusInPanel": true,
+        "semantics": true,
+        "hiddenTerminalInert": true,
+        "focusNotBehind": true,
+        "tabContained": true,
+        "switchedTerminal": true,
+        "composerFocused": true,
+        "composerClosed": true,
+        "escapeClosesPanel": true,
+        "retained": true,
+        "terminalSameSize": true,
+        "terminalSameIdentity": true,
+        "returnedToTerminal": true
+      }
+    },
+    {
+      "variant": "A",
+      "size": "narrow",
+      "viewport": {
+        "width": 1024,
+        "height": 768
+      },
+      "terminal": {
+        "x": 56,
+        "y": 52,
+        "width": 968,
+        "height": 662
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 56,
+        "height": 54
+      },
+      "nav": {
+        "x": 0,
+        "y": 54,
+        "width": 56,
+        "height": 714
+      },
+      "chrome": {
+        "x": 56,
+        "y": 0,
+        "width": 968,
+        "height": 52
+      },
+      "helper": {
+        "x": 56,
+        "y": 714,
+        "width": 968,
+        "height": 54
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 36,
+      "estimatedCols": 111,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal",
+      "interaction": {
+        "panelOpen": true,
+        "focusInPanel": true,
+        "semantics": true,
+        "hiddenTerminalInert": true,
+        "focusNotBehind": true,
+        "tabContained": true,
+        "switchedTerminal": true,
+        "composerFocused": true,
+        "composerClosed": true,
+        "escapeClosesPanel": true,
+        "retained": true,
+        "terminalSameSize": true,
+        "terminalSameIdentity": true,
+        "returnedToTerminal": true
+      }
+    },
+    {
+      "variant": "A",
+      "size": "mobile",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "terminal": {
+        "x": 0,
+        "y": 100,
+        "width": 390,
+        "height": 632
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 390,
+        "height": 50
+      },
+      "nav": {
+        "x": 0,
+        "y": 786,
+        "width": 390,
+        "height": 58
+      },
+      "chrome": {
+        "x": 0,
+        "y": 50,
+        "width": 390,
+        "height": 50
+      },
+      "helper": {
+        "x": 0,
+        "y": 732,
+        "width": 390,
+        "height": 54
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 35,
+      "estimatedCols": 43,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal",
+      "interaction": {
+        "panelOpen": true,
+        "focusInPanel": true,
+        "semantics": true,
+        "hiddenTerminalInert": true,
+        "focusNotBehind": true,
+        "tabContained": true,
+        "switchedTerminal": true,
+        "composerFocused": true,
+        "composerClosed": true,
+        "escapeClosesPanel": true,
+        "retained": true,
+        "terminalSameSize": true,
+        "terminalSameIdentity": true,
+        "returnedToTerminal": true
+      }
+    },
+    {
+      "variant": "A",
+      "size": "keyboard-390x500",
+      "viewport": {
+        "width": 390,
+        "height": 500
+      },
+      "terminal": {
+        "x": 0,
+        "y": 44,
+        "width": 390,
+        "height": 404
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "nav": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "chrome": {
+        "x": 0,
+        "y": 0,
+        "width": 390,
+        "height": 44
+      },
+      "helper": {
+        "x": 0,
+        "y": 448,
+        "width": 390,
+        "height": 52
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 22,
+      "estimatedCols": 43,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal"
+    },
+    {
+      "variant": "A",
+      "size": "state-offline",
+      "scenario": {
+        "notice": "연결이 끊겼습니다. 기존 터미널 출력은 마지막으로 받은 내용입니다. 다시 연결해도 임의로 명령을 재실행하지 않습니다.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "offline"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-refused",
+      "scenario": {
+        "notice": "다른 화면에서 현재 입력을 제어하고 있습니다. 여기서는 명령 전송이 거부됩니다. 화면 내용을 읽거나 출력 기록을 볼 수 있습니다.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "refused"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-conflict",
+      "scenario": {
+        "notice": "파일이 외부에서 수정되어 저장이 거부됐습니다. 편집 중인 문서는 유지하고 변경 내용을 비교한 뒤 다시 저장하세요.",
+        "panel": "파일",
+        "panelShown": true,
+        "state": "conflict"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-unknown",
+      "scenario": {
+        "notice": "명령 전달 결과를 확인할 수 없습니다. 중복 실행 방지를 위해 자동으로 재시도하지 않습니다. 터미널 출력을 먼저 확인하세요.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "unknown"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-host-key",
+      "scenario": {
+        "notice": "SSH 호스트 키가 이전에 승인한 값과 다릅니다. 임의로 신뢰하지 않습니다. 호스트 관리자에게 변경 사실을 확인하세요.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "host-key"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-pairing",
+      "scenario": {
+        "notice": "Node 연결 승인 또는 페어링이 만료됐습니다. 대상 컴퓨터에서 다시 승인한 뒤 재연결하세요.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "pairing"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-empty",
+      "scenario": {
+        "notice": "",
+        "panel": "최근",
+        "panelShown": true,
+        "state": "empty"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-file-run",
+      "scenario": {
+        "notice": "",
+        "panel": "실행",
+        "panelShown": true,
+        "state": "file-run"
+      }
+    },
+    {
+      "variant": "A",
+      "size": "state-remote-run",
+      "scenario": {
+        "notice": "",
+        "panel": "실행",
+        "panelShown": true,
+        "state": "remote-run"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "desktop",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "terminal": {
+        "x": 0,
+        "y": 152,
+        "width": 1440,
+        "height": 694
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 54
+      },
+      "nav": {
+        "x": 0,
+        "y": 54,
+        "width": 1440,
+        "height": 46
+      },
+      "chrome": {
+        "x": 0,
+        "y": 100,
+        "width": 1440,
+        "height": 52
+      },
+      "helper": {
+        "x": 0,
+        "y": 846,
+        "width": 1440,
+        "height": 54
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 38,
+      "estimatedCols": 167,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal",
+      "interaction": {
+        "panelOpen": true,
+        "focusInPanel": true,
+        "semantics": true,
+        "hiddenTerminalInert": true,
+        "focusNotBehind": true,
+        "tabContained": true,
+        "switchedTerminal": true,
+        "composerFocused": true,
+        "composerClosed": true,
+        "escapeClosesPanel": true,
+        "retained": true,
+        "terminalSameSize": true,
+        "terminalSameIdentity": true,
+        "returnedToTerminal": true
+      }
+    },
+    {
+      "variant": "B",
+      "size": "narrow",
+      "viewport": {
+        "width": 1024,
+        "height": 768
+      },
+      "terminal": {
+        "x": 0,
+        "y": 152,
+        "width": 1024,
+        "height": 562
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 1024,
+        "height": 54
+      },
+      "nav": {
+        "x": 0,
+        "y": 54,
+        "width": 1024,
+        "height": 46
+      },
+      "chrome": {
+        "x": 0,
+        "y": 100,
+        "width": 1024,
+        "height": 52
+      },
+      "helper": {
+        "x": 0,
+        "y": 714,
+        "width": 1024,
+        "height": 54
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 31,
+      "estimatedCols": 118,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal",
+      "interaction": {
+        "panelOpen": true,
+        "focusInPanel": true,
+        "semantics": true,
+        "hiddenTerminalInert": true,
+        "focusNotBehind": true,
+        "tabContained": true,
+        "switchedTerminal": true,
+        "composerFocused": true,
+        "composerClosed": true,
+        "escapeClosesPanel": true,
+        "retained": true,
+        "terminalSameSize": true,
+        "terminalSameIdentity": true,
+        "returnedToTerminal": true
+      }
+    },
+    {
+      "variant": "B",
+      "size": "mobile",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "terminal": {
+        "x": 0,
+        "y": 148,
+        "width": 390,
+        "height": 642
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 390,
+        "height": 50
+      },
+      "nav": {
+        "x": 0,
+        "y": 50,
+        "width": 390,
+        "height": 48
+      },
+      "chrome": {
+        "x": 0,
+        "y": 98,
+        "width": 390,
+        "height": 50
+      },
+      "helper": {
+        "x": 0,
+        "y": 790,
+        "width": 390,
+        "height": 54
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 35,
+      "estimatedCols": 43,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal",
+      "interaction": {
+        "panelOpen": true,
+        "focusInPanel": true,
+        "semantics": true,
+        "hiddenTerminalInert": true,
+        "focusNotBehind": true,
+        "tabContained": true,
+        "switchedTerminal": true,
+        "composerFocused": true,
+        "composerClosed": true,
+        "escapeClosesPanel": true,
+        "retained": true,
+        "terminalSameSize": true,
+        "terminalSameIdentity": true,
+        "returnedToTerminal": true
+      }
+    },
+    {
+      "variant": "B",
+      "size": "keyboard-390x500",
+      "viewport": {
+        "width": 390,
+        "height": 500
+      },
+      "terminal": {
+        "x": 0,
+        "y": 44,
+        "width": 390,
+        "height": 404
+      },
+      "header": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "nav": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "chrome": {
+        "x": 0,
+        "y": 0,
+        "width": 390,
+        "height": 44
+      },
+      "helper": {
+        "x": 0,
+        "y": 448,
+        "width": 390,
+        "height": 52
+      },
+      "panel": null,
+      "font": {
+        "size": "14px",
+        "lineHeight": 18,
+        "glyphWidth": 8.43
+      },
+      "estimatedRows": 22,
+      "estimatedCols": 43,
+      "pageOverflowX": false,
+      "visible": true,
+      "tabCount": 3,
+      "activeTab": "shell",
+      "activeView": "terminal"
+    },
+    {
+      "variant": "B",
+      "size": "state-offline",
+      "scenario": {
+        "notice": "연결이 끊겼습니다. 기존 터미널 출력은 마지막으로 받은 내용입니다. 다시 연결해도 임의로 명령을 재실행하지 않습니다.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "offline"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-refused",
+      "scenario": {
+        "notice": "다른 화면에서 현재 입력을 제어하고 있습니다. 여기서는 명령 전송이 거부됩니다. 화면 내용을 읽거나 출력 기록을 볼 수 있습니다.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "refused"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-conflict",
+      "scenario": {
+        "notice": "파일이 외부에서 수정되어 저장이 거부됐습니다. 편집 중인 문서는 유지하고 변경 내용을 비교한 뒤 다시 저장하세요.",
+        "panel": "파일",
+        "panelShown": true,
+        "state": "conflict"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-unknown",
+      "scenario": {
+        "notice": "명령 전달 결과를 확인할 수 없습니다. 중복 실행 방지를 위해 자동으로 재시도하지 않습니다. 터미널 출력을 먼저 확인하세요.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "unknown"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-host-key",
+      "scenario": {
+        "notice": "SSH 호스트 키가 이전에 승인한 값과 다릅니다. 임의로 신뢰하지 않습니다. 호스트 관리자에게 변경 사실을 확인하세요.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "host-key"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-pairing",
+      "scenario": {
+        "notice": "Node 연결 승인 또는 페어링이 만료됐습니다. 대상 컴퓨터에서 다시 승인한 뒤 재연결하세요.",
+        "panel": "파일",
+        "panelShown": false,
+        "state": "pairing"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-empty",
+      "scenario": {
+        "notice": "",
+        "panel": "최근",
+        "panelShown": true,
+        "state": "empty"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-file-run",
+      "scenario": {
+        "notice": "",
+        "panel": "실행",
+        "panelShown": true,
+        "state": "file-run"
+      }
+    },
+    {
+      "variant": "B",
+      "size": "state-remote-run",
+      "scenario": {
+        "notice": "",
+        "panel": "실행",
+        "panelShown": true,
+        "state": "remote-run"
+      }
+    }
+  ],
+  "problems": []
+}

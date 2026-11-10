@@ -4544,20 +4544,37 @@ details:not([open]) > :not(summary) {
   background: var(--surface-hover);
 }
 
-.workspace-run-command-editor > summary code {
+.workspace-run-command-overview {
+  display: grid;
   min-width: 0;
   overflow: hidden;
-  color: var(--text);
-  font-size: 0.67rem;
+  gap: 2px;
+}
+
+.workspace-run-command-overview > strong,
+.workspace-run-command-overview > code {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workspace-run-command-overview > strong {
+  color: var(--text);
+  font-size: 0.67rem;
+  font-weight: 680;
+}
+
+.workspace-run-command-overview > code {
+  color: var(--text-tertiary);
+  font-size: 0.59rem;
 }
 
 .workspace-run-command-card.is-empty .workspace-run-command-editor > summary {
   padding-right: 10px;
 }
 
-.workspace-run-command-card.is-empty .workspace-run-command-editor > summary code {
+.workspace-run-command-card.is-empty .workspace-run-command-overview > strong {
   color: var(--text-tertiary);
 }
 
@@ -8258,5 +8275,416 @@ details:not([open]) > :not(summary) {
 
   .workspace-page.terminal-keyboard-open .remote-workspace-bar {
     display: none;
+  }
+}
+
+/* Terminal-first candidate A: scoped to the desktop Terminal page. Other routes
+   and mobile retain their existing layout and browser action lifecycle. */
+.terminal-workspace-identity,
+.terminal-rail-utilities {
+  display: none;
+}
+
+@media (min-width: 1024px) {
+  .terminal-page {
+    --sidebar-width: 56px;
+  }
+
+  .terminal-page .workspace-header {
+    height: 54px;
+  }
+
+  .terminal-page .workspace-brand-row,
+  .terminal-page .workspace-title {
+    display: none;
+  }
+
+  .terminal-page .workspace-project-row {
+    display: flex;
+    height: 54px;
+    padding: 0;
+  }
+
+  .terminal-page .workspace-home-button {
+    width: 55px;
+    height: 53px;
+    align-self: auto;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .terminal-page .bottom-nav {
+    top: 54px;
+    bottom: 54px;
+    align-items: center;
+    gap: 2px;
+    padding: 10px 5px;
+  }
+
+  .terminal-page .workspace-nav-label {
+    display: none;
+  }
+
+  .terminal-page .bottom-nav > a {
+    display: flex;
+    width: 46px;
+    min-height: 52px;
+    flex: none;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    padding: 3px 0;
+    color: var(--text-secondary);
+    font-size: 0.61rem;
+    font-weight: 650;
+    text-align: center;
+  }
+
+  .terminal-page .bottom-nav > a svg {
+    display: block;
+    width: 18px;
+    height: 18px;
+    margin: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+  }
+
+  .terminal-page .bottom-nav > a.active::before {
+    top: 9px;
+    bottom: 9px;
+  }
+
+  .terminal-page .terminal-nav-unread {
+    top: 8px;
+    right: 7px;
+  }
+
+  .terminal-page .workspace-run-menu-navigation {
+    width: 46px;
+    flex: none;
+    margin-top: 8px;
+    padding-top: 8px;
+  }
+
+  .terminal-page .workspace-run-menu-navigation > summary {
+    width: 46px;
+    min-height: 52px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    padding: 3px 0;
+    color: var(--text-secondary);
+    font-size: 0.61rem;
+    font-weight: 650;
+    text-align: center;
+  }
+
+  .terminal-page .workspace-run-menu-navigation > summary svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .terminal-page .workspace-run-menu-navigation .workspace-run-popover {
+    position: fixed;
+    top: 54px;
+    right: auto;
+    bottom: 8px;
+    left: 64px;
+    width: min(360px, calc(100vw - 72px));
+    max-height: calc(100dvh - 62px);
+  }
+
+  .terminal-page .terminal-rail-utilities {
+    display: flex;
+    width: 46px;
+    flex: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    margin-top: auto;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .terminal-page .terminal-rail-utilities .workspace-activity-link,
+  .terminal-page .terminal-rail-utilities .user-menu-trigger {
+    display: grid;
+    width: 46px;
+    min-height: 42px;
+    height: 42px;
+    place-items: center;
+    padding: 0;
+  }
+
+  .terminal-page .terminal-rail-utilities .workspace-activity-link svg {
+    width: 18px;
+    height: 18px;
+    margin: 0;
+  }
+
+  .terminal-page .terminal-rail-utilities .user-menu-popover {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: 12px;
+    left: 64px;
+    width: min(260px, calc(100vw - 72px));
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
+  }
+
+  .terminal-page .workspace-sidebar-footer {
+    height: 54px;
+    grid-template-columns: 1fr;
+    justify-items: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  .terminal-page .workspace-sidebar-copy {
+    display: none;
+  }
+
+  .terminal-page .workspace-sidebar-usage-menu > summary {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  .terminal-page .workspace-sidebar-usage-menu .workspace-usage-popover {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: 8px;
+    left: 64px;
+    width: min(286px, calc(100vw - 72px));
+  }
+
+  .terminal-page .terminal-workspace-identity {
+    display: flex;
+    min-width: 0;
+    max-width: 180px;
+    flex: 0 1 180px;
+    flex-direction: column;
+    gap: 3px;
+    padding-right: 12px;
+    border-right: 1px solid var(--border-subtle);
+  }
+
+  .terminal-page .terminal-workspace-identity strong,
+  .terminal-page .terminal-workspace-identity small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .terminal-page .terminal-workspace-identity strong {
+    color: var(--text-primary);
+    font-size: 0.73rem;
+  }
+
+  .terminal-page .terminal-workspace-identity small {
+    color: var(--text-secondary);
+    font-size: 0.6rem;
+  }
+}
+
+/* Native, server-backed Files quick-browse sheet: the full Files route owns
+   editing, uploads, bulk actions and all mutation confirmation flows. */
+.terminal-files-drawer {
+  position: fixed;
+  top: 54px;
+  right: auto;
+  bottom: 8px;
+  left: 64px;
+  width: min(360px, calc(100vw - 72px));
+  max-width: none;
+  height: calc(100dvh - 62px);
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow-float);
+}
+.terminal-files-drawer::backdrop {
+  background: #050a10aa;
+}
+.terminal-files-drawer-inner {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+.terminal-files-drawer-header {
+  display: flex;
+  min-height: 66px;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.terminal-files-drawer-header small,
+.terminal-files-drawer-header strong {
+  display: block;
+}
+.terminal-files-drawer-header small {
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: 0.64rem;
+}
+.terminal-files-drawer-header strong {
+  font-size: 0.9rem;
+}
+.terminal-files-drawer-header button {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 1.35rem;
+  cursor: pointer;
+}
+.terminal-files-drawer-search {
+  display: flex;
+  flex: none;
+  gap: 7px;
+  margin: 0;
+  padding: 13px 15px 8px;
+}
+.terminal-files-drawer-search input {
+  min-width: 0;
+  flex: 1;
+}
+.terminal-files-drawer-search button,
+.terminal-files-drawer-footer > * {
+  min-height: 44px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+.terminal-files-drawer-location {
+  margin: 0;
+  padding: 5px 15px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-files-drawer-state {
+  margin: 0;
+  padding: 3px 15px 9px;
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+}
+.terminal-files-drawer-state:empty {
+  display: none;
+}
+.terminal-files-drawer-list {
+  min-height: 0;
+  flex: 1;
+  margin: 0;
+  padding: 5px 12px 12px;
+  overflow-y: auto;
+  list-style: none;
+  overscroll-behavior: contain;
+}
+.terminal-files-drawer-list li + li {
+  border-top: 1px solid var(--border-subtle);
+}
+.terminal-files-drawer-list a {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 5px;
+  color: var(--text);
+  font-size: 0.74rem;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.terminal-files-drawer-list a:hover,
+.terminal-files-drawer-list a:focus-visible {
+  background: var(--surface-hover);
+}
+.terminal-files-drawer-list a small {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: 0.6rem;
+}
+.terminal-files-drawer-glyph {
+  display: inline-flex;
+  width: 14px;
+  flex: none;
+  justify-content: center;
+  color: var(--accent-hover);
+}
+.terminal-files-drawer-empty {
+  padding: 14px 5px;
+  color: var(--text-secondary);
+  font-size: 0.73rem;
+}
+.terminal-files-drawer-pagination {
+  display: flex;
+  min-height: 0;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 15px;
+  color: var(--text-secondary);
+  font-size: 0.66rem;
+}
+.terminal-files-drawer-pagination a {
+  display: inline-flex;
+  min-height: 44px;
+  min-width: 44px;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-hover);
+}
+.terminal-files-drawer-footer {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+}
+.terminal-files-drawer-footer a {
+  display: inline-flex;
+  align-items: center;
+  background: var(--accent-muted);
+  color: var(--accent-hover);
+  text-decoration: none;
+}
+@media (max-width: 1023px) {
+  .terminal-files-drawer {
+    top: env(safe-area-inset-top);
+    right: 0;
+    bottom: env(safe-area-inset-bottom);
+    left: 0;
+    width: 100%;
+    height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    border: 0;
+    border-radius: 0;
   }
 }

@@ -120,7 +120,9 @@ async def test_remote_run_source_lists_only_capable_node_workspaces_and_gates_fi
         str(target_only["id"]), "/srv/target-only", "Target-only Workspace"
     )
 
-    async def empty_list(_workspace: object, _path: str):  # type: ignore[no-untyped-def]
+    async def empty_list(
+        _workspace: object, _path: str, **_options: object
+    ) -> tuple[str, list[object]]:
         return ".", []
 
     monkeypatch.setattr(app.state.remote, "list_dir", empty_list)

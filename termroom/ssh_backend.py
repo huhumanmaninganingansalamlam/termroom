@@ -81,6 +81,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_READY_POLL_SECONDS,
     WORKSPACE_COMMAND_READY_TIMEOUT_SECONDS,
     WORKSPACE_COMMAND_WRAPPER_ARGV,
+    TerminalInputRejected,
     TerminalModeRefresh,
     TerminalOutputDecoder,
     acknowledge_terminal_command,
@@ -4073,6 +4074,24 @@ class SSHBackend:
             command = capture
         return self._exec(self._computer(workspace), command)
 
+    def observe_scrollback(
+        self, workspace: dict[str, Any], terminal: dict[str, Any], *, lines: int = 100
+    ) -> tuple[str, dict[str, Any]]:
+        """Capture an existing SSH pane; never invoke ensure_workspace."""
+
+        before = self.current_pane_mode(workspace, terminal)
+        session = str(workspace["tmux_session"])
+        window = str(terminal["tmux_window"])
+        target = shlex.quote(f"{session}:{window}")
+        command = (
+            f"tmux capture-pane -p -J -S -{max(1, min(lines, 200))} -t {target}"
+        )
+        output = self._exec(self._computer(workspace), command)
+        after = self.current_pane_mode(workspace, terminal)
+        if after["window"] != before["window"] or after["pane"] != before["pane"]:
+            raise SSHBackendError("Remote Terminal changed during observation")
+        return output, after
+
     def current_pane_mode(
         self, workspace: dict[str, Any], terminal: dict[str, Any]
     ) -> dict[str, Any]:
@@ -4105,6 +4124,30 @@ class SSHBackend:
             "dead": fields[11] == "1",
             "in_mode": fields[12] == "1",
         }
+
+    def paste_terminal_input(
+        self, workspace: dict[str, Any], terminal: dict[str, Any],
+        pane: str, value: str, *, append_enter: bool,
+    ) -> dict[str, Any]:
+        mode = self.current_pane_mode(workspace, terminal)
+        if mode["window"] != terminal["tmux_window"]:
+            raise TerminalInputRejected("pane_changed")
+        if reason := terminal_command_target_error({"pane": pane}, mode):
+            raise TerminalInputRejected(reason)
+        buffer_name = "termroom-input-" + uuid.uuid4().hex
+        buffer = shlex.quote(buffer_name)
+        target = shlex.quote(pane)
+        # One remote SSH command keeps the load, paste and explicit Enter in order.
+        # The trap removes sensitive text if tmux rejects a delivery step.
+        command = (
+            "set -e; "
+            f"trap 'tmux delete-buffer -b {buffer} >/dev/null 2>&1 || true' EXIT; "
+            f"printf '%s' {shlex.quote(value)} | tmux load-buffer -b {buffer} -; "
+            f"tmux paste-buffer -p -d -b {buffer} -t {target}"
+            + (f"; tmux send-keys -t {target} Enter" if append_enter else "")
+        )
+        self._exec(self._computer(workspace), command)
+        return mode
 
     async def bridge(
         self,
@@ -4341,6 +4384,7 @@ class SSHBackend:
                                 ).encode()
                             )
                             continue
+                        self.control.mark_input(terminal_id, client_id, device_id)
                         await write_terminal_input(master_fd, raw.encode())
                         continue
                     if not isinstance(payload, dict):
@@ -4355,6 +4399,15 @@ class SSHBackend:
                                     "claim_id": payload.get("claim_id"),
                                 }
                             ).encode()
+                        )
+                        continue
+                    if kind == "control_release":
+                        released = self.control.release_browser_control(terminal_id, client_id)
+                        await websocket.send_bytes(
+                            json.dumps({
+                                **self.control.control_state(terminal_id, client_id),
+                                "released": released,
+                            }).encode()
                         )
                         continue
                     if kind in {"input", "command"} and not self.control.can_input(

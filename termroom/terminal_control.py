@@ -30,6 +30,9 @@ class TerminalControl:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._controllers: dict[str, str] = {}
+        # External claims are credential-bound. Browser partial input survives disconnect.
+        self._external_owners: dict[str, tuple[str, str]] = {}
+        self._unreleased_browser_input: set[str] = set()
         self._control_revisions: dict[str, int] = {}
         self._input_locks: dict[str, asyncio.Lock] = {}
         self._clients: dict[str, list[str]] = {}
@@ -49,7 +52,7 @@ class TerminalControl:
         safe_device_id = str(device_id).strip()
         with self._lock:
             clients = self._clients.setdefault(terminal_id, [])
-            if not clients:
+            if not clients and terminal_id not in self._controllers:
                 self._controllers[terminal_id] = client_id
                 self._control_revisions[terminal_id] = (
                     self._control_revisions.get(terminal_id, 0) + 1
@@ -80,11 +83,82 @@ class TerminalControl:
             if client_id not in self._clients.get(terminal_id, []):
                 return
             if self._controllers.get(terminal_id) != client_id:
+                self._external_owners.pop(terminal_id, None)
                 self._controllers[terminal_id] = client_id
                 self._control_revisions[terminal_id] = (
                     self._control_revisions.get(terminal_id, 0) + 1
                 )
                 self._input_owners.pop(terminal_id, None)
+
+    def release_browser_control(self, terminal_id: str, client_id: str) -> bool:
+        """Only the active browser may deliberately hand off partial input."""
+        with self._lock:
+            if self._controllers.get(terminal_id) != client_id:
+                return False
+            self._controllers.pop(terminal_id, None)
+            self._unreleased_browser_input.discard(terminal_id)
+            self._control_revisions[terminal_id] = self._control_revisions.get(terminal_id, 0) + 1
+            return True
+
+    def external_state(self, terminal_id: str, client_id: str = "") -> dict[str, int | str | bool]:
+        with self._lock:
+            external = self._external_owners.get(terminal_id)
+            owner = self._controllers.get(terminal_id)
+            return {
+                "control_revision": self._control_revisions.get(terminal_id, 0),
+                "controller_kind": "client" if external else "browser" if owner else "none",
+                "generation": external[1] if external and external[0] == client_id else "",
+                "handoff_required": terminal_id in self._unreleased_browser_input,
+            }
+
+    def claim_external(
+        self, terminal_id: str, client_id: str, expected_revision: int
+    ) -> tuple[str | None, str]:
+        """Must be called under input_lock, shared with browser claims and PTY writes."""
+        with self._lock:
+            if self._control_revisions.get(terminal_id, 0) != expected_revision:
+                return None, "control_revision_changed"
+            if terminal_id in self._unreleased_browser_input or terminal_id in self._controllers:
+                return None, "control_conflict"
+            generation = uuid.uuid4().hex
+            self._external_owners[terminal_id] = (client_id, generation)
+            self._controllers[terminal_id] = "client:" + generation
+            self._control_revisions[terminal_id] = expected_revision + 1
+            return generation, ""
+
+    def _can_external_input(
+        self, terminal_id: str, client_id: str, generation: str, revision: int
+    ) -> bool:
+        return (
+            self._external_owners.get(terminal_id) == (client_id, generation)
+            and self._controllers.get(terminal_id) == "client:" + generation
+            and self._control_revisions.get(terminal_id, 0) == revision
+        )
+
+    def can_external_input(
+        self, terminal_id: str, client_id: str, generation: str, revision: int
+    ) -> bool:
+        with self._lock:
+            return self._can_external_input(terminal_id, client_id, generation, revision)
+
+    def release_external(
+        self, terminal_id: str, client_id: str, generation: str, revision: int
+    ) -> bool:
+        with self._lock:
+            if not self._can_external_input(terminal_id, client_id, generation, revision):
+                return False
+            self._external_owners.pop(terminal_id, None)
+            self._controllers.pop(terminal_id, None)
+            self._control_revisions[terminal_id] = revision + 1
+            return True
+
+    def clear_terminal(self, terminal_id: str) -> None:
+        """Invalidate all generations after confirmed Terminal closure."""
+        with self._lock:
+            self._controllers.pop(terminal_id, None)
+            self._external_owners.pop(terminal_id, None)
+            self._unreleased_browser_input.discard(terminal_id)
+            self._control_revisions[terminal_id] = self._control_revisions.get(terminal_id, 0) + 1
 
     def control_state(self, terminal_id: str, client_id: str) -> dict[str, int | str]:
         with self._lock:
@@ -92,7 +166,10 @@ class TerminalControl:
                 "kind": "terminal_control",
                 "terminal_id": terminal_id,
                 "generation": client_id,
-                "controller_client_id": self._controllers.get(terminal_id, ""),
+                "controller_client_id": (
+                    "client" if terminal_id in self._external_owners
+                    else self._controllers.get(terminal_id, "")
+                ),
                 "control_revision": self._control_revisions.get(terminal_id, 0),
             }
 
@@ -113,6 +190,7 @@ class TerminalControl:
         with self._lock:
             if client_id in self._clients.get(terminal_id, []):
                 self._input_owners[terminal_id] = client_id
+                self._unreleased_browser_input.add(terminal_id)
                 self._bootstrap_pending.discard(terminal_id)
                 self._bootstrap_owners.pop(terminal_id, None)
                 self._input_revisions[terminal_id] = self._input_revisions.get(terminal_id, 0) + 1
@@ -161,7 +239,7 @@ class TerminalControl:
 
     def _resize_owner(self, terminal_id: str) -> str | None:
         clients = self._clients.get(terminal_id, [])
-        if not clients:
+        if not clients or terminal_id in self._external_owners:
             return None
         input_owner = self._input_owners.get(terminal_id)
         if input_owner in clients:
@@ -281,9 +359,7 @@ class TerminalControl:
                 client_devices.pop(client_id, None)
             if not clients:
                 self._clients.pop(terminal_id, None)
-                input_lock = self._input_locks.get(terminal_id)
-                if input_lock is not None and not input_lock.locked():
-                    self._input_locks.pop(terminal_id, None)
+                # Keep one lock across browser disconnect and external input claims.
                 self._client_devices.pop(terminal_id, None)
                 self._input_owners.pop(terminal_id, None)
                 self._bootstrap_owners.pop(terminal_id, None)
@@ -318,6 +394,9 @@ class TerminalControl:
                 "count": len(known_devices) + anonymous_clients,
                 "input_revision": self._input_revisions.get(terminal_id, 0),
                 "last_input_device_id": self._last_input_devices.get(terminal_id, ""),
-                "controller_client_id": self._controllers.get(terminal_id, ""),
+                "controller_client_id": (
+                    "client" if terminal_id in self._external_owners
+                    else self._controllers.get(terminal_id, "")
+                ),
                 "control_revision": self._control_revisions.get(terminal_id, 0),
             }

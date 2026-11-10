@@ -39,6 +39,49 @@ class TerminalError(RuntimeError):
     pass
 
 
+class TerminalInputRejected(TerminalError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def tmux_paste_exact(pane: str, value: str, *, append_enter: bool) -> None:
+    """One named tmux buffer and at most one explicit Enter, no pane resize.
+
+    The caller owns the Terminal input lock and checks canonical pane identity.
+    Completion means tmux handled the send, not that a TUI processed the input.
+    """
+    buffer_name = "termroom-input-" + uuid.uuid4().hex
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith("TERMROOM_"):
+            environment.pop(name, None)
+    argv = ["tmux"]
+    if socket := environment.get("PYTEST_TMUX_SOCKET"):
+        argv.extend(("-S", socket))
+
+    def run(*arguments: str, data: bytes | None = None, check: bool = True) -> None:
+        try:
+            result = subprocess.run(
+                [*argv, *arguments], input=data, capture_output=True,
+                env=environment, timeout=TERMINAL_TMUX_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TerminalError("tmux input delivery status is unknown") from exc
+        if check and result.returncode:
+            raise TerminalError("tmux input delivery status is unknown")
+
+    try:
+        run("load-buffer", "-b", buffer_name, "-", data=value.encode("utf-8"))
+        run("paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane)
+        if append_enter:
+            run("send-keys", "-t", pane, "Enter")
+    finally:
+        # A failed or interrupted paste must not leave Terminal content in tmux buffers.
+        with contextlib.suppress(TerminalError):
+            run("delete-buffer", "-b", buffer_name, check=False)
+
+
 TMUX_BROWSER_SIZE_FORMAT = (
     "#{client_width}|#{client_height}|#{window_width}|#{window_height}|#{status}"
 )
@@ -1861,6 +1904,24 @@ class TerminalManager:
             result = self._run_tmux(*(item for item in args if item != "-e"))
         return result.stdout
 
+    def observe_scrollback(
+        self, workspace: dict[str, Any], terminal: dict[str, Any], *, lines: int = 100
+    ) -> tuple[str, dict[str, Any]]:
+        """Read a known pane without ensure/reconcile, attach, focus or resize."""
+
+        mode = self.current_pane_mode(workspace, terminal)
+        if mode["window"] != str(terminal["tmux_window"]):
+            raise TerminalError("Terminal identity changed during observation")
+        target = f"{workspace['tmux_session']}:{terminal['tmux_window']}"
+        result = self._tmux_runner(TERMINAL_TMUX_TIMEOUT_SECONDS)(
+            "capture-pane", "-p", "-J", "-S", f"-{max(1, min(lines, 200))}",
+            "-t", target,
+        )
+        after = self.current_pane_mode(workspace, terminal)
+        if after["window"] != mode["window"] or after["pane"] != mode["pane"]:
+            raise TerminalError("Terminal pane changed during observation")
+        return result.stdout, after
+
     async def bridge(
         self,
         websocket: WebSocket,
@@ -2072,6 +2133,7 @@ class TerminalManager:
                             continue
                         if master_fd is None:
                             return
+                        self.control.mark_input(terminal_id, client_id, device_id)
                         await write_to_pty(raw.encode())
                         continue
 
@@ -2087,6 +2149,15 @@ class TerminalManager:
                                     "claim_id": payload.get("claim_id"),
                                 }
                             ).encode()
+                        )
+                        continue
+                    if kind == "control_release":
+                        released = self.control.release_browser_control(terminal_id, client_id)
+                        await websocket.send_bytes(
+                            json.dumps({
+                                **self.control.control_state(terminal_id, client_id),
+                                "released": released,
+                            }).encode()
                         )
                         continue
                     if kind in {"input", "command"} and not self.control.can_input(
@@ -2249,6 +2320,18 @@ class TerminalManager:
             "dead": fields[11] == "1",
             "in_mode": fields[12] == "1",
         }
+
+    def paste_terminal_input(
+        self, workspace: dict[str, Any], terminal: dict[str, Any],
+        pane: str, value: str, *, append_enter: bool,
+    ) -> dict[str, Any]:
+        mode = self.current_pane_mode(workspace, terminal)
+        if mode["window"] != terminal["tmux_window"]:
+            raise TerminalInputRejected("pane_changed")
+        if reason := terminal_command_target_error({"pane": pane}, mode):
+            raise TerminalInputRejected(reason)
+        tmux_paste_exact(pane, value, append_enter=append_enter)
+        return mode
 
     def _setup_browser_terminal(
         self,
