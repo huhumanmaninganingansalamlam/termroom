@@ -2,12 +2,12 @@
 {% block body_class %}workspace-page terminal-page{% endblock %}
 {% block extra_head %}
 <link rel="preload"
-      href="{{ url_for('static', path='vendor/d2koding-ligature-nerd-font-mono-3.5.0-core-hangul.woff2') }}?v=3.5.0.1"
+      href="{{ static_url(request, 'vendor/d2koding-ligature-nerd-font-mono-3.5.0-core-hangul.woff2') }}?v=3.5.0.1"
       as="font"
       type="font/woff2"
       crossorigin>
-<link rel="stylesheet" href="{{ url_for('static', path='terminal-font.css') }}?v={{ static_asset_version('terminal-font.css') }}">
-<link rel="stylesheet" href="{{ url_for('static', path='vendor/xterm.css') }}?v=6.0.0">
+<link rel="stylesheet" href="{{ static_url(request, 'terminal-font.css') }}?v={{ static_asset_version('terminal-font.css') }}">
+<link rel="stylesheet" href="{{ static_url(request, 'vendor/xterm.css') }}?v=6.0.0">
 {% endblock %}
 {% block workspace_content_class %}terminal-screen{% endblock %}
 {% block workspace_content %}
@@ -298,7 +298,7 @@
 </div>
 {% endblock %}
 {% block workspace_scripts %}
-<script src="{{ url_for('static', path='vendor/xterm.js') }}?v=6.0.0"></script>
-<script src="{{ url_for('static', path='vendor/addon-unicode11.js') }}?v=0.8.0"></script>
-<script src="{{ url_for('static', path='terminal.js') }}?v={{ static_asset_version('terminal.js') }}"></script>
+<script src="{{ static_url(request, 'vendor/xterm.js') }}?v=6.0.0"></script>
+<script src="{{ static_url(request, 'vendor/addon-unicode11.js') }}?v=0.8.0"></script>
+<script src="{{ static_url(request, 'terminal.js') }}?v={{ static_asset_version('terminal.js') }}"></script>
 {% endblock %}

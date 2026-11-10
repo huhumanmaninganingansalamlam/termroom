@@ -2,6 +2,17 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.23] - 2026-11-11
+
+### Fixed
+
+- Render CSS, JavaScript and font asset URLs as same-origin paths across every
+  template. HTTPS reverse proxies no longer generate blocked HTTP asset links
+  when Termroom's internal request scheme is HTTP.
+- Preserve proxy path prefixes and existing content-hashed asset versions
+  without relaxing Content Security Policy or trusting arbitrary forwarding
+  headers. Cover absent/present proxy scheme headers and proxy root paths.
+
 ## [0.4.22] - 2026-11-10
 
 ### Added

@@ -202,6 +202,15 @@ templates = Jinja2Templates(
 )
 templates.env.globals["pwa_icon_version"] = PWA_ICON_VERSION
 
+
+def _same_origin_static_url(request: Request, path: str) -> str:
+    """Keep asset links independent of reverse-proxy scheme and Host headers."""
+    return request.url_for("static", path=path).path
+
+
+templates.env.globals["static_url"] = _same_origin_static_url
+
+
 _REMOTE_STATUS_FRESH_FOR = timedelta(minutes=1)
 
 

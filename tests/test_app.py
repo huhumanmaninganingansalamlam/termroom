@@ -517,12 +517,11 @@ async def test_authentication_and_home(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("secure_cookie", "expected_scheme"),
-    [(True, "https"), (False, "http")],
-)
-async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
-    tmp_path: Path, secure_cookie: bool, expected_scheme: str
+@pytest.mark.parametrize("secure_cookie", [True, False])
+@pytest.mark.parametrize("forwarded_proto", ["https", None])
+@pytest.mark.parametrize("root_path", ["", "/termroom"])
+async def test_static_assets_use_same_origin_paths_independent_of_proxy_scheme(
+    tmp_path: Path, secure_cookie: bool, forwarded_proto: str | None, root_path: str
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -532,28 +531,26 @@ async def test_https_proxy_uses_forwarded_scheme_for_static_assets(
         access_token="test-token",
         secure_cookie=secure_cookie,
     )
-    transport = httpx.ASGITransport(app=create_app(settings), raise_app_exceptions=False)
+    transport = httpx.ASGITransport(
+        app=create_app(settings), root_path=root_path, raise_app_exceptions=False,
+    )
     async with httpx.AsyncClient(
         transport=transport,
         base_url="http://termroom",
         headers={
             "Host": "termroom.example.com",
-            "X-Forwarded-Proto": "https",
+            **({"X-Forwarded-Proto": forwarded_proto} if forwarded_proto else {}),
         },
     ) as client:
         response = await client.get("/")
 
     assert response.status_code == 401
-    css_url = (
-        f'{expected_scheme}://termroom.example.com/static/app.css'
-        f'?v={_static_asset_hash("app.css")}'
-    )
-    script_url = (
-        f'{expected_scheme}://termroom.example.com/static/app.js'
-        f'?v={_static_asset_hash("app.js")}'
-    )
+    css_url = f'{root_path}/static/app.css?v={_static_asset_hash("app.css")}'
+    script_url = f'{root_path}/static/app.js?v={_static_asset_hash("app.js")}'
     assert f'href="{css_url}"' in response.text
     assert f'src="{script_url}"' in response.text
+    assert "http://termroom.example.com/static/" not in response.text
+    assert "https://termroom.example.com/static/" not in response.text
     assert "upgrade-insecure-requests" not in response.headers["content-security-policy"]
     assert response.headers.get_list("x-frame-options") == ["SAMEORIGIN"]
     assert response.headers.get_list("permissions-policy") == [
@@ -635,7 +632,7 @@ async def test_rendered_pages_use_actual_asset_hashes_and_reuse_cached_versions(
         ("terminal_selection.js", "src"),
         ("mobile_scrollback.js", "src"),
     ):
-        url = f'http://testserver/static/{filename}?v={_static_asset_hash(filename)}'
+        url = f'/static/{filename}?v={_static_asset_hash(filename)}'
         assert f'{tag}="{url}"' in home.text
         assert f'{tag}="{url}"' in activity.text
     assert after_activity.misses == after_home.misses

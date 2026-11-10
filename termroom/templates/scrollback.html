@@ -1,11 +1,11 @@
 {% extends "workspace_base.html" %}
 {% block extra_head %}
 <link rel="preload"
-      href="{{ url_for('static', path='vendor/d2koding-ligature-nerd-font-mono-3.5.0-core-hangul.woff2') }}?v=3.5.0.1"
+      href="{{ static_url(request, 'vendor/d2koding-ligature-nerd-font-mono-3.5.0-core-hangul.woff2') }}?v=3.5.0.1"
       as="font"
       type="font/woff2"
       crossorigin>
-<link rel="stylesheet" href="{{ url_for('static', path='terminal-font.css') }}?v={{ static_asset_version('terminal-font.css') }}">
+<link rel="stylesheet" href="{{ static_url(request, 'terminal-font.css') }}?v={{ static_asset_version('terminal-font.css') }}">
 {% endblock %}
 {% block workspace_content %}
 <section class="content-heading scrollback-heading">

@@ -185,9 +185,9 @@ def test_template_static_asset_versions_match_file_hashes() -> None:
     fixed_versions: dict[str, set[str]] = {}
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     pattern = re.compile(
-        r"url_for\('static', path='([^']+)'\) }}\?v={{ static_asset_version\('([^']+)'\) }}"
+        r"static_url\(request, '([^']+)'\) }}\?v={{ static_asset_version\('([^']+)'\) }}"
     )
-    fixed_pattern = re.compile(r"url_for\('static', path='([^']+)'\) }}\?v=([0-9.]+)")
+    fixed_pattern = re.compile(r"static_url\(request, '([^']+)'\) }}\?v=([0-9.]+)")
     for template in templates_dir.glob("*.html"):
         source = template.read_text(encoding="utf-8")
         for asset, hashed_asset in pattern.findall(source):
@@ -195,6 +195,7 @@ def test_template_static_asset_versions_match_file_hashes() -> None:
             hashed_assets.setdefault(asset, set()).add(hashed_asset)
         for asset, version in fixed_pattern.findall(source):
             fixed_versions.setdefault(asset, set()).add(version)
+        assert "url_for('static'" not in source
 
     assert all(len(assets) == 1 for assets in hashed_assets.values())
     expected_app_assets = {
