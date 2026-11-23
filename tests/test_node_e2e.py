@@ -2221,7 +2221,8 @@ def test_real_node_output_seal_substitution_fails_closed(
                 assert not (metadata / "completion.json").exists()
                 (run / "release").touch()
             completed = _wait_until(
-                terminal_record, timeout=8, description="bounded seal failure",
+                terminal_record, timeout=16 if phase == "handoff" else 8,
+                description="bounded seal failure",
             )
             if phase == "handoff":
                 assert completed["state"] == "failed"

@@ -60,6 +60,12 @@ from termroom.terminals import (
     parse_tmux_terminal_records,
 )
 
+# The pipe helper is a separate Python process attached via tmux.
+# Under real Core + Node + multiple runs, process startup can exceed five
+# seconds without indicating a broken pipe. Keep a finite fail-closed bound;
+# never infer run completion from this transport readiness receipt.
+_NODE_LOG_PIPE_READY_TIMEOUT_SECONDS = 12
+
 
 class NodeRemoteRunError(SSHBackendError):
     """A typed Node target failure that fits the existing Remote Run boundary."""
@@ -254,6 +260,11 @@ if IFS= read -r -t 2 pipe_receipt < "$channel_path"; then
     fi
 fi
 ''' + script[drain_end:]
+    script = _replace_script_once(
+        script,
+        "read -r -t 5 pipe_ready",
+        f"read -r -t {_NODE_LOG_PIPE_READY_TIMEOUT_SECONDS} pipe_ready",
+    )
     return script
 
 
