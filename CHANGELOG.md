@@ -2,6 +2,30 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.24] - 2026-11-24
+
+### Added
+
+- Add discoverable Select text, Copy selection and Copy visible screen controls
+  for fullscreen mouse-reporting TUIs. Keep Unicode, wrapped rows, draft text,
+  input isolation and clipboard-denial feedback explicit.
+
+### Fixed
+
+- Bound Node Remote Run output-pipe startup readiness to a finite 12 seconds,
+  while retaining complete log seals, observed completion and idempotent replay.
+- Preserve SSH recent-file behavior for unreadable directories while keeping
+  the newer bounded SFTP traversal. Retain QA corrections for Remote Run
+  output, Git TLS defaults and rejected snapshot diagnostics.
+
+### Changed
+
+- Give scoped control routes, credential and receipt persistence, Terminal
+  copy, Files and Run menus concrete owners; align Local/SSH/Node named-command
+  reuse policy without weakening transport-specific safety.
+- Split large real Chrome and Node integration cases into focused scenarios
+  with isolated Core, SSH, tmux and process cleanup. Add architecture guards.
+
 ## [0.4.23] - 2026-11-11
 
 ### Fixed
