@@ -20,6 +20,7 @@ from fastapi.responses import (
 
 from termroom.auth import ClientCredentialManager
 from termroom.config import Settings
+from termroom.control_store import ControlStore
 from termroom.db import (
     FILE_RUN_TERMINAL_STATES,
     StateStore,
@@ -101,7 +102,7 @@ class ControlApprovalIntents:
                 self.terminal_close.pop(approval_id, None)
 
     def pending_remote_apply(
-        self, *, run: Mapping[str, Any], plan: Any, store: StateStore,
+        self, *, run: Mapping[str, Any], plan: Any, control_store: ControlStore,
     ) -> list[dict[str, str]]:
         self.prune_remote_apply()
         pending: list[dict[str, str]] = []
@@ -114,7 +115,7 @@ class ControlApprovalIntents:
                 or intent["approved"] or intent["consumed"]
             ):
                 continue
-            credential = store.get_client_credential(intent["client_id"])
+            credential = control_store.get_credential(intent["client_id"])
             if credential is None or credential.get("revoked_at"):
                 continue
             pending.append({
@@ -125,7 +126,8 @@ class ControlApprovalIntents:
         return pending
 
     def require_remote_apply(
-        self, *, approval_id: str, run_id: str, revision: str, store: StateStore,
+        self, *, approval_id: str, run_id: str, revision: str,
+        store: StateStore, control_store: ControlStore,
     ) -> dict[str, Any]:
         self.prune_remote_apply()
         intent = self.remote_apply.get(approval_id)
@@ -137,7 +139,7 @@ class ControlApprovalIntents:
         if revision != intent["revision"]:
             raise HTTPException(status_code=409, detail="The reviewed plan has changed")
         run = store.get_remote_run(run_id)
-        client_row = store.get_client_credential(intent["client_id"])
+        client_row = control_store.get_credential(intent["client_id"])
         if (
             run is None or client_row is None or client_row.get("revoked_at")
             or "operate" not in client_row["capabilities"]
@@ -165,7 +167,7 @@ class ControlApprovalIntents:
 
     def require_terminal_close(
         self, *, approval_id: str, workspace_id: str, terminal: Mapping[str, Any],
-        store: StateStore,
+        control_store: ControlStore,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.prune_terminal_close()
         intent = self.terminal_close.get(approval_id)
@@ -176,7 +178,7 @@ class ControlApprovalIntents:
             or intent["consumed"] or terminal.get("role") != "shell"
         ):
             raise HTTPException(status_code=404, detail="resource_unavailable")
-        credential = store.get_client_credential(intent["client_id"])
+        credential = control_store.get_credential(intent["client_id"])
         if credential is None or credential.get("revoked_at"):
             raise HTTPException(status_code=404, detail="resource_unavailable")
         return intent, credential
@@ -199,6 +201,7 @@ class ControlRouteContext:
     files: FileService
     terminal_control: TerminalControl
     control_credentials: ClientCredentialManager
+    control_store: ControlStore
     control_instance_id: str
     approval_intents: ControlApprovalIntents
     terminal_mutation_tasks: set[asyncio.Task[JSONResponse]]
@@ -227,6 +230,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
     files = context.files
     terminal_control = context.terminal_control
     control_credentials = context.control_credentials
+    control_store = context.control_store
     control_instance_id = context.control_instance_id
     control_apply_intents = context.approval_intents.remote_apply
     terminal_close_intents = context.approval_intents.terminal_close
@@ -328,7 +332,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
                 await control_read_gate.acquire()
                 try:
                     # A queued read cannot begin after its bearer is revoked.
-                    credential = store.get_client_credential(
+                    credential = control_store.get_credential(
                         request.state.control_client.id,
                     )
                     if credential is None or credential["revoked_at"] is not None:
@@ -340,7 +344,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
                 try:
                     result = await asyncio.shield(observer)
                     # Do not return a completed snapshot to a revoked reader.
-                    credential = store.get_client_credential(
+                    credential = control_store.get_credential(
                         request.state.control_client.id,
                     )
                     if credential is None or credential["revoked_at"] is not None:
@@ -360,7 +364,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
             raise HTTPException(status_code=404, detail="resource_unavailable")
         # Authentication precedes streamed request bodies; revocation must win
         # until a Workspace-scoped action is actually admitted.
-        credential = store.get_client_credential(client.id)
+        credential = control_store.get_credential(client.id)
         if credential is None or credential["revoked_at"] is not None:
             raise HTTPException(status_code=409, detail="credential_revoked")
         try:
@@ -541,7 +545,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
             ).encode("utf-8")
         ).hexdigest()
         try:
-            receipt, claimed = store.claim_client_action(
+            receipt, claimed = control_store.claim_action(
                 client_id=client.id, action_id=action_id, action=action,
                 resource_kind="workspace", resource_id=workspace_id,
                 payload_sha256=payload_sha256, instance_id=control_instance_id,
@@ -558,7 +562,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
         request: Request, action_id: str, *, status: str, phase: str,
         result_resource_id: str | None = None, error_code: str | None = None,
     ) -> dict[str, Any]:
-        return store.update_client_action(
+        return control_store.advance_action(
             client_id=request.state.control_client.id, action_id=action_id,
             instance_id=control_instance_id, status=status, phase=phase,
             result_resource_id=result_resource_id, error_code=error_code,
@@ -586,13 +590,13 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
         except ValueError:
             error_code = "command_limit_or_value_invalid"
         if result is None:
-            receipt = store.update_client_action(
+            receipt = control_store.advance_action(
                 client_id=client.id, action_id=action_id,
                 instance_id=control_instance_id, status="refused", phase="accepted",
                 error_code=error_code or "revision_conflict",
             )
             return _quick_control_response(receipt)
-        receipt = store.update_client_action(
+        receipt = control_store.advance_action(
             client_id=client.id, action_id=action_id,
             instance_id=control_instance_id, status="observed", phase="result_verified",
             result_resource_id=str(result["id"]),
@@ -965,7 +969,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
                         terminal_id=terminal_id, code="terminal_identity_changed",
                     )
                 # A queued rename is not admitted merely by HTTP authentication.
-                credential = store.get_client_credential(request.state.control_client.id)
+                credential = control_store.get_credential(request.state.control_client.id)
                 if credential is None or credential["revoked_at"] is not None:
                     return _terminal_action_result(
                         request, values["action_id"], status="refused", phase="accepted",
@@ -1051,7 +1055,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
                 )
             # Authentication preceded the pane wait; revocation must win
             # until this control claim is actually admitted.
-            credential = store.get_client_credential(request.state.control_client.id)
+            credential = control_store.get_credential(request.state.control_client.id)
             if credential is None or credential["revoked_at"] is not None:
                 return _terminal_action_result(
                     request, values["action_id"], status="refused", phase="accepted",
@@ -1096,7 +1100,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
             )
         async with terminal_control.input_lock(terminal_id):
             # A pending release is not admitted after its bearer is revoked.
-            credential = store.get_client_credential(request.state.control_client.id)
+            credential = control_store.get_credential(request.state.control_client.id)
             if credential is None or credential["revoked_at"] is not None:
                 return _terminal_action_result(
                     request, values["action_id"], status="refused", phase="accepted",
@@ -1193,7 +1197,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
                     )
                 # An HTTP-authenticated request may have waited for this lock
                 # or remote pane observation while its bearer was revoked.
-                credential = store.get_client_credential(request.state.control_client.id)
+                credential = control_store.get_credential(request.state.control_client.id)
                 if credential is None or credential["revoked_at"] is not None:
                     return _terminal_action_result(
                         request, values["action_id"], status="refused", phase="accepted",
@@ -1333,7 +1337,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
             raise HTTPException(status_code=404, detail="resource_unavailable")
         client_id = request.state.control_client.id
         # Re-query an immutable prior receipt even if its approval has been consumed.
-        prior = store.get_client_action(
+        prior = control_store.get_action(
             client_id, values["action_id"], instance_id=control_instance_id,
         )
         if prior is not None:
@@ -1381,7 +1385,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
                     )
                 # Approval alone is not admission: the bearer may be revoked
                 # while a close waits behind an already admitted pane write.
-                credential = store.get_client_credential(request.state.control_client.id)
+                credential = control_store.get_credential(request.state.control_client.id)
                 if credential is None or credential["revoked_at"] is not None:
                     return _terminal_action_result(
                         request, values["action_id"], status="refused", phase="accepted",
@@ -1417,7 +1421,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
     @app.get("/api/control/v1/actions/{action_id}", response_class=JSONResponse)
     async def control_action_status(request: Request, action_id: str) -> dict[str, Any]:
         client = request.state.control_client
-        row = store.get_client_action(client.id, action_id, instance_id=control_instance_id)
+        row = control_store.get_action(client.id, action_id, instance_id=control_instance_id)
         if (
             row is None
             or row["resource_kind"] != "workspace"
@@ -2366,7 +2370,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
         approval_id = values["approval_id"]
         bound = {**values, "run_id": run_id}
         # A previously claimed action is immutable and replayable even after approval expiry.
-        if store.get_client_action(
+        if control_store.get_action(
             request.state.control_client.id, values["action_id"],
             instance_id=control_instance_id,
         ) is not None:
@@ -2415,7 +2419,7 @@ def register_control_routes(app: FastAPI, context: ControlRouteContext) -> None:
             )
             return _quick_control_response(receipt)
         # Approval and review may outlive the bearer that requested the apply.
-        credential = store.get_client_credential(request.state.control_client.id)
+        credential = control_store.get_credential(request.state.control_client.id)
         if credential is None or credential["revoked_at"] is not None:
             receipt = _control_record_action(
                 request, values["action_id"], status="refused", phase="accepted",

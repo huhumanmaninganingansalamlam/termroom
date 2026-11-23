@@ -510,7 +510,7 @@ async def test_control_client_bearer_is_scoped_revocable_and_not_a_browser_sessi
         credential = created.json()["client"]
         token = credential["token"]
         assert credential["capabilities"] == ["read"]
-        saved = app.state.store.get_client_credential(credential["id"])
+        saved = app.state.control_store.get_credential(credential["id"])
         assert saved["token_hash"] != token
         assert len(saved["token_hash"]) == 64
         listed = await browser.get("/api/client-credentials")
@@ -538,7 +538,7 @@ async def test_control_client_bearer_is_scoped_revocable_and_not_a_browser_sessi
         )
         assert denied_scope.status_code == missing.status_code == 404
         assert denied_scope.json() == missing.json()
-        assert app.state.store.get_client_credential(credential["id"])["last_used_at"]
+        assert app.state.control_store.get_credential(credential["id"])["last_used_at"]
         assert (
             await agent.get("/api/control/v1/capabilities", headers={"Authorization": "Bearer bad"})
         ).status_code == 401
@@ -613,7 +613,7 @@ async def test_control_mutation_rechecks_revocation_after_streamed_body(
         assert refused.status_code == 409, refused.text
         assert refused.json()["code"] == "credential_revoked"
         assert app.state.store.list_workspace_quick_commands(one["id"]) == ()
-        assert app.state.store.get_client_action(
+        assert app.state.control_store.get_action(
             issued["id"], "body-revoke-0001",
             instance_id=app.state.control_instance_id,
         ) is None
@@ -682,7 +682,6 @@ async def test_control_action_identity_preserves_unknown_after_restart(
     issued = app.state.control_credentials.issue(
         name="runner", capabilities=["read", "operate"], workspace_ids=[one["id"]]
     )
-    store = app.state.store
     kwargs = {
         "client_id": issued["id"],
         "action_id": "request-00001",
@@ -691,64 +690,68 @@ async def test_control_action_identity_preserves_unknown_after_restart(
         "resource_id": one["id"],
         "payload_sha256": hashlib.sha256(b"synthetic-only").hexdigest(),
     }
-    first, created = store.claim_client_action(
+    first, created = app.state.control_store.claim_action(
         **kwargs, instance_id=app.state.control_instance_id
     )
     assert created and first["status"] == "accepted"
-    repeated, created = store.claim_client_action(
+    repeated, created = app.state.control_store.claim_action(
         **kwargs, instance_id=app.state.control_instance_id
     )
     assert not created and repeated["action_id"] == first["action_id"]
     with pytest.raises(ValueError, match="idempotency_conflict"):
-        store.claim_client_action(
+        app.state.control_store.claim_action(
             **{**kwargs, "payload_sha256": hashlib.sha256(b"different").hexdigest()},
             instance_id=app.state.control_instance_id,
         )
-    stage = store.update_client_action(
+    stage = app.state.control_store.advance_action(
         client_id=issued["id"], action_id=kwargs["action_id"],
         instance_id=app.state.control_instance_id,
         status="accepted", phase="pty_delivered",
     )
     assert stage["phase"] == "pty_delivered" and stage["status"] == "accepted"
     with pytest.raises(ValueError, match="backwards"):
-        store.update_client_action(
+        app.state.control_store.advance_action(
             client_id=issued["id"], action_id=kwargs["action_id"],
             instance_id=app.state.control_instance_id,
             status="accepted", phase="accepted",
         )
     with pytest.raises(ValueError, match="transport receipt"):
-        store.update_client_action(
+        app.state.control_store.advance_action(
             client_id=issued["id"], action_id=kwargs["action_id"],
             instance_id=app.state.control_instance_id,
             status="observed", phase="pty_delivered",
         )
-    assert store.get_client_action(
+    assert app.state.control_store.get_action(
         issued["id"], kwargs["action_id"], instance_id=app.state.control_instance_id
     )["status"] == "accepted"
-    recovered = store.get_client_action(
+    recovered = app.state.control_store.get_action(
         issued["id"], kwargs["action_id"], instance_id="new-core-process"
     )
     assert recovered["status"] == "unknown"
     assert recovered["phase"] == "pty_delivered"
-    still_unknown, created = store.claim_client_action(
+    still_unknown, created = app.state.control_store.claim_action(
         **kwargs, instance_id="new-core-process"
     )
     assert not created and still_unknown["status"] == "unknown"
-    assert store.get_client_action("another-client", kwargs["action_id"], instance_id="new") is None
+    assert (
+        app.state.control_store.get_action(
+            "another-client", kwargs["action_id"], instance_id="new",
+        ) is None
+    )
 
     complete_kwargs = {**kwargs, "action_id": "request-00002"}
-    completed, created = store.claim_client_action(
+    completed, created = app.state.control_store.claim_action(
         **complete_kwargs, instance_id=app.state.control_instance_id
     )
     assert created and completed["status"] == "accepted"
-    completed = store.update_client_action(
+    completed = app.state.control_store.advance_action(
         client_id=issued["id"], action_id=complete_kwargs["action_id"],
         instance_id=app.state.control_instance_id,
         status="observed", phase="process_finished",
     )
     assert completed["status"] == "observed"
     with pytest.raises(ValueError, match="erase observed completion"):
-        store.update_client_action(
+        app.state.control_store.advance_action(
             client_id=issued["id"], action_id=complete_kwargs["action_id"],
             instance_id=app.state.control_instance_id,
             status="accepted", phase="process_finished",
@@ -2087,7 +2090,7 @@ async def test_control_result_apply_waiting_for_review_refuses_revoked_credentia
         ))
         try:
             await asyncio.wait_for(entered.wait(), 5)
-            row = store.get_client_action(
+            row = app.state.control_store.get_action(
                 issued["id"], "apply-revoked-0001",
                 instance_id=app.state.control_instance_id,
             )
@@ -2106,7 +2109,7 @@ async def test_control_result_apply_waiting_for_review_refuses_revoked_credentia
         assert refused.json()["code"] == "credential_revoked"
         assert applied == []
         assert source_file.read_text(encoding="utf-8") == "human original\n"
-        row = store.get_client_action(
+        row = app.state.control_store.get_action(
             issued["id"], "apply-revoked-0001",
             instance_id=app.state.control_instance_id,
         )
@@ -2486,7 +2489,7 @@ async def test_control_terminal_close_waiting_for_lock_refuses_revoked_approval(
         try:
             receipt = None
             for _ in range(100):
-                receipt = app.state.store.get_client_action(
+                receipt = app.state.control_store.get_action(
                     issued["id"], "close-revoked-0001",
                     instance_id=app.state.control_instance_id,
                 )
@@ -2509,7 +2512,7 @@ async def test_control_terminal_close_waiting_for_lock_refuses_revoked_approval(
         assert refused.json()["code"] == "credential_revoked"
         assert closed == []
         assert app.state.store.get_terminal(selected["id"]) is not None
-        receipt = app.state.store.get_client_action(
+        receipt = app.state.control_store.get_action(
             issued["id"], "close-revoked-0001",
             instance_id=app.state.control_instance_id,
         )
@@ -2554,7 +2557,7 @@ async def test_control_terminal_rename_waiting_for_lock_refuses_revoked_credenti
         try:
             receipt = None
             for _ in range(100):
-                receipt = app.state.store.get_client_action(
+                receipt = app.state.control_store.get_action(
                     issued["id"], "rename-revoked-0001",
                     instance_id=app.state.control_instance_id,
                 )
@@ -2693,7 +2696,7 @@ async def test_control_terminal_waiting_input_refuses_revoked_credential(
         pending = asyncio.create_task(agent.post(base + "/input", headers=headers, json=payload))
         try:
             for _ in range(100):
-                row = app.state.store.get_client_action(
+                row = app.state.control_store.get_action(
                     issued["id"], payload["action_id"],
                     instance_id=app.state.control_instance_id,
                 )
@@ -2765,7 +2768,7 @@ async def test_control_terminal_waiting_release_refuses_revoked_credential(
         try:
             row = None
             for _ in range(100):
-                row = app.state.store.get_client_action(
+                row = app.state.control_store.get_action(
                     issued["id"], "release-revoked-0001",
                     instance_id=app.state.control_instance_id,
                 )
@@ -2786,7 +2789,7 @@ async def test_control_terminal_waiting_release_refuses_revoked_credential(
         assert refused.json()["status"] == "refused"
         assert refused.json()["code"] == "credential_revoked"
         assert control.external_state(terminal_id, issued["id"]) == before
-        receipt = app.state.store.get_client_action(
+        receipt = app.state.control_store.get_action(
             issued["id"], "release-revoked-0001",
             instance_id=app.state.control_instance_id,
         )
@@ -2827,7 +2830,7 @@ async def test_control_terminal_waiting_claim_refuses_revoked_credential(
         try:
             row = None
             for _ in range(100):
-                row = app.state.store.get_client_action(
+                row = app.state.control_store.get_action(
                     issued["id"], "revocation-waiting-claim-0001",
                     instance_id=app.state.control_instance_id,
                 )
@@ -3365,7 +3368,7 @@ async def test_control_read_waiting_for_slot_refuses_revoked_credential(
         assert release.wait(5), "Held observer did not get released"
         return "bounded", {"pane": "%13", "window": "@13", "dead": False}
 
-    original_credential = app.state.store.get_client_credential
+    original_credential = app.state.control_store.get_credential
     waiter_credential_reads = 0
 
     def observed_credential(client_id):
@@ -3379,7 +3382,7 @@ async def test_control_read_waiting_for_slot_refuses_revoked_credential(
                 loop.call_soon(waiter_at_workspace.set)
         return row
 
-    monkeypatch.setattr(app.state.store, "get_client_credential", observed_credential)
+    monkeypatch.setattr(app.state.control_store, "get_credential", observed_credential)
     monkeypatch.setattr(app.state.terminals, "observe_scrollback", fake_observe)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     url = (

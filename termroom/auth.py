@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import Request, WebSocket
 
 from termroom.config import Settings
+from termroom.control_store import ControlStore
 from termroom.db import StateStore
 from termroom.security import secure_compare
 
@@ -131,8 +132,9 @@ class ControlClient:
 class ClientCredentialManager:
     """Issue high-entropy bearer secrets; persist only their SHA-256 verifiers."""
 
-    def __init__(self, store: StateStore) -> None:
-        self.store = store
+    def __init__(self, store: StateStore, control_store: ControlStore) -> None:
+        self.store = store  # workspace identity remains in the existing StateStore
+        self.control_store = control_store
 
     def issue(
         self, *, name: str, capabilities: list[str], workspace_ids: list[str]
@@ -167,7 +169,7 @@ class ClientCredentialManager:
         client_id = uuid.uuid4().hex
         token = f"trc1_{client_id}.{secrets.token_urlsafe(32)}"
         verifier = hashlib.sha256(token.encode("ascii")).hexdigest()
-        row = self.store.create_client_credential(
+        row = self.control_store.create_credential(
             client_id=client_id,
             name=safe_name,
             token_hash=verifier,
@@ -183,14 +185,14 @@ class ClientCredentialManager:
         match = CONTROL_TOKEN_PATTERN.fullmatch(token)
         if match is None:
             return None
-        row = self.store.get_client_credential(match.group(1))
+        row = self.control_store.get_credential(match.group(1))
         verifier = hashlib.sha256(token.encode("ascii")).hexdigest()
         expected = str(row["token_hash"]) if row is not None else "0" * 64
         if not hmac.compare_digest(expected, verifier):
             return None
         if row is None or row["revoked_at"] is not None:
             return None
-        self.store.touch_client_credential(str(row["id"]))
+        self.control_store.touch_credential(str(row["id"]))
         return ControlClient(
             id=str(row["id"]),
             name=str(row["name"]),
@@ -199,10 +201,10 @@ class ClientCredentialManager:
         )
 
     def list_public(self) -> list[dict[str, Any]]:
-        return [self._public(row) for row in self.store.list_client_credentials()]
+        return [self._public(row) for row in self.control_store.list_credentials()]
 
     def revoke(self, client_id: str) -> dict[str, Any] | None:
-        row = self.store.revoke_client_credential(client_id)
+        row = self.control_store.revoke_credential(client_id)
         return self._public(row) if row is not None else None
 
     @staticmethod

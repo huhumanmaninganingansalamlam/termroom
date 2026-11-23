@@ -452,8 +452,18 @@ ownership separation, not a new control protocol or new manager layer.
 The 45 pre-extraction route shapes are frozen in
 [control_routes_v1.json](../tests/control_routes_v1.json) and checked by
 [test_control_routes_contract.py](../tests/test_control_routes_contract.py).
-Credential revocation, bounded concurrent reads, action receipt idempotency
-and exact Workspace/Terminal scope still use the same existing owners.
+Credential issuance and idempotent action receipts now use the concrete
+[ControlStore](../termroom/control_store.py), with unchanged SQLite
+tables/constraints and the existing [StateStore](../termroom/db.py) connection
+transaction policy. Auth, Control routes and human approval checks reference
+ControlStore directly; StateStore no longer contains credential/receipt SQL.
+The prior table DDL is independently recorded in
+[control_schema_v0423.sql](../tests/control_schema_v0423.sql), with migration
+regression coverage in [test_control_store.py](../tests/test_control_store.py).
+Browser-approved intents remain transient per-process state in the Control
+feature, not durable client credentials. Credential revocation, bounded
+concurrent reads, receipt idempotency and exact Workspace/Terminal scope
+keep their original rules.
 Browser approval pages retain human session and CSRF admission. Do not
 equate action acceptance/PTY transport with observed process completion.
 

@@ -49,6 +49,7 @@ from termroom.control_api import (
     ControlRouteContext,
     register_control_routes,
 )
+from termroom.control_store import ControlStore
 from termroom.db import (
     MAX_WORKSPACE_COMMANDS,
     StateStore,
@@ -570,7 +571,8 @@ def create_app(settings: Settings) -> FastAPI:
     )
     workspace_usage = WorkspaceUsageService()
     auth = AuthManager(settings)
-    control_credentials = ClientCredentialManager(store)
+    control_store = ControlStore(store)
+    control_credentials = ClientCredentialManager(store, control_store)
     control_instance_id = uuid.uuid4().hex
     # Instance-local approvals expire closed on restart; no persistent permission is minted.
     control_approvals = ControlApprovalIntents()
@@ -600,6 +602,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.workspace_usage = workspace_usage
     app.state.auth = auth
     app.state.control_credentials = control_credentials
+    app.state.control_store = control_store
     app.state.control_instance_id = control_instance_id
     app.state.terminal_mutation_tasks = terminal_mutation_tasks
     app.state.runtime_stamp = runtime_stamp()
@@ -1289,6 +1292,7 @@ def create_app(settings: Settings) -> FastAPI:
             files=files,
             terminal_control=terminal_control,
             control_credentials=control_credentials,
+            control_store=control_store,
             control_instance_id=control_instance_id,
             approval_intents=control_approvals,
             terminal_mutation_tasks=terminal_mutation_tasks,
@@ -1808,7 +1812,7 @@ def create_app(settings: Settings) -> FastAPI:
                 502,
             )
         pending_control_approvals = control_approvals.pending_remote_apply(
-            run=run, plan=plan, store=store,
+            run=run, plan=plan, control_store=control_store,
         )
         return templates.TemplateResponse(
             request=request,
@@ -1910,7 +1914,8 @@ def create_app(settings: Settings) -> FastAPI:
         form = await _verified_form(request, settings)
         revision = str(form.get("revision") or "")
         intent = control_approvals.require_remote_apply(
-            approval_id=approval_id, run_id=run_id, revision=revision, store=store,
+            approval_id=approval_id, run_id=run_id, revision=revision,
+            store=store, control_store=control_store,
         )
         try:
             plan = await run_results.review(run_id)
@@ -3821,7 +3826,7 @@ def create_app(settings: Settings) -> FastAPI:
         terminal = _require_terminal(store, workspace_id, terminal_id)
         intent, credential = control_approvals.require_terminal_close(
             approval_id=approval_id, workspace_id=workspace_id,
-            terminal=terminal, store=store,
+            terminal=terminal, control_store=control_store,
         )
         return workspace, terminal, intent, credential
 

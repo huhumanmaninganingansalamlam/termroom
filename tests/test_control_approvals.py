@@ -27,7 +27,7 @@ class _EvidenceStore:
             "computer_id": "node-actual",
         }]
 
-    def get_client_credential(self, client_id: str):
+    def get_credential(self, client_id: str):
         return self.credential if client_id == self.credential["id"] else None
 
     def get_remote_run(self, run_id: str):
@@ -71,7 +71,7 @@ def test_remote_approval_rechecks_exact_grant_and_revocation() -> None:
     state.remote_apply["id-exact"] = _remote_intent()
     intent = state.require_remote_apply(
         approval_id="id-exact", run_id="run-actual", revision="revision-1",
-        store=store,
+        store=store, control_store=store,
     )
     assert intent is state.remote_apply["id-exact"]
     state.approve_remote_apply(
@@ -83,7 +83,7 @@ def test_remote_approval_rechecks_exact_grant_and_revocation() -> None:
     with pytest.raises(HTTPException) as done:
         state.require_remote_apply(
             approval_id="id-exact", run_id="run-actual", revision="revision-1",
-            store=store,
+            store=store, control_store=store,
         )
     assert done.value.status_code == 404
 
@@ -91,13 +91,13 @@ def test_remote_approval_rechecks_exact_grant_and_revocation() -> None:
     with pytest.raises(HTTPException) as revised:
         state.require_remote_apply(
             approval_id="new", run_id="run-actual", revision="revision-2",
-            store=store,
+            store=store, control_store=store,
         )
     assert revised.value.status_code == 409
     with pytest.raises(HTTPException) as wrong_run:
         state.require_remote_apply(
             approval_id="new", run_id="run-other", revision="revision-1",
-            store=store,
+            store=store, control_store=store,
         )
     assert wrong_run.value.status_code == 404
 
@@ -105,7 +105,7 @@ def test_remote_approval_rechecks_exact_grant_and_revocation() -> None:
     with pytest.raises(HTTPException) as revoked:
         state.require_remote_apply(
             approval_id="new", run_id="run-actual", revision="revision-1",
-            store=store,
+            store=store, control_store=store,
         )
     assert revoked.value.status_code == 404
     store.credential["revoked_at"] = None
@@ -113,7 +113,7 @@ def test_remote_approval_rechecks_exact_grant_and_revocation() -> None:
     with pytest.raises(HTTPException) as missing_target:
         state.require_remote_apply(
             approval_id="new", run_id="run-actual", revision="revision-1",
-            store=store,
+            store=store, control_store=store,
         )
     assert missing_target.value.status_code == 404
 
@@ -134,7 +134,7 @@ def test_close_approval_rejects_stale_pane_and_revoked_client() -> None:
     }
     intent, credential = state.require_terminal_close(
         approval_id="id", workspace_id="workspace-source",
-        terminal=terminal, store=store,
+        terminal=terminal, control_store=store,
     )
     assert credential["id"] == "client-exact"
     assert intent["approved"] is False
@@ -143,13 +143,13 @@ def test_close_approval_rejects_stale_pane_and_revoked_client() -> None:
     with pytest.raises(HTTPException) as changed_pane:
         state.require_terminal_close(
             approval_id="id", workspace_id="workspace-source",
-            terminal={**terminal, "tmux_window": "@24"}, store=store,
+            terminal={**terminal, "tmux_window": "@24"}, control_store=store,
         )
     assert changed_pane.value.status_code == 404
     store.credential["revoked_at"] = "2026-11-23T00:00:00Z"
     with pytest.raises(HTTPException) as revoked:
         state.require_terminal_close(
             approval_id="id", workspace_id="workspace-source",
-            terminal=terminal, store=store,
+            terminal=terminal, control_store=store,
         )
     assert revoked.value.status_code == 404
