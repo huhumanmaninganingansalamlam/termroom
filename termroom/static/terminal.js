@@ -202,6 +202,7 @@
   const mouseService = term._core.coreMouseService;
   const reportMouse = mouseService.triggerMouseEvent.bind(mouseService);
   mouseService.triggerMouseEvent = (event) => {
+    if (terminalCopyModeActive) return false;
     // An ended shell cannot consume reports; tmux still needs pane-selection clicks.
     if (paneMode?.shell_foreground === true && !paneMode.alternate && !paneMode.dead) return false;
     return reportMouse(event);
@@ -343,6 +344,8 @@
   let mobileViewportBaselineWidth = window.visualViewport?.width || window.innerWidth;
 
   let controlGeneration = null;
+  let terminalCopyModeActive = false;
+  let setCopyMouseGate = null;
   let controlRevision = 0;
   let controlsInput = false;
   let controlClaimPending = false;
@@ -356,9 +359,31 @@
   const MAX_PENDING_CONTROL_BYTES = 1024 * 1024;
   Object.defineProperty(host, "termroomControlsInput", { get: () => controlsInput });
   const updateInputControl = () => {
-    term.options.disableStdin = !controlsInput && !controlClaimPending;
+    term.options.disableStdin = terminalCopyModeActive || (!controlsInput && !controlClaimPending);
     if (releaseControlButton) releaseControlButton.disabled = !controlsInput;
   };
+
+  host.termroomSetCopyMode = (enabled) => {
+    const selecting = Boolean(enabled);
+    if (selecting === terminalCopyModeActive) return true;
+    if (!setCopyMouseGate) {
+      setCopyMouseGate = window.TermroomSelectionOwnership?.createCopyMouseGate(mouseService);
+    }
+    if (!setCopyMouseGate) return false;
+    setCopyMouseGate(selecting);
+    terminalCopyModeActive = selecting;
+    updateInputControl();
+    if (selecting) terminalTextarea?.blur();
+    else term.clearSelection();
+    return true;
+  };
+  host.termroomGetSelection = () => term.hasSelection() ? term.getSelection() : "";
+  host.termroomGetVisibleText = () =>
+    window.TermroomSelectionOwnership?.visibleTerminalText(term) || "";
+  term.onSelectionChange?.(() => {
+    host.dispatchEvent(new Event("termroom:terminal-selection-changed"));
+  });
+  window.dispatchEvent?.(new Event("termroom:terminal-copy-ready"));
   const acceptInputControl = (value) => {
     if (
       value?.terminal_id !== host.dataset.terminalId ||

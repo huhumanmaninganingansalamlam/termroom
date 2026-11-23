@@ -51,6 +51,18 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
       <span class="terminal-tool-label">{{ t('terminal.output') }}</span>
     </a>
+    <button id="terminal-copy-mode"
+            class="terminal-tool-button terminal-copy-mode-button"
+            type="button"
+            aria-pressed="false"
+            aria-controls="terminal-copy-controls"
+            aria-label="{{ t('terminal.copy_mode_on') }}"
+            title="{{ t('terminal.copy_mode_on') }}"
+            disabled>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h9a2 2 0 0 1 2 2v10M6 8h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z"/></svg>
+      <span class="terminal-tool-label">{{ t('terminal.copy_mode_on') }}</span>
+      <span class="terminal-copy-mobile-label">{{ t('terminal.copy_mode_short') }}</span>
+    </button>
     <div class="new-terminal-menu terminal-manage-menu" data-popover>
       <button class="terminal-tool-button"
               type="button"
@@ -184,6 +196,12 @@
   </span>
 </aside>
 {% endif %}
+<div id="terminal-copy-controls" class="terminal-copy-controls" hidden>
+  <span id="terminal-copy-hint">{{ t('terminal.copy_hint') }}</span>
+  <button id="terminal-copy-selection" type="button" disabled>{{ t('terminal.copy_selection') }}</button>
+  <button id="terminal-copy-visible" type="button" disabled>{{ t('terminal.copy_visible') }}</button>
+  <span id="terminal-copy-status" role="status" aria-live="polite"></span>
+</div>
 <div id="terminal"
      class="terminal-host"
      role="region"

@@ -1543,6 +1543,244 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
                     f"enter_count={raw_t39.count(bytes([13]))} "
                     f"client_receipt={receipt.json()['phase']} stale_refused=True"
                 )
+
+            # TUI copy: exercise the production Terminal in the same isolated
+            # Chrome + private tmux pane. No second browser/server harness.
+            copy_script = tmp_path / "copy_tui_fixture.py"
+            copy_bytes = tmp_path / "copy_tui_input.bin"
+            copy_script.write_text(
+                """import os, select, sys, termios, time, tty
+fd=sys.stdin.fileno()
+old=termios.tcgetattr(fd)
+try:
+    tty.setraw(fd)
+    sys.stdout.write("\\x1b[?1049h\\x1b[?1000h\\x1b[?1006h"
+                     "\\x1b[2J\\x1b[HFIRST-한글-LINE\\r\\nSECOND-한글-LINE")
+    sys.stdout.flush()
+    end=time.monotonic()+45
+    while time.monotonic()<end:
+        ready,_,_=select.select([fd],[],[],0.1)
+        if ready:
+            with open(sys.argv[1],"ab") as output:
+                output.write(os.read(fd,4096))
+finally:
+    sys.stdout.write("\\x1b[?1000l\\x1b[?1006l\\x1b[?1049l")
+    sys.stdout.flush()
+    termios.tcsetattr(fd,termios.TCSADRAIN,old)
+""", encoding="utf-8",
+            )
+            app.state.terminals._run_tmux(
+                "send-keys", "-l", "-t", target,
+                f"python3 -u {shlex.quote(str(copy_script))} {shlex.quote(str(copy_bytes))}",
+            )
+            app.state.terminals._run_tmux("send-keys", "-t", target, "Enter")
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if evaluate(
+                    "document.querySelector('#terminal')"
+                    ".termroomGetVisibleText().includes('FIRST-한글-LINE') && "
+                    "document.querySelector('#terminal').termroomPaneMode?.mouse_tracking === true"
+                ):
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("Real TUI copy fixture not painted or not tracking mouse")
+
+            # A non-modified drag is passed to the TUI before selecting copy mode.
+            # Copy controls change the viewport layout. Recalculate after each
+            # toggle instead of sending synthetic mouse events to stale pixels.
+            def tui_drag() -> None:
+                x = evaluate("""(() => {
+                  const host=document.querySelector('#terminal');
+                  const screen=host.querySelector('.xterm-screen').getBoundingClientRect();
+                  const row=host.querySelector('.xterm-rows > div').getBoundingClientRect();
+                  const w=parseFloat(getComputedStyle(host).getPropertyValue(
+                    '--termroom-terminal-cell-width')) || 8;
+                  return {sx:screen.left+w,ex:screen.left+w*17,y:screen.top+row.height/2};
+                })()""")
+                cdp("Input.dispatchMouseEvent", {
+                    "type": "mousePressed", "x": x["sx"], "y": x["y"],
+                    "button": "left", "buttons": 1, "clickCount": 1,
+                })
+                # A real pointer moves through intermediate cells while held.
+                # A single teleporting CDP event can race xterm's selection
+                # requestAnimationFrame and leave no selection at mouseup.
+                for index in range(1, 8):
+                    cdp("Input.dispatchMouseEvent", {
+                        "type": "mouseMoved",
+                        "x": x["sx"] + (x["ex"] - x["sx"]) * index / 7,
+                        "y": x["y"], "button": "left", "buttons": 1,
+                    })
+                    time.sleep(0.025)
+                cdp("Input.dispatchMouseEvent", {
+                    "type": "mouseReleased", "x": x["ex"], "y": x["y"],
+                    "button": "left", "buttons": 0, "clickCount": 1,
+                })
+
+            def tui_click(selector: str) -> None:
+                r = evaluate("""(() => {
+                  const r=document.querySelector(SELECTOR).getBoundingClientRect();
+                  return {x:r.left+r.width/2,y:r.top+r.height/2};
+                })()""".replace("SELECTOR", json.dumps(selector)))
+                for kind in ("mousePressed", "mouseReleased"):
+                    cdp("Input.dispatchMouseEvent", {
+                        "type": kind, "x": r["x"], "y": r["y"],
+                        "button": "left", "clickCount": 1,
+                    })
+
+            tui_drag()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not copy_bytes.exists():
+                time.sleep(0.05)
+            assert copy_bytes.exists(), "ordinary TUI drag sent no mouse bytes"
+            before_copy = copy_bytes.read_bytes()
+            assert before_copy, "zero bytes before copy mode"
+
+            cdp("Browser.grantPermissions", {
+                "origin": base_url,
+                "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"],
+            })
+            tui_click("#terminal-copy-mode")
+            assert evaluate(
+                "document.querySelector('#terminal-copy-mode').getAttribute('aria-pressed')"
+            ) == "true"
+            assert not evaluate(
+                "document.querySelector('#terminal .xterm')"
+                ".classList.contains('enable-mouse-events')"
+            )
+            # Wait until the copy-controls layout and xterm dimensions settle.
+            time.sleep(0.15)
+            tui_drag()
+            deadline = time.monotonic() + 3
+            selected = ""
+            while time.monotonic() < deadline:
+                selected = evaluate(
+                    "document.querySelector('#terminal').termroomGetSelection()"
+                )
+                if selected:
+                    break
+                time.sleep(0.05)
+            assert "한글" in selected, selected
+            time.sleep(0.3)
+            assert copy_bytes.read_bytes() == before_copy, "copy-mode selection sent PTY bytes"
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if evaluate(
+                    "!document.querySelector('#terminal-copy-selection').disabled"
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Selected xterm text did not enable Copy selection")
+            tui_click("#terminal-copy-selection")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if evaluate(
+                    "document.querySelector('#terminal-copy-status').textContent"
+                ) == "Copied to clipboard":
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Copy selection did not confirm browser clipboard write")
+            clipboard = cdp("Runtime.evaluate", {
+                "expression": "navigator.clipboard.readText()",
+                "awaitPromise": True, "returnByValue": True,
+            })
+            assert clipboard["result"]["value"] == selected
+            # Explicit keyboard focus may replace the current selection, so
+            # verify PTY keyboard suppression after the exact-selection copy.
+            # Even explicit textarea focus cannot bypass xterm's input gate.
+            assert evaluate("""(() => {
+              document.querySelector('#terminal .xterm-helper-textarea').focus();
+              return document.querySelector('#terminal-copy-mode')
+                .getAttribute('aria-pressed') === 'true';
+            })()""")
+            cdp("Input.insertText", {"text": "COPY-SHOULD-NOT-INPUT-한글"})
+            time.sleep(0.2)
+            assert copy_bytes.read_bytes() == before_copy, "copy-mode keyboard input reached PTY"
+            visible = evaluate(
+                "document.querySelector('#terminal').termroomGetVisibleText()"
+            )
+            assert "FIRST-한글-LINE\nSECOND-한글-LINE" in visible, repr(visible)
+            tui_click("#terminal-copy-visible")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                copied = cdp("Runtime.evaluate", {
+                    "expression": "navigator.clipboard.readText()",
+                    "awaitPromise": True, "returnByValue": True,
+                })["result"].get("value")
+                if copied == visible:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Copy visible screen clipboard mismatch")
+            assert copy_bytes.read_bytes() == before_copy
+            assert evaluate("document.querySelector('#command-input').value") == (
+                "private-draft-한글-keep"
+            )
+            # A denied Clipboard API write must show failure, not retain success.
+            assert evaluate("""(() => {
+              navigator.clipboard.writeText = () => Promise.reject(
+                new DOMException('Denied', 'NotAllowedError'));
+              return true;
+            })()""")
+            tui_click("#terminal-copy-visible")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if evaluate(
+                    "document.querySelector('#terminal-copy-status').textContent"
+                ) == (
+                    "Could not copy. Use Ctrl+C or ⌘C on the selection; "
+                    "clipboard permission or HTTPS may be required."
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Browser clipboard write denial was not surfaced")
+            tui_click("#terminal-copy-mode")
+            assert evaluate(
+                "document.querySelector('#terminal-copy-mode').getAttribute('aria-pressed')"
+            ) == "false"
+            tui_drag()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and copy_bytes.stat().st_size <= len(before_copy):
+                time.sleep(0.05)
+            assert copy_bytes.stat().st_size > len(before_copy), "TUI mouse input not restored"
+            # Responsive smoke: virtual mobile viewport checks discoverability,
+            # but is NOT evidence of a physical touch gesture.
+            cdp("Emulation.setDeviceMetricsOverride", {
+                "width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": True,
+            })
+            metrics = evaluate("""(() => {
+              const button=document.querySelector('#terminal-copy-mode');
+              const rect=button.getBoundingClientRect();
+              const short=button.querySelector('.terminal-copy-mobile-label');
+              return {width:innerWidth, left:rect.left, right:rect.right,
+                height:rect.height, label:getComputedStyle(short).display,
+                text:short.textContent};
+            })()""")
+            assert metrics["left"] >= 0 and metrics["right"] <= metrics["width"], metrics
+            assert metrics["height"] >= 44, metrics
+            assert metrics["label"] != "none", metrics
+            assert metrics["text"] == "Select", metrics
+            tui_click("#terminal-copy-mode")
+            assert evaluate(
+                "!document.querySelector('#terminal-copy-controls').hidden"
+            )
+            action_heights = evaluate("""Array.from(
+              document.querySelectorAll('#terminal-copy-controls button')
+            ).map(button => button.getBoundingClientRect().height)""")
+            assert min(action_heights) >= 44, action_heights
+            assert evaluate(
+                "document.querySelector('#terminal-copy-mode')"
+                ".querySelector('.terminal-copy-mobile-label').textContent"
+            ) == "Exit"
+            tui_click("#terminal-copy-mode")
+            print(
+                "TUI-copy Chrome clipboard exact; PTY quiet in copy mode; "
+                "mouse restored; responsive control visible"
+            )
+
     finally:
         if chrome is not None and chrome.poll() is None:
             os.killpg(chrome.pid, signal.SIGTERM)

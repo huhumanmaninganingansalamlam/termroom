@@ -271,6 +271,7 @@ host.addEventListener('termroom:pane-mode', () => modeEvents++);
 let paneMode = null;
 let paneModeGeneration = null;
 let paneModeRevision = 0;
+let terminalCopyModeActive = false;
 const mouseReports = [];
 const term = {_core:{coreMouseService:{triggerMouseEvent(event) {
  mouseReports.push(event); return true;

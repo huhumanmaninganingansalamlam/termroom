@@ -89,6 +89,33 @@ clipboard
 shell/TUI가 bracketed paste mode를 켰다면 xterm이 `CSI 200~` / `CSI 201~`를 처리한다.
 command editor에 붙여넣은 내용은 실행 전 textarea에서 수정할 수 있다.
 
+## 4a. Copying the current TUI screen
+
+Fullscreen mouse-reporting applications (Vim, tmux and coding-agent TUIs) receive
+ordinary mouse drags instead of letting xterm select text. Terminal exposes a
+visible **Select text / 텍스트 선택** toggle in the top toolbar. While it is on,
+xterm receives the mouse for selecting text rather than forwarding mouse reports
+to the PTY, and xterm keyboard input is disabled. The toggle remains active until
+the person explicitly selects **Exit selection / 선택 종료**, or switches Terminal.
+
+- Drag over the current xterm screen, then choose **Copy selection / 선택 영역 복사**
+  to copy xterm's exact selection. Soft-wrap and UTF-8/Korean boundaries come
+  from xterm's public selection API; do not reconstruct the selection from HTML.
+- **Copy visible screen / 현재 화면 복사** uses xterm's public active-buffer rows.
+  It does not fetch the scrollback history and does not mean the whole tmux
+  backlog. It merges soft-wrapped rows and omits trailing empty rows.
+- Clipboard write requires a secure browser context and permission. On rejection
+  the UI shows failure; browser-native Ctrl+C or ⌘C on a selection remains a
+  fallback. No success claim is based solely on clicking the button.
+- The current mouse protocol is restored on exit even if the TUI changed its
+  requested protocol while selection was active. Normal tmux/Vim mouse input
+  remains available immediately after exiting the mode.
+- The state owner is terminal_selection.js + its integration in
+  mobile_scrollback.js; terminal.js only gates xterm input and exposes public
+  selection/viewport access. No parallel mobile clipboard algorithm is allowed.
+- Touch controls offer visible-screen copy without a drag. Physical-device text
+  drag support and macOS Safari behavior require device-specific verification.
+
 ## 5. Helper keys
 
 화면의 Esc, Tab, Ctrl, C-c, 방향키 등도 별도 raw WebSocket bypass를 만들지 않는다.
