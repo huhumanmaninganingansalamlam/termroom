@@ -44,7 +44,10 @@ jobs:
         run: uv sync --all-groups --frozen
 
       - name: Lint Python
-        run: uv run --frozen ruff check termroom tests
+        run: uv run --frozen ruff check termroom tests scripts
+
+      - name: Check accepted architecture ownership
+        run: uv run --frozen python scripts/check_architecture.py
 
       - name: Run tests
         run: |

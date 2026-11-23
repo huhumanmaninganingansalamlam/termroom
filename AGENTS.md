@@ -31,7 +31,8 @@ running terminal sessions. Work inside the product Git root (repos/ in the
 private task workspace).
 
     uv sync --all-groups --frozen
-    uv run --frozen ruff check termroom tests
+    uv run --frozen ruff check termroom tests scripts
+    uv run --frozen python scripts/check_architecture.py
     uv run --frozen pytest -q tests/test_terminal_copy.py tests/test_mobile_scrollback.py
     uv run --frozen pytest -q
     uv run --frozen pytest -q tests/test_websocket.py  # separate process in CI

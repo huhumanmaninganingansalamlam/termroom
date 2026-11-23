@@ -43,6 +43,8 @@ def test_agent_map_links_resolve_to_real_files() -> None:
     assert "PTY write" in map_file.read_text()
     assert "idempotency" in map_file.read_text().lower()
     assert "CAS" in map_file.read_text()
+    assert "scripts/check_architecture.py" in map_file.read_text()
+    assert (ROOT / "scripts/check_architecture.py").is_file()
 
 
 def test_public_entry_docs_point_to_same_feature_map() -> None:

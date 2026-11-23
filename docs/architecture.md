@@ -439,6 +439,22 @@ pairing must not infer manifests, install packages, or run arbitrary initializat
 Locale JSON lives under `termroom/locales/`. User-facing cookies and product copy
 use Termroom names.
 
+## Mechanical ownership guardrails
+
+The small [check_architecture.py](../scripts/check_architecture.py) script
+rejects only completed, evidence-backed boundary regressions: control routes
+returning to the app factory, client/receipt SQL returning to StateStore,
+duplicate managed-command reuse policy in the three concrete backends,
+Terminal copy/Files/Run UI returning to global scripts, Terminal-only scripts
+loaded on all pages, or duplicated Chrome CDP/profile startup in the real
+integration scenarios. There are no line-count quotas or generic managers.
+
+[Negative fixtures](../tests/test_architecture.py) prove each rule reports
+its offending path and expected remediation. CI runs the quick checker before
+the full tests, and pytest runs the fixtures. A legitimate new product
+decision must change the actual owner **and** its direct regression proof
+before the rule is revised; never silence or exclude a failure to turn CI green.
+
 ## Local, SSH and Node managed-command parity
 
 The exact launch identity and managed tmux slot reuse decision are shared
