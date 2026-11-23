@@ -701,9 +701,9 @@ def _isolated_chrome_abc(tmp_path: Path) -> Iterator[_ABCChrome]:
         directory.mkdir()
         (directory / "qa-target.txt").write_text(f"project-{name}\n", encoding="utf-8")
         if name == "c":
-            # Force the file-run start response to remain in its true
-            # process-started phase, independent of host scheduling. Release
-            # the real child only after the response has been asserted.
+            # Keep the real child alive while we observe its startup.
+            # Its exit gate controls completion, not scheduler readiness:
+            # dispatch can precede a real observed process start.
             release = directory / "qa-c-run-release"
             (directory / "qa-check.py").write_text(
                 "from pathlib import Path\nimport time\n"
@@ -1117,8 +1117,30 @@ def test_real_chrome_a_is_unchanged_by_scoped_b_c_mutations(tmp_path: Path) -> N
                 },
             )
             assert started.status_code == 202, started.text
-            assert started.json()["phase"] == "process_started"
-            c_run_id = started.json()["run"]["id"]
+            response = started.json()
+            assert response["status"] == "accepted", response
+            c_run_id = response["run"]["id"]
+            assert response["result_resource_id"] == c_run_id, response
+            # The POST reports what was actually observed at admission time.
+            # A busy runner can return preparing/dispatched before the tmux
+            # process starts. Do not upgrade transport dispatch to startup.
+            if response["phase"] == "process_started":
+                assert response["run"]["state"] == "running", response
+            else:
+                assert response["phase"] == "dispatched", response
+                assert response["run"]["state"] == "preparing", response
+                assert response["run"]["started_at"] is None, response
+            deadline = time.monotonic() + 12
+            actual_start = app.state.file_runs.reconcile(c_run_id)
+            while actual_start["state"] == "preparing":
+                assert time.monotonic() < deadline, {"receipt": response, "run": actual_start}
+                time.sleep(0.05)
+                actual_start = app.state.file_runs.reconcile(c_run_id)
+            assert actual_start["state"] == "running", {
+                "receipt": response, "run": actual_start,
+            }
+            assert actual_start["started_at"] is not None, actual_start
+            # Only release the real child after the run has been observed alive.
             (project_root / "c" / "qa-c-run-release").touch()
 
         deadline = time.monotonic() + 10
