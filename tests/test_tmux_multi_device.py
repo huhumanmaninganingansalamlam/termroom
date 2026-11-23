@@ -9,9 +9,7 @@ import os
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -19,7 +17,6 @@ from typing import Any
 
 import httpx
 import pytest
-import uvicorn
 
 from termroom.db import StateStore
 from termroom.node_agent import NodeRuntime
@@ -31,6 +28,8 @@ from termroom.terminals import (
     tmux_browser_view_session,
 )
 from termroom.workspaces import RootManager, WorkspaceManager
+from tests.support.chrome import open_chrome_page
+from tests.support.core import IsolatedCore, start_isolated_core
 
 
 def _wait_for_window_size(manager: TerminalManager, target: str, expected: str) -> None:
@@ -671,8 +670,6 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
 ) -> None:
     """A stays live while scoped B/C clients read, edit, and run real work."""
 
-    from websockets.sync.client import connect as websocket_connect
-
     from termroom.app import create_app
     from termroom.config import Settings
 
@@ -683,7 +680,19 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
         directory.mkdir()
         (directory / "qa-target.txt").write_text(f"project-{name}\n", encoding="utf-8")
         if name == "c":
-            (directory / "qa-check.py").write_text("print('qa-c-run-ok')\n", encoding="utf-8")
+            # Force the file-run start response to remain in its true
+            # process-started phase, independent of host scheduling. Release
+            # the real child only after the response has been asserted.
+            release = directory / "qa-c-run-release"
+            (directory / "qa-check.py").write_text(
+                "from pathlib import Path\nimport time\n"
+                f"gate = Path({str(release)!r})\n"
+                "deadline = time.monotonic() + 15\n"
+                "while not gate.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.02)\n"
+                "print('qa-c-run-ok')\n",
+                encoding="utf-8",
+            )
     settings = Settings.create(
         project_root, state_dir=tmp_path / "state",
         login_password="isolated-qa-password", access_token="isolated-qa-token",
@@ -702,30 +711,10 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
         for name in ("b", "c")
     }
 
-    with socket.socket() as port_socket:
-        port_socket.bind(("127.0.0.1", 0))
-        port = int(port_socket.getsockname()[1])
-    base_url = f"http://127.0.0.1:{port}"
-    server = uvicorn.Server(
-        uvicorn.Config(
-            app, host="127.0.0.1", port=port,
-            log_level="error", access_log=False,
-        )
-    )
-    server_thread = threading.Thread(target=server.run, daemon=True)
-    chrome: subprocess.Popen[bytes] | None = None
+    core: IsolatedCore | None = None
     try:
-        server_thread.start()
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                if httpx.get(f"{base_url}/health", timeout=0.3).status_code == 200:
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.05)
-        else:
-            raise AssertionError("Isolated Termroom Core did not become ready")
+        core = start_isolated_core(app)
+        base_url = core.base_url
 
         with httpx.Client(base_url=base_url) as login:
             response = login.post(
@@ -736,79 +725,33 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
             assert cookie
 
         chrome_profile = tmp_path / "isolated-chrome-profile"
-        chrome_profile.mkdir()
-        chrome = subprocess.Popen(
-            [
-                "google-chrome", "--headless=new", "--disable-gpu",
-                "--no-first-run", "--no-default-browser-check",
-                "--remote-debugging-port=0",
-                "--remote-allow-origins=http://127.0.0.1",
-                f"--user-data-dir={chrome_profile}", "about:blank",
-            ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        debug_port_file = chrome_profile / "DevToolsActivePort"
-        deadline = time.monotonic() + 10
-        while not debug_port_file.exists() and time.monotonic() < deadline:
-            if chrome.poll() is not None:
-                raise AssertionError("Isolated Chrome exited before readiness")
-            time.sleep(0.05)
-        assert debug_port_file.exists(), "Isolated Chrome debugger not ready"
-        debug_port = int(debug_port_file.read_text(encoding="utf-8").splitlines()[0])
-        page = httpx.put(
-            f"http://127.0.0.1:{debug_port}/json/new?about:blank", timeout=5,
-        ).json()
-        with websocket_connect(
-            page["webSocketDebuggerUrl"],
-            origin="http://127.0.0.1",
-            open_timeout=5,
-        ) as devtools:
-            sequence = 0
-            protocol_frames: list[tuple[str, dict[str, Any]]] = []
+        protocol_frames: list[tuple[str, dict[str, Any]]] = []
 
-            def cdp(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-                nonlocal sequence
-                sequence += 1
-                request_id = sequence
-                devtools.send(json.dumps({
-                    "id": request_id, "method": method, "params": params or {},
-                }))
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    message = json.loads(devtools.recv(timeout=10))
-                    if message.get("method") in (
-                        "Network.webSocketFrameSent", "Network.webSocketFrameReceived",
-                    ):
-                        response = message.get("params", {}).get("response", {})
-                        if response.get("opcode") in (1, 2):
-                            try:
-                                payload = response.get("payloadData", "")
-                                if response["opcode"] == 2:
-                                    payload = base64.b64decode(payload).decode("utf-8", "replace")
-                                parsed = json.loads(payload)
-                            except (TypeError, ValueError):
-                                parsed = None
-                            if isinstance(parsed, dict) and parsed.get("kind") in (
-                                "command", "command_ack",
-                            ):
-                                protocol_frames.append((message["method"], parsed))
-                    if message.get("id") != request_id:
-                        continue
-                    if "error" in message:
-                        raise AssertionError(f"Chrome CDP {method}: {message['error']}")
-                    return message.get("result", {})
-                raise AssertionError(f"Chrome CDP {method} timed out")
+        def observe_protocol_frame(message: dict[str, Any]) -> None:
+            if message.get("method") not in (
+                "Network.webSocketFrameSent", "Network.webSocketFrameReceived",
+            ):
+                return
+            response = message.get("params", {}).get("response", {})
+            if response.get("opcode") not in (1, 2):
+                return
+            try:
+                payload = response.get("payloadData", "")
+                if response["opcode"] == 2:
+                    payload = base64.b64decode(payload).decode("utf-8", "replace")
+                parsed = json.loads(payload)
+            except (TypeError, ValueError):
+                return
+            if isinstance(parsed, dict) and parsed.get("kind") in (
+                "command", "command_ack",
+            ):
+                protocol_frames.append((message["method"], parsed))
 
-            def evaluate(expression: str) -> Any:
-                result = cdp("Runtime.evaluate", {
-                    "expression": expression,
-                    "returnByValue": True,
-                })
-                if "exceptionDetails" in result:
-                    raise AssertionError(str(result["exceptionDetails"]))
-                return result.get("result", {}).get("value")
-
+        with open_chrome_page(
+            chrome_profile, on_event=observe_protocol_frame,
+        ) as chrome_session:
+            cdp = chrome_session.cdp
+            evaluate = chrome_session.evaluate
             cdp("Page.enable")
             cdp("Runtime.enable")
             cdp("Network.enable")
@@ -949,7 +892,28 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
                 a_terminal_id, "qa-observer",
             ) == before_controller
             assert app.state.store.get_workspace(a_id)["last_opened_at"] == before_workspace
-            assert app.state.store.list_terminals(a_id) == before_terminals
+            after_terminals = app.state.store.list_terminals(a_id)
+            assert len(after_terminals) == len(before_terminals)
+            # Output timestamps are passive tmux activity observations and may
+            # advance while an unrelated B/C read runs. Exact user identity,
+            # tab, ownership, name, tmux pane, and creation/open metadata must
+            # not change; monotonic output activity is not a user mutation.
+            for before_terminal, after_terminal in zip(
+                before_terminals, after_terminals, strict=True,
+            ):
+                passive_activity = {"last_output_at", "activity_at"}
+                assert {
+                    key: value for key, value in after_terminal.items()
+                    if key not in passive_activity
+                } == {
+                    key: value for key, value in before_terminal.items()
+                    if key not in passive_activity
+                }
+                assert after_terminal["activity_at"] >= before_terminal["activity_at"]
+                if before_terminal["last_output_at"] and after_terminal["last_output_at"]:
+                    assert (
+                        after_terminal["last_output_at"] >= before_terminal["last_output_at"]
+                    )
 
             # T43: actual scoped B/C mutations while the real browser stays on A.
             # All files, browsers, tmux sessions, and tokens belong to tmp_path.
@@ -1047,13 +1011,15 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
                         "action_id": "qa-c-file-run-0001",
                         "relative_path": "qa-check.py",
                         "expected_digest": hashlib.sha256(
-                            b"print('qa-c-run-ok')\n",
+                            (project_root / "c" / "qa-check.py").read_bytes(),
                         ).hexdigest(),
                         "idempotency_key": str(uuid.uuid4()),
                     },
                 )
                 assert started.status_code == 202, started.text
+                assert started.json()["phase"] == "process_started"
                 c_run_id = started.json()["run"]["id"]
+                (project_root / "c" / "qa-c-run-release").touch()
 
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
@@ -1544,6 +1510,88 @@ def test_real_headless_browser_a_is_unchanged_by_scoped_b_c_reads(
                     f"client_receipt={receipt.json()['phase']} stale_refused=True"
                 )
 
+
+    finally:
+        if core:
+            core.close()
+        for workspace in workspaces.values():
+            app.state.terminals._run_tmux(
+                "kill-session", "-t", str(workspace["tmux_session"]), check=False,
+            )
+
+
+@pytest.mark.skipif(
+    shutil.which("tmux") is None or shutil.which("google-chrome") is None,
+    reason="Real tmux and Google Chrome are required",
+)
+def test_real_chrome_tui_copy_preserves_clipboard_and_pty_input(
+    tmp_path: Path,
+) -> None:
+    """Isolated real mouse-reporting TUI: copy text, no inadvertent PTY bytes."""
+    from termroom.app import create_app
+    from termroom.config import Settings
+
+    project_root = tmp_path / "projects"
+    (project_root / "copy").mkdir(parents=True)
+    settings = Settings.create(
+        project_root, state_dir=tmp_path / "state",
+        login_password="isolated-tui-copy-password",
+        access_token="isolated-tui-copy-token",
+    )
+    app = create_app(settings)
+    workspace = app.state.workspaces.open("copy")
+    terminal = app.state.terminals.ensure_workspace(workspace)[0]
+    core: IsolatedCore | None = None
+    try:
+        core = start_isolated_core(app)
+        base_url = core.base_url
+        with httpx.Client(base_url=base_url) as login:
+            response = login.post(
+                "/login", data={"password": "isolated-tui-copy-password"},
+            )
+            assert response.status_code == 303, response.text
+            cookie = login.cookies.get("termroom_session")
+            assert cookie
+
+        with open_chrome_page(tmp_path / "tui-chrome-profile") as chrome:
+            cdp = chrome.cdp
+            evaluate = chrome.evaluate
+            cdp("Page.enable")
+            cdp("Page.bringToFront")
+            cdp("Runtime.enable")
+            cdp("Network.enable")
+            assert cdp("Network.setCookie", {
+                "name": "termroom_session", "value": cookie,
+                "url": f"{base_url}/", "httpOnly": True,
+            })["success"]
+            cdp("Page.navigate", {
+                "url": (
+                    f"{base_url}/w/{workspace['id']}/terminal"
+                    f"?terminal={terminal['id']}"
+                ),
+            })
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if (
+                    evaluate(
+                        "document.readyState === 'complete' && "
+                        "!document.querySelector('#terminal-copy-mode').disabled"
+                    )
+                    and app.state.terminals.control.client_count(terminal["id"]) > 0
+                ):
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("Isolated Chrome copy Terminal did not become ready")
+            target = f"{workspace['tmux_session']}:{terminal['tmux_window']}"
+            assert evaluate("""(() => {
+              document.querySelector('#open-command-editor').click();
+              const draft = document.querySelector('#command-input');
+              draft.value = 'private-draft-한글-keep';
+              draft.dispatchEvent(new Event('input', {bubbles: true}));
+              return draft.value;
+            })()""") == "private-draft-한글-keep"
+
             # TUI copy: exercise the production Terminal in the same isolated
             # Chrome + private tmux pane. No second browser/server harness.
             copy_script = tmp_path / "copy_tui_fixture.py"
@@ -1782,17 +1830,8 @@ finally:
             )
 
     finally:
-        if chrome is not None and chrome.poll() is None:
-            os.killpg(chrome.pid, signal.SIGTERM)
-            try:
-                chrome.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(chrome.pid, signal.SIGKILL)
-                chrome.wait(timeout=5)
-        server.should_exit = True
-        if server_thread.is_alive():
-            server_thread.join(timeout=8)
-        for workspace in workspaces.values():
-            app.state.terminals._run_tmux(
-                "kill-session", "-t", str(workspace["tmux_session"]), check=False,
-            )
+        if core:
+            core.close()
+        app.state.terminals._run_tmux(
+            "kill-session", "-t", str(workspace["tmux_session"]), check=False,
+        )

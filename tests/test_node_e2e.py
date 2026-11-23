@@ -8,7 +8,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import ssl
 import stat
 import subprocess
@@ -32,90 +31,9 @@ from termroom.node_protocol import NODE_REMOTE_RUN_VERSION
 from termroom.node_remote_runs import NodeRemoteRunError
 from termroom.node_service import NODE_SERVICE_UNIT_NAME, NodeServiceManager
 from termroom.ssh_backend import REMOTE_RUN_SESSION_PREFIX, SSHBackend
-
-
-def _free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-@contextlib.contextmanager
-def _test_sshd(tmp_path: Path) -> Iterator[dict[str, object]]:
-    qa = tmp_path / "sshd"
-    qa.mkdir()
-    remote_tmux_root = qa / "tmux"
-    remote_tmux_root.mkdir(mode=0o700)
-    host_key = qa / "host_key"
-    client_key = qa / "client_key"
-    authorized_keys = qa / "authorized_keys"
-    subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(host_key)],
-        check=True,
-    )
-    subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)],
-        check=True,
-    )
-    authorized_keys.write_bytes(client_key.with_suffix(".pub").read_bytes())
-    authorized_keys.chmod(0o600)
-    port = _free_port()
-    username = os.environ.get("USER") or subprocess.check_output(
-        ["id", "-un"], text=True
-    ).strip()
-    config = qa / "sshd_config"
-    config.write_text(
-        "\n".join(
-            [
-                f"Port {port}",
-                "ListenAddress 127.0.0.1",
-                f"HostKey {host_key}",
-                f"PidFile {qa / 'sshd.pid'}",
-                f"AuthorizedKeysFile {authorized_keys}",
-                "StrictModes no",
-                "PasswordAuthentication no",
-                "KbdInteractiveAuthentication no",
-                "PubkeyAuthentication yes",
-                "UsePAM no",
-                "PermitRootLogin no",
-                f"AllowUsers {username}",
-                f"SetEnv TMUX_TMPDIR={remote_tmux_root}",
-                "LogLevel ERROR",
-                "Subsystem sftp internal-sftp",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    log = (qa / "sshd.log").open("wb")
-    process = subprocess.Popen(
-        ["/usr/sbin/sshd", "-D", "-e", "-f", str(config)],
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    try:
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                    break
-            except OSError as exc:
-                if process.poll() is not None:
-                    raise RuntimeError(
-                        (qa / "sshd.log").read_text(encoding="utf-8")
-                    ) from exc
-                time.sleep(0.05)
-        else:
-            raise RuntimeError("test sshd did not start")
-        yield {"port": port, "username": username, "client_key": client_key}
-    finally:
-        process.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=2)
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=2)
-        log.close()
+from tests.support.chrome import open_chrome_page
+from tests.support.core import free_loopback_port as _free_port
+from tests.support.ssh import start_isolated_sshd as _test_sshd
 
 
 def _wait_until(
@@ -567,85 +485,31 @@ def test_real_node_pairing_and_control_connection_use_custom_ca(tmp_path: Path) 
 def _isolated_chrome_terminal(
     profile: Path, base_url: str, cookie: str, workspace_id: str, terminal_id: str,
 ) -> Iterator[Callable[[str], Any]]:
-    """Drive only a test-owned Chrome profile during remote backend work."""
-    profile.mkdir()
-    chrome = subprocess.Popen(
-        [
-            "google-chrome", "--headless=new", "--disable-gpu",
-            "--no-first-run", "--no-default-browser-check",
-            "--remote-debugging-port=0",
-            "--remote-allow-origins=http://127.0.0.1",
-            f"--user-data-dir={profile}", "about:blank",
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    try:
-        port_file = profile / "DevToolsActivePort"
-        _wait_until(lambda: port_file.exists(), description="isolated Chrome debugger")
-        debug_port = int(port_file.read_text(encoding="utf-8").splitlines()[0])
-        page = httpx.put(
-            f"http://127.0.0.1:{debug_port}/json/new?about:blank", timeout=5,
-        ).json()
-        with websocket_connect(
-            page["webSocketDebuggerUrl"],
-            origin="http://127.0.0.1",
-            open_timeout=5,
-        ) as devtools:
-            next_id = 0
-
-            def cdp(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-                nonlocal next_id
-                next_id += 1
-                request_id = next_id
-                devtools.send(json.dumps({
-                    "id": request_id, "method": method, "params": params or {},
-                }))
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    message = json.loads(devtools.recv(timeout=10))
-                    if message.get("id") != request_id:
-                        continue
-                    if "error" in message:
-                        raise AssertionError(f"Chrome CDP {method}: {message['error']}")
-                    return message.get("result", {})
-                raise AssertionError(f"Chrome CDP {method} timed out")
-
-            def evaluate(expression: str) -> Any:
-                result = cdp("Runtime.evaluate", {
-                    "expression": expression, "returnByValue": True,
-                })
-                if "exceptionDetails" in result:
-                    raise AssertionError(str(result["exceptionDetails"]))
-                return result.get("result", {}).get("value")
-
-            cdp("Page.enable")
-            # A separate initial about:blank tab exists in this test profile.
-            # Keep the observed Chrome page foreground for real focus checks.
-            cdp("Page.bringToFront")
-            cdp("Runtime.enable")
-            cdp("Network.enable")
-            assert cdp("Network.setCookie", {
-                "name": "termroom_session", "value": cookie,
-                "url": f"{base_url}/", "httpOnly": True,
-            })["success"]
-            cdp("Page.navigate", {
-                "url": f"{base_url}/w/{workspace_id}/terminal?terminal={terminal_id}",
-            })
-            _wait_until(
-                lambda: evaluate(
-                    "document.readyState === 'complete' && "
-                    "!!document.querySelector('#terminal .xterm-helper-textarea') && "
-                    "document.querySelector('.terminal-tabs a.active')"
-                    f"?.dataset.terminalActivityTab === '{terminal_id}'"
-                ),
-                description="real Chrome Terminal A",
-            )
-            yield evaluate
-    finally:
-        _stop_process(chrome)
-
+    """Open the real Terminal in one isolated Chrome page."""
+    with open_chrome_page(profile) as page:
+        page.cdp("Page.enable")
+        # The initial about:blank tab stays isolated; foreground this page
+        # so focus/draft assertions keep testing real browser semantics.
+        page.cdp("Page.bringToFront")
+        page.cdp("Runtime.enable")
+        page.cdp("Network.enable")
+        assert page.cdp("Network.setCookie", {
+            "name": "termroom_session", "value": cookie,
+            "url": f"{base_url}/", "httpOnly": True,
+        })["success"]
+        page.cdp("Page.navigate", {
+            "url": f"{base_url}/w/{workspace_id}/terminal?terminal={terminal_id}",
+        })
+        _wait_until(
+            lambda: page.evaluate(
+                "document.readyState === 'complete' && "
+                "!!document.querySelector('#terminal .xterm-helper-textarea') && "
+                "document.querySelector('.terminal-tabs a.active')"
+                f"?.dataset.terminalActivityTab === '{terminal_id}'"
+            ),
+            description=f"real Chrome terminal {terminal_id} in {workspace_id}",
+        )
+        yield page.evaluate
 
 @pytest.mark.skipif(
     not all(shutil.which(command) for command in ("tmux", "google-chrome")),
@@ -851,14 +715,14 @@ def test_real_chrome_a_stays_unchanged_while_ssh_b_operates(tmp_path: Path) -> N
             a_session = str(a_workspace["tmux_session"])
 
             backend = SSHBackend(store, state_dir)
-            host_key = backend.probe_host_key("127.0.0.1", int(server["port"]))
+            host_key = backend.probe_host_key("127.0.0.1", int(server.port))
             computer = store.create_computer(
                 name="Isolated SSH B",
                 ssh_alias="",
                 host="127.0.0.1",
-                port=int(server["port"]),
-                username=str(server["username"]),
-                identity_file=str(server["client_key"]),
+                port=int(server.port),
+                username=str(server.username),
+                identity_file=str(server.client_key),
                 host_key_type=host_key["host_key_type"],
                 host_key_data=host_key["host_key_data"],
                 host_fingerprint=host_key["host_fingerprint"],
@@ -3444,14 +3308,14 @@ def test_real_node_workspace_source_streams_to_ssh_target(tmp_path: Path) -> Non
 
             store = StateStore(core_state / "termroom.sqlite3")
             backend = SSHBackend(store, core_state)
-            host_key = backend.probe_host_key("127.0.0.1", int(server["port"]))
+            host_key = backend.probe_host_key("127.0.0.1", int(server.port))
             ssh_computer = store.create_computer(
                 name="SSH Target",
                 ssh_alias="",
                 host="127.0.0.1",
-                port=int(server["port"]),
-                username=str(server["username"]),
-                identity_file=str(server["client_key"]),
+                port=int(server.port),
+                username=str(server.username),
+                identity_file=str(server.client_key),
                 host_key_type=host_key["host_key_type"],
                 host_key_data=host_key["host_key_data"],
                 host_fingerprint=host_key["host_fingerprint"],
