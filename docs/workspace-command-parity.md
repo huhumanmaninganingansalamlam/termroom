@@ -41,8 +41,11 @@ acceptance:
   test_ssh_backend_remote_tmux_sftp_and_resize, plus
   [SSH workspace command identity/quoting](../tests/test_workspace_commands.py):
   test_ssh_workspace_command_quotes_user_text_and_replays_one_window.
-- [Real Node process and remote workspace](../tests/test_node_e2e.py):
-  test_real_node_process_pair_workspace_terminal_files_and_recovery, plus
+- [Real Node process and remote workspace](../tests/test_real_node_scenarios.py):
+  test_real_node_workspace_archive_and_git_sources_clean_up,
+  test_real_node_scoped_client_preserves_browser_a_and_exact_file_run,
+  test_real_node_core_restart_preserves_pty_runs_and_receipts,
+  test_real_node_disconnect_resume_stop_and_revocation; plus
   [Node descriptor/replay boundaries](../tests/test_workspace_commands.py):
   test_node_descriptor_handoff_bypasses_shell_startup_hooks,
   test_node_workspace_command_revalidates_boundary_and_replays.

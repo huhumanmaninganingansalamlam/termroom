@@ -439,6 +439,37 @@ pairing must not infer manifests, install packages, or run arbitrary initializat
 Locale JSON lives under `termroom/locales/`. User-facing cookies and product copy
 use Termroom names.
 
+## Real-boundary test ownership
+
+The isolated browser, loopback Core and private SSH fixtures live in
+[tests/support/chrome.py](../tests/support/chrome.py),
+[tests/support/core.py](../tests/support/core.py) and
+[tests/support/ssh.py](../tests/support/ssh.py). The actual Core CLI,
+approved outbound Node process, temporary directories, independent credentials
+and owned tmux cleanup now live in
+[tests/support/node.py](../tests/support/node.py). The old 999-line Node
+multi-workflow test is split into distinct real-process test functions in
+[tests/test_real_node_scenarios.py](../tests/test_real_node_scenarios.py):
+workspace/archive/Git Remote Runs, read/operate scope and Chrome A isolation,
+private files and CAS editor, Core restart and action receipts, and Node offline
+to reconnect/stop/revoke. One private Node lifecycle smoke test asserts no
+orphan Core/Node PID or owned tmux session remains.
+
+The former 850-line Chrome A/B/C scenario is separated into real scoped
+reads, mutations/CAS/revocation, and exact PTY/ACK/control-handoff tests in
+[tests/test_tmux_multi_device.py](../tests/test_tmux_multi_device.py). The
+real browser and tmux fixtures share setup but **each scenario is separately
+runnable** and still uses the original production Core/PTY routes. Existing
+larger remote-run conflict, SSL and systemd tests still own distinct behaviors.
+
+A real Node Git Remote Run exposed a five-second output-pipe helper startup
+race during the split. A separately tracked
+[pipe readiness regression](../tests/test_node_pipe_readiness.py) exercises a
+real tmux pipe with an intentionally delayed ready signal. Node now waits for
+its helper only within a finite 12-second bound, preserving fail-closed output
+integrity and the existing negative seal/pipe tests. Transport readiness
+alone does not represent command completion.
+
 ## Mechanical ownership guardrails
 
 The small [check_architecture.py](../scripts/check_architecture.py) script
