@@ -587,6 +587,7 @@ docker compose config
 - [`docs/mobile-terminal.md`](docs/mobile-terminal.md) — mobile terminal and IME input
   contract
 - [`docs/i18n.md`](docs/i18n.md) — locale and translation rules
+- [AGENTS.md](AGENTS.md) — feature-to-file/test map, verified checks and safety boundaries
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — development setup and contribution rules
 
 ## License

@@ -1,5 +1,7 @@
 # T41 · Terminal-first Workspace UX — isolated design review
 
+Historical synthetic review (2026-11-09), **not current product guidance**. See the [current architecture](../../architecture.md) and [repository map](../../../AGENTS.md).
+
 Status: **A selected by the user for a local implementation trial** (2026-11-09 Asia/Seoul). These are still synthetic prototype fixtures, not production code. Existing dirty product changes must remain protected; no deployment was authorized.
 
 ## Open the review fixtures

@@ -550,6 +550,7 @@ docker compose config
   보안 경계
 - [`docs/mobile-terminal.md`](docs/mobile-terminal.md) — 모바일 terminal/IME 입력 계약
 - [`docs/i18n.md`](docs/i18n.md) — locale 추가와 번역 규칙
+- [AGENTS.md](AGENTS.md) — 기능별 담당 파일·테스트, 검증 명령 및 안전 경계
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — 개발 환경과 기여 규칙
 
 ## 라이선스
