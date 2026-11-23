@@ -17,9 +17,9 @@ import termios
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -418,6 +418,33 @@ def validate_workspace_command_launch(value: object) -> str:
 
 def workspace_command_digest(command: str) -> str:
     return hashlib.sha256(normalize_workspace_command(command).encode("utf-8")).hexdigest()
+
+
+WorkspaceCommandReuseDecision = Literal[
+    "replay", "idempotency_conflict", "detach_changed",
+    "reuse_running", "remove_dead", "respawn_shell",
+]
+
+
+def classify_workspace_command_reuse(
+    existing: Mapping[str, Any], *, launch_id: str, digest: str,
+) -> WorkspaceCommandReuseDecision:
+    """Only the common tmux command identity policy, not backend transport.
+
+    A launch ID cannot be reused for different bytes. A changed command must
+    relinquish a slot; identical commands in an active window are reused;
+    a dead window is replaced and an idle shell is respawned. Backend-specific
+    tmux execution, quoting, rollback and errors remain in their own owners.
+    """
+    if existing["launch_id"] == launch_id:
+        return "replay" if existing["digest"] == digest else "idempotency_conflict"
+    if existing["digest"] != digest:
+        return "detach_changed"
+    if existing["state"] in {"running", "settling"}:
+        return "reuse_running"
+    if existing["dead"]:
+        return "remove_dead"
+    return "respawn_shell"
 
 
 def parse_tmux_workspace_command_records(output: str) -> list[dict[str, Any]]:
@@ -1724,13 +1751,16 @@ class TerminalManager:
             )
             if terminal is None:
                 raise TerminalError("Workspace command Terminal is missing")
-            if existing["launch_id"] == safe_launch:
-                if existing["digest"] != digest:
+            reuse_decision = classify_workspace_command_reuse(
+                existing, launch_id=safe_launch, digest=digest,
+            )
+            if reuse_decision in {"replay", "idempotency_conflict"}:
+                if reuse_decision == "idempotency_conflict":
                     raise TerminalError(
                         "Workspace command launch identity was reused for another command"
                     )
                 return terminal
-            if existing["digest"] != digest:
+            if reuse_decision == "detach_changed":
                 if existing["dead"]:
                     self._run_tmux("kill-window", "-t", str(existing["tmux_window"]))
                 elif not clear_tmux_workspace_command_identity(
@@ -1746,9 +1776,9 @@ class TerminalManager:
                         check=False,
                     )
                 existing = None
-            elif existing["state"] in {"running", "settling"}:
+            elif reuse_decision == "reuse_running":
                 return terminal
-            elif existing["dead"]:
+            elif reuse_decision == "remove_dead":
                 self._run_tmux("kill-window", "-t", str(existing["tmux_window"]))
             else:
                 window = str(existing["tmux_window"])

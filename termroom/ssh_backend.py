@@ -85,6 +85,7 @@ from termroom.terminals import (
     TerminalModeRefresh,
     TerminalOutputDecoder,
     acknowledge_terminal_command,
+    classify_workspace_command_reuse,
     complete_terminal_command,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
@@ -3905,13 +3906,16 @@ class SSHBackend:
             )
             if terminal is None:
                 raise SSHBackendError("Workspace command Terminal is missing")
-            if existing["launch_id"] == safe_launch:
-                if existing["digest"] != digest:
+            reuse_decision = classify_workspace_command_reuse(
+                existing, launch_id=safe_launch, digest=digest,
+            )
+            if reuse_decision in {"replay", "idempotency_conflict"}:
+                if reuse_decision == "idempotency_conflict":
                     raise SSHBackendError(
                         "Workspace command launch identity was reused for another command"
                     )
                 return terminal
-            if existing["digest"] != digest:
+            if reuse_decision == "detach_changed":
                 if existing["dead"]:
                     self._exec(
                         computer,
@@ -3931,9 +3935,9 @@ class SSHBackend:
                         f"{detach}; tmux rename-window -t {quoted_window} {history_name}",
                     )
                 existing = None
-            elif existing["state"] in {"running", "settling"}:
+            elif reuse_decision == "reuse_running":
                 return terminal
-            elif existing["dead"]:
+            elif reuse_decision == "remove_dead":
                 self._exec(
                     computer,
                     f"tmux kill-window -t {shlex.quote(str(existing['tmux_window']))}",

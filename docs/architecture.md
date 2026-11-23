@@ -439,6 +439,18 @@ pairing must not infer manifests, install packages, or run arbitrary initializat
 Locale JSON lives under `termroom/locales/`. User-facing cookies and product copy
 use Termroom names.
 
+## Local, SSH and Node managed-command parity
+
+The exact launch identity and managed tmux slot reuse decision are shared
+as pure policy by [classify_workspace_command_reuse](../termroom/terminals.py),
+used by Local TerminalManager, SSHBackend and NodeRuntime. Their actual
+tmux/process/network operations, error envelopes, rollback and security
+checks remain backend-specific.
+
+See the executable [parity matrix](workspace-command-parity.md) for common
+and intentionally different outcomes, with real Local/SSH/Node counterparts.
+No common backend interface or command transport was introduced.
+
 ## Scoped Control feature ownership
 
 The exact scoped /api/control/v1/* and browser-only

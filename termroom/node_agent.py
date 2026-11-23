@@ -115,6 +115,7 @@ from termroom.terminals import (
     WORKSPACE_COMMAND_WRAPPER_ARGV,
     TerminalError,
     TerminalModeRefresh,
+    classify_workspace_command_reuse,
     clear_tmux_workspace_command_identity,
     file_run_completion_grace_active,
     file_run_completion_was_stopped,
@@ -1825,14 +1826,17 @@ class NodeRuntime:
                     "Workspace command Terminal is missing",
                     code="workspace_command_invalid",
                 )
-            if existing["launch_id"] == safe_launch:
-                if existing["digest"] != digest:
+            reuse_decision = classify_workspace_command_reuse(
+                existing, launch_id=safe_launch, digest=digest,
+            )
+            if reuse_decision in {"replay", "idempotency_conflict"}:
+                if reuse_decision == "idempotency_conflict":
                     raise NodeAgentError(
                         "Workspace command launch identity was reused for another command",
                         code="idempotency_conflict",
                     )
                 return {"terminal": terminal, "terminals": terminals}
-            if existing["digest"] != digest:
+            if reuse_decision == "detach_changed":
                 if existing["dead"]:
                     self._tmux("kill-window", "-t", str(existing["tmux_window"]))
                 elif not clear_tmux_workspace_command_identity(
@@ -1851,9 +1855,9 @@ class NodeRuntime:
                         check=False,
                     )
                 existing = None
-            elif existing["state"] in {"running", "settling"}:
+            elif reuse_decision == "reuse_running":
                 return {"terminal": terminal, "terminals": terminals}
-            elif existing["dead"]:
+            elif reuse_decision == "remove_dead":
                 self._tmux("kill-window", "-t", str(existing["tmux_window"]))
             else:
                 window = str(existing["tmux_window"])
