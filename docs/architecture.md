@@ -439,6 +439,24 @@ pairing must not infer manifests, install packages, or run arbitrary initializat
 Locale JSON lives under `termroom/locales/`. User-facing cookies and product copy
 use Termroom names.
 
+## Scoped Control feature ownership
+
+The exact scoped /api/control/v1/* and browser-only
+/api/client-credentials endpoints are registered by
+[control_api.py](../termroom/control_api.py) through register_control_routes
+with a concrete ControlRouteContext. The large create_app in
+[app.py](../termroom/app.py) handles application composition, browser routes,
+session/CSRF middleware and underlying feature managers. This is route
+ownership separation, not a new control protocol or new manager layer.
+
+The 45 pre-extraction route shapes are frozen in
+[control_routes_v1.json](../tests/control_routes_v1.json) and checked by
+[test_control_routes_contract.py](../tests/test_control_routes_contract.py).
+Credential revocation, bounded concurrent reads, action receipt idempotency
+and exact Workspace/Terminal scope still use the same existing owners.
+Browser approval pages retain human session and CSRF admission. Do not
+equate action acceptance/PTY transport with observed process completion.
+
 ## UI-independent application actions (v1 foundation)
 
 This section traces the versioned credential/action foundation and the

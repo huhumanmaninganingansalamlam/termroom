@@ -1,0 +1,407 @@
+[
+  {
+    "path": "/api/client-credentials",
+    "methods": [
+      "GET"
+    ],
+    "name": "list_client_credentials",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/client-credentials",
+    "methods": [
+      "POST"
+    ],
+    "name": "create_client_credential",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/client-credentials/{client_id}/revoke",
+    "methods": [
+      "POST"
+    ],
+    "name": "revoke_client_credential",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/control/v1/actions/{action_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_action_status",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/control/v1/capabilities",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_capabilities",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/control/v1/workspaces",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_workspace_list",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_workspace_identity",
+    "status_code": null,
+    "response_class": "JSONResponse"
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/commands",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_workspace_commands",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/commands",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_quick_command_create",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/commands/{command_id}",
+    "methods": [
+      "DELETE"
+    ],
+    "name": "control_quick_command_delete",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/commands/{command_id}",
+    "methods": [
+      "PATCH"
+    ],
+    "name": "control_quick_command_update",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/commands/{command_id}/launch",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_quick_command_launch",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/file-runs",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_file_runs_list",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/file-runs",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_file_run_start",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/file-runs/{run_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_file_run_detail",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/file-runs/{run_id}/stop",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_file_run_stop",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/files",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_files_list",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/files/create",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_files_create",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/files/search",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_files_search",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/files/stat",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_files_stat",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/files/text",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_files_read",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/files/text",
+    "methods": [
+      "PUT"
+    ],
+    "name": "control_files_write",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_remote_runs_list",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_remote_run_start",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_remote_run_detail",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}/result/apply",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_remote_run_result_apply",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}/result/apply-intents",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_remote_run_apply_intent",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}/result/apply-intents/{approval_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_remote_run_apply_intent_status",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}/result/review",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_remote_run_result_review",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}/snapshot",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_remote_run_snapshot",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/remote-runs/{run_id}/stop",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_remote_run_stop",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_terminal_list",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_create",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_terminal_detail",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/close",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_close",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/close-intents",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_close_intent",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/close-intents/{approval_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_terminal_close_intent_status",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/control",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_terminal_control_state",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/control/claim",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_claim",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/control/release",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_release",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/input",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_input",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/rename",
+    "methods": [
+      "POST"
+    ],
+    "name": "control_terminal_rename",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/terminals/{terminal_id}/snapshot",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_terminal_snapshot",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/workspace-runs",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_workspace_run_claims",
+    "status_code": null,
+    "response_class": null
+  },
+  {
+    "path": "/api/control/v1/workspaces/{workspace_id}/workspace-runs/{launch_id}",
+    "methods": [
+      "GET"
+    ],
+    "name": "control_workspace_run_claim_detail",
+    "status_code": null,
+    "response_class": null
+  }
+]
