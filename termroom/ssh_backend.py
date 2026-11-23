@@ -5174,7 +5174,9 @@ class SSHBackend:
                         if recent_path_ignored(relative, ignore_patterns):
                             continue
                         if stat_module.S_ISDIR(attr.st_mode):
-                            if not name.startswith("."):
+                            # Preserve unreadable-directory pruning on the SFTP scan.
+                            # Do not descend even if the account can list this mode.
+                            if not name.startswith(".") and int(attr.st_mode or 0) & 0o444:
                                 pending.append(child)
                             continue
                         if not stat_module.S_ISREG(attr.st_mode):
