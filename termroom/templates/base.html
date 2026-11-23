@@ -169,8 +169,6 @@
   </main>
   {% endblock %}
   <script src="{{ static_url(request, 'app.js') }}?v={{ static_asset_version('app.js') }}" defer></script>
-  <script src="{{ static_url(request, 'terminal_selection.js') }}?v={{ static_asset_version('terminal_selection.js') }}" defer></script>
-  <script src="{{ static_url(request, 'mobile_scrollback.js') }}?v={{ static_asset_version('mobile_scrollback.js') }}" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

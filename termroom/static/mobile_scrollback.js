@@ -3,13 +3,7 @@
   const terminalHost = document.querySelector("#terminal");
   const selectionOwnership = window.TermroomSelectionOwnership;
   if (!outputLink || !terminalHost || !selectionOwnership) return;
-  const tr = window.TermroomT || ((key) => key);
-  const copyModeButton = document.querySelector("#terminal-copy-mode");
-  const copyControls = document.querySelector("#terminal-copy-controls");
-  const copySelectionButton = document.querySelector("#terminal-copy-selection");
-  const copyVisibleButton = document.querySelector("#terminal-copy-visible");
-  const copyStatus = document.querySelector("#terminal-copy-status");
-
+  const tr = (key) => window.TermroomT?.(key) || key;
   const mobileViewport = window.matchMedia("(max-width: 1023px), (pointer: coarse)");
   const SCROLL_BOTTOM_EPSILON_PX = 3;
   const TOUCH_DISTANCE_PX = 24;
@@ -57,14 +51,16 @@
   const history = document.createElement("pre");
   history.className = "terminal-scroll-history";
   history.hidden = true;
-  history.setAttribute("aria-label", outputLink.getAttribute("aria-label") || "Terminal history");
+  history.setAttribute(
+    "aria-label", outputLink.getAttribute("aria-label") || tr("terminal.output"),
+  );
 
   const liveButton = document.createElement("button");
   liveButton.type = "button";
   liveButton.className = "terminal-scroll-live";
-  liveButton.textContent = "LIVE ↓";
+  liveButton.textContent = tr("terminal.live_view");
   liveButton.hidden = true;
-  liveButton.setAttribute("aria-label", "Live terminal");
+  liveButton.setAttribute("aria-label", tr("terminal.live_view_label"));
 
   terminalHost.before(surface);
   surface.append(history, terminalHost, liveButton);
@@ -551,41 +547,21 @@
     return { fragment, text: plainText, styled };
   };
 
-  const syncTerminalCopyActions = () => {
-    if (!copyModeButton || !copyControls) return;
-    const selecting = terminalSelectionMode === selectionOwnership.COPY_XTERM;
-    copyModeButton.disabled = typeof terminalHost.termroomSetCopyMode !== "function";
-    copyModeButton.setAttribute("aria-pressed", String(selecting));
-    copyModeButton.setAttribute("aria-label", tr(
-      selecting ? "terminal.copy_mode_off" : "terminal.copy_mode_on",
-    ));
-    copyModeButton.title = copyModeButton.getAttribute("aria-label");
-    copyModeButton.querySelector(".terminal-tool-label").textContent =
-      copyModeButton.getAttribute("aria-label");
-    copyModeButton.querySelector(".terminal-copy-mobile-label").textContent =
-      tr(selecting ? "terminal.copy_mode_short_off" : "terminal.copy_mode_short");
-    copyControls.hidden = !selecting;
-    if (copySelectionButton) {
-      copySelectionButton.disabled = !selecting || !terminalHost.termroomGetSelection?.();
-    }
-    if (copyVisibleButton) {
-      copyVisibleButton.disabled = !selecting || !terminalHost.termroomGetVisibleText?.();
-    }
-  };
+  let terminalCopyControls = null;
 
   const setTerminalSelectionMode = (nextMode, reason, { refreshHistory = true } = {}) => {
     const wasNative = nativeCopySelectionActive;
     const wasCopying = terminalSelectionMode === selectionOwnership.COPY_XTERM;
     const isCopying = nextMode === selectionOwnership.COPY_XTERM;
     if (wasCopying !== isCopying && terminalHost.termroomSetCopyMode?.(isCopying) === false) {
-      if (copyStatus) copyStatus.textContent = tr("terminal.copy_error");
+      terminalCopyControls?.showError();
       return;
     }
     terminalSelectionMode = nextMode;
     nativeCopySelectionActive = nextMode === selectionOwnership.READING_NATIVE;
     surface.classList.toggle(NATIVE_COPY_SELECTION_CLASS, nativeCopySelectionActive);
-    if (copyStatus && wasCopying !== isCopying) copyStatus.textContent = "";
-    syncTerminalCopyActions();
+    if (wasCopying !== isCopying) terminalCopyControls?.clearStatus();
+    terminalCopyControls?.sync();
     if (refreshHistory && wasNative && !nativeCopySelectionActive && historyDirty && liveFollowing) {
       scheduleHistoryRefresh({ urgent: true });
     }
@@ -599,43 +575,14 @@
     );
   };
 
-  const writeTerminalClipboard = async (text) => {
-    if (!copyStatus) return;
-    if (!text) {
-      copyStatus.textContent = tr("terminal.copy_empty");
-      return;
-    }
-    if (!window.isSecureContext || typeof navigator.clipboard?.writeText !== "function") {
-      copyStatus.textContent = tr("terminal.copy_error");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-      if (terminalSelectionMode === selectionOwnership.COPY_XTERM) {
-        copyStatus.textContent = tr("terminal.copy_success");
-      }
-    } catch {
-      copyStatus.textContent = tr("terminal.copy_error");
-    }
-  };
-  const copyTerminalSelection = () =>
-    writeTerminalClipboard(terminalHost.termroomGetSelection?.() || "");
-  const copyVisibleTerminal = () =>
-    writeTerminalClipboard(terminalHost.termroomGetVisibleText?.() || "");
-
-  copyModeButton?.addEventListener("click", () => {
-    if (typeof terminalHost.termroomSetCopyMode !== "function") return;
-    applySelectionOwnership({
-      type: terminalSelectionMode === selectionOwnership.COPY_XTERM ? "stop-copy" : "start-copy",
-      mouseTracking: mouseTrackingActive(),
-      away: !atLiveBottom(),
-    });
-  });
-  copySelectionButton?.addEventListener("click", () => { void copyTerminalSelection(); });
-  copyVisibleButton?.addEventListener("click", () => { void copyVisibleTerminal(); });
-  terminalHost.addEventListener("termroom:terminal-selection-changed", syncTerminalCopyActions);
-  window.addEventListener("termroom:terminal-copy-ready", syncTerminalCopyActions);
-  syncTerminalCopyActions();
+  terminalCopyControls = window.TermroomTerminalCopy?.installTerminalCopyControls({
+    terminalHost,
+    selectionOwnership,
+    getSelectionMode: () => terminalSelectionMode,
+    applySelectionOwnership,
+    mouseTrackingActive: () => mouseTrackingActive(),
+    atLiveBottom: () => atLiveBottom(),
+  }) || null;
 
   const selectionBelongsToSurface = () => {
     const selection = window.getSelection();
@@ -652,7 +599,7 @@
     // The document capture phase runs before xterm's mouseup selection update.
     // Re-evaluate after it completes, including when xterm does not emit its
     // public selection change event for a particular drag path.
-    window.setTimeout(syncTerminalCopyActions, 0);
+    window.setTimeout(() => terminalCopyControls?.sync(), 0);
   };
 
   const crossBoundaryCopyText = () => {
@@ -1287,7 +1234,7 @@
   // mouseup without a matching pointerup. xterm updates its selection later
   // in this dispatch, so refresh after the event, not in capture.
   document.addEventListener("mouseup", () => {
-    window.setTimeout(syncTerminalCopyActions, 0);
+    window.setTimeout(() => terminalCopyControls?.sync(), 0);
   }, { capture: true, passive: true });
   document.addEventListener(
     "pointerdown",

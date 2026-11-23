@@ -648,6 +648,8 @@
   "terminal.purpose": "Run commands",
   "terminal.switch": "Switch terminal",
   "terminal.output": "Output",
+  "terminal.live_view": "Live ↓",
+  "terminal.live_view_label": "Return to live terminal output",
   "terminal.copy_mode_on": "Select text",
   "terminal.copy_mode_off": "Exit selection",
   "terminal.copy_mode_short": "Select",

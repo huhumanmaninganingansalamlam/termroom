@@ -102,19 +102,26 @@ assert.equal(visibleTerminalText(term), "next");
 
 def test_copy_ui_single_mode_owner_and_localized_actions() -> None:
     source = (ROOT / "termroom/static/mobile_scrollback.js").read_text()
+    copy_ui = (ROOT / "termroom/static/terminal_copy.js").read_text()
     terminal = (ROOT / "termroom/static/terminal.js").read_text()
     page = (ROOT / "termroom/templates/terminal.html").read_text()
+    assert "static_asset_version('terminal_copy.js')" in page
+    assert "window.TermroomTerminalCopy" in copy_ui
+    assert "terminalCopyControls = window.TermroomTerminalCopy?" in source
+    assert "let terminalSelectionMode =" in source
+    assert "let terminalSelectionMode =" not in copy_ui
+    assert "navigator.clipboard.writeText" not in source
     for marker in (
         "setTerminalSelectionMode", "syncTerminalCopyActions",
         "copyTerminalSelection", "copyVisibleTerminal",
         "termroomSetCopyMode",
     ):
-        assert marker in source or marker in terminal
+        assert marker in source or marker in copy_ui or marker in terminal
     for element in ("terminal-copy-mode", "terminal-copy-selection",
                     "terminal-copy-visible", "terminal-copy-status"):
         assert f'id="{element}"' in page
     assert "term.options.disableStdin = terminalCopyModeActive ||" in terminal
-    assert "navigator.clipboard.writeText" in source
+    assert "navigator.clipboard.writeText" in copy_ui
     for locale in ("en", "ko"):
         messages = json.loads((ROOT / f"termroom/locales/{locale}.json").read_text())
         for key in ("terminal.copy_mode_on", "terminal.copy_mode_off",

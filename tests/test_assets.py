@@ -1646,7 +1646,7 @@ def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
         assert 'aria-atomic="true"' in template
 
     pending_start = app_script.index("  const pendingWorkspaceLinks = [")
-    pending_end = app_script.index("  const workspaceRunMenus = [", pending_start)
+    pending_end = app_script.index("  const remoteConnectionChecks = [", pending_start)
     pending_script = app_script[pending_start:pending_end]
     for behavior in (
         'querySelectorAll("[data-workspace-open-pending]")',
@@ -1678,7 +1678,10 @@ def test_remote_workspace_navigation_pending_contract_is_wired() -> None:
 def test_workspace_command_pending_contract_is_wired() -> None:
     templates_dir = VENDOR_DIR.parents[1] / "templates"
     workspace_template = (templates_dir / "workspace_base.html").read_text(encoding="utf-8")
-    app_script = (VENDOR_DIR.parent / "app.js").read_text(encoding="utf-8")
+    app_script = (VENDOR_DIR.parent / "workspace_run_menu.js").read_text(encoding="utf-8")
+    assert "workspaceCommandForms" not in (
+        VENDOR_DIR.parent / "app.js"
+    ).read_text(encoding="utf-8")
 
     for marker in (
         "data-workspace-command-run",
@@ -1692,8 +1695,7 @@ def test_workspace_command_pending_contract_is_wired() -> None:
         assert marker in workspace_template
 
     pending_start = app_script.index("  const workspaceCommandForms = [")
-    pending_end = app_script.index("  const remoteConnectionChecks = [", pending_start)
-    pending_script = app_script[pending_start:pending_end]
+    pending_script = app_script[pending_start:]
     for behavior in (
         'querySelectorAll("[data-workspace-command-run]")',
         'form.setAttribute("aria-busy", "true")',

@@ -648,6 +648,8 @@
   "terminal.purpose": "명령 실행",
   "terminal.switch": "터미널 전환",
   "terminal.output": "출력",
+  "terminal.live_view": "실시간 ↓",
+  "terminal.live_view_label": "실시간 터미널 출력으로 돌아가기",
   "terminal.copy_mode_on": "텍스트 선택",
   "terminal.copy_mode_off": "선택 종료",
   "terminal.copy_mode_short": "선택",

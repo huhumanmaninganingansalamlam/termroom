@@ -278,7 +278,21 @@ const historyOnlyUrl = () => '/history';
     assert result.returncode == 0, result.stderr
 
 
-def test_base_loads_mobile_scrollback_assets() -> None:
+def test_live_scrollback_action_uses_en_ko_locale_messages() -> None:
+    import json
+
+    script = (ROOT / "termroom/static/mobile_scrollback.js").read_text(encoding="utf-8")
+    assert 'liveButton.textContent = tr("terminal.live_view");' in script
+    assert 'liveButton.setAttribute("aria-label", tr("terminal.live_view_label"));' in script
+    for locale in ("en", "ko"):
+        values = json.loads(
+            (ROOT / f"termroom/locales/{locale}.json").read_text(encoding="utf-8")
+        )
+        assert values["terminal.live_view"]
+        assert values["terminal.live_view_label"]
+
+
+def test_terminal_only_loads_mobile_scrollback_assets() -> None:
     template = (ROOT / "termroom/templates/base.html").read_text(encoding="utf-8")
     terminal_template = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
 
@@ -288,30 +302,38 @@ def test_base_loads_mobile_scrollback_assets() -> None:
     )
     assert (
         "terminal_selection.js') }}?v={{ static_asset_version('terminal_selection.js') }}\" defer"
-        in template
+        in terminal_template
     )
     assert (
         "mobile_scrollback.js') }}?v={{ static_asset_version('mobile_scrollback.js') }}\" defer"
-        in template
+        in terminal_template
     )
     assert "__termroomTerminalOutputHookInstalled" not in template
+    assert "terminal_selection.js" not in template
+    assert "mobile_scrollback.js" not in template
     assert "terminal.js') }}?v={{ static_asset_version('terminal.js') }}" in terminal_template
 
 
 @pytest.mark.asyncio
 async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    root.mkdir()
+    project = root / "project"
+    project.mkdir(parents=True)
     settings = Settings.create(
         root,
         state_dir=tmp_path / "state",
         access_token="test-token",
     )
     app = create_app(settings)
+    workspace = app.state.workspaces.open("project")
+    app.state.terminals.ensure_workspace(workspace)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        page = await client.get("/")
+        login = await client.get("/")
+        response = await client.post("/login", data={"password": "test-token"})
+        assert response.status_code == 303
+        page = await client.get(f"/w/{workspace['id']}/terminal")
         stylesheet_version = _asset_hash("mobile_scrollback.css")
         ownership_version = _asset_hash("terminal_selection.js")
         script_version = _asset_hash("mobile_scrollback.js")
@@ -319,7 +341,10 @@ async def test_mobile_scrollback_assets_are_served(tmp_path: Path) -> None:
         ownership = await client.get(f"/static/terminal_selection.js?v={ownership_version}")
         script = await client.get(f"/static/mobile_scrollback.js?v={script_version}")
 
-    assert page.status_code == 401
+    assert login.status_code == 401
+    assert f"/static/terminal_selection.js?v={ownership_version}" not in login.text
+    assert f"/static/mobile_scrollback.js?v={script_version}" not in login.text
+    assert page.status_code == 200
     assert f"/static/mobile_scrollback.css?v={stylesheet_version}" in page.text
     assert f"/static/terminal_selection.js?v={ownership_version}" in page.text
     assert f"/static/mobile_scrollback.js?v={script_version}" in page.text
@@ -386,7 +411,7 @@ def test_mobile_scrollback_uses_existing_capture_page_without_touching_pty() -> 
     assert "historyBeforeLiveViewport" not in script
     assert "bestMatchedRows" not in script
     assert 'terminalHost.querySelectorAll(".xterm-rows > div")' not in script
-    assert 'liveButton.textContent = "LIVE ↓";' in script
+    assert 'liveButton.textContent = tr("terminal.live_view");' in script
     assert "surface.scrollTop = maxScrollTop();" in script
     assert 'behavior: "smooth"' not in script
     assert "const historyBoundarySignature = (rows) =>" in script

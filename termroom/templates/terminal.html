@@ -318,5 +318,9 @@
 {% block workspace_scripts %}
 <script src="{{ static_url(request, 'vendor/xterm.js') }}?v=6.0.0"></script>
 <script src="{{ static_url(request, 'vendor/addon-unicode11.js') }}?v=0.8.0"></script>
+<script src="{{ static_url(request, 'terminal_copy.js') }}?v={{ static_asset_version('terminal_copy.js') }}"></script>
 <script src="{{ static_url(request, 'terminal.js') }}?v={{ static_asset_version('terminal.js') }}"></script>
+<script src="{{ static_url(request, 'terminal_selection.js') }}?v={{ static_asset_version('terminal_selection.js') }}" defer></script>
+<script src="{{ static_url(request, 'mobile_scrollback.js') }}?v={{ static_asset_version('mobile_scrollback.js') }}" defer></script>
+<script src="{{ static_url(request, 'terminal_files_drawer.js') }}?v={{ static_asset_version('terminal_files_drawer.js') }}" defer></script>
 {% endblock %}

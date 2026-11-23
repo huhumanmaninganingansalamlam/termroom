@@ -1729,7 +1729,20 @@ finally:
                     break
                 time.sleep(0.05)
             else:
-                raise AssertionError("Copy selection did not confirm browser clipboard write")
+                observed_copy_state = evaluate("""(() => ({
+                  status:document.querySelector('#terminal-copy-status').textContent,
+                  selected:document.querySelector('#terminal').termroomGetSelection(),
+                  mode:document.querySelector('#terminal-copy-mode').getAttribute('aria-pressed'),
+                  enabled:!document.querySelector('#terminal-copy-selection').disabled,
+                  secure:window.isSecureContext,
+                  clipboard:typeof navigator.clipboard?.writeText,
+                  translator:typeof window.TermroomT,
+                  translated:window.TermroomT?.('terminal.copy_success'),
+                  i18n:window.TermroomI18n?.['terminal.copy_success']
+                }))()""")
+                raise AssertionError(
+                    f"Copy selection did not confirm browser clipboard write: {observed_copy_state}"
+                )
             clipboard = cdp("Runtime.evaluate", {
                 "expression": "navigator.clipboard.readText()",
                 "awaitPromise": True, "returnByValue": True,

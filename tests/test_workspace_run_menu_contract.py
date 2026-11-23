@@ -27,10 +27,15 @@ def test_workspace_run_menu_has_an_accessible_close_control() -> None:
 
 
 def test_workspace_run_menu_dismissal_preserves_terminal_focus_contract() -> None:
-    script = (ROOT / "termroom/static/app.js").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/workspace_run_menu.js").read_text(encoding="utf-8")
     start = script.index("  const workspaceRunMenus = [")
     end = script.index("  const workspaceCommandForms = [", start)
     behavior = script[start:end]
+    shell = (ROOT / "termroom/templates/workspace_base.html").read_text(encoding="utf-8")
+    assert "static_asset_version('workspace_run_menu.js')" in shell
+    assert "workspaceRunMenus" not in (
+        ROOT / "termroom/static/app.js"
+    ).read_text(encoding="utf-8")
 
     for contract in (
         'querySelectorAll("[data-workspace-run-menu]")',
@@ -78,7 +83,7 @@ def test_workspace_command_editing_stays_inside_each_command_card() -> None:
 
 def test_workspace_run_commands_reveal_progressively() -> None:
     template = (ROOT / "termroom/templates/workspace_base.html").read_text(encoding="utf-8")
-    script = (ROOT / "termroom/static/app.js").read_text(encoding="utf-8")
+    script = (ROOT / "termroom/static/workspace_run_menu.js").read_text(encoding="utf-8")
     stylesheet = (ROOT / "termroom/static/app.css").read_text(encoding="utf-8")
 
     assert "data-workspace-run-command-list" in template
@@ -177,7 +182,7 @@ def test_terminal_first_rail_utility_actions_are_real_and_named() -> None:
 
 def test_terminal_files_drawer_uses_authenticated_read_only_file_results() -> None:
     shell = (ROOT / "termroom/templates/workspace_base.html").read_text(encoding="utf-8")
-    js = (ROOT / "termroom/static/app.js").read_text(encoding="utf-8")
+    js = (ROOT / "termroom/static/terminal_files_drawer.js").read_text(encoding="utf-8")
     partial = (ROOT / "termroom/templates/_file_results.html").read_text(encoding="utf-8")
 
     assert "data-terminal-files-trigger" in shell
@@ -185,6 +190,11 @@ def test_terminal_files_drawer_uses_authenticated_read_only_file_results() -> No
     assert 'href="/w/{{ workspace.id }}/files"' in shell
     assert "data-terminal-files-list" in shell
     assert "data-terminal-files-close" in shell
+    terminal = (ROOT / "termroom/templates/terminal.html").read_text(encoding="utf-8")
+    assert "static_asset_version('terminal_files_drawer.js')" in terminal
+    assert "terminalFilesDrawer" not in (
+        ROOT / "termroom/static/app.js"
+    ).read_text(encoding="utf-8")
     assert '"x-termroom-partial": "file-results"' in js
     assert "terminalFilesDrawer.showModal()" in js
     assert 'typeof terminalFilesDrawer.showModal === "function"' in js

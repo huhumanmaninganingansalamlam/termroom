@@ -629,12 +629,16 @@ async def test_rendered_pages_use_actual_asset_hashes_and_reuse_cached_versions(
         ("app.css", "href"),
         ("mobile_scrollback.css", "href"),
         ("app.js", "src"),
-        ("terminal_selection.js", "src"),
-        ("mobile_scrollback.js", "src"),
     ):
         url = f'/static/{filename}?v={_static_asset_hash(filename)}'
         assert f'{tag}="{url}"' in home.text
         assert f'{tag}="{url}"' in activity.text
+    for filename in (
+        "terminal_selection.js", "mobile_scrollback.js", "terminal_copy.js",
+        "terminal_files_drawer.js", "workspace_run_menu.js",
+    ):
+        assert f'/static/{filename}' not in home.text
+        assert f'/static/{filename}' not in activity.text
     assert after_activity.misses == after_home.misses
     assert after_activity.hits > after_home.hits
 

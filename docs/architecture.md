@@ -451,6 +451,33 @@ See the executable [parity matrix](workspace-command-parity.md) for common
 and intentionally different outcomes, with real Local/SSH/Node counterparts.
 No common backend interface or command transport was introduced.
 
+## Browser Terminal and Workspace feature ownership
+
+The shared browser script app.js owns cross-page theme, login/navigation and
+general Workspace behavior, not the Terminal Files drawer or Quick Commands
+menu implementations. workspace_run_menu.js installs the progressive saved
+command editor/launch interactions only when that menu exists; the
+terminal_files_drawer.js script is loaded only on the Terminal page and reads
+the existing authenticated Files partial. The file manager and CAS stay with
+Files, and opening the dialog never remounts the PTY or changes the Workspace
+active tab.
+
+The Terminal page alone loads terminal_selection.js, mobile_scrollback.js
+and terminal_copy.js. terminal_selection.js owns the selection-mode policy;
+mobile_scrollback.js owns native historical reading state and transitions;
+terminal_copy.js owns localized actions and Clipboard API feedback; terminal.js
+owns the xterm, WebSocket and PTY input gates. This is not a frontend framework,
+global event bus or separate mobile copy algorithm.
+
+Direct source/DOM contract tests:
+[test_workspace_run_menu_contract.py](../tests/test_workspace_run_menu_contract.py),
+[test_terminal_copy.py](../tests/test_terminal_copy.py) and
+[test_mobile_scrollback.py](../tests/test_mobile_scrollback.py).
+The authenticated actual-Chrome integration in
+[test_terminal_workflow_browser.py](../tests/test_terminal_workflow_browser.py)
+exercises file search, modal focus, draft, Terminal identity and Quick Command
+editing without replacing real tmux.
+
 ## Scoped Control feature ownership
 
 The exact scoped /api/control/v1/* and browser-only

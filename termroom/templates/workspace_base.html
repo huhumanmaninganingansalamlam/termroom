@@ -441,6 +441,9 @@
 </details>
 {% endif %}
 {% block workspace_scripts %}{% endblock %}
+{% if workspace_commands_visible %}
+<script src="{{ static_url(request, 'workspace_run_menu.js') }}?v={{ static_asset_version('workspace_run_menu.js') }}" defer></script>
+{% endif %}
 {% if remote_run %}
 <script src="{{ static_url(request, 'remote_run.js') }}?v={{ static_asset_version('remote_run.js') }}" defer></script>
 {% endif %}

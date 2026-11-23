@@ -110,9 +110,11 @@ the person explicitly selects **Exit selection / 선택 종료**, or switches Te
 - The current mouse protocol is restored on exit even if the TUI changed its
   requested protocol while selection was active. Normal tmux/Vim mouse input
   remains available immediately after exiting the mode.
-- The state owner is terminal_selection.js + its integration in
-  mobile_scrollback.js; terminal.js only gates xterm input and exposes public
-  selection/viewport access. No parallel mobile clipboard algorithm is allowed.
+- Terminal selection state is owned by terminal_selection.js and integrated in
+  mobile_scrollback.js. The page-only terminal_copy.js owns the Copy/Exit
+  button and browser Clipboard API actions. terminal.js only gates xterm
+  input and exposes public selection/viewport access. No parallel mobile
+  clipboard or hidden selection-state implementation is allowed.
 - Touch controls offer visible-screen copy without a drag. Physical-device text
   drag support and macOS Safari behavior require device-specific verification.
 
