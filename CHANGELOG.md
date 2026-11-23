@@ -2,6 +2,35 @@
 
 All notable changes to Termroom are documented in this file.
 
+## [0.4.25] - 2026-11-24
+
+### Added
+
+- Make fullscreen mouse-reporting TUI text selection and copying discoverable
+  with explicit Select text, Copy selection and Copy visible screen controls.
+  Preserve Korean text, clipboard-denial feedback and PTY input isolation.
+
+### Fixed
+
+- Observe actual File Run startup in the real Chrome A/B/C regression before
+  releasing the test-owned child. A valid `dispatched` receipt is not proof
+  that a process started, and is verified as `preparing` rather than mislabeled.
+- Bound Node output-pipe readiness to a finite 12 seconds without weakening
+  log seals, process completion evidence or idempotent Remote Run replay.
+- Keep unreadable SSH directories out of recent-file scans and preserve the
+  existing Remote Run output, Git TLS and snapshot-diagnostic QA corrections.
+
+### Changed
+
+- Isolate scoped control API, credential/receipt persistence and frontend
+  Terminal copy, Files and Run menu owners; preserve Local/SSH/Node parity.
+- Split real Chrome and Node scenarios into independently runnable cases with
+  owned Core, tmux, Node and SSH process cleanup and architecture guardrails.
+
+Release note: `v0.4.24` was tagged but did not pass its release CI and was not
+published to PyPI or GHCR. Version 0.4.25 includes those changes and the
+release-CI regression correction.
+
 ## [0.4.24] - 2026-11-24
 
 ### Added
